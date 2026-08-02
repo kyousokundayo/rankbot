@@ -2325,8 +2325,12 @@ class StatsView(discord.ui.View):
         from database import list_player_blocks
         from recruitment import PlayerBlockSettingsView
 
+        # DB問い合わせより先にACKする。インタラクションの応答期限は3秒で、
+        # 書き込み側のBEGIN IMMEDIATEと競合して待たされると
+        # Unknown interaction (10062) になり、押した人には何も返せなくなる
+        await interaction.response.defer(ephemeral=True, thinking=True)
         blocked_ids = await list_player_blocks(interaction.guild.id, interaction.user.id)
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"同村拒否リスト: {len(blocked_ids)}/{PLAYER_BLOCK_LIMIT}\n"
             "この設定と解除は本人にだけ表示されます。",
             view=PlayerBlockSettingsView(

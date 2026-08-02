@@ -149,6 +149,68 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(runner.night_actions_open())
         runner._persist_room_state.assert_awaited()
 
+    async def test_restore_falls_back_to_fetch_when_cache_is_cold(self) -> None:
+        """起動直後のキャッシュ未反映を「サーバー退出」と誤判定しない。
+
+        discord.py は chunking が max(5秒, 人数/10000) で終わらなくても
+        警告だけ出して ready を発火する。get_member だけを信じると、
+        在籍している進行中ゲームの参加者を投票権ごと消してしまう。
+        """
+        runner = make_runner()
+        cached = FakeMember(1)
+        not_cached = FakeMember(2)
+        left_server = FakeMember(3)
+
+        class ColdCacheGuild:
+            id = 123
+
+            def get_member(self, user_id: int):
+                # chunking未完了で、1人しかキャッシュに載っていない状態
+                return cached if user_id == cached.id else None
+
+            async def fetch_member(self, user_id: int):
+                if user_id == not_cached.id:
+                    return not_cached
+                raise discord.NotFound(
+                    SimpleNamespace(status=404, reason="Not Found"),
+                    {"message": "Unknown Member", "code": 10007},
+                )
+
+        runner.state.guild = ColdCacheGuild()
+
+        # キャッシュ済み・未反映・退出済みの3通り
+        self.assertIs(
+            await runner._fetch_member_for_restore(not_cached.id), not_cached
+        )
+        self.assertIsNone(await runner._fetch_member_for_restore(left_server.id))
+
+    async def test_restore_fetch_treats_api_failure_as_unknown(self) -> None:
+        """API障害は退出と区別できないので不在扱いにするが、握り潰さない。"""
+        runner = make_runner()
+
+        class FlakyGuild:
+            id = 123
+
+            def get_member(self, user_id: int):
+                return None
+
+            async def fetch_member(self, user_id: int):
+                raise discord.HTTPException(
+                    SimpleNamespace(status=503, reason="Service Unavailable"),
+                    {"message": "Service Unavailable", "code": 0},
+                )
+
+        runner.state.guild = FlakyGuild()
+        with self.assertLogs("room_runner", level="WARNING") as logs:
+            self.assertIsNone(await runner._fetch_member_for_restore(1))
+        self.assertTrue(any("メンバー照会に失敗" in line for line in logs.output))
+
+    async def test_restore_fetch_is_safe_without_fetch_member(self) -> None:
+        """fetch_member を持たない相手 (古いfake等) でも例外にしない。"""
+        runner = make_runner()
+        runner.state.guild = SimpleNamespace(id=123, get_member=lambda _uid: None)
+        self.assertIsNone(await runner._fetch_member_for_restore(1))
+
     async def test_join_lock_serializes_across_rooms(self) -> None:
         """参加の判定〜登録は全卓で直列化する。
 
@@ -336,6 +398,42 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
 
         await runner.on_message(message)
         other_wolf.member.send.assert_not_awaited()
+
+    async def test_wolf_relay_fits_discord_message_limit(self) -> None:
+        """中継はプレフィックス込みで2000字に収める。
+
+        超えるとDiscordが送信自体を拒否し (50035)、_relay_to_wolves の
+        except がそれを握り潰すので、相談が黙って仲間に届かなくなる。
+        """
+        from config import DISCORD_MESSAGE_LIMIT
+
+        runner = make_runner()
+        wolf = add_player(runner, 1, Role.WEREWOLF)
+        # 表示名は「番号2桁.名前(最大32字)」まで伸びうる
+        wolf.base_name = "あ" * 32
+        add_player(runner, 2, Role.WEREWOLF)
+        runner.state.wolf_relay_window_open = True
+        relayed: list[str] = []
+        runner._relay_to_wolves = AsyncMock(
+            side_effect=lambda text, exclude_id=None: relayed.append(text)
+        )
+
+        message = SimpleNamespace(
+            author=SimpleNamespace(id=wolf.user_id, bot=False),
+            channel=Mock(spec=discord.DMChannel),
+            content="x" * DISCORD_MESSAGE_LIMIT,  # 通常ユーザーが送れる上限
+        )
+        await runner.on_message(message)
+
+        self.assertEqual(len(relayed), 1)
+        self.assertLessEqual(len(relayed[0]), DISCORD_MESSAGE_LIMIT)
+        self.assertTrue(relayed[0].endswith("…"))  # 切り詰めたことが分かる
+
+        # 収まる長さはそのまま流す
+        relayed.clear()
+        message.content = "3を噛もう"
+        await runner.on_message(message)
+        self.assertTrue(relayed[0].endswith("3を噛もう"))
 
     async def test_wolf_target_change_is_not_broadcast_after_time_limit(self) -> None:
         """制限時間後は襲撃先の変更通知も他の狼へ流さない。
