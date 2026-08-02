@@ -46,6 +46,12 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         self.rating_lock = asyncio.Lock()
         self.season_reset_lock = asyncio.Lock()
         self.private_room_lock = asyncio.Lock()
+        # 「どの卓に所属するか」を変える操作 (参加・GM取得) を全卓で直列化する。
+        # 各卓の action_lock は卓ローカルなので、卓Aが二重参加チェックを
+        # 通過してからDM送信テスト (Discordへの往復) を待つ間に、卓Bが
+        # 「まだどこにも参加していない」と判定して同じ人を登録できてしまう。
+        # 判定から state.players / gm_id への書き込みまでをこのロックで囲む。
+        self.join_lock = asyncio.Lock()
         # ゲーム開始処理 (ニックネーム変更/ロール付与/DM一斉送信) は
         # ギルド共有のメンバー編集バケットを長く占有するため、全卓で1件ずつ直列化する
         self.start_lock = asyncio.Lock()

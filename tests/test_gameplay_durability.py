@@ -27,6 +27,9 @@ class FakeManager:
         self.discord_api_sem = asyncio.Semaphore(20)
         self.start_lock = asyncio.Lock()
         self.rating_lock = asyncio.Lock()
+        # 「どの卓に所属するか」を変える操作を全卓で直列化する共有ロック
+        self.join_lock = asyncio.Lock()
+        self.rooms: dict = {}
 
     async def paced_discord_api_call(self, func, *args, **kwargs):
         # RoomRunner単体テストでは待機なし。Semaphore経由であることは維持する。
@@ -145,6 +148,47 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(runner.state.morning_ready_event.is_set())
         self.assertFalse(runner.night_actions_open())
         runner._persist_room_state.assert_awaited()
+
+    async def test_join_lock_serializes_across_rooms(self) -> None:
+        """参加の判定〜登録は全卓で直列化する。
+
+        卓ごとの action_lock だけだと、卓Aが二重参加チェックを通過してから
+        DM送信テスト (Discordへの往復) を待つ間に、卓Bが「まだどこにも
+        参加していない」と判定して同じ人を登録できてしまう。
+        """
+        manager = FakeManager()
+        rooms = {}
+        for room_id in ("a", "b"):
+            runner = RoomRunner(None, manager, RoomDefinition(room_id, f"卓{room_id}"))
+            runner.state.room_id = room_id
+            runner.state.phase = Phase.LOBBY
+            runner._persist_room_state = AsyncMock()
+            rooms[room_id] = runner
+        manager.rooms = rooms
+
+        member = FakeMember(1)
+        joined_rooms: list[str] = []
+
+        async def join(runner: RoomRunner) -> None:
+            """join_button と同じ順序・同じ窓を再現する"""
+            async with manager.join_lock, runner.action_lock:
+                # 他卓に登録済みなら参加させない (validate_join 相当)
+                for other in rooms.values():
+                    if other is not runner and member.id in other.state.players:
+                        return
+                # DM送信テストのawait。ここが割り込みの窓になる
+                await asyncio.sleep(0)
+                runner.state.players[member.id] = Player(
+                    user_id=member.id, member=member, base_name=member.display_name
+                )
+                joined_rooms.append(runner.state.room_id)
+
+        await asyncio.gather(join(rooms["a"]), join(rooms["b"]))
+
+        # 二重登録されない
+        self.assertEqual(len(joined_rooms), 1)
+        registered = [r for r in rooms.values() if member.id in r.state.players]
+        self.assertEqual(len(registered), 1)
 
     async def test_prep_gate_opens_only_after_everyone_declares(self) -> None:
         """役職確認は参加者全員が押すまで開かず、押し直しで取り消せる。"""

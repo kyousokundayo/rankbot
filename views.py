@@ -210,7 +210,11 @@ class LobbyView(discord.ui.View):
     @discord.ui.button(label="参加", style=discord.ButtonStyle.success, custom_id="join_game", row=0)
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
-        async with self.cog.action_lock:
+        # join_lock (全卓共通) → action_lock (卓ローカル) の順で取る。
+        # 二重参加チェックからstate.playersへの書き込みまでの間にDM送信テストの
+        # awaitが挟まるため、卓ローカルのロックだけでは別卓が割り込めてしまう。
+        # 取得順序はGM取得側と揃えること (逆順で取るとデッドロックする)
+        async with self.cog.manager.join_lock, self.cog.action_lock:
             state = self.cog.state
             user_id = interaction.user.id
 
@@ -261,7 +265,10 @@ class LobbyView(discord.ui.View):
 
     @discord.ui.button(label="GM取得", style=discord.ButtonStyle.primary, custom_id="get_gm", row=1)
     async def gm_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        async with self.cog.action_lock:
+        # 参加ボタンと同じ理由で全卓共通のjoin_lockを先に取る。
+        # validate_gm_claim はランク確認でDBを待つため、卓ローカルのロック
+        # だけでは別卓が同じ人をGMにできてしまう。取得順序は参加側と揃える
+        async with self.cog.manager.join_lock, self.cog.action_lock:
             state = self.cog.state
             if state.phase != Phase.LOBBY:
                 return await interaction.response.send_message("ゲーム中は変更できません。", ephemeral=True)
@@ -765,6 +772,17 @@ class GMControlView(discord.ui.View):
                     "ゲーム状態が変わったため実行できません。", ephemeral=True
                 )
                 return
+            # 確認を待つ間に自然決着してしまう窓がある。精算中の
+            # force_end は走行中の _end_game をキャンセルし、CancelledError は
+            # _end_game の except Exception に捕まらないため、確定済みの勝敗と
+            # レートを取りこぼしたまま廃村になる。押下時と同じ条件で再確認する。
+            if self._settlement_locked():
+                await confirm_interaction.followup.send(
+                    "結果保存・精算中に勝敗が確定したため強制終了しませんでした。"
+                    "「再開」で精算を再試行してください。",
+                    ephemeral=True,
+                )
+                return
             await self.cog.force_end("GMにより強制終了されました。")
             await confirm_interaction.followup.send(
                 "⏹️ ゲームを強制終了しました。", ephemeral=True
@@ -790,6 +808,15 @@ class GMControlView(discord.ui.View):
             if not self._is_current() or not self._is_gm(confirm_interaction):
                 await confirm_interaction.followup.send(
                     "ゲーム状態が変わったため実行できません。", ephemeral=True
+                )
+                return
+            # リセットも内部で force_end を呼ぶため、強制終了と同じ理由で
+            # 確認待ちの間に確定した勝敗を潰さないよう再確認する
+            if self._settlement_locked():
+                await confirm_interaction.followup.send(
+                    "結果保存・精算中に勝敗が確定したためリセットしませんでした。"
+                    "「再開」で精算を再試行してください。",
+                    ephemeral=True,
                 )
                 return
             result = await self.cog.reset_game()
