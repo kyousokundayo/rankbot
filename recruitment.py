@@ -42,6 +42,19 @@ def _utc_datetime(text: str) -> datetime:
     return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
+def _schedule_out_of_range(local_start: datetime, now: datetime) -> bool:
+    """開催日時が「今より後、RECRUITMENT_MAX_DAYS_AHEAD 日以内」から外れるか。
+
+    上限は**日付単位**で判定する。日時で比較すると、日付セレクトが提示した
+    最終日 (now + MAX日) のうち「今の時刻より後」だけが弾かれ、10:00に開いた
+    人には最終日の11:00以降が選べないという食い違いが起きる。
+    """
+    if local_start <= now:
+        return True
+    last_day = (now + timedelta(days=RECRUITMENT_MAX_DAYS_AHEAD)).date()
+    return local_start.date() > last_day
+
+
 def _display_name(guild: discord.Guild, user_id: int) -> str:
     member = guild.get_member(user_id)
     return member.display_name if member is not None else f"ID:{user_id}"
@@ -755,9 +768,10 @@ class RecruitmentCreateModal(discord.ui.Modal, title="募集内容"):
             hour=int(self.values["hour"]), minute=int(self.values["minute"]), tzinfo=JST,
         )
         now = datetime.now(JST)
-        if local_start <= now or local_start > now + timedelta(days=RECRUITMENT_MAX_DAYS_AHEAD):
+        if _schedule_out_of_range(local_start, now):
             return await interaction.response.send_message(
-                "開催日時は現在より後、7日以内を選んでください。", ephemeral=True,
+                f"開催日時は現在より後、{RECRUITMENT_MAX_DAYS_AHEAD}日以内を選んでください。",
+                ephemeral=True,
             )
         room_id = self.values["room"]
         is_open = room_id == "open"
@@ -1022,8 +1036,11 @@ class RecruitmentDuplicateModal(discord.ui.Modal, title="募集を複製"):
         except ValueError:
             return await interaction.response.send_message("日時は YYYY-MM-DD HH:MM 形式で入力してください。", ephemeral=True)
         now = datetime.now(JST)
-        if local_start <= now or local_start > now + timedelta(days=RECRUITMENT_MAX_DAYS_AHEAD):
-            return await interaction.response.send_message("開催日時は現在より後、7日以内にしてください。", ephemeral=True)
+        if _schedule_out_of_range(local_start, now):
+            return await interaction.response.send_message(
+                f"開催日時は現在より後、{RECRUITMENT_MAX_DAYS_AHEAD}日以内にしてください。",
+                ephemeral=True,
+            )
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             new_id = await database.create_recruitment(

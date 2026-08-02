@@ -287,5 +287,50 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             )
 
 
+class ScheduleRangeTest(unittest.TestCase):
+    """日付セレクトが提示する候補と、上限判定の範囲を一致させる。"""
+
+    def test_last_offered_day_is_accepted_at_any_hour(self) -> None:
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+
+        from config import RECRUITMENT_MAX_DAYS_AHEAD
+        from recruitment import _schedule_out_of_range
+
+        jst = ZoneInfo("Asia/Tokyo")
+        now = datetime(2026, 8, 3, 10, 0, tzinfo=jst)
+        # 日付セレクトは offset=0..MAX の日付を候補に出す
+        last_day = (now + timedelta(days=RECRUITMENT_MAX_DAYS_AHEAD)).date()
+
+        for hour in (0, 9, 10, 11, 23):
+            with self.subTest(hour=hour):
+                local_start = datetime(
+                    last_day.year, last_day.month, last_day.day, hour, tzinfo=jst
+                )
+                self.assertFalse(
+                    _schedule_out_of_range(local_start, now),
+                    f"提示された最終日の{hour}時が拒否された",
+                )
+
+    def test_past_and_beyond_last_day_are_rejected(self) -> None:
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+
+        from config import RECRUITMENT_MAX_DAYS_AHEAD
+        from recruitment import _schedule_out_of_range
+
+        jst = ZoneInfo("Asia/Tokyo")
+        now = datetime(2026, 8, 3, 10, 0, tzinfo=jst)
+
+        # 過去・現在ちょうどは拒否
+        self.assertTrue(_schedule_out_of_range(now, now))
+        self.assertTrue(
+            _schedule_out_of_range(now - timedelta(minutes=1), now)
+        )
+        # 候補外の翌日は拒否 (上限は日付単位でも、その先まで緩めない)
+        beyond = now + timedelta(days=RECRUITMENT_MAX_DAYS_AHEAD + 1)
+        self.assertTrue(_schedule_out_of_range(beyond, now))
+
+
 if __name__ == "__main__":
     unittest.main()
