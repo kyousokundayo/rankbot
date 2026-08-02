@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from config import (
+    FEEDBACK_MAX_PER_DAY,
     INITIAL_RATING,
     PLAYER_BLOCK_LIMIT,
     RECRUITMENT_BACKUP_CAPACITY,
@@ -58,6 +59,10 @@ class RecruitmentConflict(RuntimeError):
 
 class PlayerBlockLimitReached(RuntimeError):
     """同村拒否の登録上限に達した。"""
+
+
+class FeedbackRateLimited(RuntimeError):
+    """不具合・改善報告の投稿上限に達した。"""
 
 
 _EXPECTED_GM_UNSET = object()
@@ -726,8 +731,26 @@ async def save_feedback_report(
     phase: Optional[str] = None,
     source_channel_id: Optional[int] = None,
 ) -> int:
-    """プレイヤーから届いた不具合・改善報告をローカルDBへ保存する。"""
+    """プレイヤーから届いた不具合・改善報告をローカルDBへ保存する。
+
+    誰でも押せるフォームなので、1人あたり直近24時間の件数で上限をかける。
+    上限判定とINSERTは BEGIN IMMEDIATE の同一トランザクションで行い、
+    連打で同時に走っても上限を越えられないようにする。
+    """
     async with connect_db() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        recent_rows = await db.execute_fetchall(
+            "SELECT COUNT(*) FROM feedback_reports "
+            "WHERE guild_id=? AND user_id=? "
+            "AND created_at >= datetime('now', '-1 day')",
+            (guild_id, user_id),
+        )
+        if int(recent_rows[0][0]) >= FEEDBACK_MAX_PER_DAY:
+            await db.rollback()
+            raise FeedbackRateLimited(
+                f"報告は1日{FEEDBACK_MAX_PER_DAY}件までです。"
+                "時間をおいてからお試しください。"
+            )
         cursor = await db.execute(
             "INSERT INTO feedback_reports "
             "(guild_id, user_id, category, summary, details, bot_version, "

@@ -142,6 +142,7 @@ AppleScriptの実行環境へ明示的に渡した場合だけ最優先され、
 | ランク段階・相対評価の割合 | `RANK_SPECS` / `SEASON_RANK_PERCENTAGES` / `SEASON_RANK_MIN_GAMES` |
 | 統計の率・平均を表示する最低サンプル数 | `STATS_MIN_SAMPLES` |
 | 募集の占有時間・通知・上限・ランク選択肢 | `RECRUITMENT_*` / `PLAYER_BLOCK_LIMIT` |
+| 不具合報告の投稿上限（1人あたり24時間） | `FEEDBACK_MAX_PER_DAY` |
 | 標準卓の定義・参加条件 | `ROOM_DEFINITIONS` |
 | 個別サーバー専用の固定卓 | `.env`の`WEREWOLF_LOCAL_ROOMS_JSON` |
 | 当面管理者だけに見せる卓・村長説明 | `ADMIN_ONLY_ROOM_IDS` / `MAYOR_INFO_ADMIN_ONLY` |

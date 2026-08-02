@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -20,6 +21,7 @@ from config import (
     PLAYER_BLOCK_LIMIT,
     PRIVATE_ROOM_CREATOR_ROLE_NAME,
     RECRUITMENT_BACKUP_CAPACITY,
+    RECRUITMENT_CONTACT_COOLDOWN_SECONDS,
     RECRUITMENT_MAX_DAYS_AHEAD,
     RECRUITMENT_OCCUPANCY_MINUTES,
     RECRUITMENT_RANK_OPTIONS,
@@ -29,7 +31,7 @@ from config import (
     RECRUITMENT_ROOM_IDS,
     Phase,
 )
-from models import Player
+from models import Player, parse_select_id
 
 log = logging.getLogger(__name__)
 JST = ZoneInfo("Asia/Tokyo")
@@ -92,6 +94,11 @@ class RecruitmentManager:
         self.channel: Optional[discord.TextChannel] = None
         self.operations_channel: Optional[discord.TextChannel] = None
         self.lock = asyncio.Lock()
+        # 募集ごとの「参加者へ一括連絡」の最終送信時刻 (monotonic秒)。
+        # 1回で最大16人へDMが飛ぶため、連打・誤操作で参加者のDMが
+        # 埋まらないよう間隔を空ける。主催者だけが使う機能なので、
+        # 再起動をまたぐ厳密さは要らずメモリ保持で足りる。
+        self._contact_sent_at: dict[int, float] = {}
 
     async def _ensure_public_channel(self, guild: discord.Guild) -> discord.TextChannel:
         channel = None
@@ -1044,6 +1051,22 @@ class RecruitmentContactModal(discord.ui.Modal, title="参加者へ一括連絡"
         row = await database.get_recruitment(self.recruitment_id)
         if row is None or interaction.user.id != self.host_id or interaction.guild is None:
             return await interaction.response.send_message("主催者だけ操作できます。", ephemeral=True)
+
+        # 連打・誤操作で参加者のDMが埋まらないよう間隔を空ける
+        now = time.monotonic()
+        last_sent = self.manager._contact_sent_at.get(self.recruitment_id)
+        if last_sent is not None:
+            elapsed = now - last_sent
+            if elapsed < RECRUITMENT_CONTACT_COOLDOWN_SECONDS:
+                wait = int(RECRUITMENT_CONTACT_COOLDOWN_SECONDS - elapsed) + 1
+                return await interaction.response.send_message(
+                    f"⏳ 一括連絡は{RECRUITMENT_CONTACT_COOLDOWN_SECONDS // 60}分に1回までです。"
+                    f"あと約{wait}秒お待ちください。",
+                    ephemeral=True,
+                )
+        # 送信前に記録する。DM送信中の再送信も弾く
+        self.manager._contact_sent_at[self.recruitment_id] = now
+
         await interaction.response.defer(ephemeral=True, thinking=True)
         entries = await database.list_recruitment_entries(self.recruitment_id)
         recipients = {e["user_id"] for e in entries}
@@ -1115,7 +1138,11 @@ class PlayerBlockSettingsView(discord.ui.View):
     async def remove(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.owner_id:
             return await interaction.response.send_message("本人だけ操作できます。", ephemeral=True)
-        selected_id = int(self.children[1].values[0])
+        selected_id = parse_select_id(self.children[1].values[0])
+        if selected_id is None:
+            return await interaction.response.send_message(
+                "❌ 不正な選択です。", ephemeral=True
+            )
         await database.remove_player_block(self.guild_id, self.owner_id, selected_id)
         blocked_ids = await database.list_player_blocks(self.guild_id, self.owner_id)
         await interaction.response.edit_message(
@@ -1210,7 +1237,11 @@ class OperationsRecruitmentArchiveView(discord.ui.View):
         if not OperationsView._is_admin(interaction):
             return await interaction.response.send_message("管理者のみ操作できます。", ephemeral=True)
         await interaction.response.defer(ephemeral=True, thinking=True)
-        recruitment_id = int(self.children[0].values[0])
+        recruitment_id = parse_select_id(self.children[0].values[0])
+        if recruitment_id is None:
+            return await interaction.followup.send(
+                "❌ 不正な選択です。", ephemeral=True
+            )
         await database.set_recruitment_status(recruitment_id, database.RECRUITMENT_ARCHIVED)
         await self.manager.refresh_message(recruitment_id)
         await interaction.followup.send("募集を強制アーカイブしました。", ephemeral=True)

@@ -10,6 +10,37 @@ import discord
 from config import Phase, Role, Team, ROLE_TEAM
 
 
+def parse_select_id(raw: object) -> Optional[int]:
+    """セレクトUIから返った値をIDとして安全に解釈する。
+
+    インタラクションの values はクライアントが送る値なので、Discord公式
+    クライアント以外からは任意の文字列が届きうる。そのまま int() すると
+    ValueError でコールバックが落ち、押した人にはDiscordの
+    「インタラクションに失敗しました」しか出ない。解釈できない値は None を
+    返し、呼び出し側が理由を本人へ返せるようにする。
+
+    IDは常にASCII数字なので、それ以外は受け付けない。int() は全角やアラビア
+    数字などのUnicode数字も解釈してしまう (int("１２３") や int("١٢٣") が通る)
+    ため、提示した選択肢以外の表記が別のIDへ化けないよう明示的に弾く。
+
+    (views.py と recruitment.py の両方から使うため、双方が既に依存している
+     このモジュールへ置く。遅延importを増やさないための配置)
+    """
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw
+    if not isinstance(raw, str):
+        return None
+    text = raw[1:] if raw.startswith("-") else raw  # 「噛みなし」の -1 を許す
+    if not text.isascii() or not text.isdigit():
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
 @dataclass
 class Player:
     user_id: int
