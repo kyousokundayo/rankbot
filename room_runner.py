@@ -5226,7 +5226,17 @@ class RoomRunner:
         生存者は「生存ロール」への許可上書き、弁明者は個別上書きで発言する。
         注意: set_permissions のkwargs指定は既存上書きの「置換」であり
         マージではない。制限卓のVCが持つ表示権限 (view/connect拒否) を
-        消さないよう、overwrites_for で現在値を取得し speak だけ変更して書き戻す。
+        消さないよう、overwrites_for で現在値を取得し必要な項目だけ
+        変更して書き戻す。
+
+        音声(speak)と併せて**VCの内蔵テキストチャット(send_messages)も塞ぐ**。
+        ここを開けたままだと、サーバーミュートで音声を封じた死亡者・観戦者が
+        VCのチャット欄へ書き込め、それが生存者全員に見えてしまう
+        (霊界で知った役職をそのまま伝えられる)。昼の会話は #昼 で行うため、
+        VCのテキストは生存者にも開けない。
+        スレッド系の権限は触らない: VCの内蔵チャットはスレッドを作れず、
+        受け付けられない権限ビットでこの呼び出し全体が失敗すると
+        speak の制限まで巻き添えで外れてしまう。
         """
         state = self.state
         vc = state.voice_channel
@@ -5235,6 +5245,7 @@ class RoomRunner:
         try:
             ow = vc.overwrites_for(state.guild.default_role)
             ow.speak = False
+            ow.send_messages = False
             await self._paced_discord_api_call(
                 vc.set_permissions, state.guild.default_role,
                 overwrite=ow, reason="人狼: ゲーム中の観戦者発言禁止",
@@ -5255,7 +5266,12 @@ class RoomRunner:
                     log.warning(f"GM発言許可失敗 ({state.room_name}): {e}")
 
     async def _release_vc_after_game(self) -> None:
-        """ゲーム終了時に@everyoneの発言禁止だけを解除する (表示権限は維持)"""
+        """ゲーム終了時に@everyoneの発言制限だけを解除する (表示権限は維持)。
+
+        _restrict_vc_for_game で伏せた音声とテキストを揃って None
+        (未設定=サーバー既定) へ戻す。片方だけ残すと、ゲーム外でも
+        VCのチャットが使えないままになる。
+        """
         state = self.state
         vc = state.voice_channel
         if vc is None or state.guild is None:
@@ -5263,6 +5279,7 @@ class RoomRunner:
         try:
             ow = vc.overwrites_for(state.guild.default_role)
             ow.speak = None
+            ow.send_messages = None
             await self._paced_discord_api_call(
                 vc.set_permissions, state.guild.default_role,
                 overwrite=None if ow.is_empty() else ow,

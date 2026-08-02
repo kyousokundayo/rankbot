@@ -665,6 +665,64 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
                 1, 999, expected_season_start=expected
             )
 
+    async def test_feedback_reports_are_capped_per_user_per_day(self) -> None:
+        """誰でも押せるフォームなので、1人あたりの日次件数で上限をかける。"""
+        from config import FEEDBACK_MAX_PER_DAY
+
+        async def submit(user_id: int) -> int:
+            return await database.save_feedback_report(
+                guild_id=1,
+                user_id=user_id,
+                category="不具合",
+                summary="テスト報告",
+                details=None,
+                bot_version="v0.0",
+            )
+
+        for _ in range(FEEDBACK_MAX_PER_DAY):
+            await submit(100)
+
+        with self.assertRaises(database.FeedbackRateLimited):
+            await submit(100)
+
+        # 上限は利用者ごと。他の人の報告は引き続き受け付ける
+        await submit(200)
+
+        rows = await database.load_recent_feedback_reports(1, limit=200)
+        self.assertEqual(
+            len([r for r in rows if r["user_id"] == 100]), FEEDBACK_MAX_PER_DAY
+        )
+        self.assertEqual(len([r for r in rows if r["user_id"] == 200]), 1)
+
+
+class ParseSelectIdTest(unittest.TestCase):
+    """セレクトの値はクライアント送信なので、int()前に必ず検証する。"""
+
+    def test_accepts_ids_and_rejects_crafted_values(self) -> None:
+        from models import parse_select_id
+
+        self.assertEqual(parse_select_id("123456789012345678"), 123456789012345678)
+        self.assertEqual(parse_select_id("-1"), -1)  # 「噛みなし」の番兵
+        self.assertEqual(parse_select_id(42), 42)
+
+        crafted_values = (
+            "", "abc", "1; DROP TABLE games", None, [], {}, 1.5,
+            # int() はUnicode数字も解釈するので明示的に弾く
+            "１２３", "١٢٣", "０",
+            # 前後の空白・符号・区切り・別表記も受け付けない
+            " 12", "12 ", "+12", "--1", "-", "12_3", "0x1f", "1e3",
+        )
+        for crafted in crafted_values:
+            with self.subTest(crafted=crafted):
+                self.assertIsNone(parse_select_id(crafted))
+
+    def test_bool_is_not_treated_as_id(self) -> None:
+        from models import parse_select_id
+
+        # PythonではTrueがint扱いになるため明示的に弾く
+        self.assertIsNone(parse_select_id(True))
+        self.assertIsNone(parse_select_id(False))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -135,7 +135,15 @@ RECRUITMENT_BACKUP_CAPACITY = 3
 RECRUITMENT_NOTIFICATION_INTERVAL_MINUTES = 10
 RECRUITMENT_NOTIFICATION_WINDOW_MINUTES = 15
 RECRUITMENT_ARCHIVE_RETENTION_DAYS = 30
+# 「参加者へ一括連絡」の再送までの間隔 (秒)。1回で最大16人へDMが飛ぶため、
+# 連打・誤操作で参加者のDMが埋まるのを防ぐ
+RECRUITMENT_CONTACT_COOLDOWN_SECONDS = 300
 PLAYER_BLOCK_LIMIT = 10
+
+# 不具合・改善報告の1人あたり投稿上限 (直近24時間)。
+# 誰でも押せるフォームなので、連投でDBとバックアップが膨らむのを防ぐ。
+# 正当な報告を妨げない程度に余裕を持たせる。
+FEEDBACK_MAX_PER_DAY = 10
 
 # 利用人数が増えるまで一般ユーザーから隠す固定卓。
 # @everyone と全ロールへの閲覧許可を外す。DiscordのAdministrator権限を

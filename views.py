@@ -22,6 +22,7 @@ from config import (
     PRIVATE_ROOM_CREATOR_ROLE_NAME, BOT_VERSION,
     ROOM_DEFINITIONS, RATED_ROOM_NAMES, STATS_MIN_SAMPLES, PLAYER_BLOCK_LIMIT,
 )
+from models import parse_select_id
 
 if TYPE_CHECKING:
     from game import GameCog
@@ -846,8 +847,11 @@ class RemovePlayerSelectView(discord.ui.View):
 
     async def select_callback(self, interaction: discord.Interaction) -> None:
         async with self.cog.action_lock:
-            select = interaction.data["values"][0]
-            user_id = int(select)
+            user_id = parse_select_id(interaction.data["values"][0])
+            if user_id is None:
+                return await interaction.response.send_message(
+                    "❌ 不正な選択です。", ephemeral=True
+                )
             state = self.cog.state
             if self.game_run_id and not self.cog.is_current_game_view(self.game_run_id):
                 return await interaction.response.send_message("⏳ このゲームの操作は終了しています。", ephemeral=True)
@@ -1152,7 +1156,11 @@ class WolfVoteView(discord.ui.View):
                     "⏳ 現在この操作はできません。", ephemeral=True
                 )
 
-            target_id = int(interaction.data["values"][0])
+            target_id = parse_select_id(interaction.data["values"][0])
+            if target_id is None:
+                return await interaction.followup.send(
+                    "❌ 不正な対象です。", ephemeral=True
+                )
 
             if target_id != -1:
                 target = state.get_player(target_id)
@@ -1403,7 +1411,11 @@ class SeerView(discord.ui.View):
         if error:
             return await interaction.response.send_message(error, ephemeral=True)
 
-        target_id = int(interaction.data["values"][0])
+        target_id = parse_select_id(interaction.data["values"][0])
+        if target_id is None:
+            return await interaction.response.send_message(
+                "❌ 不正な対象です。", ephemeral=True
+            )
         target = state.get_player(target_id)
         if target is None or not target.alive:
             return await interaction.response.send_message(
@@ -1510,7 +1522,11 @@ class GuardView(discord.ui.View):
         if error:
             return await interaction.response.send_message(error, ephemeral=True)
 
-        target_id = int(interaction.data["values"][0])
+        target_id = parse_select_id(interaction.data["values"][0])
+        if target_id is None:
+            return await interaction.response.send_message(
+                "❌ 不正な対象です。", ephemeral=True
+            )
 
         if target_id == state.guard_previous:
             return await interaction.response.send_message(
@@ -1917,6 +1933,11 @@ class FeedbackModal(discord.ui.Modal, title="不具合・改善を報告"):
                 phase=phase,
                 source_channel_id=getattr(interaction, "channel_id", None),
             )
+        except database.FeedbackRateLimited as e:
+            # 障害ではなく上限。スタックトレースは残さず理由をそのまま返す
+            log.info("フィードバック上限: user=%s (%s)", interaction.user.id, e)
+            await interaction.followup.send(f"⏳ {e}", ephemeral=True)
+            return
         except Exception as e:
             log.exception("フィードバック保存失敗: %s", e)
             await interaction.followup.send(
