@@ -1,0 +1,37 @@
+# 機密情報
+.env
+.env.*
+!.env.example
+
+# 仮想環境
+.venv/
+venv/
+
+# Python実行時生成物
+__pycache__/
+*.pyc
+.python-version
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ローカルビルドした音声ライブラリ (SE用。各マシンでビルドする)
+data/lib/
+
+# データベース (実データ。リポジトリには含めない)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+*.db
+*.db-shm
+*.db-wal
+
+# ログ
+logs/
+bot.log
+
+# macOS / エディタ
+.DS_Store
+.claude/
