@@ -432,6 +432,20 @@ class FakeGuild:
     def get_member(self, member_id: int) -> Optional[FakeMember]:
         return self._members.get(member_id)
 
+    async def fetch_member(self, member_id: int) -> FakeMember:
+        """本番同様、在籍しなければ discord.NotFound を投げる。
+
+        本番のフォールバック (キャッシュ未反映と退出済みの切り分け) を
+        シミュレータでも通すために必要。無いと AttributeError になる。
+        """
+        member = self._members.get(member_id)
+        if member is None:
+            raise discord.NotFound(
+                SimpleNamespace(status=404, reason="Not Found"),
+                {"message": "Unknown Member", "code": 10007},
+            )
+        return member
+
     def get_channel(self, channel_id: int):
         return next(
             (

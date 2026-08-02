@@ -14,6 +14,7 @@ import discord
 
 from config import (
     Role, Team, Phase, ROLE_TEAM, ROLE_DISTRIBUTION, MAX_PLAYERS,
+    DISCORD_MESSAGE_LIMIT,
     PREPARATION_TIME, CHANNEL_DELETE_DELAY, VOTE_TIMEOUT,
     CH_VILLAGE, CH_SPIRIT, CH_LOBBY, VC_GAME,
     RUNOFF_SPEECH_TIME, LAST_WILL_TIME, DISCUSSION_GRACE_TIME,
@@ -846,6 +847,28 @@ class RoomRunner:
             self._build_room_snapshot(),
         )
 
+    async def _fetch_member_for_restore(self, user_id: int) -> Optional[discord.Member]:
+        """復元時、メンバーキャッシュに載っていない相手をAPIへ確認する。
+
+        起動直後のchunking未完了とサーバー退出を区別するために使う。
+        NotFound だけが「本当に退出済み」で、それ以外の失敗は不明として
+        Noneを返す (従来どおり不在扱いになるが、ログで切り分けられる)。
+        """
+        guild = self.state.guild
+        fetch = getattr(guild, "fetch_member", None)
+        if guild is None or not callable(fetch):
+            return None
+        try:
+            return await self._discord_api_call(fetch, user_id)
+        except discord.NotFound:
+            return None
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.warning(
+                "復元時のメンバー照会に失敗 (%s / user=%s): %s",
+                self.state.room_name, user_id, e,
+            )
+            return None
+
     async def restore_from_snapshot(self, payload: Optional[dict]) -> None:
         state = self.state
         if payload is not None:
@@ -891,6 +914,15 @@ class RoomRunner:
         dropped_players: list[str] = []
         for row in payload.get("players", []):
             member = state.guild.get_member(row["user_id"]) if state.guild else None
+            if member is None and state.guild is not None:
+                # 起動直後はメンバーキャッシュのchunkingが間に合わないことがある。
+                # discord.pyは最大 max(5秒, 人数/10000) 待つだけで、揃わなくても
+                # 警告ログを出して ready を発火する (ConnectionState._delay_ready)。
+                # ここでキャッシュだけを信じると、在籍している進行中ゲームの
+                # 参加者を「不在」と誤判定して投票権ごと消してしまうため、
+                # APIへ直接問い合わせて確かめる (通常は get_member で足り、
+                # この経路は走らない)
+                member = await self._fetch_member_for_restore(row["user_id"])
             if member is None:
                 # サーバー不在者は復元できない (Memberオブジェクトを作れない)。
                 # 黙って消すと人数が変わったことに誰も気付けないため後で告知する
@@ -1858,9 +1890,16 @@ class RoomRunner:
         if not sender or not sender.is_wolf or not sender.alive:
             return
 
-        # 他の人狼に中継
-        relay_msg = f"🐺 **{sender.display_name}**: {message.content}"
-        await self._relay_to_wolves(relay_msg, exclude_id=sender.user_id)
+        # 他の人狼に中継。Discordの2000字上限は「送信するメッセージ全体」に
+        # かかるため、名前のプレフィックス分だけ本文を詰める。超えると
+        # HTTPException(50035)で送信が失敗し、_relay_to_wolves がそれを
+        # 握り潰すので、相談が黙って仲間に届かなくなる
+        prefix = f"🐺 **{sender.display_name}**: "
+        budget = DISCORD_MESSAGE_LIMIT - len(prefix)
+        content = message.content
+        if len(content) > budget:
+            content = content[: budget - 1] + "…"
+        await self._relay_to_wolves(prefix + content, exclude_id=sender.user_id)
 
     # ============================================================
     # ゲームループ

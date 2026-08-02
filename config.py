@@ -71,6 +71,11 @@ ROLE_DISTRIBUTION = {
 
 MAX_PLAYERS = 13
 
+# Discordの1メッセージあたりの文字数上限。超えると送信自体が
+# HTTPException (50035 Invalid Form Body) で失敗するため、
+# 名前などを前置して中継する箇所では本文をこの範囲へ収める
+DISCORD_MESSAGE_LIMIT = 2000
+
 # タイマー設定 (秒)
 PREPARATION_TIME = 30
 DAY_DISCUSSION_BASE = 480      # 8分
