@@ -22,7 +22,7 @@ from config import (
     PRIVATE_ROOM_CREATOR_ROLE_NAME, BOT_VERSION,
     ROOM_DEFINITIONS, RATED_ROOM_NAMES, STATS_MIN_SAMPLES, PLAYER_BLOCK_LIMIT,
 )
-from models import parse_select_id
+from models import by_number, parse_select_id
 
 if TYPE_CHECKING:
     from game import GameCog
@@ -564,7 +564,7 @@ def build_gm_status_embed(cog: RoomRunner) -> discord.Embed:
     if state.disconnected_players:
         waiting = [
             player.display_name
-            for player in state.players.values()
+            for player in by_number(state.players.values())
             if player.user_id in state.disconnected_players
         ]
         embed.add_field(
@@ -841,9 +841,10 @@ class GMControlView(discord.ui.View):
 
         state = self.cog.state
         if state.phase == Phase.LOBBY:
+            # ロビー中は番号未割り当て (全員0)。参加順のまま出す
             players = list(state.players.values())
         else:
-            players = state.alive_players()
+            players = by_number(state.alive_players())
 
         if not players:
             return await interaction.response.send_message("対象プレイヤーがいません。", ephemeral=True)
@@ -965,7 +966,11 @@ class RemovePlayerSelectView(discord.ui.View):
 # ============================================================
 
 class VoteConfirmView(discord.ui.View):
-    """通常投票・決戦投票に共通する、本人だけの最終確認。"""
+    """通常投票・決戦投票に共通する、本人だけの最終確認。
+
+    確定結果は新しいephemeralを足さず**この確認メッセージを書き換えて**残す。
+    「押したのに反応が分からない」を消しつつ、ephemeralの枚数を増やさない。
+    """
 
     def __init__(self, source: "_BaseVoteView", actor_id: int, target_id: int) -> None:
         super().__init__(timeout=30)
@@ -981,11 +986,26 @@ class VoteConfirmView(discord.ui.View):
             return await interaction.response.send_message(
                 "投票を選択した本人だけが確定できます。", ephemeral=True
             )
+        # 引数なしのdeferはコンポーネント用の deferred_message_update。
+        # この確認メッセージ自体を編集対象にできる (thinking=Trueだと
+        # 別枠のephemeralが増えて確認が2枚になる)。DB保存を挟むので
+        # 3秒の応答期限対策としてdefer自体は必要。
+        await interaction.response.defer()
         for item in self.children:
             item.disabled = True
-        self.stop()
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.source.commit_vote(interaction, self.target_id)
+        result, committed = await self.source.commit_vote(
+            self.actor_id, self.target_id
+        )
+        if committed:
+            self.stop()
+        else:
+            # DBの一時失敗などで未確定なら、もう一度確定を試せるよう戻す
+            for item in self.children:
+                item.disabled = False
+        try:
+            await interaction.edit_original_response(content=result, view=self)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
     @discord.ui.button(label="選び直す", style=discord.ButtonStyle.secondary)
     async def cancel_btn(
@@ -1065,16 +1085,21 @@ class _BaseVoteView(discord.ui.View):
 
         return callback
 
-    async def commit_vote(
-        self, interaction: discord.Interaction, target_id: int
-    ) -> None:
+    async def commit_vote(self, voter_id: int, target_id: int) -> tuple[str, bool]:
+        """投票を確定する。(確認メッセージへ出す本文, 確定したか) を返す。
+
+        表示は呼び出し側 (VoteConfirmView) が確認メッセージの書き換えで行う。
+        ここでDiscordへ送らないのは、確定できたかどうかで確認ボタンを
+        戻すか無効化するかが変わるため。
+        """
         async with self.cog.action_lock:
             state = self.cog.state
-            voter_id = interaction.user.id
             error = self._vote_error(voter_id, target_id)
             if error:
-                await interaction.followup.send(error, ephemeral=True)
-                return
+                return error, False
+
+            target = state.get_player(target_id)
+            target_name = target.display_name if target is not None else "選択した相手"
 
             old_action_log_len = len(state.action_log)
             state.votes[voter_id] = target_id
@@ -1088,11 +1113,10 @@ class _BaseVoteView(discord.ui.View):
                 state.votes.pop(voter_id, None)
                 del state.action_log[old_action_log_len:]
                 log.exception(f"{self.persist_label}の保存に失敗: {e}")
-                await interaction.followup.send(
+                return (
                     "❌ 投票を保存できませんでした。もう一度投票してください。",
-                    ephemeral=True,
+                    False,
                 )
-                return
 
             alive_voters = {
                 uid
@@ -1101,7 +1125,7 @@ class _BaseVoteView(discord.ui.View):
             }
             if alive_voters <= state.votes.keys():
                 state.vote_complete_event.set()
-        await interaction.followup.send("✅ 投票しました。", ephemeral=True)
+        return f"✅ **{target_name}** に投票しました。", True
 
 
 class VoteView(_BaseVoteView):
@@ -1648,7 +1672,7 @@ class PrepReadyView(discord.ui.View):
 # ============================================================
 
 class MorningReadyView(discord.ui.View):
-    """夜の間、生存者のDMへ1通ずつ配るパネル。
+    """夜の間 `#昼` に1枚だけ掲示するパネル。
 
     生存者全員が「朝を迎える」を押すと夜が明ける。制限時間が切れても
     自動では明けないので、離席したい人は押さずに待たせればよい
@@ -1656,12 +1680,15 @@ class MorningReadyView(discord.ui.View):
     GMコントロールパネルの「朝」だけに置く (このパネルには参加者用の
     ボタンしか出さず、押せないボタンで紛らわせない)。
 
-    **夜の終わりにstopしない** (night=Trueで登録しない) 点が夜の役職UIと違う。
-    View.stop() 後は discord.py がコールバックを起動しないため、押した人には
-    Discordの「インタラクションに失敗しました」しか出ない。DMには前夜以前の
-    パネルが残り続けて誤タップしやすいので、Viewは生かしたまま
-    night_generation で弾き、理由を本人へ返す。ゲーム終了時に
-    _stop_all_game_views でまとめて停止する。
+    夜は `#昼` の書き込みが止まっているが、**ボタン押下は送信権限とは
+    無関係**なので押せる (同じ条件で PrepReadyView が動いている)。
+
+    **パネル本文は押下では編集しない。** 宣言人数を村へ出すと、夜に行動が
+    あるのが狼3・占い師・狩人の5人だけである以上、未宣言者の数から
+    生存役職が推定できてしまう。押した本人にも人数は返さず (押して
+    確かめて押し直せば測れてしまうため)、自分の操作が通ったかどうかだけを
+    ephemeralで返す。人数を出すのは目安時間切れの1回だけで、全員が同時に
+    知る (_reveal_morning_count)。
     """
 
     def __init__(self, cog: RoomRunner) -> None:
@@ -1679,19 +1706,20 @@ class MorningReadyView(discord.ui.View):
             or self.cog._effective_phase() != Phase.NIGHT
         ):
             return await interaction.response.send_message("⏳ この夜のパネルは終了しています。", ephemeral=True)
+        # 公開チャンネルのパネルなので死亡者・観戦者にもボタンが見える。
+        # deferより前に弾き、押されるたびに2回APIを使わないようにする。
+        player = self.cog.state.get_player(interaction.user.id)
+        if player is None or not player.alive:
+            return await interaction.response.send_message(
+                "⏳ 生存中の参加者だけが押せます。", ephemeral=True
+            )
         # 13人同時押下で後続がlock+DB保存待ちになっても
         # Discordの3秒応答期限を失わないよう先にACKする。
         await interaction.response.defer()
         async with self.cog.action_lock:
             content, error = await self.cog.toggle_morning_ready(interaction.user)
-            if error:
-                return await interaction.followup.send(error, ephemeral=True)
-            # 状態更新とメッセージ編集を同じロック内で直列化し、同時押しで
-            # 新しい人数表示が古い表示に巻き戻るのを防ぐ。
-            try:
-                await interaction.edit_original_response(content=content, view=self)
-            except (discord.NotFound, discord.HTTPException):
-                pass
+        # 成否どちらも本人にだけ返す (公開パネルは編集しない)
+        await interaction.followup.send(error or content, ephemeral=True)
 
 
 # ============================================================
@@ -2658,24 +2686,20 @@ def build_vote_result_embed(votes: dict, players: dict, title: str = "投票結�
     for target_id in votes.values():
         tally[target_id] = tally.get(target_id, 0) + 1
 
-    # 得票順ソート
-    sorted_tally = sorted(tally.items(), key=lambda x: x[1], reverse=True)
-    max_votes = sorted_tally[0][1] if sorted_tally else 1
+    max_votes = max(tally.values()) if tally else 1
 
+    # 番号順に並べる (得票順ではなく番号順。誰に何票入ったかを
+    # 名簿と同じ並びで追えるようにする。最多得票はバーの長さで分かる)。
+    # 生存者は0票でも出し、死亡・除外済みでも票が残っている人は隠さない。
     lines = []
-    for target_id, count in sorted_tally:
-        player = players.get(target_id)
-        if player is None:
+    for player in by_number(players.values()):
+        count = tally.get(player.user_id, 0)
+        if not player.alive and count == 0:
             continue
         bar_len = 10
         filled = round(count / max_votes * bar_len)
         bar = "█" * filled + "░" * (bar_len - filled)
         lines.append(f"{player.display_name} {bar} {count}票")
-
-    # 0票のプレイヤーも表示
-    for pid, p in players.items():
-        if p.alive and pid not in tally:
-            lines.append(f"{p.display_name} {'░' * 10} 0票")
 
     embed = discord.Embed(
         title=f"📋 {title}",
@@ -2683,9 +2707,13 @@ def build_vote_result_embed(votes: dict, players: dict, title: str = "投票結�
         color=discord.Color.orange(),
     )
 
-    # 投票内訳
+    # 投票内訳 (投票者の番号順。dictの反復順は投票が届いた順なので、
+    # そのまま出すと「誰が先に投票したか」まで公開してしまう)
     detail_lines = []
-    for voter_id, target_id in votes.items():
+    for voter_id, target_id in sorted(
+        votes.items(),
+        key=lambda kv: getattr(players.get(kv[0]), "number", 0),
+    ):
         voter = players.get(voter_id)
         target = players.get(target_id)
         if voter and target:
@@ -2784,9 +2812,11 @@ def build_rule_embeds() -> list[discord.Embed]:
     embed.add_field(
         name="朝を迎える",
         value=(
-            "夜は時間切れでは明けません。**DMに届くパネルで生存者全員が「朝を迎える」を押す**と朝になります。\n"
+            f"夜は時間切れでは明けません。**`#{CH_VILLAGE}` のパネルで生存者全員が「朝を迎える」を押す**と朝になります。\n"
             "押し直しで取り消せます。離席したいときは押さずに待たせてください。\n"
-            "**人数はあなたが押したときにDMへ反映**されます（全体の進捗はGMが確認します）。\n"
+            "**宣言した人数は夜の間は誰にも見えません。**"
+            "目安時間が切れたときにパネルへ表示され、全員が同時に知ります"
+            "（未宣言の人数から生存役職を推測されないためです）。\n"
             "未行動の役職が押した場合は警告が出て、もう一度押すと未行動のまま確定します。\n"
             "戻らない人がいる場合は、GMがGMメニューの「朝」で進行できます。"
         ),
@@ -2873,7 +2903,7 @@ def build_help_embeds() -> list[discord.Embed]:
     embed3.add_field(
         name="終了後の進行ログ",
         value=(
-            f"ゲームが終わると、結果発表の直後に**その村の全行動**が `#{CH_VILLAGE}` に貼られます。\n"
+            f"ゲームが終わると、結果発表の直前に**その村の全行動**が `#{CH_VILLAGE}` に貼られます。\n"
             "占い・護衛・襲撃先・投票・処刑・襲撃死を発生順に並べたものです。\n"
             "**確定済みの操作をやり直そうとした記録も残る**ので、"
             "「2回占えてしまったのでは？」といった疑いをその場で確かめられます。"

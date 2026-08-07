@@ -3,11 +3,27 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterable, Optional
 
 import discord
 
 from config import Phase, Role, Team, ROLE_TEAM
+
+
+def by_number(players: Iterable["Player"]) -> list["Player"]:
+    """プレイヤーを番号昇順に並べた**コピー**を返す。
+
+    参加者を選ぶUI (投票ボタン・占い/護衛/襲撃セレクト・GMの除外) と、
+    参加者を並べる表示は全てこれを通す。プレイヤーは毎回ランダムな番号を
+    受け取るので、参加順のまま出すと「01, 07, 03…」と読めない並びになる。
+
+    **state.players の dict 自体は絶対に並べ替えないこと。** 番号割り当てと
+    役職配布がその反復順に依存し (room_runner の _start_game / _assign_roles)、
+    スナップショットも同じ順で保存・復元される。必ずコピーを渡す。
+
+    ロビー中は全員 number=0 だが、sorted は安定ソートなので参加順が保たれる。
+    """
+    return sorted(players, key=lambda p: p.number)
 
 
 def parse_select_id(raw: object) -> Optional[int]:
@@ -227,8 +243,12 @@ class GameState:
         # 復元時は同じ夜のUIを制限時間ごと出し直すので、保存せず作り直す
         self.wolf_relay_window_open: bool = False
 
-        # 「朝を迎える」パネル (夜の間、生存者のDMへ1通ずつ配る。非永続)
-        self.morning_panel_messages: dict[int, discord.Message] = {}
+        # 「朝を迎える」パネル (夜の間 #昼 に1枚だけ掲示。非永続)
+        self.morning_panel_message: Optional[discord.Message] = None
+        # 掲示中パネルのメッセージID (永続)。再起動するとViewが復元されず
+        # 押しても「インタラクションに失敗しました」になるだけなので、
+        # 次の掲示より前にこのIDで消す。
+        self.morning_panel_message_id: Optional[int] = None
 
         # 「役職を確認した」パネル (役職確認タイム中 #昼 に掲示。非永続)
         self.prep_panel_message: Optional[discord.Message] = None

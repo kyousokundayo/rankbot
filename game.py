@@ -694,7 +694,9 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             room.state.phase = Phase.GAME_OVER
             # 朝パネルのViewも _game_views 経由でここで止まる
             room._stop_all_game_views()
-            room._morning_views.clear()
+            room._morning_view = None
+            room.state.morning_panel_message = None
+            room.state.morning_panel_message_id = None
             gm_view = room.state.gm_panel_view
             if gm_view is not None:
                 gm_view.stop()
