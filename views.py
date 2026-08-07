@@ -12,8 +12,7 @@ import database
 import rating as rating_lib
 from config import (
     MAX_PLAYERS, Role, Team, Phase,
-    RUNOFF_SPEECH_TIME, LAST_WILL_TIME, DISCUSSION_GRACE_TIME, MUTE_GRACE_TIME,
-    PREPARATION_TIME, DAY_DISCUSSION_BASE,
+    RUNOFF_SPEECH_TIME, LAST_WILL_TIME, DAY_DISCUSSION_BASE,
     DAY_DISCUSSION_DECREASE, DAY_DISCUSSION_MIN, VOTE_TIMEOUT,
     NIGHT_BASE, NIGHT_MIN,
     CH_LOBBY, CH_STATS, CH_VILLAGE,
@@ -2807,7 +2806,7 @@ def build_rule_embeds() -> list[discord.Embed]:
         value=(
             "**村陣営** — 人狼3人を全滅させる\n"
             "**狼陣営** — 生存人狼数 ≧ 生存非人狼数\n"
-            "※ 狂人は狼陣営の勝ちですが、**占い・霊媒・人数判定では「村人」扱い**です"
+            "※ 狂人は狼陣営の勝ちですが、**占い・霊媒・襲撃・人数判定では「村人」扱い**です"
         ),
         inline=False,
     )
@@ -2827,19 +2826,10 @@ def build_rule_embeds() -> list[discord.Embed]:
         name="1日の流れ",
         value=(
             "朝の結果発表 → 議論 → 投票 →（同票なら弁明と決戦投票）→ 遺言 → 処刑 → 夜\n"
-            f"夜明けにミュートが解除され、**{DISCUSSION_GRACE_TIME}秒後**に音が鳴って議論が始まります。\n"
-            f"議論終了・投票前には**{MUTE_GRACE_TIME}秒のミュート整列**を挟みます。"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="時間",
-        value=(
-            f"役職確認 **{PREPARATION_TIME}秒**（目安。議論は全員の「役職を確認した」で始まる）\n"
-            f"議論 **初日{day_base_min}分 / 毎日{day_drop_min}分短縮 / 最低{day_min_min}分**\n"
-            f"投票 **{VOTE_TIMEOUT}秒**（全員が投票したら即開示）\n"
-            f"弁明 **{RUNOFF_SPEECH_TIME}秒** / 遺言 **{LAST_WILL_TIME}秒**（本人かGMが短縮可）\n"
-            f"夜 **初日{NIGHT_BASE}秒 / 以降{NIGHT_MIN}秒固定**（目安。朝は全員の宣言で明ける）"
+            f"議論 **初日{day_base_min}分 / 毎日{day_drop_min}分短縮 / 最低{day_min_min}分**"
+            f" ／ 投票 **{VOTE_TIMEOUT}秒**（全員投票で即開示）\n"
+            f"弁明 **{RUNOFF_SPEECH_TIME}秒** ／ 遺言 **{LAST_WILL_TIME}秒**（本人かGMが短縮可）\n"
+            f"夜 **初日{NIGHT_BASE}秒 / 以降{NIGHT_MIN}秒**（目安。朝は全員の宣言で明ける）"
         ),
         inline=False,
     )
@@ -2855,13 +2845,11 @@ def build_rule_embeds() -> list[discord.Embed]:
     embed.add_field(
         name="夜の行動",
         value=(
-            "**占い・護衛は「実行確認」を挟んで確定します（誤タップ防止）。**\n"
-            "確定すると今夜は変更できません。**占い結果は確定と同時に表示**されます。\n"
-            "人狼は最後に選ばれた対象を襲撃します（「噛みなし」も選べます）。"
-            "現在の襲撃先はDMに常に表示され、制限時間中の変更は狼全員に伝わります。\n"
-            "**人狼どうしのやり取りは夜の制限時間で終わります**（会話の中継も、"
-            "襲撃先の変更通知も止まります）。**襲撃先の選択自体は夜明けまで可能**ですが、"
-            "その変更は他の人狼へは伝わりません。\n"
+            "占い・護衛は**実行確認**を挟んで確定し、今夜は変更できません。"
+            "**占い結果は確定と同時に表示**されます。\n"
+            "人狼は最後に選んだ対象を襲撃します（「噛みなし」も可）。**人狼同士は噛めません。**\n"
+            "襲撃先の変更は制限時間中だけ狼全員に伝わります。"
+            "**時間後も変更はできますが、他の狼には伝わりません。**\n"
             "襲撃がなかった朝は、理由を問わず「平和な朝を迎えました」と表示されます。"
         ),
         inline=False,
@@ -2869,14 +2857,12 @@ def build_rule_embeds() -> list[discord.Embed]:
     embed.add_field(
         name="宣言で進みます",
         value=(
-            f"どちらも `#{CH_VILLAGE}` のパネルで、**時間切れでは進みません**。押し直しで取り消せます。\n"
+            f"どちらも `#{CH_VILLAGE}` のパネル。**時間切れでは進みません**。押し直しで取り消せます。\n"
             "**📩 役職を確認した** — 参加者全員が押すと議論開始\n"
             "**🌅 朝を迎える** — 生存者全員が押すと朝\n"
             "離席したいときは押さずに待たせてください（これが一時停止の代わりです）。\n"
-            "**宣言した人数は夜の間は誰にも見えません**（未宣言の数から生存役職を"
-            "推測されないため）。目安時間が切れたときに全員へ同時に表示されます。\n"
-            "夜の行動を選んでいない人が押すと警告が出て、もう一度押すと未行動のまま確定します。\n"
-            "戻らない人がいる場合は、GMがGMメニューから進行できます。"
+            "**宣言した人数は夜の間は誰にも見えません。** "
+            "目安時間が切れたときに全員へ同時に表示されます。"
         ),
         inline=False,
     )
@@ -2893,21 +2879,11 @@ def build_help_embeds() -> list[discord.Embed]:
     )
     embed3.set_footer(text=BOT_VERSION)
     embed3.add_field(
-        name="DMでやること",
+        name="DMに届くもの",
         value=(
-            "役職の確認、人狼の相談と襲撃、占い・護衛の選択、霊媒結果の受信。\n"
-            "占い・護衛は選択後に**実行確認**があり、確定すると変更できません。\n"
-            "**占い結果は確定した瞬間にDMへ表示**されます。"
-        ),
-        inline=False,
-    )
-    embed3.add_field(
-        name="離席したいとき",
-        value=(
-            "夜は生存者全員が「朝を迎える」を押すまで明けません。"
-            "席を外したいときは押さずに待たせてください（昼は口頭でGMに伝えてください）。\n"
-            "**一時停止中も占い・護衛・襲撃・朝の宣言は操作できます**"
-            "（止まっている間に選べないと、再開後に消えたように見えるため）。"
+            "役職の確認、人狼の相談と襲撃、占い・護衛の選択、霊媒結果。\n"
+            "夜の行動を選んでいないまま「朝を迎える」を押すと警告が出て、"
+            "**もう一度押すと未行動のまま確定**します。"
         ),
         inline=False,
     )
@@ -2916,8 +2892,7 @@ def build_help_embeds() -> list[discord.Embed]:
         value=(
             "議論中は生存者のみ、投票と夜は全員ミュート、弁明と遺言は本人だけ発言できます。\n"
             "死亡者と観戦者はゲーム中発言できません（終了時に解除）。\n"
-            "**一時停止すると全員ミュートされます**（切断者不在のまま議論が続くのを防ぐため）。\n"
-            "**GMのみミュート / ミュート解除は手動です。**"
+            "**一時停止すると全員ミュートされます。** GMのミュートだけは手動です。"
         ),
         inline=False,
     )
@@ -2926,6 +2901,7 @@ def build_help_embeds() -> list[discord.Embed]:
         value=(
             "VCから落ちる・サーバーを抜けると**自動で一時停止**し、復帰を待ちます。\n"
             "戻ったらGMが「再開」を押します。戻れない場合はGMが「プレイヤー除外」で外して再開できます。\n"
+            "**一時停止中も占い・護衛・襲撃・朝の宣言は操作できます。**\n"
             "ゲーム中にGMが抜けた場合は廃村になります。"
         ),
         inline=False,
@@ -2938,23 +2914,6 @@ def build_help_embeds() -> list[discord.Embed]:
             "フェーズ・日数・生存人数・投票や宣言の進捗・復帰待ちを確認しながら、"
             "一時停止 / 再開 / 朝（強制で夜を明ける）/ 強制終了 / リセット / プレイヤー除外ができます。\n"
             "（役職と夜の行動内容は表示されません）"
-        ),
-        inline=False,
-    )
-    embed3.add_field(
-        name="終了後の推薦",
-        value=(
-            "レート対象卓の終了後、**霊媒師・初日の処刑者・初夜の襲撃死者**にDMが届き、"
-            "自分以外の1人へ **+1** を贈れます（3分以内・推薦者名は非公開）。"
-        ),
-        inline=False,
-    )
-    embed3.add_field(
-        name="専用村",
-        value=(
-            f"**{PRIVATE_ROOM_CREATOR_ROLE_NAME}** ロールを持っていると自分の村を作れます。\n"
-            "作成・村名変更・削除は専用村作成チャンネルから、"
-            "参加者の招待・除外は自分の村の受付にある「専用村管理」から行います。"
         ),
         inline=False,
     )
@@ -3001,10 +2960,19 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
     rate.add_field(
         name="終了後推薦",
         value=(
-            "レート対象卓の終了後、**霊媒師・初日の処刑者・初夜の襲撃死者**が、"
-            "自分以外の参加者1人へ **+1** を贈れます。初夜が平和なら襲撃死者枠はありません。\n"
-            "同じ人が複数条件に当てはまっても1票です。GMもプレイヤー参加していれば推薦対象です。\n"
-            "DMで3分以内に確定し、推薦者名は公開されません。"
+            "レート対象卓の終了後、**霊媒師・初日の処刑者・初夜の襲撃死者**にDMが届き、"
+            "自分以外の1人へ **+1** を贈れます。初夜が平和なら襲撃死者枠はありません。\n"
+            "同じ人が複数条件に当てはまっても1票です。GMもプレイヤー参加していれば対象です。\n"
+            "**3分以内に確定。推薦者名は公開されません。**"
+        ),
+        inline=False,
+    )
+    rate.add_field(
+        name="対象",
+        value=(
+            f"レートが動くのは **{' / '.join(RATED_ROOM_NAMES)}** "
+            f"の{len(RATED_ROOM_NAMES)}卓です。\n"
+            "現在、初心者・中級者・上級者は準備中のため、サーバー管理者だけに表示されます。"
         ),
         inline=False,
     )
@@ -3035,29 +3003,16 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
         inline=False,
     )
 
-    misc = discord.Embed(
-        title="対象とシーズン",
-        color=discord.Color.blue(),
-    )
-    misc.add_field(
-        name="対象と例外",
-        value=(
-            f"レートが動くのは **{' / '.join(RATED_ROOM_NAMES)}** "
-            f"の{len(RATED_ROOM_NAMES)}卓です。\n"
-            "現在、初心者・中級者・上級者は準備中のため、サーバー管理者だけに表示されます。"
-        ),
-        inline=False,
-    )
-    misc.add_field(
+    rank.add_field(
         name="シーズン（管理者向け）",
         value=(
             "`/season_reset` でレートをハーフリセットし、前シーズンの結果を保存します。\n"
-            "Botにはチャンネル管理 / ロール管理 / ニックネーム変更 / メンバーをミュート / "
-            "DM送信の権限が必要です。"
+            "必要な権限: チャンネル管理 / ロール管理 / ニックネーム変更 / "
+            "メンバーをミュート / DM送信。"
         ),
         inline=False,
     )
 
     # どのバージョンの仕様を見ているかが分かるようにする
-    misc.set_footer(text=BOT_VERSION)
-    return [rate, rank, misc]
+    rank.set_footer(text=BOT_VERSION)
+    return [rate, rank]
