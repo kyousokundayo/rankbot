@@ -11,7 +11,12 @@ import discord
 from config import Phase, Role, RoomDefinition, Team
 from game import GameCog
 from models import Player, by_number
-from room_runner import RoomRunner, StateDurabilityError, death_nick
+from room_runner import (
+    RoomRunner,
+    StateDurabilityError,
+    death_nick,
+    timer_should_update,
+)
 from views import (
     GuardView,
     MorningReadyView,
@@ -1532,6 +1537,54 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
 
         # 進行ログ → 勝利陣営+役職公開 → ランク変動 の順で掲示する
         self.assertEqual(order, ["action_log", "result_embed", "rating"])
+
+    def _count_timer_edits(self, seconds: int) -> int:
+        """seconds 秒のカウントダウンで発生するメッセージ編集の回数。"""
+        edits, last = 0, seconds
+        for display in range(seconds, -1, -1):
+            if timer_should_update(display, last):
+                edits += 1
+                last = display
+        return edits
+
+    async def test_timer_ticks_coarsely_until_the_last_30_seconds(self) -> None:
+        """秒読みは残り30秒から。メッセージ編集はチャンネルバケットを食う。
+
+        1ゲーム (13人・5日) の議論・投票・夜・遺言を合わせると
+        1000回規模になるため、終盤以外は粗く刻む。
+        """
+        # 60秒フェーズ: 55,50,45,40,35 の5回 + 30..1 の30回 + 0 の1回
+        # (60は初期表示と同じなので書き換えない)
+        self.assertEqual(self._count_timer_edits(60), 36)
+        # 残り30秒からは毎秒 (秒読みが要る場面は落とさない)
+        for display in (30, 29, 5, 1, 0):
+            self.assertTrue(timer_should_update(display, display + 1), display)
+        # 60〜31秒は5秒刻みだけ
+        self.assertTrue(timer_should_update(45, 46))
+        self.assertFalse(timer_should_update(44, 45))
+        # 60秒超は30秒刻み
+        self.assertTrue(timer_should_update(120, 121))
+        self.assertFalse(timer_should_update(119, 120))
+        # 同じ表示なら書き換えない
+        self.assertFalse(timer_should_update(10, 10))
+
+    async def test_timer_edits_drop_by_about_a_third_over_a_game(self) -> None:
+        """5日ゲーム全体で3割以上減ること (回帰で刻みを戻さないための下限)。"""
+        def old_count(seconds: int) -> int:
+            edits, last = 0, seconds
+            for display in range(seconds, -1, -1):
+                if display != last and (display == 0 or display <= 60 or display % 30 == 0):
+                    edits += 1
+                    last = display
+            return edits
+
+        phases = [(480, 1), (420, 1), (360, 1), (300, 1), (240, 1),
+                  (60, 5), (80, 1), (60, 4), (30, 5), (30, 2)]
+        before = sum(old_count(sec) * times for sec, times in phases)
+        after = sum(self._count_timer_edits(sec) * times for sec, times in phases)
+
+        self.assertLess(after, before)
+        self.assertGreaterEqual((before - after) / before, 0.30, f"{before} -> {after}")
 
     async def test_death_nick_keeps_number_first_and_marker_survives_truncation(self) -> None:
         # 番号を先頭に残す接尾辞にすることで、VC参加者一覧の並びが動かない

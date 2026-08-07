@@ -81,6 +81,31 @@ DEATH_NICK_MARKERS: dict[str, str] = {
 DEATH_NICK_FALLBACK_MARKER = "(死亡)"
 
 
+# カウントダウン表示を書き換える間隔。メッセージ編集はチャンネル単位の
+# バケット (約5回/5秒) を消費し、1ゲーム (13人・5日) で議論・投票・夜・遺言を
+# 合わせると800〜1100回に達する。秒読みが要るのは終盤だけなので、
+# 残り30秒までは粗く刻む。
+TIMER_TICK_PER_SECOND_FROM = 30   # 残りこの秒数からは毎秒
+TIMER_TICK_PER_5_SECONDS_FROM = 60  # ここまでは5秒ごと
+TIMER_TICK_COARSE_INTERVAL = 30   # それ以前は30秒ごと
+
+
+def timer_should_update(display: int, last_display: int) -> bool:
+    """カウントダウンの表示を書き換えるべきか。
+
+    毎秒の秒読みを残り60秒から30秒へ縮めることで、1フェーズあたりの
+    メッセージ編集が61回から37回へ減る (約4割減)。緊張感が要る最後の
+    30秒は毎秒のまま残す。
+    """
+    if display == last_display:
+        return False
+    if display == 0 or display <= TIMER_TICK_PER_SECOND_FROM:
+        return True
+    if display <= TIMER_TICK_PER_5_SECONDS_FROM:
+        return display % 5 == 0
+    return display % TIMER_TICK_COARSE_INTERVAL == 0
+
+
 def death_nick(display_name: str, method: str) -> str:
     """死亡者のニックネーム「01.名前(処刑)」を組み立てる。
 
@@ -5719,7 +5744,7 @@ class RoomRunner:
     ) -> bool:
         """
         一時停止対応のカウントダウン。
-        表示は30秒ごと、残り60秒から1秒ごとに更新する。
+        表示は30秒ごと → 残り60秒から5秒ごと → 残り30秒から毎秒。
 
         Returns:
             True  : event が発生した
@@ -5750,15 +5775,7 @@ class RoomRunner:
 
             remaining -= loop.time() - start
             display = max(0, int(remaining + 0.999))
-            # 60秒超: 30秒ごと / 残り60秒からは毎秒の秒読み。
-            # メッセージ編集はチャンネル単位のバケット (約5回/5秒) なので
-            # 毎秒1回なら他の卓と競合せずに収まる
-            should_update = display != last_display and (
-                display == 0
-                or display <= 60
-                or display % 30 == 0
-            )
-            if should_update:
+            if timer_should_update(display, last_display):
                 message = await self._safe_timer_edit(message, build_content(display))
                 last_display = display
 
