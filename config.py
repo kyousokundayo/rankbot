@@ -133,6 +133,16 @@ CH_MAYOR_INFO = "専用村作成"
 # 統計チャンネルの配置先
 STATS_PARENT_CHANNEL_NAME = "総合"
 MAYOR_INFO_CATEGORY_NAME = "村長ロール説明"
+
+# 終了した #昼 / #霊界 を消さずに退避するログカテゴリ。
+# 試合番号を先頭に付けて移す (Discordはカテゴリ内を名前順に並べるため、
+# 番号が前にあると自然に試合順になる)。読むだけで書き込みはできない。
+LOG_CATEGORY_VILLAGE = "ログ-昼"
+LOG_CATEGORY_SPIRIT = "ログ-霊界"
+# Discordの上限がカテゴリあたり50チャンネル。上限に達したら
+# 古い順にまとめて減らす (毎回1つずつ消すより整理の頻度が下がる)。
+LOG_CATEGORY_LIMIT = 50
+LOG_CATEGORY_TRIM_TO = 40
 OPERATIONS_CATEGORY_NAME = "開発"
 
 # 募集システム。占有区間は [開催時刻, 開催時刻+90分) とし、

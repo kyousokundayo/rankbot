@@ -16,6 +16,8 @@ from config import (
     Role, Team, Phase, ROLE_TEAM, ROLE_DISTRIBUTION, MAX_PLAYERS,
     DISCORD_MESSAGE_LIMIT,
     PREPARATION_TIME, CHANNEL_DELETE_DELAY, VOTE_TIMEOUT,
+    LOG_CATEGORY_VILLAGE, LOG_CATEGORY_SPIRIT,
+    LOG_CATEGORY_LIMIT, LOG_CATEGORY_TRIM_TO,
     CH_VILLAGE, CH_SPIRIT, CH_LOBBY, VC_GAME,
     RUNOFF_SPEECH_TIME, LAST_WILL_TIME, DISCUSSION_GRACE_TIME,
     MUTE_GRACE_TIME, MUTE_RETRY_DELAY,
@@ -2503,6 +2505,71 @@ class RoomRunner:
 
         await self._apply_death_effect(effect)
 
+    async def _ensure_log_category(self, name: str) -> Optional[discord.CategoryChannel]:
+        """ログカテゴリを用意する (全員が読めて、誰も書き込めない)。"""
+        guild = self.state.guild
+        if guild is None:
+            return None
+        category = discord.utils.get(guild.categories, name=name)
+        if category is not None:
+            return category
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(
+                view_channel=True, read_messages=True, send_messages=False,
+                add_reactions=False, create_public_threads=False,
+                create_private_threads=False, send_messages_in_threads=False,
+            ),
+        }
+        try:
+            return await self._discord_api_call(
+                guild.create_category, name, overwrites=overwrites
+            )
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.warning(f"ログカテゴリ作成失敗 ({name}): {e}")
+            return None
+
+    async def _trim_log_category(self, category: discord.CategoryChannel) -> None:
+        """上限に達したら古い順にまとめて減らす。
+
+        Discordの上限はカテゴリあたり50チャンネル。埋まってから1つずつ
+        消すと毎試合その処理が走るので、まとめて LOG_CATEGORY_TRIM_TO まで
+        落とす。作成が古い順 = チャンネルIDの昇順 (Snowflakeは時刻を含む)。
+        """
+        channels = sorted(category.channels, key=lambda ch: ch.id)
+        if len(channels) < LOG_CATEGORY_LIMIT:
+            return
+        for ch in channels[: len(channels) - LOG_CATEGORY_TRIM_TO]:
+            try:
+                await self._paced_discord_api_call(ch.delete)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                log.warning(f"古いログチャンネルの削除失敗 (#{ch.name}): {e}")
+
+    async def _archive_game_channel(
+        self, channel: discord.TextChannel, category_name: str, seq: int
+    ) -> bool:
+        """終了した卓チャンネルをログカテゴリへ移す。成功したらTrue。
+
+        名前は「04-昼」のように試合番号を先頭へ置く。Discordはカテゴリ内を
+        名前順に並べるため、番号が前にあると自然に試合順で並ぶ。
+        権限はカテゴリへ同期させる (書き込み不可・全員閲覧可)。
+        """
+        category = await self._ensure_log_category(category_name)
+        if category is None:
+            return False
+        await self._trim_log_category(category)
+        try:
+            await self._paced_discord_api_call(
+                channel.edit,
+                name=f"{seq:02d}-{channel.name}",
+                category=category,
+                sync_permissions=True,
+                reason="人狼: 終了した卓のログを保管",
+            )
+            return True
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            log.warning(f"ログカテゴリへの移動失敗 (#{channel.name}): {e}")
+            return False
+
     async def _stop_for_durability_error(self, context: str, error: Exception) -> None:
         """勝敗に関わる保存失敗で状態を捨てず安全停止する。"""
         state = self.state
@@ -3933,22 +4000,44 @@ class RoomRunner:
             "✅ **ゲーム終了処理が完了しました。**\nニックネームとVC設定を復元しました。",
         )
 
-        # チャンネル削除予約 (#昼 / #霊界)
-        game_channels = [ch for ch in (state.village_channel, state.spirit_channel) if ch]
+        # ログカテゴリへ退避 (#昼 / #霊界)。移せなければ従来どおり削除する。
+        game_channels = [
+            (state.village_channel, LOG_CATEGORY_VILLAGE),
+            (state.spirit_channel, LOG_CATEGORY_SPIRIT),
+        ]
+        game_channels = [(ch, cat) for ch, cat in game_channels if ch]
+        seq = None
+        if game_id is not None and state.guild is not None:
+            try:
+                seq = await database.get_game_sequence_number(
+                    state.guild.id, int(game_id)
+                )
+            except Exception as e:
+                log.warning(f"ログ用の試合番号を取得できません: {e}")
 
-        await self._safe_village_send(
-            f"🕐 このチャンネルは {CHANNEL_DELETE_DELAY}秒後 に削除されます。"
-        )
+        if seq is None:
+            await self._safe_village_send(
+                f"🕐 このチャンネルは {CHANNEL_DELETE_DELAY}秒後 に削除されます。"
+            )
+        else:
+            await self._safe_village_send(
+                f"🕐 このチャンネルは {CHANNEL_DELETE_DELAY}秒後 に "
+                f"**{LOG_CATEGORY_VILLAGE}** へ移動します (読み返せます)。"
+            )
 
-        async def delete_channels():
+        async def archive_channels():
             await asyncio.sleep(CHANNEL_DELETE_DELAY)
-            for ch in game_channels:
+            for ch, category_name in game_channels:
+                if seq is not None and await self._archive_game_channel(
+                    ch, category_name, seq
+                ):
+                    continue
                 try:
                     await ch.delete()
                 except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
                     log.warning(f"#{ch.name} チャンネル削除失敗: {e}")
 
-        self.manager.spawn_bg_task(delete_channels())
+        self.manager.spawn_bg_task(archive_channels())
 
         # 次村用に直前のメンバーを記録
         if state.players:

@@ -8,7 +8,14 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import discord
 
-from config import Phase, Role, RoomDefinition, Team
+from config import (
+    LOG_CATEGORY_LIMIT,
+    LOG_CATEGORY_TRIM_TO,
+    Phase,
+    Role,
+    RoomDefinition,
+    Team,
+)
 from game import GameCog
 from models import Player, by_number
 from room_runner import (
@@ -938,6 +945,59 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn(voter.user_id, runner.state.votes)
         runner._persist_room_state.assert_not_awaited()
+
+    async def test_finished_channel_moves_to_the_log_category(self) -> None:
+        """終了した卓は削除せず、試合番号を付けてログカテゴリへ移す。"""
+        runner = make_runner()
+        category = SimpleNamespace(name="ログ-昼", channels=[])
+        guild = SimpleNamespace(
+            id=1, categories=[category], create_category=AsyncMock()
+        )
+        runner.state.guild = guild
+        channel = SimpleNamespace(name="昼", id=500, edit=AsyncMock())
+
+        moved = await runner._archive_game_channel(channel, "ログ-昼", 4)
+
+        self.assertTrue(moved)
+        guild.create_category.assert_not_awaited()  # 既存を使い回す
+        kwargs = channel.edit.await_args.kwargs
+        # 番号を先頭に置く (Discordはカテゴリ内を名前順に並べる)
+        self.assertEqual(kwargs["name"], "04-昼")
+        self.assertIs(kwargs["category"], category)
+        self.assertTrue(kwargs["sync_permissions"])
+
+    async def test_log_category_is_trimmed_when_it_hits_the_limit(self) -> None:
+        """上限50に達したら古い順に40まで減らす (IDの昇順 = 作成順)。"""
+        runner = make_runner()
+        old = [SimpleNamespace(name=f"{i:02d}-昼", id=100 + i, delete=AsyncMock())
+               for i in range(LOG_CATEGORY_LIMIT)]
+        category = SimpleNamespace(name="ログ-昼", channels=list(reversed(old)))
+        runner.state.guild = SimpleNamespace(
+            id=1, categories=[category], create_category=AsyncMock()
+        )
+        channel = SimpleNamespace(name="昼", id=9999, edit=AsyncMock())
+
+        await runner._archive_game_channel(channel, "ログ-昼", 51)
+
+        deleted = [ch for ch in old if ch.delete.await_count]
+        self.assertEqual(len(deleted), LOG_CATEGORY_LIMIT - LOG_CATEGORY_TRIM_TO)
+        # 消えるのは古い順 (IDが小さいほう)
+        self.assertEqual([ch.id for ch in deleted], [100 + i for i in range(len(deleted))])
+
+    async def test_archive_failure_falls_back_to_deleting(self) -> None:
+        """カテゴリを用意できなければ False を返し、呼び出し側が削除へ倒す。"""
+        runner = make_runner()
+        runner.state.guild = SimpleNamespace(
+            id=1, categories=[],
+            default_role=FakeRole(1, "@everyone", default=True),
+            create_category=AsyncMock(side_effect=discord.Forbidden(Mock(status=403), "denied")),
+        )
+        channel = SimpleNamespace(name="昼", id=500, edit=AsyncMock())
+
+        moved = await runner._archive_game_channel(channel, "ログ-昼", 4)
+
+        self.assertFalse(moved)
+        channel.edit.assert_not_awaited()
 
     async def test_provisional_vote_can_be_changed_but_the_final_one_cannot(self) -> None:
         """議論中の仮投票は入れ替え自由、投票フェーズでは確定。

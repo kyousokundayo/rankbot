@@ -2036,6 +2036,20 @@ _GAME_SEQ_CTE = (
 )
 
 
+async def get_game_sequence_number(guild_id: int, game_id: int) -> Optional[int]:
+    """その試合がサーバー内で何試合目かを返す (統計の表示番号と同じ)。
+
+    ログチャンネルの名前に使う。game_id はAUTOINCREMENTで欠番が出るので、
+    画面に出る番号と揃えるには数え直す必要がある。
+    """
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT COUNT(*) FROM games WHERE guild_id = ? AND game_id <= ?",
+            (guild_id, game_id),
+        )
+    return int(rows[0][0]) if rows and rows[0][0] else None
+
+
 async def get_recent_games(guild_id: int, limit: int = 10) -> list[dict]:
     async with connect_db() as db:
         rows = await db.execute_fetchall(
