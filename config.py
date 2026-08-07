@@ -6,7 +6,6 @@ from enum import Enum, auto
 from pathlib import Path
 
 from room_config import (
-    LocalRoomConfigError,
     RoomDefinition,
     load_local_room_json,
     parse_local_room_config,
@@ -143,7 +142,6 @@ RECRUITMENT_MAX_DAYS_AHEAD = 7
 RECRUITMENT_MAX_PER_HOST = 3
 RECRUITMENT_CAPACITY = MAX_PLAYERS
 RECRUITMENT_BACKUP_CAPACITY = 3
-RECRUITMENT_NOTIFICATION_INTERVAL_MINUTES = 10
 RECRUITMENT_NOTIFICATION_WINDOW_MINUTES = 15
 RECRUITMENT_ARCHIVE_RETENTION_DAYS = 30
 # 「参加者へ一括連絡」の再送までの間隔 (秒)。1回で最大16人へDMが飛ぶため、

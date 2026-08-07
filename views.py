@@ -11,7 +11,7 @@ import discord
 import database
 import rating as rating_lib
 from config import (
-    MAX_PLAYERS, Role, ROLE_TEAM, Team, Phase,
+    MAX_PLAYERS, Role, Team, Phase,
     RUNOFF_SPEECH_TIME, LAST_WILL_TIME, DISCUSSION_GRACE_TIME, MUTE_GRACE_TIME,
     PREPARATION_TIME, DAY_DISCUSSION_BASE,
     DAY_DISCUSSION_DECREASE, DAY_DISCUSSION_MIN, VOTE_TIMEOUT,

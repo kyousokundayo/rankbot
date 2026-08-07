@@ -337,8 +337,10 @@ bot/
 ├── SPEC.md             本書
 ├── README.md           クイックガイド (セットアップ/起動/テスト)
 ├── requirements.txt    依存パッケージ (discord.py==2.7.1 ほか)
+├── CHANGELOG.md        プレイヤー向けの変更履歴 (そのままDiscordへ貼れる粒度)
 ├── scripts/            run_bot.sh / stop_bot.sh / setup_venv.sh /
 │                       start_bot_detached.py / verify_runtime.py /
+│                       check_se_playback.py / renumber_game_ids.py /
 │                       *.applescript / run_checks.sh
 ├── data/               werewolf_stats.db + backups/ (gitignore対象。起動時・
 │                       24時間ごと・/season_reset 前に自動バックアップ、
@@ -346,8 +348,7 @@ bot/
 │                       -wal / -shm を残さず、世代を捨てるときは本体と
 │                       一緒にサイドカーも消す)
 ├── logs/               bot.log (5MB×3世代ローテーション) / launcher.log
-├── .github/workflows/  ci.yml (GitHub push時の自動チェック)
-└── docs/               旧仕様書アーカイブ
+└── .github/workflows/  ci.yml (GitHub push時の自動チェック)
 ```
 
 ### 実装上の要点
