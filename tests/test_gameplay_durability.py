@@ -939,14 +939,65 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(voter.user_id, runner.state.votes)
         runner._persist_room_state.assert_not_awaited()
 
-    async def test_recovered_vote_phase_keeps_already_persisted_votes(self) -> None:
+    async def test_provisional_vote_can_be_changed_but_the_final_one_cannot(self) -> None:
+        """議論中の仮投票は入れ替え自由、投票フェーズでは確定。
+
+        議論の途中で心変わりできないと、早く入れた人が話し合いから
+        降りてしまうため、確定は投票フェーズまで遅らせる。
+        """
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_DISCUSSION
+        voter = add_player(runner, 1)
+        first = add_player(runner, 2)
+        second = add_player(runner, 3)
+        alive = [voter, first, second]
+
+        provisional = VoteView(runner, alive, alive, provisional=True)
+        self.assertIsNone(provisional._vote_error(voter.user_id, first.user_id))
+        result, committed = await provisional.commit_vote(voter.user_id, first.user_id)
+        self.assertTrue(committed)
+        self.assertIn("入れ替えられます", result)
+
+        # 入れ替えできる
+        self.assertIsNone(provisional._vote_error(voter.user_id, second.user_id))
+        _, committed = await provisional.commit_vote(voter.user_id, second.user_id)
+        self.assertTrue(committed)
+        self.assertEqual(runner.state.votes[voter.user_id], second.user_id)
+
+        # 投票フェーズに入ると、同じ票のまま変更を受け付けない
+        runner.state.phase = Phase.DAY_VOTE
+        final = VoteView(runner, alive, alive)
+        self.assertEqual(final._vote_error(voter.user_id, first.user_id), "投票済みです。")
+        # 仮投票パネルもフェーズ違いで弾かれる
+        self.assertIsNotNone(provisional._vote_error(voter.user_id, first.user_id))
+
+    async def test_all_provisional_votes_end_the_discussion_early(self) -> None:
+        """生存者全員が仮投票を終えたら議論を切り上げる。"""
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_DISCUSSION
+        players = [add_player(runner, uid) for uid in (1, 2, 3)]
+
+        view = VoteView(runner, players, players, provisional=True)
+        for voter, target in zip(players, [players[1], players[2], players[0]]):
+            await view.commit_vote(voter.user_id, target.user_id)
+            if voter is not players[-1]:
+                self.assertFalse(runner.state.vote_complete_event.is_set())
+
+        self.assertTrue(runner.state.vote_complete_event.is_set())
+
+    async def test_vote_phase_keeps_votes_cast_before_it_started(self) -> None:
+        """議論中の仮投票と、復元した投票の両方をそのまま引き継ぐ。
+
+        投票フェーズは votes をクリアしない。議論中に入れた票が
+        持ち越され、全員そろっていればそのまま開示される。
+        """
         runner = make_runner()
         first = add_player(runner, 1)
         second = add_player(runner, 2)
         runner.state.votes = {first.user_id: second.user_id}
         runner._pausable_countdown = AsyncMock(return_value=True)
 
-        executed = await runner._day_vote(resume_existing=True)
+        executed = await runner._day_vote()
 
         self.assertEqual(executed, second.user_id)
         self.assertEqual(runner.state.votes, {first.user_id: second.user_id})

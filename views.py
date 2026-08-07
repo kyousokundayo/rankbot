@@ -1078,13 +1078,30 @@ class _BaseVoteView(discord.ui.View):
     button_style: discord.ButtonStyle
     persist_label: str
 
-    def __init__(self, cog: RoomRunner, candidates: list, voters: list) -> None:
+    def __init__(
+        self,
+        cog: RoomRunner,
+        candidates: list,
+        voters: list,
+        *,
+        provisional: bool = False,
+    ) -> None:
+        """provisional=True で議論中の仮投票パネルになる。
+
+        仮投票は**何度でも入れ替えられる**。議論の途中で心変わりできないと、
+        早く入れた人が話し合いから降りてしまうため。投票フェーズへ持ち越され、
+        そこで初めて確定 (変更不可) になる。全員が仮投票を終えた時点で
+        議論を切り上げる。
+        """
         super().__init__(timeout=None)
         self.cog = cog
         self.game_run_id = cog.state.game_run_id
         self.day_generation = cog.state.day_generation
         cog.register_game_view(self)
         self.voters = {v.user_id for v in voters}
+        self.provisional = provisional
+        # 仮投票は議論フェーズ、確定は本来のフェーズでだけ受け付ける
+        self.accept_phase = Phase.DAY_DISCUSSION if provisional else self.expected_phase
 
         # 13人なら5・5・3の3段。確認ボタンはephemeralなので公開行を増やさない。
         for player in candidates:
@@ -1100,12 +1117,13 @@ class _BaseVoteView(discord.ui.View):
         state = self.cog.state
         if (
             not self.cog.is_current_day_view(self.game_run_id, self.day_generation)
-            or state.phase != self.expected_phase
+            or state.phase != self.accept_phase
         ):
             return "⏳ 現在この操作はできません。"
         if voter_id not in self.voters:
             return "投票権がありません。"
-        if voter_id in state.votes:
+        # 仮投票は入れ替え自由。確定後 (投票フェーズ) だけ二重投票を弾く
+        if voter_id in state.votes and not self.provisional:
             return "投票済みです。"
         if voter_id == target_id:
             return "自分には投票できません。"
@@ -1126,8 +1144,15 @@ class _BaseVoteView(discord.ui.View):
                 target_name = target.display_name if target is not None else "選択した相手"
             if error:
                 return await interaction.followup.send(error, ephemeral=True)
+            if self.provisional:
+                prompt = (
+                    f"**{target_name}** に投票します。よろしいですか？\n"
+                    "投票フェーズに入るまでは、別の人を押せば入れ替えられます。"
+                )
+            else:
+                prompt = f"**{target_name}** に投票しますか？確定後は変更できません。"
             await interaction.followup.send(
-                f"**{target_name}** に投票しますか？確定後は変更できません。",
+                prompt,
                 view=VoteConfirmView(self, interaction.user.id, target_id),
                 ephemeral=True,
             )
@@ -1182,7 +1207,15 @@ class _BaseVoteView(discord.ui.View):
                 if state.get_player(uid) is not None and state.get_player(uid).alive
             }
             if alive_voters <= state.votes.keys():
+                # 仮投票でも全員そろえばイベントを立てる。議論はここで
+                # 切り上がり、投票フェーズは持ち越した票でそのまま開示される
                 state.vote_complete_event.set()
+        if self.provisional:
+            return (
+                f"✅ **{target_name}** に投票しました。\n"
+                "投票フェーズに入るまでは入れ替えられます。",
+                True,
+            )
         return f"✅ **{target_name}** に投票しました。", True
 
 
@@ -2832,6 +2865,8 @@ def build_rule_embeds() -> list[discord.Embed]:
         name="1日の流れ",
         value=(
             "朝の結果発表 → 議論 → 投票 →（同票なら弁明と決戦投票）→ 遺言 → 処刑 → 夜\n"
+            "**議論中から投票できます**（投票フェーズまでは入れ替え自由。"
+            "全員が入れ終わると議論を切り上げてそのまま開示します）\n"
             f"議論 **初日{day_base_min}分 / 毎日{day_drop_min}分短縮 / 最低{day_min_min}分**"
             f" ／ 投票 **{VOTE_TIMEOUT}秒**（全員投票で即開示）\n"
             f"弁明 **{RUNOFF_SPEECH_TIME}秒** ／ 遺言 **{LAST_WILL_TIME}秒**（本人かGMが短縮可）\n"

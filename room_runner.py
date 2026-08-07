@@ -2115,14 +2115,30 @@ class RoomRunner:
         def discussion_content(remaining: float) -> str:
             return (
                 f"☀️ **{state.day_number}日目 - 議論タイム** (生存者: {len(state.alive_players())}人)\n"
+                "話しながら投票できます。投票フェーズまでは何度でも入れ替えられます。\n"
                 + self._timer_line(remaining)
             )
 
-        timer_msg = await self._safe_village_send(discussion_content(duration))
+        # 議論中の仮投票。全員がそろえば議論を切り上げ、その票を
+        # 投票フェーズへ持ち越してそのまま開示する。
+        # 途中で心変わりできるので、早く入れた人が議論から降りずに済む。
+        alive = state.alive_players()
+        state.votes.clear()
+        state.vote_complete_event.clear()
+        provisional_view = VoteView(
+            self, candidates=by_number(alive), voters=alive, provisional=True
+        )
+        timer_msg = await self._safe_village_send(
+            discussion_content(duration), view=provisional_view
+        )
         await self._repost_gm_panel()
 
-        # 一時停止対応のタイマー
-        await self._pausable_countdown(timer_msg, discussion_content, duration)
+        # 一時停止対応のタイマー (全員の仮投票がそろっても切り上げる)
+        await self._pausable_countdown(
+            timer_msg, discussion_content, duration, state.vote_complete_event
+        )
+        # 議論用のパネルは投票フェーズで貼り直すのでここで止める
+        provisional_view.stop()
 
         # 議論終了。ミュートが行き渡るまで数秒かかるので、
         # 「終了 = もう喋れない」と誤解させない文言にする
@@ -2135,12 +2151,12 @@ class RoomRunner:
     # 昼フェーズ: 投票
     # ============================================================
 
-    async def _day_vote(self, *, resume_existing: bool = False) -> Optional[int]:
+    async def _day_vote(self) -> Optional[int]:
         state = self.state
         await state.pause_event.wait()
         state.phase = Phase.DAY_VOTE
-        if not resume_existing:
-            state.votes.clear()
+        # 議論中の仮投票をそのまま引き継ぐ (clearしない)。
+        # 全員そろっていれば下のガードで即開示になる。
         state.vote_complete_event.clear()
         await self._persist_room_state()
 
@@ -4462,7 +4478,7 @@ class RoomRunner:
                     f"♻️ **{state.day_number}日目の投票フェーズ** を投票済み状態から再開します。"
                 )
                 if await finish_recovered_vote(
-                    await self._day_vote(resume_existing=True)
+                    await self._day_vote()
                 ):
                     return
             elif resume_phase in (Phase.DAY_RUNOFF_SPEECH, Phase.DAY_RUNOFF_VOTE) and not state.day_execution_resolved:
