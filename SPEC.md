@@ -358,7 +358,14 @@ bot/
 - **外部副作用の再実行**: 死亡通知・権限変更はoutbox、専用村作成/改名/招待/削除は進捗journalとして保存し、Discord APIとDBの間で停止しても再調停する。通知は欠落防止を優先するため障害窓では重複する場合がある
 - **レート整合性**: 勝敗結果を先に未精算キューへ保存し、ゲーム履歴とレート更新を同一トランザクションで冪等精算する。推薦も1試合・1推薦者の一意制約と集計済み状態を同一トランザクションで更新し、二重加算を防ぐ。レート計算・推薦集計・シーズンリセットは `rating_lock` で直列化する
 - **DBスキーマ**: games / game_players / **game_stats** / player_ratings / rating_history / game_recommendations / season_resets / rating_snapshots / room_states / room_state_quarantine / game_settlements / pending_unmutes / private_rooms / private_room_members / **recruitments** / **recruitment_entries** / **player_blocks**
-  - **試合番号の表示**: `games.game_id` はAUTOINCREMENTで欠番が出るため、UIには出さず**サーバー内の通し番号 (古い順に1から)** を `ROW_NUMBER()` で振って表示する。欠番の原因は「開発中の検証で消費したぶん (本番DBへの書き込みガードは後から導入)」と「精算に失敗して記録されなかった試合」。**廃村 (`force_end`) は精算しないので `games` に入らず、番号も消費しない**。DBの `game_id` は変更しない (`game_players` / `rating_history` / `game_stats` などが参照するため)
+  - **試合番号の表示**: `games.game_id` はAUTOINCREMENTで欠番が出るため、UIには出さず**サーバー内の通し番号 (古い順に1から)** を `ROW_NUMBER()` で振って表示する (`database._GAME_SEQ_CTE`)。欠番の原因は開発中の検証で消費したぶん (本番DBへの書き込みガードは `34c77e5` で後から導入)。**廃村 (`force_end`) は精算しないので `games` に入らず、番号も消費しない**。精算がロールバックされた場合も、SQLiteは採番カウンタを巻き戻すので消費しない
+  - **`game_id` の振り直し**: `scripts/renumber_game_ids.py` が一度きりの移行として用意されている (v0.34で本番へ適用済み: 3,69,70,71 → 1,2,3,4)。**表示は通し番号なので、振り直しても画面の見え方は変わらない**。内部IDとログを突き合わせたいときだけ使う
+    - 外部キーは全て `games.game_id` を `ON UPDATE NO ACTION` で参照するため、`PRAGMA foreign_keys = OFF` を**`BEGIN` より前に**置き (トランザクション内では効かない)、全テーブルを同一トランザクションで書き換えて `foreign_key_check` を通してからコミットする
+    - 新旧のIDが重なるので、一度オフセット領域へ退避してから確定値へ移す**2段構えが必須**。`game_players` と `rating_history` には `game_id` の一意制約が無く、1段で順序を誤ると無警告で行が混ざる
+    - `sqlite_sequence` を更新しないと次の試合が旧採番の続きになり、欠番が即座に復活する
+    - 前提条件 (Bot稼働・進行中の卓・未精算・未確定の推薦・`game_id` を持つ未知のテーブル) はスクリプトが検査して拒否する
+    - 復元は**`-wal` / `-shm` を先に削除してから**本体を差し替える。残したままだとSQLiteが古いWALを再生し、エラーを出さずに移行後のデータが復活する
+  - `games.gm_id`: 進行GM
   - `games.gm_id`: 進行GM
   - `games.base_room_id`: 将来の増設卓を固定卓へ正規化するキー。現在は `room_id` と同値
   - `games.recruitment_id`: 募集経由の試合だけ募集ID、直接開始はNULL
