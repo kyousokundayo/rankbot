@@ -109,6 +109,42 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         rapid_files = list((Path(self._tmp.name) / "backups").glob("*_rapid.db"))
         self.assertEqual(len(rapid_files), 2)
 
+    async def test_backup_retention_also_removes_wal_and_shm(self) -> None:
+        """本体だけ消すと -wal / -shm が孤児として溜まり続ける。
+
+        バックアップ先がWALモードだとSQLiteが同名の -wal / -shm を作る。
+        世代を捨てるときに一緒に消さないと、.db を消してもディスクを
+        食い続ける (実際に本番で46ファイル取り残していた)。
+        """
+        backup_dir = Path(self._tmp.name) / "backups"
+        original_backup_dir = database.BACKUP_DIR
+        database.BACKUP_DIR = backup_dir
+        try:
+            first = await database.backup_db(label="keep1", keep=1)
+            # 作成直後はチェックポイント済みでサイドカーが残らない
+            self.assertFalse(Path(f"{first}-wal").exists())
+            self.assertFalse(Path(f"{first}-shm").exists())
+            # 過去にSQLiteが残していたぶんを再現する
+            for suffix in ("-wal", "-shm"):
+                Path(f"{first}{suffix}").write_bytes(b"")
+            # 本体だけ消していた頃の取り残しも用意する
+            # (DB_PATH の stem は asyncSetUp で "test")
+            orphan = backup_dir / "test_20000101_000000_000000_old.db-wal"
+            orphan.write_bytes(b"")
+
+            second = await database.backup_db(label="keep1", keep=1)
+        finally:
+            database.BACKUP_DIR = original_backup_dir
+
+        # 世代落ちした first は本体もサイドカーも残さない
+        self.assertFalse(Path(first).exists())
+        self.assertFalse(Path(f"{first}-wal").exists())
+        self.assertFalse(Path(f"{first}-shm").exists())
+        # 過去の取り残しも回収する
+        self.assertFalse(orphan.exists())
+        # 残す世代には手を付けない
+        self.assertTrue(Path(second).exists())
+
     async def test_restricted_room_removes_arbitrary_stale_view_allows(self) -> None:
         default = _PermissionTarget(1, "@everyone")
         bot_member = _PermissionTarget(2, "bot")

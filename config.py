@@ -6,14 +6,13 @@ from enum import Enum, auto
 from pathlib import Path
 
 from room_config import (
-    LocalRoomConfigError,
     RoomDefinition,
     load_local_room_json,
     parse_local_room_config,
 )
 
 # Botのバージョン (ヘルプに表示。ソース公開された派生でも識別できるように)
-BOT_VERSION = "v0.33"
+BOT_VERSION = "v0.34"
 
 # 新規導入先に同名カテゴリが既にある場合、無関係なDiscord構成をBot所有と
 # 誤認しない。既存運用は保存済みchannel IDで自動再利用できる。
@@ -106,6 +105,12 @@ MUTE_RETRY_DELAY = 3
 # 短時間に集中する呼び出しは別途ここで平準化する (約9件/10秒)。
 BULK_DISCORD_API_INTERVAL = 1.1
 
+# 全員が同時に押すボタン (朝を迎える/役職を確認した/投票) が、この秒数より
+# 遅れたらWARNINGでログへ残す。「押したのに反応しない」の原因が
+# Discordへの応答・卓ロックの待ち・DB保存のどこにあるかを切り分けるため、
+# 段階ごとの所要時間も一緒に出す (views.InteractionTimer)。
+SLOW_INTERACTION_SECONDS = 2.0
+
 # シーン切替SE (朝/処刑/投票/投票開示/遺言/夜)。
 # 依存 (davey/PyNaCl/libopus) が無い環境ではTrueでも自動で無効になる
 SE_ENABLED = True
@@ -137,7 +142,6 @@ RECRUITMENT_MAX_DAYS_AHEAD = 7
 RECRUITMENT_MAX_PER_HOST = 3
 RECRUITMENT_CAPACITY = MAX_PLAYERS
 RECRUITMENT_BACKUP_CAPACITY = 3
-RECRUITMENT_NOTIFICATION_INTERVAL_MINUTES = 10
 RECRUITMENT_NOTIFICATION_WINDOW_MINUTES = 15
 RECRUITMENT_ARCHIVE_RETENTION_DAYS = 30
 # 「参加者へ一括連絡」の再送までの間隔 (秒)。1回で最大16人へDMが飛ぶため、

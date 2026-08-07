@@ -1074,9 +1074,12 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         await self._ensure_mayor_info_channel(guild)
         log.info(f"村長説明チャンネル確認完了: {MAYOR_INFO_CATEGORY_NAME}/#{CH_MAYOR_INFO}")
         fixed_room_errors: list[str] = []
+        completed_rooms = 0
         try:
             for room in self.rooms.values():
-                log.info(f"卓セットアップ開始: {room.state.room_name}")
+                # 卓ごとの開始/完了は起動のたびに卓数ぶん出るのでDEBUGへ。
+                # 失敗したときは下の log.exception が卓名を出す。
+                log.debug(f"卓セットアップ開始: {room.state.room_name}")
                 snapshot = snapshots.get(room.state.room_id)
                 try:
                     if room.state.room_id in quarantined_room_ids:
@@ -1098,7 +1101,8 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                             category_id=room.state.category.id if room.state.category else None,
                             role_id=private_role.id if private_role else None,
                         )
-                    log.info(f"卓セットアップ完了: {room.state.room_name}")
+                    log.debug(f"卓セットアップ完了: {room.state.room_name}")
+                    completed_rooms += 1
                 except Exception as e:
                     log.exception(f"卓セットアップ失敗: {room.state.room_name}: {e}")
                     if room.is_private_room():
@@ -1114,6 +1118,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             # 復元失敗卓まで永久にactiveと見なすとpending muteが
             # 解除されないため、以後は動的なroom状態だけを正とする。
             self._startup_active_vc_rooms.clear()
+        log.info(f"卓セットアップ完了: {completed_rooms} / {len(self.rooms)}卓")
         for room_id, room in list(self.rooms.items()):
             if room.is_private_room():
                 row = await database.get_private_room_by_name(guild.id, room.state.room_name)

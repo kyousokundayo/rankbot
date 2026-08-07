@@ -227,12 +227,46 @@ async def backup_db(*, label: str = "auto", keep: int = BACKUP_KEEP_PER_LABEL) -
     async with aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT_SECONDS) as src:
         async with aiosqlite.connect(str(dest)) as dst:
             await src.backup(dst)
+            # 元DBがWALなのでバックアップ先もWALになる。閉じる前に
+            # 本体へ書き戻し、-wal / -shm 無しで復元できる状態にする。
+            await dst.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    # チェックポイント済みなので、残っていても復元には要らない
+    for suffix in ("-wal", "-shm"):
+        Path(f"{dest}{suffix}").unlink(missing_ok=True)
 
     if keep > 0:
         backups = sorted(BACKUP_DIR.glob(f"{src_path.stem}_*_{label}.db"))
         for old in backups[:-keep]:
-            old.unlink(missing_ok=True)
+            _remove_backup_files(old)
+        _remove_orphan_backup_sidecars(src_path.stem)
     return str(dest)
+
+
+def _remove_backup_files(backup: Path) -> None:
+    """バックアップ本体と、SQLiteが同名で作る -wal / -shm をまとめて消す。
+
+    本体だけ消すと、バックアップ先がWALモードのときに残る
+    `xxx.db-wal` / `xxx.db-shm` が回収されず、世代を捨てても
+    ディスクを食い続ける。
+    """
+    for suffix in ("", "-wal", "-shm"):
+        Path(f"{backup}{suffix}").unlink(missing_ok=True)
+
+
+def _remove_orphan_backup_sidecars(stem: str) -> None:
+    """本体が無い -wal / -shm を回収する。
+
+    本体だけを消していた頃に取り残されたぶんを、次のバックアップで
+    まとめて片付ける。単体では復元に使えないので消して問題ない。
+    """
+    for sidecar in BACKUP_DIR.glob(f"{stem}_*.db-*"):
+        name = sidecar.name
+        for suffix in ("-wal", "-shm"):
+            if not name.endswith(suffix):
+                continue
+            if not (BACKUP_DIR / name[: -len(suffix)]).exists():
+                sidecar.unlink(missing_ok=True)
+            break
 
 
 async def _ensure_column(
@@ -1984,20 +2018,37 @@ async def load_private_room_members(guild_id: int, room_id: str) -> list[dict]:
     ]
 
 
+# サーバー内での通し番号 (1から連番)。game_id はAUTOINCREMENTで欠番が出るため、
+# 表示にはこちらを使う。
+#   - 開発中の検証で消費した採番 (本番DBへの書き込みガードは後から入れた)
+#   - 精算に失敗して記録されなかった試合
+# のぶんが game_id には穴として残る。廃村 (force_end) は精算しないので
+# そもそも games に入らず、番号も消費しない。
+_GAME_SEQ_CTE = (
+    "WITH numbered AS ("
+    " SELECT game_id, ROW_NUMBER() OVER (ORDER BY game_id) AS seq"
+    " FROM games WHERE guild_id = ?"
+    ") "
+)
+
+
 async def get_recent_games(guild_id: int, limit: int = 10) -> list[dict]:
     async with connect_db() as db:
         rows = await db.execute_fetchall(
-            "SELECT game_id, room_name, winner_team, played_at "
-            "FROM games WHERE guild_id = ? "
-            "ORDER BY game_id DESC LIMIT ?",
-            (guild_id, limit),
+            _GAME_SEQ_CTE
+            + "SELECT g.game_id, n.seq, g.room_name, g.winner_team, g.played_at "
+            "FROM games g JOIN numbered n ON n.game_id = g.game_id "
+            "WHERE g.guild_id = ? "
+            "ORDER BY g.game_id DESC LIMIT ?",
+            (guild_id, guild_id, limit),
         )
     return [
         {
             "game_id": row[0],
-            "room_name": row[1] or "不明卓",
-            "winner_team": row[2],
-            "played_at": row[3],
+            "seq": row[1],
+            "room_name": row[2] or "不明卓",
+            "winner_team": row[3],
+            "played_at": row[4],
         }
         for row in rows
     ]
@@ -2006,30 +2057,34 @@ async def get_recent_games(guild_id: int, limit: int = 10) -> list[dict]:
 async def get_player_recent_games(player_id: int, guild_id: int, limit: int = 10) -> list[dict]:
     async with connect_db() as db:
         rows = await db.execute_fetchall(
-            "SELECT g.game_id, g.room_name, g.winner_team, g.played_at, gp.role, gp.team, gp.won, "
+            _GAME_SEQ_CTE
+            + "SELECT g.game_id, n.seq, g.room_name, g.winner_team, g.played_at, "
+            "gp.role, gp.team, gp.won, "
             "rh.rating_before, rh.rating_after, rh.elo_delta, rh.bonus, rh.recommendation_bonus "
             "FROM game_players gp "
             "JOIN games g ON gp.game_id = g.game_id "
+            "JOIN numbered n ON n.game_id = g.game_id "
             "LEFT JOIN rating_history rh "
             "ON rh.game_id = g.game_id AND rh.player_id = gp.player_id AND rh.guild_id = g.guild_id "
             "WHERE gp.player_id = ? AND g.guild_id = ? "
             "ORDER BY g.game_id DESC LIMIT ?",
-            (player_id, guild_id, limit),
+            (guild_id, player_id, guild_id, limit),
         )
     return [
         {
             "game_id": row[0],
-            "room_name": row[1] or "不明卓",
-            "winner_team": row[2],
-            "played_at": row[3],
-            "role": row[4],
-            "team": row[5],
-            "won": bool(row[6]),
-            "rating_before": row[7],
-            "rating_after": row[8],
-            "elo_delta": row[9],
-            "bonus": row[10],
-            "recommendation_bonus": row[11],
+            "seq": row[1],
+            "room_name": row[2] or "不明卓",
+            "winner_team": row[3],
+            "played_at": row[4],
+            "role": row[5],
+            "team": row[6],
+            "won": bool(row[7]),
+            "rating_before": row[8],
+            "rating_after": row[9],
+            "elo_delta": row[10],
+            "bonus": row[11],
+            "recommendation_bonus": row[12],
         }
         for row in rows
     ]

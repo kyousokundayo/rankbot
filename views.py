@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
@@ -10,7 +11,7 @@ import discord
 import database
 import rating as rating_lib
 from config import (
-    MAX_PLAYERS, Role, ROLE_TEAM, Team, Phase,
+    MAX_PLAYERS, Role, Team, Phase,
     RUNOFF_SPEECH_TIME, LAST_WILL_TIME, DISCUSSION_GRACE_TIME, MUTE_GRACE_TIME,
     PREPARATION_TIME, DAY_DISCUSSION_BASE,
     DAY_DISCUSSION_DECREASE, DAY_DISCUSSION_MIN, VOTE_TIMEOUT,
@@ -21,6 +22,7 @@ from config import (
     RATING_FLOOR, INITIAL_RATING, WIN_PARTICIPATION_BONUS,
     PRIVATE_ROOM_CREATOR_ROLE_NAME, BOT_VERSION,
     ROOM_DEFINITIONS, RATED_ROOM_NAMES, STATS_MIN_SAMPLES, PLAYER_BLOCK_LIMIT,
+    SLOW_INTERACTION_SECONDS,
 )
 from models import by_number, parse_select_id
 
@@ -29,6 +31,43 @@ if TYPE_CHECKING:
     from room_runner import RoomRunner
 
 log = logging.getLogger(__name__)
+
+
+class InteractionTimer:
+    """ボタン押下の所要時間を段階ごとに記録する (詰まりの切り分け用)。
+
+    全員が同時に押すボタン (朝を迎える / 役職を確認した / 投票) は、
+    Discordへの応答 → 卓ロックの取得 → 状態更新とDB保存 → 本人への返信、
+    という4段階を通る。「押したのに反応しない」と言われたとき、どの段階で
+    詰まったのかはログが無いと分からない。とくに卓ロックは他の処理
+    (ミュート整列など) も取るため、待ちが数秒に伸びうる。
+
+    平常時に13人ぶんのログを毎晩出しても読めないので、
+    SLOW_INTERACTION_SECONDS を超えたときだけWARNINGへ上げる。
+    """
+
+    __slots__ = ("label", "user_id", "_started", "_marks")
+
+    def __init__(self, label: str, user_id: int) -> None:
+        self.label = label
+        self.user_id = user_id
+        self._started = time.perf_counter()
+        self._marks: list[tuple[str, float]] = []
+
+    def mark(self, stage: str) -> None:
+        """段階の到達時刻を記録する (押下からの経過秒)。"""
+        self._marks.append((stage, time.perf_counter() - self._started))
+
+    def finish(self, *, note: str = "") -> None:
+        total = time.perf_counter() - self._started
+        if total < SLOW_INTERACTION_SECONDS:
+            return
+        stages = " ".join(f"{stage}={sec:.2f}s" for stage, sec in self._marks)
+        suffix = f" {note}" if note else ""
+        log.warning(
+            f"ボタン応答が遅延: {self.label} user={self.user_id} "
+            f"total={total:.2f}s {stages}{suffix}"
+        )
 
 
 class DangerConfirmView(discord.ui.View):
@@ -986,16 +1025,19 @@ class VoteConfirmView(discord.ui.View):
             return await interaction.response.send_message(
                 "投票を選択した本人だけが確定できます。", ephemeral=True
             )
+        timer = InteractionTimer("投票の確定", interaction.user.id)
         # 引数なしのdeferはコンポーネント用の deferred_message_update。
         # この確認メッセージ自体を編集対象にできる (thinking=Trueだと
         # 別枠のephemeralが増えて確認が2枚になる)。DB保存を挟むので
         # 3秒の応答期限対策としてdefer自体は必要。
         await interaction.response.defer()
+        timer.mark("ack")
         for item in self.children:
             item.disabled = True
         result, committed = await self.source.commit_vote(
-            self.actor_id, self.target_id
+            self.actor_id, self.target_id, timer
         )
+        timer.mark("state")
         if committed:
             self.stop()
         else:
@@ -1006,6 +1048,8 @@ class VoteConfirmView(discord.ui.View):
             await interaction.edit_original_response(content=result, view=self)
         except (discord.NotFound, discord.HTTPException):
             pass
+        timer.mark("reply")
+        timer.finish(note=f"committed={committed}")
 
     @discord.ui.button(label="選び直す", style=discord.ButtonStyle.secondary)
     async def cancel_btn(
@@ -1085,14 +1129,23 @@ class _BaseVoteView(discord.ui.View):
 
         return callback
 
-    async def commit_vote(self, voter_id: int, target_id: int) -> tuple[str, bool]:
+    async def commit_vote(
+        self,
+        voter_id: int,
+        target_id: int,
+        timer: Optional[InteractionTimer] = None,
+    ) -> tuple[str, bool]:
         """投票を確定する。(確認メッセージへ出す本文, 確定したか) を返す。
 
         表示は呼び出し側 (VoteConfirmView) が確認メッセージの書き換えで行う。
         ここでDiscordへ送らないのは、確定できたかどうかで確認ボタンを
         戻すか無効化するかが変わるため。
+
+        timer を渡すと、卓ロックの待ちとDB保存を分けて計測できる。
         """
         async with self.cog.action_lock:
+            if timer is not None:
+                timer.mark("lock")
             state = self.cog.state
             error = self._vote_error(voter_id, target_id)
             if error:
@@ -1655,16 +1708,24 @@ class PrepReadyView(discord.ui.View):
             return await interaction.response.send_message(
                 "⏳ このパネルは終了しています。", ephemeral=True
             )
+        timer = InteractionTimer("役職を確認した", interaction.user.id)
         # 13人同時押下でも Discord の3秒応答期限を失わないよう先にACKする。
         await interaction.response.defer()
-        async with self.cog.action_lock:
-            content, error = await self.cog.toggle_prep_ready(interaction.user)
-            if error:
-                return await interaction.followup.send(error, ephemeral=True)
-            try:
-                await interaction.edit_original_response(content=content, view=self)
-            except (discord.NotFound, discord.HTTPException):
-                pass
+        timer.mark("ack")
+        try:
+            async with self.cog.action_lock:
+                timer.mark("lock")
+                content, error = await self.cog.toggle_prep_ready(interaction.user)
+                timer.mark("state")
+                if error:
+                    return await interaction.followup.send(error, ephemeral=True)
+                try:
+                    await interaction.edit_original_response(content=content, view=self)
+                except (discord.NotFound, discord.HTTPException):
+                    pass
+                timer.mark("reply")
+        finally:
+            timer.finish()
 
 
 # ============================================================
@@ -1713,13 +1774,19 @@ class MorningReadyView(discord.ui.View):
             return await interaction.response.send_message(
                 "⏳ 生存中の参加者だけが押せます。", ephemeral=True
             )
+        timer = InteractionTimer("朝を迎える", interaction.user.id)
         # 13人同時押下で後続がlock+DB保存待ちになっても
         # Discordの3秒応答期限を失わないよう先にACKする。
         await interaction.response.defer()
+        timer.mark("ack")
         async with self.cog.action_lock:
+            timer.mark("lock")
             content, error = await self.cog.toggle_morning_ready(interaction.user)
+            timer.mark("state")
         # 成否どちらも本人にだけ返す (公開パネルは編集しない)
         await interaction.followup.send(error or content, ephemeral=True)
+        timer.mark("reply")
+        timer.finish()
 
 
 # ============================================================
@@ -2282,7 +2349,7 @@ class StatsView(discord.ui.View):
             return await interaction.followup.send("試合履歴はまだありません。", ephemeral=True)
 
         lines = [
-            f"`{row['game_id']:>4}` {row['room_name']} / {row['winner_team']} / {format_played_at(row['played_at'])}"
+            f"`{row['seq']:>4}` {row['room_name']} / {row['winner_team']} / {format_played_at(row['played_at'])}"
             for row in rows
         ]
         embed = discord.Embed(
@@ -2323,7 +2390,7 @@ class StatsView(discord.ui.View):
                     + " / ".join(parts) + ")"
                 )
             lines.append(
-                f"`{row['game_id']:>4}` {row['room_name']} / {row['role']} / {result}{delta_txt}"
+                f"`{row['seq']:>4}` {row['room_name']} / {row['role']} / {result}{delta_txt}"
             )
 
         embed = discord.Embed(
@@ -2760,7 +2827,6 @@ def build_rule_embeds() -> list[discord.Embed]:
         name="1日の流れ",
         value=(
             "朝の結果発表 → 議論 → 投票 →（同票なら弁明と決戦投票）→ 遺言 → 処刑 → 夜\n"
-            "初日は**参加者全員が「📩 役職を確認した」を押すと議論が始まります**。\n"
             f"夜明けにミュートが解除され、**{DISCUSSION_GRACE_TIME}秒後**に音が鳴って議論が始まります。\n"
             f"議論終了・投票前には**{MUTE_GRACE_TIME}秒のミュート整列**を挟みます。"
         ),
@@ -2773,7 +2839,7 @@ def build_rule_embeds() -> list[discord.Embed]:
             f"議論 **初日{day_base_min}分 / 毎日{day_drop_min}分短縮 / 最低{day_min_min}分**\n"
             f"投票 **{VOTE_TIMEOUT}秒**（全員が投票したら即開示）\n"
             f"弁明 **{RUNOFF_SPEECH_TIME}秒** / 遺言 **{LAST_WILL_TIME}秒**（本人かGMが短縮可）\n"
-            f"夜 **初日{NIGHT_BASE}秒 / 以降{NIGHT_MIN}秒固定**（目安。朝はDMでの全員の宣言で明ける）"
+            f"夜 **初日{NIGHT_BASE}秒 / 以降{NIGHT_MIN}秒固定**（目安。朝は全員の宣言で明ける）"
         ),
         inline=False,
     )
@@ -2801,24 +2867,16 @@ def build_rule_embeds() -> list[discord.Embed]:
         inline=False,
     )
     embed.add_field(
-        name="役職を確認した",
+        name="宣言で進みます",
         value=(
-            "ゲーム開始直後は時間切れでは議論が始まりません。"
-            "**#昼 のパネルで参加者全員が「📩 役職を確認した」を押す**と議論が始まります。\n"
-            "押し直しで取り消せます。DMを開くのが遅れても待ってもらえます。"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="朝を迎える",
-        value=(
-            f"夜は時間切れでは明けません。**`#{CH_VILLAGE}` のパネルで生存者全員が「朝を迎える」を押す**と朝になります。\n"
-            "押し直しで取り消せます。離席したいときは押さずに待たせてください。\n"
-            "**宣言した人数は夜の間は誰にも見えません。**"
-            "目安時間が切れたときにパネルへ表示され、全員が同時に知ります"
-            "（未宣言の人数から生存役職を推測されないためです）。\n"
-            "未行動の役職が押した場合は警告が出て、もう一度押すと未行動のまま確定します。\n"
-            "戻らない人がいる場合は、GMがGMメニューの「朝」で進行できます。"
+            f"どちらも `#{CH_VILLAGE}` のパネルで、**時間切れでは進みません**。押し直しで取り消せます。\n"
+            "**📩 役職を確認した** — 参加者全員が押すと議論開始\n"
+            "**🌅 朝を迎える** — 生存者全員が押すと朝\n"
+            "離席したいときは押さずに待たせてください（これが一時停止の代わりです）。\n"
+            "**宣言した人数は夜の間は誰にも見えません**（未宣言の数から生存役職を"
+            "推測されないため）。目安時間が切れたときに全員へ同時に表示されます。\n"
+            "夜の行動を選んでいない人が押すと警告が出て、もう一度押すと未行動のまま確定します。\n"
+            "戻らない人がいる場合は、GMがGMメニューから進行できます。"
         ),
         inline=False,
     )
@@ -2846,7 +2904,7 @@ def build_help_embeds() -> list[discord.Embed]:
     embed3.add_field(
         name="離席したいとき",
         value=(
-            "夜は生存者全員が **DMの「朝を迎える」** を押すまで明けません。\n"
+            "夜は生存者全員が「朝を迎える」を押すまで明けません。"
             "席を外したいときは押さずに待たせてください（昼は口頭でGMに伝えてください）。\n"
             "**一時停止中も占い・護衛・襲撃・朝の宣言は操作できます**"
             "（止まっている間に選べないと、再開後に消えたように見えるため）。"

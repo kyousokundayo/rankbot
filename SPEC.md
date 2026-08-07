@@ -279,8 +279,8 @@
 | 全体ランキング | 今シーズンの相対ランク順位 (上位20) |
 | 全体データ | 試合指標を卓別、プレイヤー指標を試合時の確定表示ランク別に表示 |
 | 前シーズン | 前シーズン最終順位 |
-| 最近の試合 | 直近10試合 (卓/勝利陣営/日時はDiscordタイムスタンプ表示) |
-| 自分の履歴 | 自分の直近10試合 (役職/勝敗/レート変動) |
+| 最近の試合 | 直近10試合 (通し番号/卓/勝利陣営/日時はDiscordタイムスタンプ表示) |
+| 自分の履歴 | 自分の直近10試合 (通し番号/役職/勝敗/レート変動) |
 | ランク仕様 | レート増減 / ランク9段階と決まり方 / 対象卓とシーズン |
 | 同村拒否 | 本人専用表示で拒否リストを追加・解除（最大10人） |
 | 不具合・改善を報告 | 不具合 / 分かりにくい / 改善要望 / その他を選び、本文と任意の発生状況を送信。Bot版・卓・フェーズ・送信チャンネルとともにSQLiteへ保存。**1人あたり直近24時間で `FEEDBACK_MAX_PER_DAY` 件まで** (誰でも押せるフォームなので、連投でDBとバックアップが膨らむのを防ぐ)。件数判定とINSERTは `BEGIN IMMEDIATE` の同一トランザクションで行い、連打で上限を越えられないようにする |
@@ -337,24 +337,36 @@ bot/
 ├── SPEC.md             本書
 ├── README.md           クイックガイド (セットアップ/起動/テスト)
 ├── requirements.txt    依存パッケージ (discord.py==2.7.1 ほか)
+├── CHANGELOG.md        プレイヤー向けの変更履歴 (そのままDiscordへ貼れる粒度)
 ├── scripts/            run_bot.sh / stop_bot.sh / setup_venv.sh /
 │                       start_bot_detached.py / verify_runtime.py /
+│                       check_se_playback.py / renumber_game_ids.py /
 │                       *.applescript / run_checks.sh
 ├── data/               werewolf_stats.db + backups/ (gitignore対象。起動時・
 │                       24時間ごと・/season_reset 前に自動バックアップ、
-│                       ラベル別に10世代保持)
+│                       ラベル別に10世代保持。作成時に wal_checkpoint して
+│                       -wal / -shm を残さず、世代を捨てるときは本体と
+│                       一緒にサイドカーも消す)
 ├── logs/               bot.log (5MB×3世代ローテーション) / launcher.log
-├── .github/workflows/  ci.yml (GitHub push時の自動チェック)
-└── docs/               旧仕様書アーカイブ
+└── .github/workflows/  ci.yml (GitHub push時の自動チェック)
 ```
 
 ### 実装上の要点
 - **実行環境**: Python 3.14（3.14.6で検証）。Apple Siliconでは `/opt/homebrew` のarm64 PythonをPATH探索より優先し、Rosetta上のx86_64 Pythonを拒否する。直接依存は `requirements.txt`、推移依存を含む検証済み完全固定版は `requirements-lock.txt` で管理する。ただし `discord.py[voice]` 2.7.1 が `PyNaCl<1.6` を要求するため、PyNaClだけは互換範囲内の最新1.5.0を使う
 - **API負荷対策**: Discord API呼び出しは `Semaphore(5)` で全卓共有のスロットリング。権限上書きは差分がある時だけ送信
+- **押下の計測**: 全員が同時に押すボタン (朝を迎える / 役職を確認した / 投票の確定) は `views.InteractionTimer` で段階ごとの所要時間を測る。`ack` (Discordへの応答) → `lock` (卓の `action_lock` 取得) → `state` (状態更新とDB保存) → `reply` (本人への返信) の4区間を記録し、合計が `SLOW_INTERACTION_SECONDS` を超えたときだけWARNINGで出す。「押したのに反応しない」の原因が、Discordの応答なのか、他の処理が握っている卓ロック待ちなのか、DB保存なのかをログだけで切り分けるため。平常時は13人×毎晩のログを出さない
 - **状態永続化**: フェーズ遷移に加え、夜の行動・朝の宣言・死亡・ミュート所有・開始処理の進捗を卓スナップショットへ保存する。読込時に破損した卓だけを隔離し、他卓の復元を継続する
 - **外部副作用の再実行**: 死亡通知・権限変更はoutbox、専用村作成/改名/招待/削除は進捗journalとして保存し、Discord APIとDBの間で停止しても再調停する。通知は欠落防止を優先するため障害窓では重複する場合がある
 - **レート整合性**: 勝敗結果を先に未精算キューへ保存し、ゲーム履歴とレート更新を同一トランザクションで冪等精算する。推薦も1試合・1推薦者の一意制約と集計済み状態を同一トランザクションで更新し、二重加算を防ぐ。レート計算・推薦集計・シーズンリセットは `rating_lock` で直列化する
 - **DBスキーマ**: games / game_players / **game_stats** / player_ratings / rating_history / game_recommendations / season_resets / rating_snapshots / room_states / room_state_quarantine / game_settlements / pending_unmutes / private_rooms / private_room_members / **recruitments** / **recruitment_entries** / **player_blocks**
+  - **試合番号の表示**: `games.game_id` はAUTOINCREMENTで欠番が出るため、UIには出さず**サーバー内の通し番号 (古い順に1から)** を `ROW_NUMBER()` で振って表示する (`database._GAME_SEQ_CTE`)。欠番の原因は開発中の検証で消費したぶん (本番DBへの書き込みガードは `34c77e5` で後から導入)。**廃村 (`force_end`) は精算しないので `games` に入らず、番号も消費しない**。精算がロールバックされた場合も、SQLiteは採番カウンタを巻き戻すので消費しない
+  - **`game_id` の振り直し**: `scripts/renumber_game_ids.py` が一度きりの移行として用意されている (v0.34で本番へ適用済み: 3,69,70,71 → 1,2,3,4)。**表示は通し番号なので、振り直しても画面の見え方は変わらない**。内部IDとログを突き合わせたいときだけ使う
+    - 外部キーは全て `games.game_id` を `ON UPDATE NO ACTION` で参照するため、`PRAGMA foreign_keys = OFF` を**`BEGIN` より前に**置き (トランザクション内では効かない)、全テーブルを同一トランザクションで書き換えて `foreign_key_check` を通してからコミットする
+    - 新旧のIDが重なるので、一度オフセット領域へ退避してから確定値へ移す**2段構えが必須**。`game_players` と `rating_history` には `game_id` の一意制約が無く、1段で順序を誤ると無警告で行が混ざる
+    - `sqlite_sequence` を更新しないと次の試合が旧採番の続きになり、欠番が即座に復活する
+    - 前提条件 (Bot稼働・進行中の卓・未精算・未確定の推薦・`game_id` を持つ未知のテーブル) はスクリプトが検査して拒否する
+    - 復元は**`-wal` / `-shm` を先に削除してから**本体を差し替える。残したままだとSQLiteが古いWALを再生し、エラーを出さずに移行後のデータが復活する
+  - `games.gm_id`: 進行GM
   - `games.gm_id`: 進行GM
   - `games.base_room_id`: 将来の増設卓を固定卓へ正規化するキー。現在は `room_id` と同値
   - `games.recruitment_id`: 募集経由の試合だけ募集ID、直接開始はNULL

@@ -242,7 +242,9 @@ class SoundPlayer:
                     log.warning(f"SE再生エラー ({scene}): {playback_errors[0]}")
                 else:
                     played = True
-                    log.info(
+                    # 正常再生は1ゲームで数十回出るため既定では残さない。
+                    # 失敗は上のWARNINGで残るので、切り分けには困らない。
+                    log.debug(
                         "SE再生完了 (%s / VC:%s)",
                         scene,
                         getattr(voice_channel, "name", voice_channel.id),

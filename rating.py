@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from config import (
     GRANDMASTER_PERCENTAGE,
     GRANDMASTER_SLOTS,
-    INITIAL_RATING,
     RANK_ROLE_PREFIX,
     RANK_SPECS,
     RATING_FLOOR,
