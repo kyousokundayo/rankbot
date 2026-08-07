@@ -13,6 +13,9 @@ from views import (
     InteractionTimer,
     LobbyView,
     StatsView,
+    build_help_embeds,
+    build_rank_spec_embeds,
+    build_rule_embeds,
     build_vote_result_embed,
 )
 
@@ -101,6 +104,38 @@ class DangerConfirmationTest(unittest.IsolatedAsyncioTestCase):
 
         actor.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
         action.assert_awaited_once_with(actor)
+
+
+class HelpAndRuleEmbedTest(unittest.TestCase):
+    """ヘルプ・ルールがDiscordの上限を超えず、実装と食い違わないこと。"""
+
+    def _all_embeds(self):
+        return [
+            *build_rule_embeds(),
+            *build_help_embeds(),
+            *build_rank_spec_embeds(),
+        ]
+
+    def test_embeds_fit_discord_limits(self) -> None:
+        for embed in self._all_embeds():
+            total = (
+                len(embed.title or "")
+                + len(embed.description or "")
+                + sum(len(f.name) + len(f.value) for f in embed.fields)
+            )
+            self.assertLessEqual(total, 6000, embed.title)
+            for field in embed.fields:
+                self.assertLessEqual(len(field.value), 1024, f"{embed.title}/{field.name}")
+
+    def test_no_stale_reference_to_the_morning_panel_being_in_dms(self) -> None:
+        """「朝を迎える」は #昼 のパネルへ移った。DM前提の説明を残さない。"""
+        for embed in self._all_embeds():
+            for field in embed.fields:
+                self.assertNotRegex(
+                    field.value,
+                    r"DM[^\n]*朝を迎える|朝を迎える[^\n]*DM",
+                    f"{embed.title}/{field.name}",
+                )
 
 
 class InteractionTimerTest(unittest.TestCase):
