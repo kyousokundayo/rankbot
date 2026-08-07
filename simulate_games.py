@@ -554,6 +554,8 @@ class SimulationController:
             self._schedule(self._handle_speech_done_view(message, view))
         elif isinstance(view, PrepReadyView):
             self._schedule(self._handle_prep_ready_view(message, view))
+        elif isinstance(view, MorningReadyView):
+            self._schedule(self._handle_morning_ready_view(message, view))
 
     def on_dm_message(self, member: FakeMember, message: FakeMessage) -> None:
         view = message.view
@@ -563,8 +565,6 @@ class SimulationController:
             self._schedule(self._handle_seer_view(member, message, view))
         elif isinstance(view, GuardView):
             self._schedule(self._handle_guard_view(member, message, view))
-        elif isinstance(view, MorningReadyView):
-            self._schedule(self._handle_morning_ready_view(member, message, view))
 
     async def drain(self) -> None:
         """保留中のUI操作タスクを全て完了させる (エラーは投げずに保持)。
@@ -589,13 +589,23 @@ class SimulationController:
         if self.errors:
             raise self.errors[0]
 
-    def _candidate_ids_from_buttons(self, view: discord.ui.View) -> list[int]:
-        ids = []
+    def _candidate_buttons(self, view: discord.ui.View) -> dict[int, discord.ui.Button]:
+        """候補者ボタンだけを {user_id: ボタン} で取り出す。
+
+        custom_id にアンダースコアが入っているかどうかで判定すると、
+        候補以外のボタンを足したときに int() で落ちる。
+        _BaseVoteView.button_prefix の一致でだけ候補と判定する。
+        """
+        prefix = f"{view.button_prefix}_"
+        buttons: dict[int, discord.ui.Button] = {}
         for child in view.children:
             custom_id = getattr(child, "custom_id", "") or ""
-            if "_" in custom_id:
-                ids.append(int(custom_id.rsplit("_", 1)[1]))
-        return ids
+            if custom_id.startswith(prefix):
+                buttons[int(custom_id[len(prefix):])] = child
+        return buttons
+
+    def _candidate_ids_from_buttons(self, view: discord.ui.View) -> list[int]:
+        return list(self._candidate_buttons(view))
 
     def _random_vote_mapping(self, voters: list[int], candidates: list[int]) -> dict[int, int]:
         mapping: dict[int, int] = {}
@@ -641,7 +651,7 @@ class SimulationController:
         else:
             mapping = self._random_vote_mapping(voters, candidates)
 
-        buttons = {int(child.custom_id.rsplit("_", 1)[1]): child for child in view.children}
+        buttons = self._candidate_buttons(view)
         for voter_id in voters:
             interaction = FakeInteraction(
                 user=self.guild.get_member(voter_id),
@@ -656,7 +666,7 @@ class SimulationController:
         voters = list(view.voters)
         candidates = self._candidate_ids_from_buttons(view)
         mapping = self._random_vote_mapping(voters, candidates)
-        buttons = {int(child.custom_id.rsplit("_", 1)[1]): child for child in view.children}
+        buttons = self._candidate_buttons(view)
         for voter_id in voters:
             interaction = FakeInteraction(
                 user=self.guild.get_member(voter_id),
@@ -740,22 +750,22 @@ class SimulationController:
         await self._select_and_confirm(member, message, view)
 
     async def _handle_morning_ready_view(
-        self, member: FakeMember, message: FakeMessage, view: MorningReadyView
+        self, message: FakeMessage, view: MorningReadyView
     ) -> None:
-        """DMを受け取った本人に「朝を迎える」を押させる (未行動警告があれば2度押す)"""
+        """生存者全員に #昼 の「朝を迎える」を押させる (未行動警告があれば2度押す)"""
         await asyncio.sleep(0)
         button = next(
             child for child in view.children
             if isinstance(child, discord.ui.Button) and child.label.endswith("朝を迎える")
         )
         state = self.cog.state
-        player = state.get_player(member.id)
-        if player is None:
-            return
-        for _ in range(2):
-            if player.user_id in state.morning_ready_ids:
-                break
-            await button.callback(FakeInteraction(user=member, message=message))
+        for player in list(state.alive_players()):
+            for _ in range(2):
+                if player.user_id in state.morning_ready_ids:
+                    break
+                await button.callback(
+                    FakeInteraction(user=player.member, message=message)
+                )
 
     async def _handle_prep_ready_view(
         self, message: FakeMessage, view: PrepReadyView

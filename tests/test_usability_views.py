@@ -12,6 +12,7 @@ from views import (
     GMPanelEntryView,
     LobbyView,
     StatsView,
+    build_vote_result_embed,
 )
 
 
@@ -99,6 +100,58 @@ class DangerConfirmationTest(unittest.IsolatedAsyncioTestCase):
 
         actor.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
         action.assert_awaited_once_with(actor)
+
+
+class VoteResultOrderTest(unittest.TestCase):
+    """投票結果は得票順ではなく番号順に並べる (名簿と同じ並びで追えるように)。"""
+
+    @staticmethod
+    def _players() -> dict:
+        # 参加順(キーの順)と番号をわざとずらす
+        spec = [(10, 7, True), (20, 2, True), (30, 11, False)]
+        return {
+            user_id: SimpleNamespace(
+                user_id=user_id,
+                number=number,
+                alive=alive,
+                display_name=f"{number:02d}.p{user_id}",
+            )
+            for user_id, number, alive in spec
+        }
+
+    def test_tally_lines_and_details_follow_player_numbers(self) -> None:
+        players = self._players()
+        # 投票が届いた順もばらばらにする
+        votes = {10: 20, 30: 20, 20: 10}
+
+        embed = build_vote_result_embed(votes, players)
+
+        lines = [
+            line for line in embed.description.strip("`\n").splitlines() if line
+        ]
+        # 得票のある生存者だけが番号順で並ぶ (11.p30 は死亡かつ0票)
+        self.assertEqual(
+            [line.split(" ")[0] for line in lines],
+            ["02.p20", "07.p10"],
+        )
+        # 内訳は投票者の番号順 (dictの反復順=投票が届いた順のままだと、
+        # 誰が先に投票したかまで公開される)
+        detail = embed.fields[0].value.splitlines()
+        self.assertEqual(
+            [row.split(" ")[0] for row in detail],
+            ["02.p20", "07.p10", "11.p30"],
+        )
+
+    def test_alive_player_with_no_votes_is_still_listed(self) -> None:
+        players = self._players()
+        votes = {10: 20}
+
+        embed = build_vote_result_embed(votes, players)
+
+        lines = embed.description
+        self.assertIn("07.p10", lines)   # 0票の生存者も出す
+        self.assertIn("02.p20", lines)
+        self.assertNotIn("11.p30", lines)  # 死亡かつ0票は出さない
 
 
 if __name__ == "__main__":

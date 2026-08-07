@@ -25,7 +25,7 @@ from config import (
     PRIVATE_ROOM_CREATOR_ROLE_NAME,
     RATED_ROOM_IDS, RoomDefinition,
 )
-from models import Player, GameState
+from models import Player, GameState, by_number
 from views import (
     LobbyView, GMPanelEntryView, VoteView, RunoffVoteView,
     WolfVoteView, SeerView, GuardView, SpeechDoneView,
@@ -68,6 +68,32 @@ ROLE_EMOJI: dict[Role, str] = {
 # muteとrolesはdiscord.pyのMember.editで同一PATCHに入るため、
 # API成功後・DB checkpoint前にプロセスが落ちても曖昧にならない。
 MUTE_MARKER_ROLE_PREFIX = "人狼Botミュート:"
+
+# Discordのニックネーム上限
+NICK_MAX_LEN = 32
+
+# 死亡者のニックネームへ付ける死因マーカー (接尾辞)
+DEATH_NICK_MARKERS: dict[str, str] = {
+    "処刑": "(処刑)",
+    "襲撃": "(襲撃)",
+    "除外": "(除外)",
+}
+DEATH_NICK_FALLBACK_MARKER = "(死亡)"
+
+
+def death_nick(display_name: str, method: str) -> str:
+    """死亡者のニックネーム「01.名前(処刑)」を組み立てる。
+
+    Discordのボイスチャンネル参加者一覧は表示名の辞書順に並ぶため、
+    マーカーを前置すると死亡した人だけが番号順から外れて飛んでしまう。
+    番号を先頭に残す接尾辞にすることで、処刑・襲撃されても並び順が動かない。
+
+    末尾から切ると32字上限でマーカーごと消え、生存中のニックネームと
+    同一文字列になって死亡が見えなくなる (例外もログも出ない)。
+    そのため名前側を先に切り詰めてからマーカーを連結する。
+    """
+    marker = DEATH_NICK_MARKERS.get(method, DEATH_NICK_FALLBACK_MARKER)
+    return f"{display_name[:NICK_MAX_LEN - len(marker)]}{marker}"
 
 
 def _action_subject_id(
@@ -280,8 +306,8 @@ class RoomRunner:
         # 次村用: 直前のゲームの参加者とGM (スナップショットへ永続化)
         self.last_game_roster: list[int] = []
         self.last_game_gm: Optional[int] = None
-        # 夜の「朝を迎える」DMパネルのView (user_id -> View。夜ごとに作り直す)
-        self._morning_views: dict[int, MorningReadyView] = {}
+        # 夜の「朝を迎える」パネルのView (#昼 に1枚。夜ごとに作り直す)
+        self._morning_view: Optional[MorningReadyView] = None
         # 役職確認タイムの「役職を確認した」パネルのView (ゲームごとに作り直す)
         self._prep_view: Optional[PrepReadyView] = None
         # その夜に配った役職UI (夜の終わりに全てstopする。
@@ -614,7 +640,7 @@ class RoomRunner:
 
     def log_action(self, kind: str, actor: Optional[object] = None,
                    target: Optional[object] = None, detail: str = "") -> None:
-        """進行ログへ1件積む (終了時に #参加受付 へ貼る)。
+        """進行ログへ1件積む (終了時に #昼 へ貼る)。
 
         二重実行などの不具合を後から追えるよう、**拒否された操作も残す**。
         Player でも discord.Member でも表示名を引けるようにしておく。
@@ -674,7 +700,7 @@ class RoomRunner:
         return "\n".join(lines).strip()
 
     async def _post_action_log(self) -> None:
-        """終了時に進行ログを #昼 へ貼る (結果発表の直後)。
+        """終了時に進行ログを #昼 へ貼る (結果発表の直前)。
 
         Discordの2000字上限を超える場合はテキストファイルとして添付する。
         """
@@ -815,6 +841,7 @@ class RoomRunner:
             "morning_ready_ids": list(state.morning_ready_ids),
             "morning_warned_ids": list(state.morning_warned_ids),
             "morning_confirmed": state.morning_confirmed,
+            "morning_panel_message_id": state.morning_panel_message_id,
             "prep_ready_ids": list(state.prep_ready_ids),
             "prep_confirmed": state.prep_confirmed,
             "disconnected_players": list(state.disconnected_players),
@@ -992,6 +1019,7 @@ class RoomRunner:
         state.morning_ready_ids = set(payload.get("morning_ready_ids", []))
         state.morning_warned_ids = set(payload.get("morning_warned_ids", []))
         state.morning_confirmed = bool(payload.get("morning_confirmed", False))
+        state.morning_panel_message_id = payload.get("morning_panel_message_id")
         state.prep_ready_ids = set(payload.get("prep_ready_ids", []))
         state.prep_confirmed = bool(payload.get("prep_confirmed", False))
         state.disconnected_players = set(payload.get("disconnected_players", []))
@@ -1740,7 +1768,7 @@ class RoomRunner:
 
     async def _send_role_dms(self) -> list[discord.Member]:
         state = self.state
-        wolves = [p for p in state.players.values() if p.is_wolf]
+        wolves = by_number([p for p in state.players.values() if p.is_wolf])
         wolf_names = ", ".join(w.display_name for w in wolves)
         failed: list[discord.Member] = []
 
@@ -1761,7 +1789,7 @@ class RoomRunner:
                 "この役職を確認したら #昼 の「役職を確認した」を押してください。\n"
                 "\n"
                 "🌅 **朝は生存者全員の宣言で明けます。**\n"
-                "夜の行動が終わったら、毎晩このDMに届くパネルの「朝を迎える」を押してください。\n"
+                "夜の行動が終わったら、毎晩 #昼 に出るパネルの「朝を迎える」を押してください。\n"
                 "席を外したいときは押さずにお待ちください (どちらも押し直しで取り消せます)。"
             )
             try:
@@ -1780,7 +1808,12 @@ class RoomRunner:
         await self._persist_room_state()
 
         if failed:
-            return failed
+            # gather の完了順で積まれるため並びが非決定的になる。
+            # 中断メッセージも番号順で読めるように揃える。
+            return sorted(
+                failed,
+                key=lambda m: getattr(state.get_player(m.id), "number", 0),
+            )
 
         # 占い師: 初日ランダム白結果。対象は最初のDMより前に
         # スナップショット済みなので、再起動後も同じ結果を再送する。
@@ -2086,7 +2119,7 @@ class RoomRunner:
         await self._persist_room_state()
 
         alive = state.alive_players()
-        view = VoteView(self, candidates=alive, voters=alive)
+        view = VoteView(self, candidates=by_number(alive), voters=alive)
         alive_voter_ids = {p.user_id for p in alive}
         if alive_voter_ids and alive_voter_ids <= state.votes.keys():
             state.vote_complete_event.set()
@@ -2228,7 +2261,10 @@ class RoomRunner:
         await self._persist_room_state()
 
         alive = state.alive_players()
-        view = RunoffVoteView(self, candidates=candidates, voters=alive)
+        # 投票ボタンだけ番号順にする。candidates 自体のランダム順は
+        # 弁明順の仕様 (上の random.shuffle) で、0票時のランダム処刑も
+        # この順を使うため上書きしない。
+        view = RunoffVoteView(self, candidates=by_number(candidates), voters=alive)
         alive_voter_ids = {p.user_id for p in alive}
         if alive_voter_ids and alive_voter_ids <= state.votes.keys():
             state.vote_complete_event.set()
@@ -2470,11 +2506,6 @@ class RoomRunner:
 
         method = str(effect.get("method"))
         reason = effect.get("reason")
-        prefix = {
-            "処刑": "(処刑)",
-            "襲撃": "(襲撃)",
-            "除外": "(除外)",
-        }.get(method, "(死亡)")
 
         # interaction由来の古いMemberでroles全置換すると、開始後に付いた
         # 専用村等のロールまで落としうる。必ず最新のguild cacheを優先する。
@@ -2485,7 +2516,7 @@ class RoomRunner:
 
         # ニックネーム更新・サーバーミュート・生存ロール剥奪を同じPATCHへ
         # まとめる。再適用しても同じ値になる。
-        edit_kwargs: dict = {"nick": f"{prefix}{player.display_name}"[:32]}
+        edit_kwargs: dict = {"nick": death_nick(player.display_name, method)}
         vs = getattr(player.member, "voice", None)
         vc = state.voice_channel
         will_mute = (
@@ -2704,7 +2735,9 @@ class RoomRunner:
         self._night_views = []
 
         # 人狼: 各狼のDMに襲撃UIを送信 (並列)
-        non_wolves_alive = [p for p in state.alive_players() if not p.is_wolf]
+        non_wolves_alive = by_number(
+            [p for p in state.alive_players() if not p.is_wolf]
+        )
         state.wolf_dm_messages.clear()
 
         async def send_wolf_dm(wolf: Player) -> None:
@@ -2731,7 +2764,9 @@ class RoomRunner:
             None,
         )
         if seer:
-            targets = [p for p in state.alive_players() if p.user_id != seer.user_id]
+            targets = by_number(
+                [p for p in state.alive_players() if p.user_id != seer.user_id]
+            )
             if state.seer_target is None:
                 seer_view = SeerView(self, targets)
                 self.register_game_view(seer_view, night=True)
@@ -2764,10 +2799,10 @@ class RoomRunner:
             None,
         )
         if guard:
-            targets = [
+            targets = by_number([
                 p for p in state.alive_players()
                 if p.user_id != guard.user_id and p.user_id != state.guard_previous
-            ]
+            ])
             if state.guard_target is None:
                 guard_view = GuardView(self, targets)
                 self.register_game_view(guard_view, night=True)
@@ -2791,10 +2826,12 @@ class RoomRunner:
                     except (discord.Forbidden, discord.HTTPException):
                         pass
 
-        # 「朝を迎える」パネル (夜の終了はこのボタンで決まる)。生存者のDMへ配る。
-        # 役職DMを配り終えてから送る: 先に送ると、役職DMが届く前に
-        # 全員が押して夜が終わってしまう
-        state.morning_panel_messages.clear()
+        # 「朝を迎える」パネル (夜の終了はこのボタンで決まる)。#昼 へ1枚掲示する。
+        # 役職DMを配り終えてから出す: 先に出すと、役職DMが届く前に
+        # 全員が押して夜が終わってしまう。
+        # 前夜のパネルは夜の終わり (_close_morning_panel) で閉じて参照を
+        # 手放しているので、ここは常に新規掲示になる。同じ夜をやり直す
+        # resume_existing では参照が残っていれば冪等ガードで再利用する。
         await self._post_morning_panel()
         # 夜は #昼 の書き込みが止まるため、GM入口を最後に整理する。
         await self._repost_gm_panel()
@@ -2886,23 +2923,23 @@ class RoomRunner:
 
         時間切れでは自動的に朝にしない (離席したい人はボタンを押さずに
         待たせることで、一時停止の代わりになる)。誰が押していないかは
-        村へ出さない (人数だけ表示する)。全員が戻らない場合はGMが
-        GMコントロールパネルの「朝」で進行できる。
+        村へ出さない。**宣言人数もここで初めて公開する** (夜の間ずっと
+        見えていると、未宣言者から生存役職を推定されるため)。
+        全員が戻らない場合はGMがGMコントロールパネルの「朝」で進行できる。
         """
         state = self.state
         if state.morning_ready_event.is_set():
             return
 
-        # DMを配れていない人は押せない。取りこぼしをここで補完する
+        # パネルを掲示できていないと誰も押せない。取りこぼしをここで補完する
         await self._post_morning_panel()
 
-        # 宣言がまだ必要な人に1通も届いていないなら、誰も夜を明けられない。
-        # 待ち続けても永久に明けないので、自動で明けて進行を止めない
+        # パネルを掲示できないなら、誰も夜を明けられない。待ち続けても
+        # 永久に明けないので、自動で明けて進行を止めない
         missing = self._morning_required_ids() - state.morning_ready_ids
-        undelivered = missing - state.morning_panel_messages.keys()
-        if missing and undelivered == missing:
+        if missing and state.morning_panel_message is None:
             log.error(
-                f"朝パネルのDMを配れません ({state.room_name}): 自動で夜を明けます"
+                f"朝パネルを掲示できません ({state.room_name}): 自動で夜を明けます"
             )
             # この分岐も「夜明け確定」として保存する。イベント
             # だけを立てずにreturnすると、再起動後に同じ夜を再実行
@@ -2915,7 +2952,7 @@ class RoomRunner:
                 raise
             state.morning_ready_event.set()
             await self._safe_village_send(
-                "⚠️ 「朝を迎える」パネルをDMへ送れないため、自動で夜を明けます。"
+                "⚠️ 「朝を迎える」パネルを掲示できないため、自動で夜を明けます。"
             )
             return
 
@@ -2935,21 +2972,9 @@ class RoomRunner:
 
             await asyncio.gather(*(warn(p, action) for p, action in pending))
 
-        required = self._morning_required_ids()
-        ready = len(required & state.morning_ready_ids)
-        notice = (
-            "⏳ **夜の目安時間が終了しました。**\n"
-            "生存者全員が **DMの「🌅 朝を迎える」** を押すと朝になります"
-            f"（現在 **{ready} / {len(required)}人**）。\n"
-            "(戻らない人がいる場合はGMがGMメニューの「朝」で進行できます)"
-        )
-        if undelivered:
-            names = ", ".join(
-                player.display_name for player in state.alive_players()
-                if player.user_id in undelivered
-            )
-            notice += f"\n⚠️ DMを送れなかった参加者がいます: {names}"
-        await self._safe_village_send(notice)
+        # 通知を新規メッセージで送るとパネルが上へ流れて見失うので、
+        # パネル本文そのものを人数入りへ書き換える。
+        await self._reveal_morning_count()
         await self._pausable_wait_forever(state.morning_ready_event)
 
     # ============================================================
@@ -2960,81 +2985,179 @@ class RoomRunner:
         """「朝を迎える」を押す必要がある人 (生存者。GMは参加者のときだけ)"""
         return {p.user_id for p in self.state.alive_players()}
 
-    def _morning_panel_content(self, *, declared: bool = False) -> str:
-        """DMへ配る「朝を迎える」パネルの本文 (押した本人の表示だけ更新する)。
-
-        13人分のDMを毎回そろえて編集するとAPIが跳ね上がる (13人×13編集) ため、
-        人数は押した本人のDMにだけ反映する。全体の進捗はGMメニューで見る。
-        """
-        state = self.state
+    def _morning_ready_count(self) -> tuple[int, int]:
+        """(宣言済み人数, 必要人数)"""
         required = self._morning_required_ids()
-        ready = len(required & state.morning_ready_ids)
-        if required and ready >= len(required):
-            return (
-                "🌅 **全員が「朝を迎える」を押しました。夜が明けます。**\n"
-                f"**{ready} / {len(required)}人**"
-            )
-        if declared:
-            return (
-                "✅ **「朝を迎える」を宣言しました。**\n"
-                "他の生存者を待っています。押し直すと取り消せます。\n"
-                f"現在 **{ready} / {len(required)}人**"
-            )
-        return (
+        return len(required & self.state.morning_ready_ids), len(required)
+
+    def _morning_panel_content(self, *, reveal_count: bool = False) -> str:
+        """#昼 に1枚だけ掲示する「朝を迎える」パネルの本文。
+
+        **夜の間は人数を出さない。** 13人固定構成で夜に行動があるのは
+        狼3・占い師・狩人の5人だけなので、宣言人数を常時公開すると
+        「まだ押していない役職者が何人いるか」が毎晩測れてしまい、
+        占い師・狩人の生存がCO前に推定できる。人狼は互いを知っていて
+        夜のDM中継で相談できるため、押す順番を申し合わせれば
+        カウンタを能動的に読む道具にもなる。
+
+        押した本人にも人数は返さない (_morning_feedback_text)。押せば
+        見えるなら、押して確かめて押し直すだけで測れてしまうため。
+        人数を出すのは**目安時間が切れた後の1回だけ** (reveal_count=True)
+        で、これは従来の「時間切れ後に #昼 へ人数を1回通知する」露出量と
+        同じ。全員が同時に知るので不公平も生まない。
+        """
+        body = (
             "🌅 **朝を迎える**\n"
             "夜の行動が終わったら押してください。\n"
             "**生存者全員が押すと朝になります。**\n"
             "押し直すと取り消せます。離席したいときは押さずにお待ちください。\n"
-            f"現在 **{ready} / {len(required)}人**"
+            "宣言した人数は、夜の目安時間が切れたときにここへ表示されます。"
+        )
+        if not reveal_count:
+            return body
+        ready, required = self._morning_ready_count()
+        return (
+            f"{body}\n"
+            "\n"
+            "⏳ **夜の目安時間が終了しました。**"
+            f"（現在 **{ready} / {required}人**）\n"
+            "(戻らない人がいる場合はGMがGMメニューの「朝」で進行できます)"
+        )
+
+    def _morning_feedback_text(self, *, declared: bool) -> str:
+        """押した本人にだけ ephemeral で返す文面。
+
+        **人数は出さない。** 押せば人数が見えると、押して確かめて押し直す
+        だけで進捗を測れてしまい、夜の間は公開しない意味が薄れる。
+        自分の操作が通ったかどうかだけを返し、人数は目安時間が切れた
+        ときにパネルへ一度だけ全員へ出す (_reveal_morning_count)。
+        """
+        ready, required = self._morning_ready_count()
+        if required and ready >= required:
+            return "🌅 **全員が「朝を迎える」を押しました。夜が明けます。**"
+        if declared:
+            return (
+                "✅ **「朝を迎える」を宣言しました。**\n"
+                "他の生存者を待っています。押し直すと取り消せます。"
+            )
+        return (
+            "↩️ **宣言を取り消しました。**\n"
+            "もう一度押すと宣言し直せます。"
         )
 
     async def _post_morning_panel(self) -> None:
-        """夜の「朝を迎える」パネルを生存者のDMへ1通ずつ配る。
+        """夜の「朝を迎える」パネルを #昼 へ1枚だけ掲示する。
 
-        既に配れている人には送り直さない (再掲示は取りこぼしの補完に使う)。
+        夜は #昼 が書き込み禁止だが、**ボタン押下は送信権限と無関係**なので
+        押せる (役職確認タイムの PrepReadyView が同じ条件で動いている)。
+        生存者13人へDMを配っていた頃と比べ、送信APIが13→1になる。
+        減るのはグローバルのレート制限枠を使う通常送信で、押下時の
+        defer/followup は interaction 専用ルートなので数以上に効く。
+
+        既に掲示済みなら何もしない (再掲示は取りこぼしの補完に使う)。
         """
         state = self.state
-        content = self._morning_panel_content()
-        targets = [
-            player for player in state.alive_players()
-            if player.user_id not in state.morning_panel_messages
-        ]
-        if not targets:
+        if state.morning_panel_message is not None:
             return
+        # 再起動をまたいだ前回のパネルを先に消す (下の説明を参照)
+        await self._delete_stale_morning_panel()
+        self._morning_view = MorningReadyView(self)
+        state.morning_panel_message = await self._safe_village_send(
+            self._morning_panel_content(), view=self._morning_view
+        )
+        if state.morning_panel_message is None:
+            # 掲示できなかった場合はViewを残さない (押される先が無い)
+            self._morning_view.stop()
+            self._morning_view = None
+            return
+        # 掲示直後に落ちても次回消せるよう、IDを永続化してから先へ進む
+        state.morning_panel_message_id = getattr(
+            state.morning_panel_message, "id", None
+        )
+        try:
+            await self._persist_room_state()
+        except Exception as e:
+            # 消し損ねたパネルが1枚残るだけで進行は続けられる
+            log.warning(f"朝パネルIDの保存に失敗 ({state.room_name}): {e}")
 
-        async def send_one(player: Player) -> None:
-            view = MorningReadyView(self)
-            try:
-                msg = await self._discord_api_call(
-                    player.member.send, content, view=view
-                )
-                state.morning_panel_messages[player.user_id] = msg
-                self._morning_views[player.user_id] = view
-            except (discord.Forbidden, discord.HTTPException) as e:
-                view.stop()
-                log.warning(
-                    f"「朝を迎える」DM送信失敗 ({player.display_name}): {e}"
-                )
+    async def _delete_stale_morning_panel(self) -> None:
+        """再起動前に掲示した朝パネルを消す。
 
-        await asyncio.gather(*(send_one(p) for p in targets))
+        Viewはプロセスをまたいで復元されない (ボタンに custom_id が無く
+        永続View化もできない) ため、残ったパネルを押すとDiscordの
+        「インタラクションに失敗しました」しか出ない。#昼 に新旧2枚が
+        並ぶと誤タップの元なので、次の掲示より前に消す。
+
+        get_partial_message ならメッセージを取得せず1回のAPIで消せる。
+        """
+        state = self.state
+        message_id = state.morning_panel_message_id
+        state.morning_panel_message_id = None
+        ch = state.village_channel
+        if message_id is None or ch is None:
+            return
+        get_partial = getattr(ch, "get_partial_message", None)
+        if not callable(get_partial):
+            return
+        try:
+            await self._discord_api_call(get_partial(message_id).delete)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            # 既に消えている・権限が無いなら放置してよい
+            log.warning(f"前回の朝パネル削除に失敗 ({state.room_name}): {e}")
+
+    async def _reveal_morning_count(self) -> None:
+        """目安時間が切れたときだけ、パネル本文に人数を出す。
+
+        新しいメッセージを送らずパネル自体を編集するのは、通知でパネルが
+        上へ流れて見失うのを避けるため。
+        """
+        state = self.state
+        msg = state.morning_panel_message
+        if msg is None:
+            return
+        try:
+            await self._discord_api_call(
+                msg.edit, content=self._morning_panel_content(reveal_count=True)
+            )
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            log.warning(f"朝パネルの人数表示に失敗 ({state.room_name}): {e}")
 
     async def _close_morning_panel(self) -> None:
-        """夜明け後に朝パネルの参照を手放す。
+        """夜明け後にパネルのボタンを無効化して閉じる。
 
-        DMメッセージの編集 (人数分のAPI) はしない。Viewもstopしない:
-        stopすると discord.py がコールバックを起動しなくなり、押した人には
-        「インタラクションに失敗しました」しか出ない。DMには前夜のパネルが
-        残るため、Viewは生かしたまま night_generation で弾いて理由を返す。
-        実体はゲーム終了時の _stop_all_game_views でまとめて停止する。
+        DMへ13通配っていた頃は「前夜のパネルが各自のDMに残る」ため
+        View を stop できなかった (stopするとコールバックが起動せず、
+        押した人にはDiscordの「インタラクションに失敗しました」しか出ない)。
+        #昼 の1枚になったことで、その場で無効化して閉じられる。
         """
-        self._morning_views.clear()
-        self.state.morning_panel_messages.clear()
+        state = self.state
+        view = self._morning_view
+        msg = state.morning_panel_message
+        self._morning_view = None
+        state.morning_panel_message = None
+        # 閉じたパネルは次の夜に消す対象ではない (ボタンは無効化済み)。
+        # 無効化に失敗した場合もViewをstopするので押しても動かない。
+        state.morning_panel_message_id = None
+        if view is None:
+            return
+        # 先に表示を無効化してから stop する。逆順だと、編集が着地するまでの
+        # 数百msに押した人へ汎用エラーが出る。
+        if msg is not None and not all(item.disabled for item in view.children):
+            for item in view.children:
+                item.disabled = True
+            try:
+                await self._discord_api_call(msg.edit, view=view)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                pass
+        view.stop()
 
     async def toggle_morning_ready(self, member: discord.Member) -> tuple[str, Optional[str]]:
         """「朝を迎える」の宣言をトグルする。
 
         Returns:
-            (パネルの新しい本文, エラー文字列) — エラー時は本文を使わない
+            (押した本人へephemeralで返す本文, エラー文字列)
+            — どちらも本人にしか見えない。公開パネルは編集しない
+              (夜の宣言人数を村へ出さないため)
         """
         state = self.state
         if state.morning_ready_event.is_set():
@@ -3056,7 +3179,7 @@ class RoomRunner:
                 state.morning_ready_ids.add(member.id)
                 log.exception(f"朝宣言の取り消し保存に失敗: {e}")
                 return "", "❌ 宣言の取り消しを保存できませんでした。もう一度お試しください。"
-            return self._morning_panel_content(), None
+            return self._morning_feedback_text(declared=False), None
 
         # 未行動の役職には1度だけ警告し、2度目の押下で確定させる (誤タップ防止)
         pending_ids = {p.user_id for p, _ in self._pending_night_actions()}
@@ -3089,7 +3212,7 @@ class RoomRunner:
             return "", "❌ 宣言を保存できませんでした。もう一度お試しください。"
         if release_morning:
             state.morning_ready_event.set()
-        return self._morning_panel_content(declared=True), None
+        return self._morning_feedback_text(declared=True), None
 
     async def force_morning(self, member: discord.Member) -> tuple[str, Optional[str]]:
         """GMによる強制的な夜明け (AFKで止まったままにならないための逃げ道)"""
@@ -3610,7 +3733,14 @@ class RoomRunner:
             # スナップショットからGM再試行できる。
             log.error("GAME_OVER checkpointを3回保存できませんでしたが、settlement済みのため終了処理を継続します")
 
-        # 全役職公開
+        # 掲示順は「進行ログ → 勝利陣営 + 全役職公開 → ランク変動」。
+        # 結果とレート変動を最後にまとめ、長い進行ログで押し流されない
+        # ようにする。ログを先に出しても、この時点で既にGAME_OVERへ移り
+        # _stop_all_game_views で全UIを止めており、直後に役職を全公開
+        # するため新たな情報漏洩にはならない。
+        await self._post_action_log()
+
+        # 全役職公開 (embedのtitleが勝利陣営、descriptionが役職一覧)
         role_lines = []
         for p in sorted(state.players.values(), key=lambda x: x.number):
             status = "✅" if p.alive else "💀"
@@ -3626,9 +3756,6 @@ class RoomRunner:
             color=discord.Color.red() if winner == Team.WOLF else discord.Color.green(),
         )
         await self._safe_village_send(embed=embed)
-        # 結果に続けて進行ログを出す。役職は上で全公開済みなので新たな
-        # 情報漏洩はなく、その場で「2回実行された?」を確かめられる
-        await self._post_action_log()
 
         game_id = None
         results = None
@@ -4178,7 +4305,7 @@ class RoomRunner:
         if state.disconnected_players:
             waiting = ", ".join(
                 p.display_name
-                for p in state.players.values()
+                for p in by_number(state.players.values())
                 if p.user_id in state.disconnected_players
             )
             # GM判断での未復帰のまま再開も許可する (復帰待ちの記録だけ残す)
@@ -4579,10 +4706,13 @@ class RoomRunner:
             state.pause_event.set()
 
         # 夜の「朝を迎える」宣言待ちで止まったままにならないよう解除する
-        # (DMのパネルは編集しない。Viewの停止は _stop_all_game_views が行う)
+        # (パネルは編集しない。Viewの停止は _stop_all_game_views が行う)
         state.morning_ready_event.set()
-        self._morning_views.clear()
-        state.morning_panel_messages.clear()
+        if self._morning_view is not None:
+            self._morning_view.stop()
+            self._morning_view = None
+        state.morning_panel_message = None
+        state.morning_panel_message_id = None
 
         # 役職確認の宣言待ちも同様に解除する
         state.prep_ready_event.set()
@@ -5929,7 +6059,7 @@ class RoomRunner:
         if state.disconnected_players:
             waiting = ", ".join(
                 p.display_name
-                for p in state.players.values()
+                for p in by_number(state.players.values())
                 if p.user_id in state.disconnected_players
             )
             text += f"\n復帰待ち: {waiting}"

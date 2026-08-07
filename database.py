@@ -100,7 +100,7 @@ def _validate_room_snapshot(phase: str, payload: dict) -> None:
         "initial_seer_target", "guard_previous",
         "seer_target", "guard_target", "last_game_gm",
         "last_executed", "last_killed", "day1_executed_id", "night1_killed_id",
-        "recruitment_id",
+        "recruitment_id", "morning_panel_message_id",
     ):
         value = payload.get(key)
         if value is not None and not _is_snapshot_id(value):

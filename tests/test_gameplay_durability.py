@@ -10,8 +10,8 @@ import discord
 
 from config import Phase, Role, RoomDefinition, Team
 from game import GameCog
-from models import Player
-from room_runner import RoomRunner, StateDurabilityError
+from models import Player, by_number
+from room_runner import RoomRunner, StateDurabilityError, death_nick
 from views import (
     GuardView,
     MorningReadyView,
@@ -139,8 +139,8 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
     async def test_panel_double_failure_confirms_and_closes_night_actions(self) -> None:
         runner = make_runner()
         add_player(runner, 1)
-        runner.state.morning_panel_messages.clear()
-        runner._post_morning_panel = AsyncMock()  # 再送しても1通も届かない
+        runner.state.morning_panel_message = None
+        runner._post_morning_panel = AsyncMock()  # 再掲示しても出せない
 
         await runner._wait_for_morning()
 
@@ -305,67 +305,146 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(runner.state.prep_ready_event.is_set())
         self.assertNotIn(player.user_id, runner.state.prep_ready_ids)
 
-    async def test_morning_panel_is_sent_to_each_alive_player_dm_once(self) -> None:
-        """朝パネルは生存者のDMへ1通ずつ。再掲示では届いた人へ送り直さない。"""
-        runner = make_runner()
-        alive = [add_player(runner, uid) for uid in (1, 2, 3)]
-        dead = add_player(runner, 4)
-        dead.alive = False
-
-        await runner._post_morning_panel()
-
-        self.assertEqual(set(runner.state.morning_panel_messages), {1, 2, 3})
-        for player in alive:
-            player.member.send.assert_awaited_once()
-        dead.member.send.assert_not_awaited()
-
-        # 取りこぼし補完では、まだ届いていない人にだけ送り直す
-        del runner.state.morning_panel_messages[2]
-        for player in alive:
-            player.member.send.reset_mock()
-
-        await runner._post_morning_panel()
-
-        alive[0].member.send.assert_not_awaited()
-        alive[1].member.send.assert_awaited_once()
-        alive[2].member.send.assert_not_awaited()
-
-    async def test_morning_panel_close_neither_edits_nor_stops_views(self) -> None:
-        """夜明けの後始末でDMを編集せず、Viewも止めない。
-
-        View.stop() すると discord.py はコールバックを起動しなくなり
-        (View._dispatch_item が None を返す)、古いパネルを押した人には
-        「インタラクションに失敗しました」しか出せない。理由を返せるよう
-        Viewは生かしておき、night_generation で弾く。
-        """
+    async def test_morning_panel_is_posted_once_to_the_village_channel(self) -> None:
+        """朝パネルは #昼 へ1枚だけ。再掲示は冪等で追加送信しない。"""
         runner = make_runner()
         players = [add_player(runner, uid) for uid in (1, 2, 3)]
+        dead = add_player(runner, 4)
+        dead.alive = False
+        panel = SimpleNamespace(edit=AsyncMock())
+        runner._safe_village_send = AsyncMock(return_value=panel)
 
         await runner._post_morning_panel()
 
-        views = list(runner._morning_views.values())
-        self.assertEqual(len(views), 3)
-        for player in players:
-            sent_view = player.member.send.await_args.kwargs["view"]
-            self.assertIsInstance(sent_view, MorningReadyView)
-            self.assertEqual(sent_view.night_generation, runner.state.night_generation)
-            # 送信メッセージの編集(=人数の全員分同期)はしていない
-            sent_message = runner.state.morning_panel_messages[player.user_id]
-            sent_message.edit.assert_not_awaited()
+        runner._safe_village_send.assert_awaited_once()
+        self.assertIs(runner.state.morning_panel_message, panel)
+        sent_view = runner._safe_village_send.await_args.kwargs["view"]
+        self.assertIsInstance(sent_view, MorningReadyView)
+        self.assertEqual(sent_view.night_generation, runner.state.night_generation)
+        # DMは1通も使わない
+        for player in (*players, dead):
+            player.member.send.assert_not_awaited()
+
+        # 取りこぼし補完で呼ばれても、掲示済みなら何もしない
+        await runner._post_morning_panel()
+        runner._safe_village_send.assert_awaited_once()
+
+    async def test_morning_panel_deletes_the_one_left_by_a_restart(self) -> None:
+        """再起動後はViewが復元されないので、古いパネルを消してから貼る。"""
+        runner = make_runner()
+        add_player(runner, 1)
+        stale = SimpleNamespace(delete=AsyncMock())
+        runner.state.village_channel = SimpleNamespace(
+            get_partial_message=Mock(return_value=stale)
+        )
+        runner.state.morning_panel_message_id = 555
+        panel = SimpleNamespace(id=777, edit=AsyncMock())
+        runner._safe_village_send = AsyncMock(return_value=panel)
+
+        await runner._post_morning_panel()
+
+        runner.state.village_channel.get_partial_message.assert_called_once_with(555)
+        stale.delete.assert_awaited_once()
+        # 新しいパネルのIDは、掲示直後に永続化しておく
+        self.assertEqual(runner.state.morning_panel_message_id, 777)
+        runner._persist_room_state.assert_awaited()
+
+        # 閉じたパネルは消す対象にしない (ボタンは無効化済み)
+        await runner._close_morning_panel()
+        self.assertIsNone(runner.state.morning_panel_message_id)
+
+    async def test_morning_panel_does_not_reveal_the_count_until_time_is_up(self) -> None:
+        """夜の間は宣言人数を村へ出さず、押した本人にだけ返す。
+
+        13人固定で夜に行動があるのは狼3+占い+狩人の5人だけなので、
+        人数を常時公開すると未宣言者から生存役職を推定できてしまう。
+        """
+        runner = make_runner()
+        player = add_player(runner, 1)
+        add_player(runner, 2)
+        panel = SimpleNamespace(edit=AsyncMock())
+        runner._safe_village_send = AsyncMock(return_value=panel)
+
+        await runner._post_morning_panel()
+        posted = runner._safe_village_send.await_args.args[0]
+        self.assertNotIn("人**", posted)
+
+        # 押した本人にも人数は返さない (押して確かめて押し直せば
+        # 進捗を測れてしまうため)
+        feedback, error = await runner.toggle_morning_ready(player.member)
+        self.assertIsNone(error)
+        self.assertIn("宣言しました", feedback)
+        self.assertNotIn("人**", feedback)
+        self.assertNotIn("/ 2", feedback)
+        # 押下では公開パネルを編集しない
+        panel.edit.assert_not_awaited()
+
+        # 目安時間が切れたときに初めてパネルへ人数を出す
+        await runner._reveal_morning_count()
+        panel.edit.assert_awaited_once()
+        self.assertIn("1 / 2人", panel.edit.await_args.kwargs["content"])
+
+    async def test_morning_panel_close_disables_buttons_then_stops(self) -> None:
+        """#昼 に1枚なので、夜明け時にボタンを無効化して閉じられる。
+
+        先に表示を無効化してから stop する。逆順だと、編集が着地するまでの
+        数百msに押した人へDiscordの汎用エラーが出る。
+        """
+        runner = make_runner()
+        add_player(runner, 1)
+        panel = SimpleNamespace(edit=AsyncMock())
+        runner._safe_village_send = AsyncMock(return_value=panel)
+
+        await runner._post_morning_panel()
+        view = runner._morning_view
+        self.assertIsNotNone(view)
 
         await runner._close_morning_panel()
 
-        self.assertEqual(runner._morning_views, {})
-        self.assertEqual(runner.state.morning_panel_messages, {})
-        self.assertFalse(any(view.is_finished() for view in views))
+        self.assertIsNone(runner._morning_view)
+        self.assertIsNone(runner.state.morning_panel_message)
+        self.assertTrue(all(item.disabled for item in view.children))
+        self.assertTrue(view.is_finished())
+        panel.edit.assert_awaited_once()
 
-        # 古い夜のパネルは night_generation で弾かれる
-        runner.state.night_generation += 1
-        self.assertNotEqual(views[0].night_generation, runner.state.night_generation)
+    async def test_morning_button_rejects_non_players_before_deferring(self) -> None:
+        """公開パネルなので観戦者・死亡者にもボタンが見える。
 
-        # ゲーム終了時にはまとめて停止する
-        runner._stop_all_game_views()
-        self.assertTrue(all(view.is_finished() for view in views))
+        defer してから弾くと1押下あたり2回APIを使うため、先に検査する。
+        """
+        runner = make_runner()
+        alive = add_player(runner, 1)
+        dead = add_player(runner, 2)
+        dead.alive = False
+        view = MorningReadyView(runner)
+
+        for member in (dead.member, FakeMember(99)):
+            interaction = SimpleNamespace(
+                user=member,
+                response=SimpleNamespace(
+                    send_message=AsyncMock(), defer=AsyncMock()
+                ),
+                followup=SimpleNamespace(send=AsyncMock()),
+            )
+            await view.ready_btn.callback(interaction)
+            interaction.response.defer.assert_not_awaited()
+            self.assertIn(
+                "生存中の参加者", interaction.response.send_message.await_args.args[0]
+            )
+
+        # 生存者は通る
+        interaction = SimpleNamespace(
+            user=alive.member,
+            response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        await view.ready_btn.callback(interaction)
+        interaction.response.defer.assert_awaited_once()
+        # 結果は本人にだけ返す
+        self.assertTrue(
+            interaction.followup.send.await_args.kwargs["ephemeral"]
+        )
+        self.assertIn(alive.user_id, runner.state.morning_ready_ids)
 
     async def test_wolf_relay_closes_on_time_limit_not_on_morning_declarations(self) -> None:
         """人狼DMの中継は制限時間で閉じ、朝の宣言状況では開閉しない。"""
@@ -521,7 +600,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
     async def test_panel_failure_fallback_event_waits_for_checkpoint(self) -> None:
         runner = make_runner()
         add_player(runner, 1)
-        runner.state.morning_panel_messages.clear()
+        runner.state.morning_panel_message = None
         runner._post_morning_panel = AsyncMock()
 
         async def fail_while_waiter_is_still_blocked() -> None:
@@ -778,6 +857,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
             user=second.member,
             response=SimpleNamespace(defer=AsyncMock()),
             followup=SimpleNamespace(send=AsyncMock()),
+            edit_original_response=AsyncMock(),
         )
         confirm_button = next(
             item for item in confirm_view.children if item.label == "この人に投票"
@@ -789,6 +869,12 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(runner.state.vote_complete_event.is_set())
         interaction.response.defer.assert_awaited_once()
         confirm_interaction.response.defer.assert_awaited_once()
+        # 確定結果は新しいephemeralではなく確認メッセージの書き換えで残す
+        confirm_interaction.followup.send.assert_not_awaited()
+        self.assertIn(
+            "投票しました",
+            confirm_interaction.edit_original_response.await_args.kwargs["content"],
+        )
 
     async def test_vote_persist_failure_rolls_back_and_allows_retry(self) -> None:
         runner = make_runner()
@@ -810,6 +896,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
             user=voter.member,
             response=SimpleNamespace(defer=AsyncMock()),
             followup=SimpleNamespace(send=AsyncMock()),
+            edit_original_response=AsyncMock(),
         )
         confirm_button = next(
             item for item in confirm_view.children if item.label == "この人に投票"
@@ -819,9 +906,13 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(voter.user_id, runner.state.votes)
         self.assertFalse(runner.state.vote_complete_event.is_set())
         self.assertIn(
-            "もう一度投票", confirm_interaction.followup.send.await_args.args[0]
+            "もう一度投票",
+            confirm_interaction.edit_original_response.await_args.kwargs["content"],
         )
         self.assertEqual(runner.state.action_log, [])
+        # 保存に失敗したら確定せず、確認ボタンを押し直せる状態で残す
+        self.assertFalse(confirm_view.is_finished())
+        self.assertFalse(any(item.disabled for item in confirm_view.children))
 
     async def test_vote_is_not_recorded_before_confirmation(self) -> None:
         runner = make_runner()
@@ -1406,6 +1497,107 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         settle.assert_awaited_once()
         self.assertEqual(runner.state.phase, Phase.LOBBY)
         self.assertGreaterEqual(calls, 5)
+
+    async def test_end_game_posts_action_log_before_result_and_rating_last(self) -> None:
+        runner = make_runner()
+        runner.state.guild = SimpleNamespace(id=123)
+        add_player(runner, 1, Role.VILLAGER)
+        runner._restore_nicknames = AsyncMock()
+        runner._teardown_game_roles_and_perms = AsyncMock()
+        runner._post_lobby_ui = AsyncMock()
+
+        order: list[str] = []
+
+        async def record_action_log() -> None:
+            order.append("action_log")
+
+        async def record_send(*args, **kwargs):
+            if kwargs.get("embed") is not None:
+                order.append("result_embed")
+            elif args and "ランク対象外" in str(args[0]):
+                order.append("rating")
+            return None
+
+        runner._post_action_log = record_action_log
+        runner._safe_village_send = AsyncMock(side_effect=record_send)
+
+        with (
+            patch("room_runner.database.stage_game_settlement", new=AsyncMock()),
+            patch(
+                "room_runner.database.settle_game_settlement",
+                new=AsyncMock(return_value=(1, None, None)),
+            ),
+        ):
+            await runner._end_game(Team.VILLAGE)
+
+        # 進行ログ → 勝利陣営+役職公開 → ランク変動 の順で掲示する
+        self.assertEqual(order, ["action_log", "result_embed", "rating"])
+
+    async def test_death_nick_keeps_number_first_and_marker_survives_truncation(self) -> None:
+        # 番号を先頭に残す接尾辞にすることで、VC参加者一覧の並びが動かない
+        self.assertEqual(death_nick("01.名前", "処刑"), "01.名前(処刑)")
+        self.assertEqual(death_nick("02.名前", "襲撃"), "02.名前(襲撃)")
+        self.assertEqual(death_nick("03.名前", "除外"), "03.名前(除外)")
+        self.assertEqual(death_nick("04.名前", "不明な死因"), "04.名前(死亡)")
+
+        # 32字ぎりぎりの表示名でもマーカーが消えない (消えると生存中と
+        # 同じ文字列になり、死亡が見えなくなる)
+        long_name = f"05.{'あ' * 40}"
+        nick = death_nick(long_name, "処刑")
+        self.assertLessEqual(len(nick), 32)
+        self.assertTrue(nick.startswith("05."))
+        self.assertTrue(nick.endswith("(処刑)"))
+
+    async def test_apply_death_effect_puts_marker_after_the_number(self) -> None:
+        runner = make_runner()
+        player = add_player(runner, 1)
+        player.base_name = "あ" * 40
+        everyone = FakeRole(1, "@everyone", default=True)
+        marker = FakeRole(3, runner._mute_marker_role_name())
+        player.member.roles = [everyone]
+        guild = SimpleNamespace(
+            id=1, roles=[everyone, marker], get_member=lambda _: player.member
+        )
+        runner.state.guild = guild
+        runner.state.voice_channel = SimpleNamespace(id=10, members=[player.member])
+        runner.state.village_channel = SimpleNamespace(set_permissions=AsyncMock())
+        runner.state.mute_marker_enabled = True
+        runner._enable_mute_markers = AsyncMock(return_value=marker)
+        runner._remove_alive_role = AsyncMock(return_value=True)
+        runner._play_se = Mock()
+        effect = {
+            "event_id": "run-1:処刑:1",
+            "player_id": player.user_id,
+            "method": "処刑",
+            "reason": None,
+        }
+        runner.state.pending_death_effects = [effect]
+        player.member.edit = AsyncMock(return_value=player.member)
+
+        await runner._apply_death_effect(effect)
+
+        nick = player.member.edit.await_args.kwargs["nick"]
+        self.assertTrue(nick.startswith("01."))
+        self.assertTrue(nick.endswith("(処刑)"))
+        self.assertLessEqual(len(nick), 32)
+
+    async def test_vote_buttons_are_ordered_by_number(self) -> None:
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_VOTE
+        # 参加順とは別の番号を振る (実際も番号はランダム割り当て)
+        first = add_player(runner, 1)
+        second = add_player(runner, 2)
+        third = add_player(runner, 3)
+        first.number, second.number, third.number = 7, 2, 11
+        alive = [first, second, third]
+
+        view = VoteView(runner, candidates=by_number(alive), voters=alive)
+
+        labels = [
+            item.label for item in view.children
+            if getattr(item, "custom_id", "") .startswith("vote_")
+        ]
+        self.assertEqual(labels, [p.display_name for p in (second, first, third)])
 
     async def test_force_end_initial_checkpoint_failure_still_cleans_up_to_lobby(self) -> None:
         runner = make_runner()
