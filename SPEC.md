@@ -342,7 +342,9 @@ bot/
 │                       *.applescript / run_checks.sh
 ├── data/               werewolf_stats.db + backups/ (gitignore対象。起動時・
 │                       24時間ごと・/season_reset 前に自動バックアップ、
-│                       ラベル別に10世代保持)
+│                       ラベル別に10世代保持。作成時に wal_checkpoint して
+│                       -wal / -shm を残さず、世代を捨てるときは本体と
+│                       一緒にサイドカーも消す)
 ├── logs/               bot.log (5MB×3世代ローテーション) / launcher.log
 ├── .github/workflows/  ci.yml (GitHub push時の自動チェック)
 └── docs/               旧仕様書アーカイブ
@@ -351,6 +353,7 @@ bot/
 ### 実装上の要点
 - **実行環境**: Python 3.14（3.14.6で検証）。Apple Siliconでは `/opt/homebrew` のarm64 PythonをPATH探索より優先し、Rosetta上のx86_64 Pythonを拒否する。直接依存は `requirements.txt`、推移依存を含む検証済み完全固定版は `requirements-lock.txt` で管理する。ただし `discord.py[voice]` 2.7.1 が `PyNaCl<1.6` を要求するため、PyNaClだけは互換範囲内の最新1.5.0を使う
 - **API負荷対策**: Discord API呼び出しは `Semaphore(5)` で全卓共有のスロットリング。権限上書きは差分がある時だけ送信
+- **押下の計測**: 全員が同時に押すボタン (朝を迎える / 役職を確認した / 投票の確定) は `views.InteractionTimer` で段階ごとの所要時間を測る。`ack` (Discordへの応答) → `lock` (卓の `action_lock` 取得) → `state` (状態更新とDB保存) → `reply` (本人への返信) の4区間を記録し、合計が `SLOW_INTERACTION_SECONDS` を超えたときだけWARNINGで出す。「押したのに反応しない」の原因が、Discordの応答なのか、他の処理が握っている卓ロック待ちなのか、DB保存なのかをログだけで切り分けるため。平常時は13人×毎晩のログを出さない
 - **状態永続化**: フェーズ遷移に加え、夜の行動・朝の宣言・死亡・ミュート所有・開始処理の進捗を卓スナップショットへ保存する。読込時に破損した卓だけを隔離し、他卓の復元を継続する
 - **外部副作用の再実行**: 死亡通知・権限変更はoutbox、専用村作成/改名/招待/削除は進捗journalとして保存し、Discord APIとDBの間で停止しても再調停する。通知は欠落防止を優先するため障害窓では重複する場合がある
 - **レート整合性**: 勝敗結果を先に未精算キューへ保存し、ゲーム履歴とレート更新を同一トランザクションで冪等精算する。推薦も1試合・1推薦者の一意制約と集計済み状態を同一トランザクションで更新し、二重加算を防ぐ。レート計算・推薦集計・シーズンリセットは `rating_lock` で直列化する

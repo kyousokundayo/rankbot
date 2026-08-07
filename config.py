@@ -106,6 +106,12 @@ MUTE_RETRY_DELAY = 3
 # 短時間に集中する呼び出しは別途ここで平準化する (約9件/10秒)。
 BULK_DISCORD_API_INTERVAL = 1.1
 
+# 全員が同時に押すボタン (朝を迎える/役職を確認した/投票) が、この秒数より
+# 遅れたらWARNINGでログへ残す。「押したのに反応しない」の原因が
+# Discordへの応答・卓ロックの待ち・DB保存のどこにあるかを切り分けるため、
+# 段階ごとの所要時間も一緒に出す (views.InteractionTimer)。
+SLOW_INTERACTION_SECONDS = 2.0
+
 # シーン切替SE (朝/処刑/投票/投票開示/遺言/夜)。
 # 依存 (davey/PyNaCl/libopus) が無い環境ではTrueでも自動で無効になる
 SE_ENABLED = True

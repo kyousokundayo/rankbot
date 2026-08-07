@@ -227,12 +227,46 @@ async def backup_db(*, label: str = "auto", keep: int = BACKUP_KEEP_PER_LABEL) -
     async with aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT_SECONDS) as src:
         async with aiosqlite.connect(str(dest)) as dst:
             await src.backup(dst)
+            # 元DBがWALなのでバックアップ先もWALになる。閉じる前に
+            # 本体へ書き戻し、-wal / -shm 無しで復元できる状態にする。
+            await dst.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    # チェックポイント済みなので、残っていても復元には要らない
+    for suffix in ("-wal", "-shm"):
+        Path(f"{dest}{suffix}").unlink(missing_ok=True)
 
     if keep > 0:
         backups = sorted(BACKUP_DIR.glob(f"{src_path.stem}_*_{label}.db"))
         for old in backups[:-keep]:
-            old.unlink(missing_ok=True)
+            _remove_backup_files(old)
+        _remove_orphan_backup_sidecars(src_path.stem)
     return str(dest)
+
+
+def _remove_backup_files(backup: Path) -> None:
+    """バックアップ本体と、SQLiteが同名で作る -wal / -shm をまとめて消す。
+
+    本体だけ消すと、バックアップ先がWALモードのときに残る
+    `xxx.db-wal` / `xxx.db-shm` が回収されず、世代を捨てても
+    ディスクを食い続ける。
+    """
+    for suffix in ("", "-wal", "-shm"):
+        Path(f"{backup}{suffix}").unlink(missing_ok=True)
+
+
+def _remove_orphan_backup_sidecars(stem: str) -> None:
+    """本体が無い -wal / -shm を回収する。
+
+    本体だけを消していた頃に取り残されたぶんを、次のバックアップで
+    まとめて片付ける。単体では復元に使えないので消して問題ない。
+    """
+    for sidecar in BACKUP_DIR.glob(f"{stem}_*.db-*"):
+        name = sidecar.name
+        for suffix in ("-wal", "-shm"):
+            if not name.endswith(suffix):
+                continue
+            if not (BACKUP_DIR / name[: -len(suffix)]).exists():
+                sidecar.unlink(missing_ok=True)
+            break
 
 
 async def _ensure_column(

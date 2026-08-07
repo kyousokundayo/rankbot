@@ -5,11 +5,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from config import Phase
+from config import Phase, SLOW_INTERACTION_SECONDS
 from views import (
     DangerConfirmView,
     GMControlView,
     GMPanelEntryView,
+    InteractionTimer,
     LobbyView,
     StatsView,
     build_vote_result_embed,
@@ -100,6 +101,31 @@ class DangerConfirmationTest(unittest.IsolatedAsyncioTestCase):
 
         actor.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
         action.assert_awaited_once_with(actor)
+
+
+class InteractionTimerTest(unittest.TestCase):
+    """遅いボタン押下だけをログへ残す (平常時に13人分を毎晩出さない)。"""
+
+    def test_fast_press_logs_nothing_and_slow_press_reports_each_stage(self) -> None:
+        timer = InteractionTimer("朝を迎える", 42)
+        timer.mark("ack")
+        with self.assertNoLogs("views", level="WARNING"):
+            timer.finish()
+
+        slow = InteractionTimer("朝を迎える", 42)
+        # 押下からの経過を閾値超えに見せかける
+        slow._started -= SLOW_INTERACTION_SECONDS + 1
+        slow.mark("ack")
+        slow.mark("lock")
+        with self.assertLogs("views", level="WARNING") as captured:
+            slow.finish(note="committed=True")
+
+        message = captured.output[0]
+        self.assertIn("朝を迎える", message)
+        self.assertIn("user=42", message)
+        self.assertIn("ack=", message)
+        self.assertIn("lock=", message)
+        self.assertIn("committed=True", message)
 
 
 class VoteResultOrderTest(unittest.TestCase):
