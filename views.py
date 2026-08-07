@@ -15,7 +15,8 @@ from config import (
     RUNOFF_SPEECH_TIME, LAST_WILL_TIME, DAY_DISCUSSION_BASE,
     DAY_DISCUSSION_DECREASE, DAY_DISCUSSION_MIN, VOTE_TIMEOUT,
     NIGHT_BASE, NIGHT_MIN,
-    CH_LOBBY, CH_STATS, CH_VILLAGE,
+    CH_LOBBY, CH_STATS, CH_VILLAGE, CH_SPIRIT,
+    LOG_CATEGORY_VILLAGE, LOG_CATEGORY_SPIRIT, LOG_CATEGORY_LIMIT,
     SEASON_RANK_MIN_GAMES, GRANDMASTER_PERCENTAGE, GRANDMASTER_SLOTS,
     RANK_SPECS, SEASON_RANK_PERCENTAGES,
     RATING_FLOOR, INITIAL_RATING, WIN_PARTICIPATION_BONUS,
@@ -2965,6 +2966,17 @@ def build_help_embeds() -> list[discord.Embed]:
             "占い・護衛・襲撃先・投票・処刑・襲撃死を発生順に並べたものです。\n"
             "**確定済みの操作をやり直そうとした記録も残る**ので、"
             "「2回占えてしまったのでは？」といった疑いをその場で確かめられます。"
+        ),
+        inline=False,
+    )
+    embed3.add_field(
+        name="終わった試合を読み返す",
+        value=(
+            f"`#{CH_VILLAGE}` と `#{CH_SPIRIT}` は削除されず、"
+            f"**{LOG_CATEGORY_VILLAGE}** / **{LOG_CATEGORY_SPIRIT}** カテゴリへ移ります。\n"
+            "`04-昼` のように**試合番号**が付くので、`#統計` の「最近の試合」と"
+            "突き合わせて後から読み返せます（書き込みはできません）。\n"
+            f"直近{LOG_CATEGORY_LIMIT}試合ぶんを保存し、超えたぶんは古いものから消えます。"
         ),
         inline=False,
     )
