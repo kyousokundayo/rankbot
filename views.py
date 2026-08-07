@@ -670,8 +670,14 @@ class GMPanelEntryView(discord.ui.View):
 
 
 class GMControlView(discord.ui.View):
+    # GMがパネルを開いたまま待つのは、たいてい8分の議論の途中。
+    # 180秒だと事故が起きた頃には失効していて、一番押したい「一時停止」が
+    # Discordの「インタラクションに失敗しました」になる。ephemeralの応答を
+    # 編集できるのは15分までなので、その手前まで延ばして実用上失効させない。
+    TIMEOUT_SECONDS = 870
+
     def __init__(self, cog: RoomRunner) -> None:
-        super().__init__(timeout=180)
+        super().__init__(timeout=self.TIMEOUT_SECONDS)
         self.cog = cog
         self.game_run_id = cog.state.game_run_id
         state = cog.state
@@ -2857,9 +2863,9 @@ def build_rule_embeds() -> list[discord.Embed]:
     embed.add_field(
         name="宣言で進みます",
         value=(
-            f"どちらも `#{CH_VILLAGE}` のパネル。**時間切れでは進みません**。押し直しで取り消せます。\n"
-            "**📩 役職を確認した** — 参加者全員が押すと議論開始\n"
-            "**🌅 朝を迎える** — 生存者全員が押すと朝\n"
+            f"どちらも `#{CH_VILLAGE}` のパネル。**時間切れでは進みません**。\n"
+            "**📩 役職を確認した** — 参加者全員が押すと議論開始（**一度きり**）\n"
+            "**🌅 朝を迎える** — 生存者全員が押すと朝（押し直しで取り消せます）\n"
             "離席したいときは押さずに待たせてください（これが一時停止の代わりです）。\n"
             "**宣言した人数は夜の間は誰にも見えません。** "
             "目安時間が切れたときに全員へ同時に表示されます。"

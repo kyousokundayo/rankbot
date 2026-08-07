@@ -258,7 +258,11 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(registered), 1)
 
     async def test_prep_gate_opens_only_after_everyone_declares(self) -> None:
-        """役職確認は参加者全員が押すまで開かず、押し直しで取り消せる。"""
+        """役職確認は参加者全員が押すまで開かず、**二度押しでは取り消せない**。
+
+        トグルだった頃はスマホの二度タップで無言のまま宣言が消え、
+        12/13 のまま理由が分からず議論が始まらなかった。
+        """
         runner = make_runner()
         runner.state.phase = Phase.PREPARATION
         players = [add_player(runner, uid) for uid in (1, 2, 3)]
@@ -269,13 +273,11 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(runner.state.prep_ready_event.is_set())
         self.assertFalse(runner.state.prep_confirmed)
 
-        # 押し直しは取り消しとして扱う
+        # 二度押しは冪等。宣言は消えず、本人には理由が返る
         _, error = await runner.toggle_prep_ready(players[0].member)
-        self.assertIsNone(error)
-        self.assertNotIn(players[0].user_id, runner.state.prep_ready_ids)
-
-        _, error = await runner.toggle_prep_ready(players[0].member)
-        self.assertIsNone(error)
+        self.assertIsNotNone(error)
+        self.assertIn(players[0].user_id, runner.state.prep_ready_ids)
+        self.assertEqual(len(runner.state.prep_ready_ids), 2)
         self.assertFalse(runner.state.prep_ready_event.is_set())
 
         # 最後の1人でゲートが開く
@@ -284,7 +286,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(runner.state.prep_confirmed)
         self.assertTrue(runner.state.prep_ready_event.is_set())
 
-        # 確定後は取り消しを受け付けない
+        # 確定後も受け付けない
         _, error = await runner.toggle_prep_ready(players[0].member)
         self.assertIsNotNone(error)
         self.assertEqual(len(runner.state.prep_ready_ids), 3)

@@ -1815,7 +1815,8 @@ class RoomRunner:
                 "\n"
                 "🌅 **朝は生存者全員の宣言で明けます。**\n"
                 "夜の行動が終わったら、毎晩 #昼 に出るパネルの「朝を迎える」を押してください。\n"
-                "席を外したいときは押さずにお待ちください (どちらも押し直しで取り消せます)。"
+                "席を外したいときは「朝を迎える」を押さずにお待ちください "
+                "(こちらは押し直しで取り消せます。役職確認は一度きりです)。"
             )
             try:
                 await self._discord_api_call(player.member.send, msg)
@@ -3338,7 +3339,7 @@ class RoomRunner:
             "📩 **役職を確認した**\n"
             "DMで届いた役職を確認したら押してください。\n"
             "**参加者全員が押すと議論が始まります。**\n"
-            "押し直すと取り消せます。まだ準備できていないときは押さずにお待ちください。\n"
+            "**一度押すと取り消せません。** まだ準備できていないときは押さずにお待ちください。\n"
             f"現在 **{ready} / {len(required)}人**"
         )
 
@@ -3372,7 +3373,13 @@ class RoomRunner:
             pass
 
     async def toggle_prep_ready(self, member: discord.Member) -> tuple[str, Optional[str]]:
-        """「役職を確認した」の宣言をトグルする。
+        """「役職を確認した」を宣言する (**一度きり。取り消せない**)。
+
+        トグルにしていた頃は、スマホで反応が遅いと二度タップしてしまい、
+        本人には何も返らないまま宣言が取り消されていた。誰が押していないかは
+        村へ出さないので、12/13 のまま理由が分からず議論が始まらない。
+        役職を確認し直すのにボタンを取り消す必要はないため、冪等にする。
+        (離席のために押さずに待たせる「朝を迎える」は取り消せるままにする)
 
         Returns:
             (パネルの新しい本文, エラー文字列) — エラー時は本文を使わない
@@ -3387,14 +3394,7 @@ class RoomRunner:
             return "", "⏳ 参加者だけが押せます。"
 
         if member.id in state.prep_ready_ids:
-            state.prep_ready_ids.discard(member.id)
-            try:
-                await self._persist_room_state()
-            except Exception as e:
-                state.prep_ready_ids.add(member.id)
-                log.exception(f"役職確認の取り消し保存に失敗: {e}")
-                return "", "❌ 宣言の取り消しを保存できませんでした。もう一度お試しください。"
-            return self._prep_panel_content(), None
+            return "", "✅ 既に「役職を確認した」を宣言しています。"
 
         was_confirmed = state.prep_confirmed
         was_event_set = state.prep_ready_event.is_set()
