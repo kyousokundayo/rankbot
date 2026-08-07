@@ -251,5 +251,64 @@ class GameStatsDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(old_stats, 0)
 
 
+class GameSequenceNumberTest(unittest.IsolatedAsyncioTestCase):
+    """表示用の通し番号は game_id の欠番を詰めて1から数える。
+
+    game_id はAUTOINCREMENTなので、開発中の検証で消費したぶんや、
+    精算に失敗した試合のぶんが欠番として残る。そのまま出すと
+    「3, 69, 70, 71」のように飛んで見える。
+    """
+
+    async def asyncSetUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="werewolf-game-seq-test-")
+        self._original_db_path = database.DB_PATH
+        database.DB_PATH = str(Path(self._tmp.name) / "seq.db")
+        await database.init_db()
+        # game_id を 3 / 69 / 70 と飛ばして作る (本番で起きた並びを再現)
+        async with database.connect_db() as db:
+            for game_id, winner in ((3, Team.VILLAGE.value), (69, Team.WOLF.value), (70, Team.WOLF.value)):
+                await db.execute(
+                    "INSERT INTO games (game_id, guild_id, winner_team, room_id, room_name) "
+                    "VALUES (?, ?, ?, 'open', '総合')",
+                    (game_id, 1, winner),
+                )
+                await db.execute(
+                    "INSERT INTO game_players (game_id, player_id, role, team, won) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (game_id, 555, Role.VILLAGER.value, Team.VILLAGE.value, 1),
+                )
+            # 別サーバーの試合は番号に混ぜない
+            await db.execute(
+                "INSERT INTO games (game_id, guild_id, winner_team, room_id, room_name) "
+                "VALUES (999, 2, ?, 'open', '総合')",
+                (Team.WOLF.value,),
+            )
+            await db.commit()
+
+    async def asyncTearDown(self) -> None:
+        database.DB_PATH = self._original_db_path
+        self._tmp.cleanup()
+
+    async def test_recent_games_number_from_one_ignoring_gaps(self) -> None:
+        rows = await database.get_recent_games(1, limit=10)
+
+        # 新しい順に出しつつ、番号は古い試合が1
+        self.assertEqual([row["seq"] for row in rows], [3, 2, 1])
+        self.assertEqual([row["game_id"] for row in rows], [70, 69, 3])
+
+    async def test_player_history_uses_the_same_numbers(self) -> None:
+        rows = await database.get_player_recent_games(555, 1, limit=10)
+
+        # 自分の履歴でも「サーバー全体で何試合目か」で揃える
+        self.assertEqual([row["seq"] for row in rows], [3, 2, 1])
+        self.assertEqual([row["game_id"] for row in rows], [70, 69, 3])
+
+    async def test_numbering_is_per_guild(self) -> None:
+        rows = await database.get_recent_games(2, limit=10)
+
+        self.assertEqual([row["seq"] for row in rows], [1])
+        self.assertEqual([row["game_id"] for row in rows], [999])
+
+
 if __name__ == "__main__":
     unittest.main()

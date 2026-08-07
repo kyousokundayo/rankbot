@@ -2349,7 +2349,7 @@ class StatsView(discord.ui.View):
             return await interaction.followup.send("試合履歴はまだありません。", ephemeral=True)
 
         lines = [
-            f"`{row['game_id']:>4}` {row['room_name']} / {row['winner_team']} / {format_played_at(row['played_at'])}"
+            f"`{row['seq']:>4}` {row['room_name']} / {row['winner_team']} / {format_played_at(row['played_at'])}"
             for row in rows
         ]
         embed = discord.Embed(
@@ -2390,7 +2390,7 @@ class StatsView(discord.ui.View):
                     + " / ".join(parts) + ")"
                 )
             lines.append(
-                f"`{row['game_id']:>4}` {row['room_name']} / {row['role']} / {result}{delta_txt}"
+                f"`{row['seq']:>4}` {row['room_name']} / {row['role']} / {result}{delta_txt}"
             )
 
         embed = discord.Embed(

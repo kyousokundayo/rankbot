@@ -279,8 +279,8 @@
 | 全体ランキング | 今シーズンの相対ランク順位 (上位20) |
 | 全体データ | 試合指標を卓別、プレイヤー指標を試合時の確定表示ランク別に表示 |
 | 前シーズン | 前シーズン最終順位 |
-| 最近の試合 | 直近10試合 (卓/勝利陣営/日時はDiscordタイムスタンプ表示) |
-| 自分の履歴 | 自分の直近10試合 (役職/勝敗/レート変動) |
+| 最近の試合 | 直近10試合 (通し番号/卓/勝利陣営/日時はDiscordタイムスタンプ表示) |
+| 自分の履歴 | 自分の直近10試合 (通し番号/役職/勝敗/レート変動) |
 | ランク仕様 | レート増減 / ランク9段階と決まり方 / 対象卓とシーズン |
 | 同村拒否 | 本人専用表示で拒否リストを追加・解除（最大10人） |
 | 不具合・改善を報告 | 不具合 / 分かりにくい / 改善要望 / その他を選び、本文と任意の発生状況を送信。Bot版・卓・フェーズ・送信チャンネルとともにSQLiteへ保存。**1人あたり直近24時間で `FEEDBACK_MAX_PER_DAY` 件まで** (誰でも押せるフォームなので、連投でDBとバックアップが膨らむのを防ぐ)。件数判定とINSERTは `BEGIN IMMEDIATE` の同一トランザクションで行い、連打で上限を越えられないようにする |
@@ -358,6 +358,7 @@ bot/
 - **外部副作用の再実行**: 死亡通知・権限変更はoutbox、専用村作成/改名/招待/削除は進捗journalとして保存し、Discord APIとDBの間で停止しても再調停する。通知は欠落防止を優先するため障害窓では重複する場合がある
 - **レート整合性**: 勝敗結果を先に未精算キューへ保存し、ゲーム履歴とレート更新を同一トランザクションで冪等精算する。推薦も1試合・1推薦者の一意制約と集計済み状態を同一トランザクションで更新し、二重加算を防ぐ。レート計算・推薦集計・シーズンリセットは `rating_lock` で直列化する
 - **DBスキーマ**: games / game_players / **game_stats** / player_ratings / rating_history / game_recommendations / season_resets / rating_snapshots / room_states / room_state_quarantine / game_settlements / pending_unmutes / private_rooms / private_room_members / **recruitments** / **recruitment_entries** / **player_blocks**
+  - **試合番号の表示**: `games.game_id` はAUTOINCREMENTで欠番が出るため、UIには出さず**サーバー内の通し番号 (古い順に1から)** を `ROW_NUMBER()` で振って表示する。欠番の原因は「開発中の検証で消費したぶん (本番DBへの書き込みガードは後から導入)」と「精算に失敗して記録されなかった試合」。**廃村 (`force_end`) は精算しないので `games` に入らず、番号も消費しない**。DBの `game_id` は変更しない (`game_players` / `rating_history` / `game_stats` などが参照するため)
   - `games.gm_id`: 進行GM
   - `games.base_room_id`: 将来の増設卓を固定卓へ正規化するキー。現在は `room_id` と同値
   - `games.recruitment_id`: 募集経由の試合だけ募集ID、直接開始はNULL
