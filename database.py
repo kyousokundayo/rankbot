@@ -1540,8 +1540,11 @@ async def season_half_reset(guild_id: int, executed_by: int,
             raise SeasonResetConflict("シーズンが別の操作によって更新されています。")
 
         # 現在の全プレイヤーレート取得
+        # games (通算) はランクの母集団判定に要る。落とすと前シーズンの
+        # 最終ランクを別の母集団で計算してしまう。
         rows = await db.execute_fetchall(
-            "SELECT player_id, rating, season_games, season_wins FROM player_ratings WHERE guild_id = ?",
+            "SELECT player_id, rating, season_games, season_wins, games "
+            "FROM player_ratings WHERE guild_id = ?",
             (guild_id,)
         )
         if not rows:
@@ -1557,6 +1560,7 @@ async def season_half_reset(guild_id: int, executed_by: int,
                 "rating": row[1],
                 "season_games": row[2],
                 "season_wins": row[3],
+                "games": row[4],
             }
             for row in rows
         ]
@@ -1571,7 +1575,7 @@ async def season_half_reset(guild_id: int, executed_by: int,
         reset_id = cursor.lastrowid
 
         # 各プレイヤーをハーフリセット
-        for player_id, old_rating, season_games, season_wins in rows:
+        for player_id, old_rating, season_games, season_wins, _games in rows:
             new_rating = INITIAL_RATING + (old_rating - INITIAL_RATING) // 2
             rank_ctx = rank_map[player_id]
 

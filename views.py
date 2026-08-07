@@ -2282,7 +2282,7 @@ class StatsView(discord.ui.View):
             description="\n".join(lines),
             color=discord.Color.gold(),
         )
-        embed.set_footer(text=f"相対ランクは今シーズン{SEASON_RANK_MIN_GAMES}戦以上のプレイヤーのみ対象")
+        embed.set_footer(text=f"相対ランクは通算{SEASON_RANK_MIN_GAMES}戦以上のプレイヤーのみ対象")
         await interaction.followup.send(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="全体データ", style=discord.ButtonStyle.secondary, custom_id="stats_overall_data", row=0)
@@ -2639,7 +2639,7 @@ def build_stats_embed(
         if rating_info["top_percent"] is None:
             top_txt = (
                 f"計測中 / 今季 {rating_info['season_games']}戦\n"
-                f"{SEASON_RANK_MIN_GAMES}戦到達で相対ランクと順位が確定します"
+                f"通算{SEASON_RANK_MIN_GAMES}戦到達で相対ランクと順位が確定します"
             )
         else:
             top_txt = (
@@ -2997,8 +2997,10 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
             f"レート順の**相対評価**で決まります（{ratios}）。\n"
             f"グランドマスターは全体上位{GRANDMASTER_PERCENTAGE * 100:g}%相当、"
             f"最大{GRANDMASTER_SLOTS}人です。\n"
-            f"**1戦目からランクが付き**、{SEASON_RANK_MIN_GAMES}戦以上で順位と上位%も表示されます。\n"
-            "ランクに応じたロールが自動で付き、見える卓もそれに連動します。"
+            f"**1戦目からランクが付き**、通算{SEASON_RANK_MIN_GAMES}戦以上で順位と上位%も確定します。\n"
+            "ランクに応じたロールが自動で付き、見える卓もそれに連動します。\n"
+            "**シーズンリセット後もランクは維持されます**"
+            "（レートは半減しますが全員同じ比率なので順位関係は変わりません）。"
         ),
         inline=False,
     )

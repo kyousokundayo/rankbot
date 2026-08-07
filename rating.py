@@ -163,15 +163,23 @@ def _largest_remainder_counts(total: int, percentages: dict[str, float]) -> dict
 
 def build_rank_context_map(player_rows: list[dict]) -> dict[int, RankContext]:
     """
-    現在シーズンの相対ランクを返す。
+    レート順の相対ランクを返す。
+
+    母集団は**通算**の試合数で決める。シーズンのハーフリセットは
+    `season_games` をゼロにするので、今季の試合数を条件にすると
+    リセット直後は全員が母集団から外れ、レートを保持しているのに
+    ランクだけ暫定ブロンズへ落ちてしまう。
+    レート変換 (1500 + (r - 1500) / 2) は単調増加でレート順を保つため、
+    通算で数えればリセットをまたいでランク分布がそのまま維持される。
+    インフレ分だけが圧縮され、順位関係は変わらない。
 
     player_rows:
-      [{"player_id", "rating", "season_games", "season_wins"}]
+      [{"player_id", "rating", "games", "season_games", "season_wins"}]
     """
     contexts: dict[int, RankContext] = {}
     active_rows = [
         row for row in player_rows
-        if row.get("season_games", 0) >= SEASON_RANK_MIN_GAMES
+        if row.get("games", 0) >= SEASON_RANK_MIN_GAMES
     ]
     active_rows.sort(
         key=lambda row: (-row["rating"], -row.get("season_wins", 0), row["player_id"])
@@ -219,10 +227,11 @@ def build_rank_context_map(player_rows: list[dict]) -> dict[int, RankContext]:
                 )
                 cursor += 1
 
-    # 3戦未満 (SEASON_RANK_MIN_GAMES未満) のプレイヤー:
+    # 通算3戦未満 (SEASON_RANK_MIN_GAMES未満) のプレイヤー:
     # 相対評価の母集団 (枠の消費) には入れないが、1戦目からランクを表示する。
     # アクティブ勢の順位に「仮スロット」した位置から同じ帯割りでランクを求める。
-    # アクティブ勢が1人もいない場合と0戦の人は従来どおりブロンズ暫定
+    # アクティブ勢が1人もいない場合と、まだ1戦もしていない人はブロンズ暫定
+    # (完全な新規だけがここに来る。初心者卓へ入れる状態にしておく)
     segment_bounds: list[tuple[str, int]] = []
     if active_rows:
         cursor = 0
@@ -232,7 +241,7 @@ def build_rank_context_map(player_rows: list[dict]) -> dict[int, RankContext]:
                 segment_bounds.append((rank_name, cursor))
 
     def _provisional_rank_for(row: dict) -> str:
-        if not active_rows or row.get("season_games", 0) <= 0:
+        if not active_rows or row.get("games", 0) <= 0:
             return "ブロンズ"
         sort_key = (-row["rating"], -row.get("season_wins", 0), row["player_id"])
         virtual_position = 1 + sum(

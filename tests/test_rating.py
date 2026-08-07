@@ -178,10 +178,12 @@ class TestCalculateGameResults(unittest.TestCase):
 
 def make_rows(count: int, games: int = SEASON_RANK_MIN_GAMES) -> list[dict]:
     # レートは player_id が小さいほど高い (順位が一意に決まる)
+    # ランクの母集団は通算 (games) で決まる
     return [
         {
             "player_id": i + 1,
             "rating": 2000 - i,
+            "games": games,
             "season_games": games,
             "season_wins": games // 2,
         }
@@ -197,6 +199,49 @@ class TestBuildRankContextMap(unittest.TestCase):
             self.assertTrue(c.provisional)
             self.assertEqual(c.rank_name, "ブロンズ")
             self.assertIsNone(c.position)
+
+    def test_rank_survives_a_season_reset(self):
+        """ハーフリセットで今季戦績が0になってもランクと順位は維持される。
+
+        レート変換は単調増加なので順位関係が保たれる。母集団を通算で
+        数えることで、リセット直後に全員が暫定ブロンズへ落ちない。
+        """
+        rows = make_rows(100)
+        before = rating_lib.build_rank_context_map(rows)
+
+        # season_half_reset と同じ変換: レート半減 + 今季戦績ゼロ (通算は残す)
+        after_rows = [
+            {
+                **row,
+                "rating": INITIAL_RATING + (row["rating"] - INITIAL_RATING) // 2,
+                "season_games": 0,
+                "season_wins": 0,
+            }
+            for row in rows
+        ]
+        after = rating_lib.build_rank_context_map(after_rows)
+
+        for player_id, ctx in before.items():
+            self.assertEqual(ctx.rank_name, after[player_id].rank_name, player_id)
+            self.assertEqual(ctx.position, after[player_id].position, player_id)
+            self.assertFalse(after[player_id].provisional, player_id)
+
+    def test_brand_new_player_is_still_provisional_bronze(self):
+        """通算0戦だけが暫定ブロンズ (初心者卓へ入れる状態にしておく)。"""
+        rows = make_rows(50)
+        rows.append({
+            "player_id": 999,
+            "rating": INITIAL_RATING,
+            "games": 0,
+            "season_games": 0,
+            "season_wins": 0,
+        })
+
+        ctx = rating_lib.build_rank_context_map(rows)
+
+        self.assertTrue(ctx[999].provisional)
+        self.assertEqual(ctx[999].rank_name, "ブロンズ")
+        self.assertIsNone(ctx[999].position)
 
     def test_everyone_gets_context(self):
         rows = make_rows(100)
