@@ -265,15 +265,22 @@ class FakeTextChannel:
     async def edit(
         self,
         *,
+        name: Optional[str] = None,
         category: Optional[FakeCategory] = None,
         position: Optional[int] = None,
+        sync_permissions: bool = False,
         reason: Optional[str] = None,
     ) -> None:
+        if name is not None:
+            self.name = name
         if self.category is not None and self in self.category.channels:
             self.category.channels.remove(self)
         self.category = category
         if category is not None and self not in category.channels:
             category.channels.append(self)
+            if sync_permissions:
+                # 本番と同じく、移動先カテゴリの権限へ揃える
+                self.overwrites = dict(getattr(category, "overwrites", {}) or {})
         if position is not None:
             self.position = position
 

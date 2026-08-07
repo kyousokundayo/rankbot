@@ -16,6 +16,8 @@ from config import (
     Role, Team, Phase, ROLE_TEAM, ROLE_DISTRIBUTION, MAX_PLAYERS,
     DISCORD_MESSAGE_LIMIT,
     PREPARATION_TIME, CHANNEL_DELETE_DELAY, VOTE_TIMEOUT,
+    LOG_CATEGORY_VILLAGE, LOG_CATEGORY_SPIRIT,
+    LOG_CATEGORY_LIMIT, LOG_CATEGORY_TRIM_TO,
     CH_VILLAGE, CH_SPIRIT, CH_LOBBY, VC_GAME,
     RUNOFF_SPEECH_TIME, LAST_WILL_TIME, DISCUSSION_GRACE_TIME,
     MUTE_GRACE_TIME, MUTE_RETRY_DELAY,
@@ -79,6 +81,31 @@ DEATH_NICK_MARKERS: dict[str, str] = {
     "除外": "(除外)",
 }
 DEATH_NICK_FALLBACK_MARKER = "(死亡)"
+
+
+# カウントダウン表示を書き換える間隔。メッセージ編集はチャンネル単位の
+# バケット (約5回/5秒) を消費し、1ゲーム (13人・5日) で議論・投票・夜・遺言を
+# 合わせると800〜1100回に達する。秒読みが要るのは終盤だけなので、
+# 残り30秒までは粗く刻む。
+TIMER_TICK_PER_SECOND_FROM = 30   # 残りこの秒数からは毎秒
+TIMER_TICK_PER_5_SECONDS_FROM = 60  # ここまでは5秒ごと
+TIMER_TICK_COARSE_INTERVAL = 30   # それ以前は30秒ごと
+
+
+def timer_should_update(display: int, last_display: int) -> bool:
+    """カウントダウンの表示を書き換えるべきか。
+
+    毎秒の秒読みを残り60秒から30秒へ縮めることで、1フェーズあたりの
+    メッセージ編集が61回から37回へ減る (約4割減)。緊張感が要る最後の
+    30秒は毎秒のまま残す。
+    """
+    if display == last_display:
+        return False
+    if display == 0 or display <= TIMER_TICK_PER_SECOND_FROM:
+        return True
+    if display <= TIMER_TICK_PER_5_SECONDS_FROM:
+        return display % 5 == 0
+    return display % TIMER_TICK_COARSE_INTERVAL == 0
 
 
 def death_nick(display_name: str, method: str) -> str:
@@ -1790,7 +1817,8 @@ class RoomRunner:
                 "\n"
                 "🌅 **朝は生存者全員の宣言で明けます。**\n"
                 "夜の行動が終わったら、毎晩 #昼 に出るパネルの「朝を迎える」を押してください。\n"
-                "席を外したいときは押さずにお待ちください (どちらも押し直しで取り消せます)。"
+                "席を外したいときは「朝を迎える」を押さずにお待ちください "
+                "(こちらは押し直しで取り消せます。役職確認は一度きりです)。"
             )
             try:
                 await self._discord_api_call(player.member.send, msg)
@@ -2089,14 +2117,30 @@ class RoomRunner:
         def discussion_content(remaining: float) -> str:
             return (
                 f"☀️ **{state.day_number}日目 - 議論タイム** (生存者: {len(state.alive_players())}人)\n"
+                "話しながら投票できます。投票フェーズまでは何度でも入れ替えられます。\n"
                 + self._timer_line(remaining)
             )
 
-        timer_msg = await self._safe_village_send(discussion_content(duration))
+        # 議論中の仮投票。全員がそろえば議論を切り上げ、その票を
+        # 投票フェーズへ持ち越してそのまま開示する。
+        # 途中で心変わりできるので、早く入れた人が議論から降りずに済む。
+        alive = state.alive_players()
+        state.votes.clear()
+        state.vote_complete_event.clear()
+        provisional_view = VoteView(
+            self, candidates=by_number(alive), voters=alive, provisional=True
+        )
+        timer_msg = await self._safe_village_send(
+            discussion_content(duration), view=provisional_view
+        )
         await self._repost_gm_panel()
 
-        # 一時停止対応のタイマー
-        await self._pausable_countdown(timer_msg, discussion_content, duration)
+        # 一時停止対応のタイマー (全員の仮投票がそろっても切り上げる)
+        await self._pausable_countdown(
+            timer_msg, discussion_content, duration, state.vote_complete_event
+        )
+        # 議論用のパネルは投票フェーズで貼り直すのでここで止める
+        provisional_view.stop()
 
         # 議論終了。ミュートが行き渡るまで数秒かかるので、
         # 「終了 = もう喋れない」と誤解させない文言にする
@@ -2109,12 +2153,12 @@ class RoomRunner:
     # 昼フェーズ: 投票
     # ============================================================
 
-    async def _day_vote(self, *, resume_existing: bool = False) -> Optional[int]:
+    async def _day_vote(self) -> Optional[int]:
         state = self.state
         await state.pause_event.wait()
         state.phase = Phase.DAY_VOTE
-        if not resume_existing:
-            state.votes.clear()
+        # 議論中の仮投票をそのまま引き継ぐ (clearしない)。
+        # 全員そろっていれば下のガードで即開示になる。
         state.vote_complete_event.clear()
         await self._persist_room_state()
 
@@ -2460,6 +2504,71 @@ class RoomRunner:
             raise StateDurabilityError("死亡状態を保存できませんでした") from e
 
         await self._apply_death_effect(effect)
+
+    async def _ensure_log_category(self, name: str) -> Optional[discord.CategoryChannel]:
+        """ログカテゴリを用意する (全員が読めて、誰も書き込めない)。"""
+        guild = self.state.guild
+        if guild is None:
+            return None
+        category = discord.utils.get(guild.categories, name=name)
+        if category is not None:
+            return category
+        overwrites = {
+            guild.default_role: discord.PermissionOverwrite(
+                view_channel=True, read_messages=True, send_messages=False,
+                add_reactions=False, create_public_threads=False,
+                create_private_threads=False, send_messages_in_threads=False,
+            ),
+        }
+        try:
+            return await self._discord_api_call(
+                guild.create_category, name, overwrites=overwrites
+            )
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.warning(f"ログカテゴリ作成失敗 ({name}): {e}")
+            return None
+
+    async def _trim_log_category(self, category: discord.CategoryChannel) -> None:
+        """上限に達したら古い順にまとめて減らす。
+
+        Discordの上限はカテゴリあたり50チャンネル。埋まってから1つずつ
+        消すと毎試合その処理が走るので、まとめて LOG_CATEGORY_TRIM_TO まで
+        落とす。作成が古い順 = チャンネルIDの昇順 (Snowflakeは時刻を含む)。
+        """
+        channels = sorted(category.channels, key=lambda ch: ch.id)
+        if len(channels) < LOG_CATEGORY_LIMIT:
+            return
+        for ch in channels[: len(channels) - LOG_CATEGORY_TRIM_TO]:
+            try:
+                await self._paced_discord_api_call(ch.delete)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                log.warning(f"古いログチャンネルの削除失敗 (#{ch.name}): {e}")
+
+    async def _archive_game_channel(
+        self, channel: discord.TextChannel, category_name: str, seq: int
+    ) -> bool:
+        """終了した卓チャンネルをログカテゴリへ移す。成功したらTrue。
+
+        名前は「04-昼」のように試合番号を先頭へ置く。Discordはカテゴリ内を
+        名前順に並べるため、番号が前にあると自然に試合順で並ぶ。
+        権限はカテゴリへ同期させる (書き込み不可・全員閲覧可)。
+        """
+        category = await self._ensure_log_category(category_name)
+        if category is None:
+            return False
+        await self._trim_log_category(category)
+        try:
+            await self._paced_discord_api_call(
+                channel.edit,
+                name=f"{seq:02d}-{channel.name}",
+                category=category,
+                sync_permissions=True,
+                reason="人狼: 終了した卓のログを保管",
+            )
+            return True
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            log.warning(f"ログカテゴリへの移動失敗 (#{channel.name}): {e}")
+            return False
 
     async def _stop_for_durability_error(self, context: str, error: Exception) -> None:
         """勝敗に関わる保存失敗で状態を捨てず安全停止する。"""
@@ -3313,7 +3422,7 @@ class RoomRunner:
             "📩 **役職を確認した**\n"
             "DMで届いた役職を確認したら押してください。\n"
             "**参加者全員が押すと議論が始まります。**\n"
-            "押し直すと取り消せます。まだ準備できていないときは押さずにお待ちください。\n"
+            "**一度押すと取り消せません。** まだ準備できていないときは押さずにお待ちください。\n"
             f"現在 **{ready} / {len(required)}人**"
         )
 
@@ -3347,7 +3456,13 @@ class RoomRunner:
             pass
 
     async def toggle_prep_ready(self, member: discord.Member) -> tuple[str, Optional[str]]:
-        """「役職を確認した」の宣言をトグルする。
+        """「役職を確認した」を宣言する (**一度きり。取り消せない**)。
+
+        トグルにしていた頃は、スマホで反応が遅いと二度タップしてしまい、
+        本人には何も返らないまま宣言が取り消されていた。誰が押していないかは
+        村へ出さないので、12/13 のまま理由が分からず議論が始まらない。
+        役職を確認し直すのにボタンを取り消す必要はないため、冪等にする。
+        (離席のために押さずに待たせる「朝を迎える」は取り消せるままにする)
 
         Returns:
             (パネルの新しい本文, エラー文字列) — エラー時は本文を使わない
@@ -3362,14 +3477,7 @@ class RoomRunner:
             return "", "⏳ 参加者だけが押せます。"
 
         if member.id in state.prep_ready_ids:
-            state.prep_ready_ids.discard(member.id)
-            try:
-                await self._persist_room_state()
-            except Exception as e:
-                state.prep_ready_ids.add(member.id)
-                log.exception(f"役職確認の取り消し保存に失敗: {e}")
-                return "", "❌ 宣言の取り消しを保存できませんでした。もう一度お試しください。"
-            return self._prep_panel_content(), None
+            return "", "✅ 既に「役職を確認した」を宣言しています。"
 
         was_confirmed = state.prep_confirmed
         was_event_set = state.prep_ready_event.is_set()
@@ -3892,22 +4000,44 @@ class RoomRunner:
             "✅ **ゲーム終了処理が完了しました。**\nニックネームとVC設定を復元しました。",
         )
 
-        # チャンネル削除予約 (#昼 / #霊界)
-        game_channels = [ch for ch in (state.village_channel, state.spirit_channel) if ch]
+        # ログカテゴリへ退避 (#昼 / #霊界)。移せなければ従来どおり削除する。
+        game_channels = [
+            (state.village_channel, LOG_CATEGORY_VILLAGE),
+            (state.spirit_channel, LOG_CATEGORY_SPIRIT),
+        ]
+        game_channels = [(ch, cat) for ch, cat in game_channels if ch]
+        seq = None
+        if game_id is not None and state.guild is not None:
+            try:
+                seq = await database.get_game_sequence_number(
+                    state.guild.id, int(game_id)
+                )
+            except Exception as e:
+                log.warning(f"ログ用の試合番号を取得できません: {e}")
 
-        await self._safe_village_send(
-            f"🕐 このチャンネルは {CHANNEL_DELETE_DELAY}秒後 に削除されます。"
-        )
+        if seq is None:
+            await self._safe_village_send(
+                f"🕐 このチャンネルは {CHANNEL_DELETE_DELAY}秒後 に削除されます。"
+            )
+        else:
+            await self._safe_village_send(
+                f"🕐 このチャンネルは {CHANNEL_DELETE_DELAY}秒後 に "
+                f"**{LOG_CATEGORY_VILLAGE}** へ移動します (読み返せます)。"
+            )
 
-        async def delete_channels():
+        async def archive_channels():
             await asyncio.sleep(CHANNEL_DELETE_DELAY)
-            for ch in game_channels:
+            for ch, category_name in game_channels:
+                if seq is not None and await self._archive_game_channel(
+                    ch, category_name, seq
+                ):
+                    continue
                 try:
                     await ch.delete()
                 except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
                     log.warning(f"#{ch.name} チャンネル削除失敗: {e}")
 
-        self.manager.spawn_bg_task(delete_channels())
+        self.manager.spawn_bg_task(archive_channels())
 
         # 次村用に直前のメンバーを記録
         if state.players:
@@ -4437,7 +4567,7 @@ class RoomRunner:
                     f"♻️ **{state.day_number}日目の投票フェーズ** を投票済み状態から再開します。"
                 )
                 if await finish_recovered_vote(
-                    await self._day_vote(resume_existing=True)
+                    await self._day_vote()
                 ):
                     return
             elif resume_phase in (Phase.DAY_RUNOFF_SPEECH, Phase.DAY_RUNOFF_VOTE) and not state.day_execution_resolved:
@@ -5719,7 +5849,7 @@ class RoomRunner:
     ) -> bool:
         """
         一時停止対応のカウントダウン。
-        表示は30秒ごと、残り60秒から1秒ごとに更新する。
+        表示は30秒ごと → 残り60秒から5秒ごと → 残り30秒から毎秒。
 
         Returns:
             True  : event が発生した
@@ -5750,15 +5880,7 @@ class RoomRunner:
 
             remaining -= loop.time() - start
             display = max(0, int(remaining + 0.999))
-            # 60秒超: 30秒ごと / 残り60秒からは毎秒の秒読み。
-            # メッセージ編集はチャンネル単位のバケット (約5回/5秒) なので
-            # 毎秒1回なら他の卓と競合せずに収まる
-            should_update = display != last_display and (
-                display == 0
-                or display <= 60
-                or display % 30 == 0
-            )
-            if should_update:
+            if timer_should_update(display, last_display):
                 message = await self._safe_timer_edit(message, build_content(display))
                 last_display = display
 

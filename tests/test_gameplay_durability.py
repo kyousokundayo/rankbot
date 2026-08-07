@@ -8,10 +8,22 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import discord
 
-from config import Phase, Role, RoomDefinition, Team
+from config import (
+    LOG_CATEGORY_LIMIT,
+    LOG_CATEGORY_TRIM_TO,
+    Phase,
+    Role,
+    RoomDefinition,
+    Team,
+)
 from game import GameCog
 from models import Player, by_number
-from room_runner import RoomRunner, StateDurabilityError, death_nick
+from room_runner import (
+    RoomRunner,
+    StateDurabilityError,
+    death_nick,
+    timer_should_update,
+)
 from views import (
     GuardView,
     MorningReadyView,
@@ -253,7 +265,11 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(registered), 1)
 
     async def test_prep_gate_opens_only_after_everyone_declares(self) -> None:
-        """役職確認は参加者全員が押すまで開かず、押し直しで取り消せる。"""
+        """役職確認は参加者全員が押すまで開かず、**二度押しでは取り消せない**。
+
+        トグルだった頃はスマホの二度タップで無言のまま宣言が消え、
+        12/13 のまま理由が分からず議論が始まらなかった。
+        """
         runner = make_runner()
         runner.state.phase = Phase.PREPARATION
         players = [add_player(runner, uid) for uid in (1, 2, 3)]
@@ -264,13 +280,11 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(runner.state.prep_ready_event.is_set())
         self.assertFalse(runner.state.prep_confirmed)
 
-        # 押し直しは取り消しとして扱う
+        # 二度押しは冪等。宣言は消えず、本人には理由が返る
         _, error = await runner.toggle_prep_ready(players[0].member)
-        self.assertIsNone(error)
-        self.assertNotIn(players[0].user_id, runner.state.prep_ready_ids)
-
-        _, error = await runner.toggle_prep_ready(players[0].member)
-        self.assertIsNone(error)
+        self.assertIsNotNone(error)
+        self.assertIn(players[0].user_id, runner.state.prep_ready_ids)
+        self.assertEqual(len(runner.state.prep_ready_ids), 2)
         self.assertFalse(runner.state.prep_ready_event.is_set())
 
         # 最後の1人でゲートが開く
@@ -279,7 +293,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(runner.state.prep_confirmed)
         self.assertTrue(runner.state.prep_ready_event.is_set())
 
-        # 確定後は取り消しを受け付けない
+        # 確定後も受け付けない
         _, error = await runner.toggle_prep_ready(players[0].member)
         self.assertIsNotNone(error)
         self.assertEqual(len(runner.state.prep_ready_ids), 3)
@@ -932,14 +946,118 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(voter.user_id, runner.state.votes)
         runner._persist_room_state.assert_not_awaited()
 
-    async def test_recovered_vote_phase_keeps_already_persisted_votes(self) -> None:
+    async def test_finished_channel_moves_to_the_log_category(self) -> None:
+        """終了した卓は削除せず、試合番号を付けてログカテゴリへ移す。"""
+        runner = make_runner()
+        category = SimpleNamespace(name="ログ-昼", channels=[])
+        guild = SimpleNamespace(
+            id=1, categories=[category], create_category=AsyncMock()
+        )
+        runner.state.guild = guild
+        channel = SimpleNamespace(name="昼", id=500, edit=AsyncMock())
+
+        moved = await runner._archive_game_channel(channel, "ログ-昼", 4)
+
+        self.assertTrue(moved)
+        guild.create_category.assert_not_awaited()  # 既存を使い回す
+        kwargs = channel.edit.await_args.kwargs
+        # 番号を先頭に置く (Discordはカテゴリ内を名前順に並べる)
+        self.assertEqual(kwargs["name"], "04-昼")
+        self.assertIs(kwargs["category"], category)
+        self.assertTrue(kwargs["sync_permissions"])
+
+    async def test_log_category_is_trimmed_when_it_hits_the_limit(self) -> None:
+        """上限50に達したら古い順に40まで減らす (IDの昇順 = 作成順)。"""
+        runner = make_runner()
+        old = [SimpleNamespace(name=f"{i:02d}-昼", id=100 + i, delete=AsyncMock())
+               for i in range(LOG_CATEGORY_LIMIT)]
+        category = SimpleNamespace(name="ログ-昼", channels=list(reversed(old)))
+        runner.state.guild = SimpleNamespace(
+            id=1, categories=[category], create_category=AsyncMock()
+        )
+        channel = SimpleNamespace(name="昼", id=9999, edit=AsyncMock())
+
+        await runner._archive_game_channel(channel, "ログ-昼", 51)
+
+        deleted = [ch for ch in old if ch.delete.await_count]
+        self.assertEqual(len(deleted), LOG_CATEGORY_LIMIT - LOG_CATEGORY_TRIM_TO)
+        # 消えるのは古い順 (IDが小さいほう)
+        self.assertEqual([ch.id for ch in deleted], [100 + i for i in range(len(deleted))])
+
+    async def test_archive_failure_falls_back_to_deleting(self) -> None:
+        """カテゴリを用意できなければ False を返し、呼び出し側が削除へ倒す。"""
+        runner = make_runner()
+        runner.state.guild = SimpleNamespace(
+            id=1, categories=[],
+            default_role=FakeRole(1, "@everyone", default=True),
+            create_category=AsyncMock(side_effect=discord.Forbidden(Mock(status=403), "denied")),
+        )
+        channel = SimpleNamespace(name="昼", id=500, edit=AsyncMock())
+
+        moved = await runner._archive_game_channel(channel, "ログ-昼", 4)
+
+        self.assertFalse(moved)
+        channel.edit.assert_not_awaited()
+
+    async def test_provisional_vote_can_be_changed_but_the_final_one_cannot(self) -> None:
+        """議論中の仮投票は入れ替え自由、投票フェーズでは確定。
+
+        議論の途中で心変わりできないと、早く入れた人が話し合いから
+        降りてしまうため、確定は投票フェーズまで遅らせる。
+        """
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_DISCUSSION
+        voter = add_player(runner, 1)
+        first = add_player(runner, 2)
+        second = add_player(runner, 3)
+        alive = [voter, first, second]
+
+        provisional = VoteView(runner, alive, alive, provisional=True)
+        self.assertIsNone(provisional._vote_error(voter.user_id, first.user_id))
+        result, committed = await provisional.commit_vote(voter.user_id, first.user_id)
+        self.assertTrue(committed)
+        self.assertIn("入れ替えられます", result)
+
+        # 入れ替えできる
+        self.assertIsNone(provisional._vote_error(voter.user_id, second.user_id))
+        _, committed = await provisional.commit_vote(voter.user_id, second.user_id)
+        self.assertTrue(committed)
+        self.assertEqual(runner.state.votes[voter.user_id], second.user_id)
+
+        # 投票フェーズに入ると、同じ票のまま変更を受け付けない
+        runner.state.phase = Phase.DAY_VOTE
+        final = VoteView(runner, alive, alive)
+        self.assertEqual(final._vote_error(voter.user_id, first.user_id), "投票済みです。")
+        # 仮投票パネルもフェーズ違いで弾かれる
+        self.assertIsNotNone(provisional._vote_error(voter.user_id, first.user_id))
+
+    async def test_all_provisional_votes_end_the_discussion_early(self) -> None:
+        """生存者全員が仮投票を終えたら議論を切り上げる。"""
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_DISCUSSION
+        players = [add_player(runner, uid) for uid in (1, 2, 3)]
+
+        view = VoteView(runner, players, players, provisional=True)
+        for voter, target in zip(players, [players[1], players[2], players[0]]):
+            await view.commit_vote(voter.user_id, target.user_id)
+            if voter is not players[-1]:
+                self.assertFalse(runner.state.vote_complete_event.is_set())
+
+        self.assertTrue(runner.state.vote_complete_event.is_set())
+
+    async def test_vote_phase_keeps_votes_cast_before_it_started(self) -> None:
+        """議論中の仮投票と、復元した投票の両方をそのまま引き継ぐ。
+
+        投票フェーズは votes をクリアしない。議論中に入れた票が
+        持ち越され、全員そろっていればそのまま開示される。
+        """
         runner = make_runner()
         first = add_player(runner, 1)
         second = add_player(runner, 2)
         runner.state.votes = {first.user_id: second.user_id}
         runner._pausable_countdown = AsyncMock(return_value=True)
 
-        executed = await runner._day_vote(resume_existing=True)
+        executed = await runner._day_vote()
 
         self.assertEqual(executed, second.user_id)
         self.assertEqual(runner.state.votes, {first.user_id: second.user_id})
@@ -1532,6 +1650,54 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
 
         # 進行ログ → 勝利陣営+役職公開 → ランク変動 の順で掲示する
         self.assertEqual(order, ["action_log", "result_embed", "rating"])
+
+    def _count_timer_edits(self, seconds: int) -> int:
+        """seconds 秒のカウントダウンで発生するメッセージ編集の回数。"""
+        edits, last = 0, seconds
+        for display in range(seconds, -1, -1):
+            if timer_should_update(display, last):
+                edits += 1
+                last = display
+        return edits
+
+    async def test_timer_ticks_coarsely_until_the_last_30_seconds(self) -> None:
+        """秒読みは残り30秒から。メッセージ編集はチャンネルバケットを食う。
+
+        1ゲーム (13人・5日) の議論・投票・夜・遺言を合わせると
+        1000回規模になるため、終盤以外は粗く刻む。
+        """
+        # 60秒フェーズ: 55,50,45,40,35 の5回 + 30..1 の30回 + 0 の1回
+        # (60は初期表示と同じなので書き換えない)
+        self.assertEqual(self._count_timer_edits(60), 36)
+        # 残り30秒からは毎秒 (秒読みが要る場面は落とさない)
+        for display in (30, 29, 5, 1, 0):
+            self.assertTrue(timer_should_update(display, display + 1), display)
+        # 60〜31秒は5秒刻みだけ
+        self.assertTrue(timer_should_update(45, 46))
+        self.assertFalse(timer_should_update(44, 45))
+        # 60秒超は30秒刻み
+        self.assertTrue(timer_should_update(120, 121))
+        self.assertFalse(timer_should_update(119, 120))
+        # 同じ表示なら書き換えない
+        self.assertFalse(timer_should_update(10, 10))
+
+    async def test_timer_edits_drop_by_about_a_third_over_a_game(self) -> None:
+        """5日ゲーム全体で3割以上減ること (回帰で刻みを戻さないための下限)。"""
+        def old_count(seconds: int) -> int:
+            edits, last = 0, seconds
+            for display in range(seconds, -1, -1):
+                if display != last and (display == 0 or display <= 60 or display % 30 == 0):
+                    edits += 1
+                    last = display
+            return edits
+
+        phases = [(480, 1), (420, 1), (360, 1), (300, 1), (240, 1),
+                  (60, 5), (80, 1), (60, 4), (30, 5), (30, 2)]
+        before = sum(old_count(sec) * times for sec, times in phases)
+        after = sum(self._count_timer_edits(sec) * times for sec, times in phases)
+
+        self.assertLess(after, before)
+        self.assertGreaterEqual((before - after) / before, 0.30, f"{before} -> {after}")
 
     async def test_death_nick_keeps_number_first_and_marker_survives_truncation(self) -> None:
         # 番号を先頭に残す接尾辞にすることで、VC参加者一覧の並びが動かない
