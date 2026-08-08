@@ -14,10 +14,12 @@ from discord.ext import commands, tasks
 
 from config import (
     Phase, INITIAL_RATING, SEASON_LENGTH_DAYS,
-    CH_STATS, CH_LOBBY, CH_MAYOR_INFO,
+    CH_STATS, CH_LOBBY, CH_GM_INFO,
     STATS_PARENT_CHANNEL_NAME,
-    MAYOR_INFO_CATEGORY_NAME, MAYOR_INFO_ADMIN_ONLY,
-    PRIVATE_ROOM_CREATOR_ROLE_NAME,
+    GM_INFO_CATEGORY_NAME, GM_INFO_ADMIN_ONLY,
+    GM_ROLE_NAME, TEMP_GM_ROLE_NAME,
+    LEGACY_MAYOR_ROLE_NAME, LEGACY_MAYOR_INFO_CATEGORY_NAME,
+    PRIVATE_ROOM_CREATOR_ROLE_NAMES, PRIVATE_ROOM_CREATOR_ROLE_LABEL,
     BULK_DISCORD_API_INTERVAL,
     DEFAULT_LADDER_ID, LADDER_DEFINITIONS,
     ACTIVE_ROOM_DEFINITIONS,
@@ -30,7 +32,7 @@ from room_runner import (  # noqa: F401  (互換のため再エクスポート)
     RoomRunner,
     member_roles_for_edit,
 )
-from views import DangerConfirmView, MayorInfoView, StatsView
+from views import DangerConfirmView, PrivateRoomInfoView, StatsView
 from recruitment import RecruitmentManager
 import database
 import rating as rating_lib
@@ -68,6 +70,12 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         self._settlement_recovered_since_notice = 0
         self._rating_recovery_needs_role_sync = False
         self._pending_settlement_fail_alerted: set[tuple[str, str]] = set()
+        # HTTPで作成した直後のDiscordロールはGatewayイベントが届くまで
+        # guild.rolesへ反映されないことがあるため、同じ起動中はここを正本にする。
+        self._gm_staff_roles: dict[str, discord.Role] = {}
+        # 旧村長からGMへHTTP成功で付与済みだが、member.rolesキャッシュへ
+        # まだ届いていない所有者。起動時cleanupだけで一時的に保護する。
+        self._legacy_migration_owner_ids: set[int] = set()
         # 各卓のrestoreが終わる前でも、raw snapshotから
         # 「別卓の進行中VC」を判定する。起動時cleanupが
         # 先に処理した卓の残留muteを剥がすレースを防ぐ。
@@ -441,8 +449,153 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 log.warning(f"統計チャンネルランク個別権限解除失敗 ({role.name}): {e}")
         return stats
 
-    async def _ensure_mayor_info_channel(self, guild: discord.Guild) -> discord.TextChannel:
-        mayor_role = discord.utils.get(guild.roles, name=PRIVATE_ROOM_CREATOR_ROLE_NAME)
+    @staticmethod
+    def _roles_named(guild: discord.Guild, name: str) -> list[discord.Role]:
+        return [role for role in guild.roles if role.name == name]
+
+    @classmethod
+    def _one_role_named(
+        cls, guild: discord.Guild, name: str
+    ) -> Optional[discord.Role]:
+        roles = cls._roles_named(guild, name)
+        if len(roles) > 1:
+            raise RuntimeError(
+                f"{name} ロールが重複しています。重複を整理してから再起動してください。"
+            )
+        return roles[0] if roles else None
+
+    @staticmethod
+    def _member_has_role_name(member: discord.Member, role_name: str) -> bool:
+        return any(role.name == role_name for role in getattr(member, "roles", ()))
+
+    async def _ensure_gm_staff_roles(
+        self, guild: discord.Guild
+    ) -> tuple[discord.Role, discord.Role]:
+        """GM／仮GMを用意し、旧村長をGMへ安全に移行する。"""
+        roles: dict[str, discord.Role] = {}
+        for role_name in (GM_ROLE_NAME, TEMP_GM_ROLE_NAME):
+            role = self._gm_staff_roles.get(role_name)
+            if role is None:
+                role = self._one_role_named(guild, role_name)
+            if role is None:
+                try:
+                    role = await self.paced_discord_api_call(
+                        guild.create_role,
+                        name=role_name,
+                        reason="GM運営ロール作成",
+                    )
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    raise RuntimeError(
+                        f"{role_name} ロールを作成できません。Botのロール管理権限と階層を確認してください。"
+                    ) from exc
+            roles[role_name] = role
+            self._gm_staff_roles[role_name] = role
+
+        gm_role = roles[GM_ROLE_NAME]
+        temp_gm_role = roles[TEMP_GM_ROLE_NAME]
+        gm_position = getattr(gm_role, "position", None)
+        temp_gm_position = getattr(temp_gm_role, "position", None)
+        if (
+            isinstance(gm_position, int)
+            and isinstance(temp_gm_position, int)
+            and gm_position <= temp_gm_position
+            and callable(getattr(gm_role, "edit", None))
+        ):
+            try:
+                moved = await self.paced_discord_api_call(
+                    gm_role.edit,
+                    position=temp_gm_position + 1,
+                    reason="GMを仮GMより上に配置",
+                )
+            except (discord.Forbidden, discord.HTTPException, ValueError) as exc:
+                raise RuntimeError(
+                    "GMを仮GMより上に配置できません。Botのロール階層を確認してください。"
+                ) from exc
+            if moved is not None:
+                gm_role = moved
+                self._gm_staff_roles[GM_ROLE_NAME] = moved
+
+        legacy_roles = self._roles_named(guild, LEGACY_MAYOR_ROLE_NAME)
+        if not legacy_roles:
+            return gm_role, temp_gm_role
+
+        # 全所持者を確認してから移す。members intentはbot.pyで有効だが、
+        # 未chunkなら先に完全な一覧を取り、取りこぼしによる専用村削除を防ぐ。
+        if getattr(guild, "chunked", True) is False:
+            chunk = getattr(guild, "chunk", None)
+            if callable(chunk):
+                try:
+                    await chunk(cache=True)
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    raise RuntimeError(
+                        "村長ロール所持者を確認できません。移行を止めました。"
+                    ) from exc
+
+        legacy_role_ids = {getattr(role, "id", None) for role in legacy_roles}
+        legacy_members = [
+            member
+            for member in getattr(guild, "members", ())
+            if any(getattr(role, "id", None) in legacy_role_ids for role in member.roles)
+        ]
+
+        # 先に全員へGMを付け切る。途中で失敗しても村長は外さないため、
+        # 再起動後に安全に再試行できる。
+        for member in legacy_members:
+            if self._member_has_role_name(member, GM_ROLE_NAME):
+                self._legacy_migration_owner_ids.add(member.id)
+                continue
+            try:
+                await self.paced_discord_api_call(
+                    member.add_roles,
+                    gm_role,
+                    reason="村長ロールをGMロールへ移行",
+                )
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                raise RuntimeError(
+                    f"{member.display_name} をGMへ移行できません。村長ロールは維持しました。"
+                ) from exc
+            self._legacy_migration_owner_ids.add(member.id)
+
+        # HTTP成功をGM付与の確定として扱う。discord.pyのmember.rolesは
+        # Gateway反映まで古い値のことがあるため、キャッシュ表示を再検査して
+        # 正常な移行を止めない。
+        for member in legacy_members:
+            member_legacy_roles = [
+                role
+                for role in member.roles
+                if getattr(role, "id", None) in legacy_role_ids
+            ]
+            if not member_legacy_roles:
+                continue
+            try:
+                await self.paced_discord_api_call(
+                    member.remove_roles,
+                    *member_legacy_roles,
+                    reason="村長ロール廃止",
+                )
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                raise RuntimeError(
+                    f"{member.display_name} から村長ロールを外せません。移行を止めました。"
+                ) from exc
+        for legacy_role in legacy_roles:
+            try:
+                await self.paced_discord_api_call(
+                    legacy_role.delete,
+                    reason="村長ロールをGMロールへ移行完了",
+                )
+            except (discord.Forbidden, discord.HTTPException) as exc:
+                raise RuntimeError(
+                    "村長ロールを削除できません。Botのロール階層を確認してください。"
+                ) from exc
+        log.info("村長ロールをGMロールへ移行し、旧ロールを削除しました (%d人)", len(legacy_members))
+        return gm_role, temp_gm_role
+
+    async def _ensure_gm_info_channel(self, guild: discord.Guild) -> discord.TextChannel:
+        staff_roles: list[discord.Role] = []
+        for name in (GM_ROLE_NAME, TEMP_GM_ROLE_NAME):
+            role = self._gm_staff_roles.get(name) or self._one_role_named(guild, name)
+            if role is not None:
+                staff_roles.append(role)
         category_overwrites = {
             guild.default_role: discord.PermissionOverwrite(
                 view_channel=False, read_messages=False, connect=False
@@ -452,23 +605,52 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 connect=True, manage_channels=True,
             ),
         }
-        if mayor_role is not None and not MAYOR_INFO_ADMIN_ONLY:
-            category_overwrites[mayor_role] = discord.PermissionOverwrite(
-                view_channel=True, read_messages=True, send_messages=False, connect=True
+        if not GM_INFO_ADMIN_ONLY:
+            for staff_role in staff_roles:
+                category_overwrites[staff_role] = discord.PermissionOverwrite(
+                    view_channel=True, read_messages=True, send_messages=False, connect=True
+                )
+        category = discord.utils.get(guild.categories, name=GM_INFO_CATEGORY_NAME)
+        if category is not None and any(
+            item.name == LEGACY_MAYOR_INFO_CATEGORY_NAME for item in guild.categories
+        ):
+            log.warning(
+                "GM説明カテゴリと旧村長説明カテゴリが両方あります。旧カテゴリは手動で整理してください。"
             )
-        category = discord.utils.get(guild.categories, name=MAYOR_INFO_CATEGORY_NAME)
+        if category is None:
+            legacy_categories = [
+                item
+                for item in guild.categories
+                if item.name == LEGACY_MAYOR_INFO_CATEGORY_NAME
+            ]
+            if len(legacy_categories) > 1:
+                raise RoomVisibilityError(
+                    "旧村長説明カテゴリが重複しています。整理してから再起動してください。"
+                )
+            if legacy_categories:
+                try:
+                    renamed = await self.paced_discord_api_call(
+                        legacy_categories[0].edit,
+                        name=GM_INFO_CATEGORY_NAME,
+                        reason="村長説明カテゴリをGM説明カテゴリへ移行",
+                    )
+                    category = renamed or legacy_categories[0]
+                except (discord.Forbidden, discord.HTTPException) as exc:
+                    raise RoomVisibilityError(
+                        f"GM説明カテゴリへ移行できません: {exc}"
+                    ) from exc
         if category is None:
             category = await guild.create_category(
-                MAYOR_INFO_CATEGORY_NAME, overwrites=category_overwrites
+                GM_INFO_CATEGORY_NAME, overwrites=category_overwrites
             )
-        channel = discord.utils.get(guild.text_channels, name=CH_MAYOR_INFO, category=category)
+        channel = discord.utils.get(guild.text_channels, name=CH_GM_INFO, category=category)
         channel_overwrites = dict(category_overwrites)
         channel_overwrites[guild.default_role] = discord.PermissionOverwrite(
             view_channel=False, read_messages=False, send_messages=False
         )
         if channel is None:
             channel = await guild.create_text_channel(
-                CH_MAYOR_INFO, category=category, overwrites=channel_overwrites
+                CH_GM_INFO, category=category, overwrites=channel_overwrites
             )
 
         try:
@@ -477,44 +659,44 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                     category,
                     target,
                     overwrite,
-                    reason="村長説明カテゴリ権限更新",
+                    reason="GM説明カテゴリ権限更新",
                 )
             for target, overwrite in channel_overwrites.items():
                 await self._set_permission_if_changed(
                     channel,
                     target,
                     overwrite,
-                    reason="村長説明チャンネル権限更新",
+                    reason="GM説明チャンネル権限更新",
                 )
         except (discord.Forbidden, discord.HTTPException) as e:
-            raise RoomVisibilityError(f"村長説明チャンネル権限更新失敗: {e}") from e
+            raise RoomVisibilityError(f"GM説明チャンネル権限更新失敗: {e}") from e
 
-        if mayor_role is None and not MAYOR_INFO_ADMIN_ONLY:
+        if not staff_roles and not GM_INFO_ADMIN_ONLY:
             log.warning(
-                f"{PRIVATE_ROOM_CREATOR_ROLE_NAME}ロールが見つからないため、"
-                "村長説明カテゴリの閲覧許可を付与できません"
+                f"{PRIVATE_ROOM_CREATOR_ROLE_LABEL}ロールが見つからないため、"
+                "GM説明カテゴリの閲覧許可を付与できません"
             )
-        if MAYOR_INFO_ADMIN_ONLY:
+        if GM_INFO_ADMIN_ONLY:
             # 以前の村長ロール・個人・役職へのallowを残すと非管理者から見えるため、
             # 現在の管理対象以外の閲覧許可はカテゴリとチャンネルの両方から外す。
             await self._remove_stale_visibility_allows(
                 guild,
                 category,
                 set(category_overwrites),
-                label=f"カテゴリ {MAYOR_INFO_CATEGORY_NAME}",
+                label=f"カテゴリ {GM_INFO_CATEGORY_NAME}",
             )
             await self._remove_stale_visibility_allows(
                 guild,
                 channel,
                 set(channel_overwrites),
-                label=f"チャンネル {MAYOR_INFO_CATEGORY_NAME}/{CH_MAYOR_INFO}",
+                label=f"チャンネル {GM_INFO_CATEGORY_NAME}/{CH_GM_INFO}",
             )
 
-        await self._purge_bot_messages(channel, "村長説明")
+        await self._purge_bot_messages(channel, "GM説明")
         embed = discord.Embed(
-            title="村長ロール説明",
+            title="GM／仮GMロール説明",
             description=(
-                f"**{PRIVATE_ROOM_CREATOR_ROLE_NAME}** ロールを持っている人は、自分専用の人狼村を1つ作れます。\n"
+                f"**{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロールを持っている人は、自分専用の人狼村を1つ作れます。\n"
                 "作成後は専用村の参加受付にある「専用村管理」ボタンから、参加者の招待と削除を操作できます。"
             ),
             color=discord.Color.dark_gold(),
@@ -525,7 +707,8 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 "専用村を作成\n"
                 "村名を変更\n"
                 "専用村を削除\n"
-                "自分の専用村に参加できる人を招待・削除"
+                "自分の専用村に参加できる人を招待・削除\n"
+                "#募集で募集を作成・複製"
             ),
             inline=False,
         )
@@ -533,8 +716,8 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             name="制限",
             value=(
                 "専用村は1人1つまでです。\n"
-                "村長本人だけが専用村のGMになれます。\n"
-                f"**{PRIVATE_ROOM_CREATOR_ROLE_NAME}** ロールが外れると、専用村は自動削除されます。"
+                "村主本人だけが専用村のゲームマスターになれます。\n"
+                f"**{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** の両方を外れると、専用村は自動削除されます。"
             ),
             inline=False,
         )
@@ -543,7 +726,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             value=(
                 f"レートとランクが変動するのは {' / '.join(RATED_ROOM_NAMES)} "
                 f"の{len(RATED_ROOM_NAMES)}卓です。\n"
-                "村長専用村では、レート、ランク、ランクロール、今季戦績は変動しません。"
+                "専用村では、レート、ランク、ランクロール、今季戦績は変動しません。"
             ),
             inline=False,
         )
@@ -557,11 +740,11 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         )
         for attempt in range(3):
             try:
-                await channel.send(embed=embed, view=MayorInfoView(self))
+                await channel.send(embed=embed, view=PrivateRoomInfoView(self))
                 break
             except discord.HTTPException as e:
                 if attempt >= 2:
-                    log.warning(f"村長説明メッセージ投稿失敗: {e}")
+                    log.warning(f"GM説明メッセージ投稿失敗: {e}")
                     return channel
                 await asyncio.sleep(2 * (attempt + 1))
         return channel
@@ -863,12 +1046,15 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 except discord.HTTPException as e:
                     log.warning(f"専用村オーナー確認失敗 ({row['room_name']} / {row['owner_id']}): {e}")
                     continue
-            if owner is not None and self._has_private_room_creator_role(owner):
+            if owner is not None and (
+                self._has_private_room_creator_role(owner)
+                or owner.id in self._legacy_migration_owner_ids
+            ):
                 continue
             await self._delete_private_room_by_row(
                 guild,
                 row,
-                reason=f"{PRIVATE_ROOM_CREATOR_ROLE_NAME}ロール未保持のため専用村削除",
+                reason=f"{PRIVATE_ROOM_CREATOR_ROLE_LABEL}ロール未保持のため専用村削除",
             )
 
     async def add_private_room_member(self, room: RoomRunner, member: discord.Member) -> str:
@@ -1164,8 +1350,14 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         log.info("チャンネルセットアップ開始")
         await self._recover_pending_settlements(guild)
         await self.load_pending_unmutes(guild)
-        await self._cleanup_private_rooms_without_creator_role(guild)
-        log.info("村長ロール未保持の専用村クリーンアップ完了")
+        await self._ensure_gm_staff_roles(guild)
+        log.info("GM／仮GMロール確認・旧村長移行完了")
+        try:
+            await self._cleanup_private_rooms_without_creator_role(guild)
+        finally:
+            # 以降はGateway反映済みのDiscordロールだけを認可に使う。
+            self._legacy_migration_owner_ids.clear()
+        log.info("GM／仮GMロール未保持の専用村クリーンアップ完了")
         await self._load_private_room_runners(guild)
         log.info("専用村読み込み完了")
         self._startup_active_vc_rooms = {
@@ -1196,8 +1388,8 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 log.warning("起動時未精算ゲーム復旧通知に失敗: %s", e)
             else:
                 self._settlement_recovered_since_notice = 0
-        await self._ensure_mayor_info_channel(guild)
-        log.info(f"村長説明チャンネル確認完了: {MAYOR_INFO_CATEGORY_NAME}/#{CH_MAYOR_INFO}")
+        await self._ensure_gm_info_channel(guild)
+        log.info(f"GM説明チャンネル確認完了: {GM_INFO_CATEGORY_NAME}/#{CH_GM_INFO}")
         fixed_room_errors: list[str] = []
         completed_rooms = 0
         try:
@@ -1590,15 +1782,15 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 await self._delete_private_room_by_row(
                     member.guild,
                     row,
-                    reason=f"{PRIVATE_ROOM_CREATOR_ROLE_NAME}がサーバーから退出したため専用村削除",
+                    reason=f"{PRIVATE_ROOM_CREATOR_ROLE_LABEL}がサーバーから退出したため専用村削除",
                 )
 
     @commands.Cog.listener()
     async def on_member_update(self, before: discord.Member, after: discord.Member) -> None:
         if not self._is_managed_guild(after.guild):
             return
-        had_creator_role = any(role.name == PRIVATE_ROOM_CREATOR_ROLE_NAME for role in before.roles)
-        has_creator_role = any(role.name == PRIVATE_ROOM_CREATOR_ROLE_NAME for role in after.roles)
+        had_creator_role = self._has_private_room_creator_role(before)
+        has_creator_role = self._has_private_room_creator_role(after)
         if not had_creator_role or has_creator_role:
             return
         async with self.private_room_lock:
@@ -1608,7 +1800,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             await self._delete_private_room_by_row(
                 after.guild,
                 row,
-                reason=f"{PRIVATE_ROOM_CREATOR_ROLE_NAME}ロールが外れたため専用村削除",
+                reason=f"{PRIVATE_ROOM_CREATOR_ROLE_LABEL}ロールが外れたため専用村削除",
             )
 
     @commands.Cog.listener()
@@ -1650,7 +1842,10 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                     log.warning(f"専用村招待ロール復元失敗 ({member.display_name}): {e}")
 
     def _has_private_room_creator_role(self, member: discord.Member) -> bool:
-        return any(role.name == PRIVATE_ROOM_CREATOR_ROLE_NAME for role in member.roles)
+        return any(
+            role.name in PRIVATE_ROOM_CREATOR_ROLE_NAMES
+            for role in getattr(member, "roles", ())
+        )
 
     def _private_room_id_for(self, owner_id: int) -> str:
         return f"private_{owner_id}"
@@ -1678,9 +1873,11 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         """
         reserved = {room.name for room in ROOM_DEFINITIONS}
         reserved.update(rating_lib.all_rank_role_names())
-        reserved.add(PRIVATE_ROOM_CREATOR_ROLE_NAME)
+        reserved.update(PRIVATE_ROOM_CREATOR_ROLE_NAMES)
+        reserved.add(LEGACY_MAYOR_ROLE_NAME)
         reserved.add(STATS_PARENT_CHANNEL_NAME)
-        reserved.add(MAYOR_INFO_CATEGORY_NAME)
+        reserved.add(GM_INFO_CATEGORY_NAME)
+        reserved.add(LEGACY_MAYOR_INFO_CATEGORY_NAME)
         if name in reserved:
             return "その村名はシステムで使用される名前のため使えません。別の村名にしてください。"
 
@@ -1716,7 +1913,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         if not self._has_private_room_creator_role(interaction.user):
             await self._private_reply(
                 interaction,
-                f"専用村を作成できるのは **{PRIVATE_ROOM_CREATOR_ROLE_NAME}** ロール保持者だけです。",
+                f"専用村を作成できるのは **{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロール保持者だけです。",
             )
             return
         if not interaction.response.is_done():
@@ -1738,7 +1935,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         if not self._has_private_room_creator_role(interaction.user):
             await self._private_reply(
                 interaction,
-                f"専用村を作成できるのは **{PRIVATE_ROOM_CREATOR_ROLE_NAME}** ロール保持者だけです。",
+                f"専用村を作成できるのは **{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロール保持者だけです。",
             )
             return
 
@@ -1850,7 +2047,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         if not self._has_private_room_creator_role(interaction.user):
             await self._private_reply(
                 interaction,
-                f"専用村名を変更できるのは **{PRIVATE_ROOM_CREATOR_ROLE_NAME}** ロール保持者だけです。",
+                f"専用村名を変更できるのは **{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロール保持者だけです。",
             )
             return
         if not interaction.response.is_done():
@@ -1872,7 +2069,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         if not self._has_private_room_creator_role(interaction.user):
             await self._private_reply(
                 interaction,
-                f"専用村名を変更できるのは **{PRIVATE_ROOM_CREATOR_ROLE_NAME}** ロール保持者だけです。",
+                f"専用村名を変更できるのは **{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロール保持者だけです。",
             )
             return
 
@@ -2021,7 +2218,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             and not interaction.user.guild_permissions.manage_guild
         ):
             await interaction.followup.send(
-                f"専用村を削除できるのは村主本人の **{PRIVATE_ROOM_CREATOR_ROLE_NAME}** "
+                f"専用村を削除できるのは村主本人の **{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** "
                 "ロール保持者、またはサーバー管理者だけです。",
                 ephemeral=True,
             )
@@ -2073,7 +2270,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         if not self._has_private_room_creator_role(interaction.user) and not interaction.user.guild_permissions.manage_guild:
             await self._private_reply(
                 interaction,
-                f"専用村を削除できるのは村主本人の **{PRIVATE_ROOM_CREATOR_ROLE_NAME}** ロール保持者、またはサーバー管理者だけです。",
+                f"専用村を削除できるのは村主本人の **{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロール保持者、またはサーバー管理者だけです。",
             )
             return
 
@@ -2113,7 +2310,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
 
     @app_commands.command(
         name="private_room_create",
-        description="自分専用の人狼村を作成します（村長専用）",
+        description="自分専用の人狼村を作成します（GM／仮GM専用）",
     )
     @app_commands.describe(room_name="村名。未入力なら自分の表示名に「村」を付けます")
     async def private_room_create(
@@ -2125,7 +2322,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
 
     @app_commands.command(
         name="private_room_delete",
-        description="自分の専用村を削除します（村長専用）",
+        description="自分の専用村を削除します（GM／仮GM専用）",
     )
     async def private_room_delete(self, interaction: discord.Interaction) -> None:
         await self.delete_private_room_for_member(interaction)

@@ -14,7 +14,8 @@ import discord
 import database
 from config import (
     ADMIN_ONLY_ROOM_IDS,
-    PRIVATE_ROOM_CREATOR_ROLE_NAME,
+    GM_ROLE_NAME,
+    TEMP_GM_ROLE_NAME,
     RECRUITMENT_DISABLED_ROOM_IDS,
     Phase,
 )
@@ -461,7 +462,7 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         class FakeMember:
             def __init__(self) -> None:
                 self.id = 1
-                self.roles = [SimpleNamespace(name=PRIVATE_ROOM_CREATOR_ROLE_NAME)]
+                self.roles = [SimpleNamespace(name=GM_ROLE_NAME)]
                 self.guild_permissions = SimpleNamespace(administrator=True)
 
         tomorrow = datetime.now(recruitment_lib.JST) + timedelta(days=1)
@@ -504,7 +505,7 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         class FakeMember:
             def __init__(self) -> None:
                 self.id = 1
-                self.roles = [SimpleNamespace(name=PRIVATE_ROOM_CREATOR_ROLE_NAME)]
+                self.roles = [SimpleNamespace(name=TEMP_GM_ROLE_NAME)]
                 self.guild_permissions = SimpleNamespace(administrator=True)
 
         modal = RecruitmentDuplicateModal(self.manager, recruitment_id, 1)
@@ -520,6 +521,42 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         text = interaction.response.send_message.await_args.args[0]
         self.assertIn("段階導入中", text)
         self.assertIn("複製できません", text)
+
+    def test_gm_and_temp_gm_can_create_recruitment(self) -> None:
+        for role_name in (GM_ROLE_NAME, TEMP_GM_ROLE_NAME):
+            member = SimpleNamespace(roles=[SimpleNamespace(name=role_name)])
+            self.assertTrue(recruitment_lib._has_private_room_creator_role(member))
+        self.assertFalse(
+            recruitment_lib._has_private_room_creator_role(
+                SimpleNamespace(roles=[SimpleNamespace(name="村長")])
+            )
+        )
+
+    async def test_temp_gm_can_open_recruitment_creation(self) -> None:
+        class FakeMember:
+            def __init__(self) -> None:
+                self.id = 1
+                self.roles = [SimpleNamespace(name=TEMP_GM_ROLE_NAME)]
+                self.send = AsyncMock()
+
+        interaction = SimpleNamespace(
+            user=FakeMember(),
+            guild=SimpleNamespace(id=1),
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        home = RecruitmentHomeView(self.manager)
+        create_button = next(
+            item for item in home.children if item.custom_id == "recruitment:create"
+        )
+        with patch.object(recruitment_lib.discord, "Member", FakeMember):
+            await create_button.callback(interaction)
+
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        interaction.user.send.assert_awaited_once()
+        self.assertIsInstance(
+            interaction.followup.send.await_args.kwargs["view"], RecruitmentScheduleView
+        )
 
     async def test_operations_block_notice_contains_no_mentions(self) -> None:
         channel = SimpleNamespace(send=AsyncMock())
@@ -541,6 +578,7 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         help_embed = build_recruitment_help_embed()
         self.assertEqual(help_embed.title, "募集の使い方")
         self.assertEqual(len(help_embed.fields), 3)
+        self.assertIn("GM または 仮GM", help_embed.fields[1].value)
 
         card = RecruitmentCardView(self.manager, 42)
         self.assertIsNone(card.timeout)
