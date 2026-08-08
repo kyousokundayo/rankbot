@@ -352,8 +352,8 @@ class TestFeedbackOperationsNotice(unittest.IsolatedAsyncioTestCase):
     """報告を #運営 へ流すときの整形。
 
     本文は利用者が自由に書けるので、通知本体に見える文面を自作されないよう
-    囲いが効いているかを見る。メンションの到達範囲はチャンネルの可視性で
-    閉じているため、allowed_mentions はノイズ対策として確認するだけ。
+    囲いが効いているかを見る。メンションは抑制しない (到達範囲はチャンネルの
+    可視性で閉じるため)。
     """
 
     def setUp(self) -> None:
@@ -379,7 +379,7 @@ class TestFeedbackOperationsNotice(unittest.IsolatedAsyncioTestCase):
             with self.subTest(value=value):
                 self.assertEqual(self.recruitment._as_quoted_block(value, 900), "")
 
-    async def test_notice_suppresses_mention_pings_and_fits_one_message(self):
+    async def test_notice_fits_in_one_message(self):
         sent: list[tuple] = []
 
         class FakeChannel:
@@ -409,11 +409,11 @@ class TestFeedbackOperationsNotice(unittest.IsolatedAsyncioTestCase):
             "phase": "DAY_VOTE",
             "bot_version": "v0.36",
         })
-        content, kwargs = sent[0]
+        content, _kwargs = sent[0]
+        # 本文は summary/details とも最大1000字。囲いと見出しを足しても
+        # Discordの1メッセージ上限 (2000字) を超えないこと
         self.assertLess(len(content), 2000)
-        self.assertFalse(kwargs["allowed_mentions"].everyone)
-        self.assertFalse(kwargs["allowed_mentions"].roles)
-        self.assertFalse(kwargs["allowed_mentions"].users)
+        self.assertIn("あ", content)
 
     async def test_missing_operations_channel_is_a_noop(self):
         manager = self.recruitment.RecruitmentManager.__new__(

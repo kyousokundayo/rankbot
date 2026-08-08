@@ -585,11 +585,10 @@ class RecruitmentManager:
         本文は一般公開しないが、`#運営` は Administrator 限定なので中身まで載せる
         (毎回「報告の一覧」を開かないと読めない形だと見落とされるため)。
 
-        本文は利用者が自由に書ける。ただし**メンションの到達範囲はチャンネルの
-        可視性で閉じる**ので、管理者限定のここに @everyone を書かれても
-        サーバー全体へは飛ばない。allowed_mentions を落とすのは、報告のたびに
-        管理者へプッシュ通知が飛ぶのを避けるためのノイズ対策にすぎない。
-        報告者をメンションしないのも同じ理由。
+        **メンションは抑制しない。** 到達範囲はチャンネルの可視性で閉じるので、
+        管理者限定のここに書かれた @everyone がサーバー全体へ飛ぶことはない。
+        報告者の表示にメンションを使わないのは、通知を出さないためではなく
+        退出済みでもIDから追えるようにするため (`_plain_identity`)。
         """
         channel = self.operations_channel
         if channel is None:
@@ -611,10 +610,7 @@ class RecruitmentManager:
             lines.append("補足:")
             lines.append(details)
         try:
-            await channel.send(
-                "\n".join(part for part in lines if part),
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+            await channel.send("\n".join(part for part in lines if part))
         except (discord.Forbidden, discord.HTTPException) as exc:
             log.warning("報告の運営通知失敗: %s", exc)
 
@@ -1346,10 +1342,7 @@ class OperationsView(discord.ui.View):
                 )[:1024],
                 inline=False,
             )
-        await interaction.response.send_message(
-            embed=embed, ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @discord.ui.button(label="途中離脱の一覧", style=discord.ButtonStyle.secondary, custom_id="operations:dropouts")
     async def dropouts(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
