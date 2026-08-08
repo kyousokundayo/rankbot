@@ -224,6 +224,51 @@ def _as_int(value: object) -> int | None:
         return None
 
 
+def _index_records(player_records: list[dict]) -> dict[int, dict]:
+    by_id: dict[int, dict] = {}
+    for record in player_records or []:
+        if not isinstance(record, dict):
+            continue
+        player_id = _as_int(record.get("player_id"))
+        if player_id is not None:
+            by_id[player_id] = record
+    return by_id
+
+
+def count_wolf_guess_hits(
+    player_records: list[dict],
+    facts: dict | None,
+) -> dict[int, int]:
+    """3狼提出の的中数を player_id -> 的中数 で返す。
+
+    **提出した人は的中0でもキーを持つ** (統計の分母になるため)。
+    ボーナス計算と「3狼予想の的中率」の両方から使うので、
+    誰の提出を有効とみなすかの判定はここへ集約する。
+    """
+    by_id = _index_records(player_records)
+    facts = facts or {}
+    wolf_ids = {
+        player_id for player_id, record in by_id.items()
+        if record.get("role") == Role.WEREWOLF.value
+    }
+    hits: dict[int, int] = {}
+    for raw_id, raw_guess in (facts.get("wolf_guesses") or {}).items():
+        guesser_id = _as_int(raw_id)
+        record = by_id.get(guesser_id) if guesser_id is not None else None
+        if record is None or record.get("team") != Team.VILLAGE.value:
+            continue
+        if record.get("death_cause") not in BONUS_WOLF_GUESS_DEATH_CAUSES:
+            continue
+        if _as_int(record.get("died_on_day")) is None:
+            continue
+        guessed = {
+            value for value in (_as_int(v) for v in (raw_guess or []))
+            if value is not None
+        }
+        hits[guesser_id] = min(len(guessed & wolf_ids), BONUS_WOLF_GUESS_SLOTS)
+    return hits
+
+
 def calculate_play_bonuses(
     player_records: list[dict],
     facts: dict | None,
@@ -242,13 +287,7 @@ def calculate_play_bonuses(
     本体プールと違い**非ゼロサム**なので、必ず別枠で加算し履歴にも分けて残す。
     """
     bonuses: dict[int, int] = {}
-    by_id: dict[int, dict] = {}
-    for record in player_records or []:
-        if not isinstance(record, dict):
-            continue
-        player_id = _as_int(record.get("player_id"))
-        if player_id is not None:
-            by_id[player_id] = record
+    by_id = _index_records(player_records)
     if not by_id:
         return bonuses
 
@@ -282,25 +321,12 @@ def calculate_play_bonuses(
             add(wolf_id, BONUS_FINAL_DAY_WOLF)
 
     # 3狼提出 (村陣営限定)。情報が少ない初日・2日目の死亡ほど倍率が高い
-    for raw_id, raw_guess in (facts.get("wolf_guesses") or {}).items():
-        guesser_id = _as_int(raw_id)
-        record = by_id.get(guesser_id) if guesser_id is not None else None
-        if record is None or record.get("team") != Team.VILLAGE.value:
-            continue
-        if record.get("death_cause") not in BONUS_WOLF_GUESS_DEATH_CAUSES:
-            continue
-        died_on_day = _as_int(record.get("died_on_day"))
-        if died_on_day is None:
-            continue
-        guessed = {
-            value for value in (_as_int(v) for v in (raw_guess or []))
-            if value is not None
-        }
-        hits = min(len(guessed & wolf_ids), BONUS_WOLF_GUESS_SLOTS)
+    for guesser_id, hits in count_wolf_guess_hits(player_records, facts).items():
         if not hits:
             continue
         points = hits * BONUS_WOLF_GUESS_HIT
-        if died_on_day <= BONUS_WOLF_GUESS_EARLY_MAX_DAY:
+        died_on_day = _as_int(by_id[guesser_id].get("died_on_day"))
+        if died_on_day is not None and died_on_day <= BONUS_WOLF_GUESS_EARLY_MAX_DAY:
             points *= BONUS_WOLF_GUESS_EARLY_MULTIPLIER
         add(guesser_id, points)
 
