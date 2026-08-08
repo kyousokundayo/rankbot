@@ -24,7 +24,7 @@ from config import (
     BONUS_WOLF_EXECUTION_VOTE, BONUS_FINAL_DAY_WOLF,
     BONUS_WOLF_GUESS_HIT, BONUS_WOLF_GUESS_EARLY_MULTIPLIER,
     BONUS_WOLF_GUESS_EARLY_MAX_DAY, BONUS_GUARD_SUCCESS, BONUS_NIGHT1_SEER_KILL,
-    PRIVATE_ROOM_CREATOR_ROLE_NAME, BOT_VERSION,
+    PRIVATE_ROOM_CREATOR_ROLE_LABEL, BOT_VERSION,
     ACTIVE_ROOM_DEFINITIONS, RATED_ROOM_NAMES, STATS_MIN_SAMPLES, PLAYER_BLOCK_LIMIT,
     SLOW_INTERACTION_SECONDS,
     DEFAULT_VARIANT_ID, VariantDefinition, get_variant_definition,
@@ -121,7 +121,7 @@ class DangerConfirmView(discord.ui.View):
         )
 
 
-class MayorInfoView(discord.ui.View):
+class PrivateRoomInfoView(discord.ui.View):
     def __init__(self, manager: GameCog) -> None:
         super().__init__(timeout=None)
         self.manager = manager
@@ -136,7 +136,7 @@ class MayorInfoView(discord.ui.View):
             return await interaction.response.send_message("サーバー内でのみ使用できます。", ephemeral=True)
         if not self.manager._has_private_room_creator_role(interaction.user):
             return await interaction.response.send_message(
-                f"村名を変更できるのは **{PRIVATE_ROOM_CREATOR_ROLE_NAME}** ロール保持者だけです。",
+                f"村名を変更できるのは **{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロール保持者だけです。",
                 ephemeral=True,
             )
         await interaction.response.send_modal(PrivateRoomRenameModal(self.manager))

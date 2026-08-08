@@ -19,7 +19,8 @@ from config import (
     OPEN_ROOM_IDS,
     OPERATIONS_CATEGORY_NAME,
     PLAYER_BLOCK_LIMIT,
-    PRIVATE_ROOM_CREATOR_ROLE_NAME,
+    PRIVATE_ROOM_CREATOR_ROLE_LABEL,
+    PRIVATE_ROOM_CREATOR_ROLE_NAMES,
     RECRUITMENT_CONTACT_COOLDOWN_SECONDS,
     RECRUITMENT_IMMEDIATE_LEAD_MINUTES,
     RECRUITMENT_DISABLED_ROOM_IDS,
@@ -43,6 +44,14 @@ IMMEDIATE_DATE_VALUE = "now"
 
 def _is_open_room(room_id: str) -> bool:
     return room_id in OPEN_ROOM_IDS
+
+
+def _has_private_room_creator_role(member: object) -> bool:
+    """GMまたは仮GMの専用村・募集管理権限を確認する。"""
+    role_names = {
+        getattr(role, "name", None) for role in getattr(member, "roles", ())
+    }
+    return bool(PRIVATE_ROOM_CREATOR_ROLE_NAMES & role_names)
 
 
 def _strict_access_role_names(room) -> frozenset[str]:
@@ -185,7 +194,7 @@ def build_recruitment_help_embed() -> discord.Embed:
     embed.add_field(
         name="募集を作る",
         value=(
-            f"**{PRIVATE_ROOM_CREATOR_ROLE_NAME}** ロール保持者が、7日先まで作成できます。"
+            f"**{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロール保持者が、7日先まで作成できます。"
             "総合卓は参加可能ランクを複数選択でき、未選択なら制限なしです。"
         ),
         inline=False,
@@ -305,7 +314,7 @@ class RecruitmentManager:
             self.channel, "recruitment_home_message_id",
             content=(
                 "📅 **人狼ゲーム募集**\n"
-                "村長ロールを持つ人が、7日先までの募集を作成できます。"
+                "GMまたは仮GMロールを持つ人が、7日先までの募集を作成できます。"
             ),
             view=RecruitmentHomeView(self),
         )
@@ -877,9 +886,9 @@ class RecruitmentHomeView(discord.ui.View):
     async def create_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             return await interaction.response.send_message("サーバー内でのみ使えます。", ephemeral=True)
-        if PRIVATE_ROOM_CREATOR_ROLE_NAME not in {role.name for role in interaction.user.roles}:
+        if not _has_private_room_creator_role(interaction.user):
             return await interaction.response.send_message(
-                f"募集を作成できるのは **{PRIVATE_ROOM_CREATOR_ROLE_NAME}** ロール保持者だけです。",
+                f"募集を作成できるのは **{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロール保持者だけです。",
                 ephemeral=True,
             )
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -1109,11 +1118,11 @@ class RecruitmentCreateModal(discord.ui.Modal, title="募集内容"):
     async def on_submit(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.host_id or interaction.guild is None:
             return await interaction.response.send_message("作成者だけ操作できます。", ephemeral=True)
-        if not isinstance(interaction.user, discord.Member) or PRIVATE_ROOM_CREATOR_ROLE_NAME not in {
-            role.name for role in interaction.user.roles
-        }:
+        if not isinstance(interaction.user, discord.Member) or not _has_private_room_creator_role(
+            interaction.user
+        ):
             return await interaction.response.send_message(
-                f"**{PRIVATE_ROOM_CREATOR_ROLE_NAME}** ロールが無いため作成できません。",
+                f"**{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロールが無いため作成できません。",
                 ephemeral=True,
             )
         now = datetime.now(JST)
@@ -1483,11 +1492,11 @@ class RecruitmentDuplicateModal(discord.ui.Modal, title="募集を複製"):
         row = await database.get_recruitment(self.recruitment_id)
         if row is None or interaction.user.id != self.host_id or interaction.guild is None:
             return await interaction.response.send_message("主催中の募集だけ複製できます。", ephemeral=True)
-        if not isinstance(interaction.user, discord.Member) or PRIVATE_ROOM_CREATOR_ROLE_NAME not in {
-            role.name for role in interaction.user.roles
-        }:
+        if not isinstance(interaction.user, discord.Member) or not _has_private_room_creator_role(
+            interaction.user
+        ):
             return await interaction.response.send_message(
-                f"**{PRIVATE_ROOM_CREATOR_ROLE_NAME}** ロールが無いため複製できません。",
+                f"**{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロールが無いため複製できません。",
                 ephemeral=True,
             )
         access_error = self.manager.validate_existing_card_action(

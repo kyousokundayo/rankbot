@@ -15,7 +15,7 @@ from room_config import (
 )
 
 # Botのバージョン (ヘルプに表示。ソース公開された派生でも識別できるように)
-BOT_VERSION = "v0.37"
+BOT_VERSION = "v0.38"
 
 # 新規導入先に同名カテゴリが既にある場合、無関係なDiscord構成をBot所有と
 # 誤認しない。既存運用は保存済みchannel IDで自動再利用できる。
@@ -342,11 +342,11 @@ CH_STATS = "統計"
 CH_RECRUITMENT = "募集"
 CH_OPERATIONS = "運営"
 VC_GAME = "人狼ゲーム"
-CH_MAYOR_INFO = "専用村作成"
+CH_GM_INFO = "専用村作成"
 
 # 統計チャンネルの配置先
 STATS_PARENT_CHANNEL_NAME = "総合"
-MAYOR_INFO_CATEGORY_NAME = "村長ロール説明"
+GM_INFO_CATEGORY_NAME = "GMロール説明"
 
 # 終了した #昼 / #霊界 を消さずに退避するログカテゴリ。
 # 試合番号を先頭に付けて移す (Discordはカテゴリ内を名前順に並べるため、
@@ -397,8 +397,8 @@ ADMIN_ONLY_ROOM_IDS = frozenset({
 # 13人ターン制だけは実装のみで完全未公開とし、募集も停止する。
 RECRUITMENT_DISABLED_ROOM_IDS = VARIANT_ROLLOUT_ROOM_IDS
 
-# 村長制度を一般公開するときはFalseへ戻す。
-MAYOR_INFO_ADMIN_ONLY = True
+# GM／仮GM制度を一般公開するときはFalseへ戻す。
+GM_INFO_ADMIN_ONLY = True
 
 
 _BUILTIN_ROOM_DEFINITIONS = [
@@ -498,7 +498,16 @@ if not (RATED_ROOM_IDS <= ACTIVE_ROOM_IDS):
 if not (RECRUITMENT_ROOM_IDS <= ACTIVE_ROOM_IDS):
     raise RuntimeError("RECRUITMENT_ROOM_IDS contains a disabled room")
 
-PRIVATE_ROOM_CREATOR_ROLE_NAME = "村長"
+# 専用村・募集を管理できるDiscordロール。
+# `GM` は `仮GM` より上に置く。グランドマスターの略称には使わない。
+GM_ROLE_NAME = "GM"
+TEMP_GM_ROLE_NAME = "仮GM"
+PRIVATE_ROOM_CREATOR_ROLE_NAMES = frozenset({GM_ROLE_NAME, TEMP_GM_ROLE_NAME})
+PRIVATE_ROOM_CREATOR_ROLE_LABEL = "GM または 仮GM"
+
+# v0.38で一度だけGMへ移す旧ロール。通常の認可には使わない。
+LEGACY_MAYOR_ROLE_NAME = "村長"
+LEGACY_MAYOR_INFO_CATEGORY_NAME = "村長ロール説明"
 
 # ============================================================
 # レーティング設定

@@ -25,7 +25,7 @@ from config import (
     WOLF_GUESS_TIMEOUT, BONUS_WOLF_GUESS_DEATH_CAUSES,
     SE_ENABLED,
     ADOPT_EXISTING_LAYOUT,
-    PRIVATE_ROOM_CREATOR_ROLE_NAME,
+    PRIVATE_ROOM_CREATOR_ROLE_NAMES, PRIVATE_ROOM_CREATOR_ROLE_LABEL,
     RATED_ROOM_IDS, RoomDefinition, VariantDefinition, get_variant_definition,
 )
 from models import Player, GameState, by_number
@@ -480,7 +480,10 @@ class RoomRunner:
             return False
         if member.id != self.room_def.private_owner_id:
             return False
-        return any(role.name == PRIVATE_ROOM_CREATOR_ROLE_NAME for role in getattr(member, "roles", []))
+        return any(
+            role.name in PRIVATE_ROOM_CREATOR_ROLE_NAMES
+            for role in getattr(member, "roles", [])
+        )
 
     # ============================================================
     # セットアップ
@@ -1647,8 +1650,8 @@ class RoomRunner:
         if self.is_private_room():
             if member.id != self.room_def.private_owner_id:
                 return "この専用村では村主だけがGM取得できます。"
-            if PRIVATE_ROOM_CREATOR_ROLE_NAME not in member_role_names:
-                return f"専用村のGM取得には **{PRIVATE_ROOM_CREATOR_ROLE_NAME}** ロールが必要です。"
+            if not (PRIVATE_ROOM_CREATOR_ROLE_NAMES & member_role_names):
+                return f"専用村のGM取得には **{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロールが必要です。"
             return None
         strict_access_error = self._strict_access_error(member, action="GM取得")
         if strict_access_error:
