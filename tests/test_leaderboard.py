@@ -346,3 +346,73 @@ class TestGrandmasterHistory(LeaderboardTestBase):
 
     async def test_empty_before_any_reset(self):
         self.assertEqual(await database.get_grandmaster_history(GUILD_ID), [])
+
+
+class TestFeedbackOperationsNotice(unittest.IsolatedAsyncioTestCase):
+    """報告を #運営 へ流すときの整形。本文は利用者が自由に書けるので囲いを検証する"""
+
+    def setUp(self) -> None:
+        import recruitment
+        self.recruitment = recruitment
+
+    def test_wraps_body_in_a_code_block(self):
+        block = self.recruitment._as_quoted_block("普通の本文", 900)
+        self.assertEqual(block, "```\n普通の本文\n```")
+
+    def test_neutralises_backticks_so_the_block_cannot_be_escaped(self):
+        block = self.recruitment._as_quoted_block("```py\nimport os\n```", 900)
+        self.assertNotIn("```py", block)
+        self.assertEqual(block.count("```"), 2)
+
+    def test_truncates_long_bodies(self):
+        block = self.recruitment._as_quoted_block("あ" * 50, 10)
+        self.assertIn("…", block)
+        self.assertLess(len(block), 40)
+
+    def test_empty_body_produces_nothing(self):
+        for value in (None, "", "   "):
+            with self.subTest(value=value):
+                self.assertEqual(self.recruitment._as_quoted_block(value, 900), "")
+
+    async def test_notice_drops_all_mentions_and_fits_one_message(self):
+        sent: list[tuple] = []
+
+        class FakeChannel:
+            async def send(self, content=None, **kwargs):
+                sent.append((content, kwargs))
+
+        class FakeMember:
+            display_name = "テストユーザー"
+
+        class FakeGuild:
+            id = 1
+
+            def get_member(self, _player_id):
+                return FakeMember()
+
+        manager = self.recruitment.RecruitmentManager.__new__(
+            self.recruitment.RecruitmentManager
+        )
+        manager.operations_channel = FakeChannel()
+        await manager.notify_feedback_report(FakeGuild(), {
+            "report_id": 7,
+            "user_id": 12345,
+            "category": "不具合",
+            "summary": "@everyone " + "あ" * 1000,
+            "details": "い" * 1000,
+            "room_name": "総合",
+            "phase": "DAY_VOTE",
+            "bot_version": "v0.36",
+        })
+        content, kwargs = sent[0]
+        self.assertLess(len(content), 2000)
+        self.assertFalse(kwargs["allowed_mentions"].everyone)
+        self.assertFalse(kwargs["allowed_mentions"].roles)
+        self.assertFalse(kwargs["allowed_mentions"].users)
+
+    async def test_missing_operations_channel_is_a_noop(self):
+        manager = self.recruitment.RecruitmentManager.__new__(
+            self.recruitment.RecruitmentManager
+        )
+        manager.operations_channel = None
+        await manager.notify_feedback_report(object(), {"report_id": 1})

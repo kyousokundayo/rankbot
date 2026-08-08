@@ -2232,6 +2232,24 @@ class FeedbackModal(discord.ui.Modal, title="不具合・改善を報告"):
             room_id or "none",
             phase or "none",
         )
+        # #運営 への通知は付随処理。失敗しても報告そのものは受理済みなので、
+        # 送信者へのお礼を止めない (DBには残っていて「報告の一覧」から読める)
+        try:
+            await self.cog.recruitment_manager.notify_feedback_report(
+                interaction.guild,
+                {
+                    "report_id": report_id,
+                    "user_id": interaction.user.id,
+                    "category": self.category,
+                    "summary": str(self.summary.value).strip(),
+                    "details": str(self.details.value).strip() or None,
+                    "bot_version": BOT_VERSION,
+                    "room_name": room_name,
+                    "phase": phase,
+                },
+            )
+        except Exception as e:
+            log.warning("報告の運営通知に失敗 (報告は保存済み): %s", e)
         await interaction.followup.send(
             f"✅ 報告を保存しました。ありがとうございます。（報告ID: `{report_id}`）",
             ephemeral=True,
