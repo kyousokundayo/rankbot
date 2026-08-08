@@ -93,6 +93,15 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             user=self.members[1], guild=self.guild,
         )
 
+    @staticmethod
+    def _hide_nine_recruitment():
+        """段階導入へ戻した場合の既存カード保護を個別に検証する。"""
+        return patch.object(
+            recruitment_lib,
+            "RECRUITMENT_DISABLED_ROOM_IDS",
+            frozenset({"open_9_cross"}),
+        )
+
     async def test_transfer_registers_thirteen_and_auto_host_gm(self) -> None:
         recruitment_id = await self._full_recruitment()
         result = await self.manager.transfer(self._interaction(), recruitment_id)
@@ -215,7 +224,7 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         row = await database.get_recruitment(recruitment_id)
         self.assertEqual(row["status"], database.RECRUITMENT_ARCHIVED)
 
-    async def test_admin_only_recruitment_is_never_published(self) -> None:
+    async def test_disabled_recruitment_is_never_published(self) -> None:
         recruitment_id = await database.create_recruitment(
             1,
             1,
@@ -228,14 +237,15 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         channel = SimpleNamespace(guild=self.guild, send=AsyncMock())
         self.manager.channel = channel
 
-        with self.assertRaisesRegex(RuntimeError, "作成を取り消しました"):
-            await self.manager.publish_new_recruitment(self.guild, recruitment_id)
+        with self._hide_nine_recruitment():
+            with self.assertRaisesRegex(RuntimeError, "作成を取り消しました"):
+                await self.manager.publish_new_recruitment(self.guild, recruitment_id)
 
         channel.send.assert_not_awaited()
         row = await database.get_recruitment(recruitment_id)
         self.assertEqual(row["status"], database.RECRUITMENT_ARCHIVED)
 
-    async def test_existing_admin_only_card_is_deleted(self) -> None:
+    async def test_existing_disabled_card_is_deleted(self) -> None:
         recruitment_id = await database.create_recruitment(
             1,
             1,
@@ -253,7 +263,8 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         )
         row = await database.get_recruitment(recruitment_id)
 
-        await self.manager.ensure_recruitment_message(self.guild, row)
+        with self._hide_nine_recruitment():
+            await self.manager.ensure_recruitment_message(self.guild, row)
 
         message.delete.assert_awaited_once()
         self.assertIsNone((await database.get_recruitment(recruitment_id))["message_id"])
@@ -282,7 +293,8 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         self.manager._upsert_panel = AsyncMock()
         self.manager.cleanup_old_messages = AsyncMock()
 
-        await self.manager.setup(self.guild)
+        with self._hide_nine_recruitment():
+            await self.manager.setup(self.guild)
 
         message.delete.assert_awaited_once()
         row = await database.get_recruitment(recruitment_id)
@@ -318,12 +330,13 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         )
         self.manager.cleanup_old_messages = AsyncMock()
 
-        await self.manager.process_notifications(self.guild)
-        self.assertEqual(
-            (await database.get_recruitment(recruitment_id))["message_id"], 1002,
-        )
+        with self._hide_nine_recruitment():
+            await self.manager.process_notifications(self.guild)
+            self.assertEqual(
+                (await database.get_recruitment(recruitment_id))["message_id"], 1002,
+            )
 
-        await self.manager.process_notifications(self.guild)
+            await self.manager.process_notifications(self.guild)
         self.assertEqual(message.delete.await_count, 2)
         self.assertIsNone(
             (await database.get_recruitment(recruitment_id))["message_id"]
@@ -347,7 +360,8 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             response=SimpleNamespace(send_message=AsyncMock()),
         )
 
-        await card.host_menu(menu_interaction)
+        with self._hide_nine_recruitment():
+            await card.host_menu(menu_interaction)
 
         text = menu_interaction.response.send_message.await_args.args[0]
         self.assertIn("段階導入中", text)
@@ -364,7 +378,8 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         note_button = next(
             item for item in host_view.children if item.label == "備考を変更"
         )
-        await note_button.callback(note_interaction)
+        with self._hide_nine_recruitment():
+            await note_button.callback(note_interaction)
 
         text = note_interaction.response.send_message.await_args.args[0]
         self.assertIn("段階導入中", text)
@@ -384,6 +399,29 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         embed = await self.manager.build_embed(self.guild, recruitment_id)
         self.assertIn("定員: **9人**", embed.description)
         self.assertIn("占有時間: 90分", embed.footer.text)
+
+    async def test_public_nine_player_recruitment_is_published(self) -> None:
+        recruitment_id = await database.create_recruitment(
+            1,
+            1,
+            title="公開9人募集",
+            scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            room_id="open_9_cross",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        message = SimpleNamespace(id=900, delete=AsyncMock())
+        self.manager.channel = SimpleNamespace(
+            guild=self.guild,
+            send=AsyncMock(return_value=message),
+        )
+
+        await self.manager.publish_new_recruitment(self.guild, recruitment_id)
+
+        self.manager.channel.send.assert_awaited_once()
+        self.assertEqual(
+            (await database.get_recruitment(recruitment_id))["message_id"], 900,
+        )
 
     async def test_config_drift_blocks_transfer_without_touching_lobby(self) -> None:
         recruitment_id = await self._full_recruitment()
@@ -414,7 +452,8 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         await database.set_recruitment_gm(recruitment_id, 1)
         row = await database.get_recruitment(recruitment_id)
 
-        await self.manager.notify_ready_if_needed(row)
+        with self._hide_nine_recruitment():
+            await self.manager.notify_ready_if_needed(row)
 
         self.members[1].send.assert_not_awaited()
 
@@ -443,7 +482,9 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             guild=SimpleNamespace(id=1, owner_id=1),
             response=SimpleNamespace(send_message=AsyncMock()),
         )
-        with patch.object(recruitment_lib.discord, "Member", FakeMember):
+        with self._hide_nine_recruitment(), patch.object(
+            recruitment_lib.discord, "Member", FakeMember,
+        ):
             await modal.on_submit(interaction)
         text = interaction.response.send_message.await_args.args[0]
         self.assertIn("段階導入中", text)
@@ -472,7 +513,9 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             guild=SimpleNamespace(id=1, owner_id=1),
             response=SimpleNamespace(send_message=AsyncMock()),
         )
-        with patch.object(recruitment_lib.discord, "Member", FakeMember):
+        with self._hide_nine_recruitment(), patch.object(
+            recruitment_lib.discord, "Member", FakeMember,
+        ):
             await modal.on_submit(interaction)
         text = interaction.response.send_message.await_args.args[0]
         self.assertIn("段階導入中", text)

@@ -383,14 +383,10 @@ PLAYER_BLOCK_LIMIT = 10
 # 正当な報告を妨げない程度に余裕を持たせる。
 FEEDBACK_MAX_PER_DAY = 10
 
-# 利用人数が増えるまで一般ユーザーから隠す固定卓。
-# @everyone と全ロールへの閲覧許可を外す。DiscordのAdministrator権限を
-# 持つメンバーはチャンネル上書きをバイパスするため閲覧できる。
+# 実装だけを保持し、一般ユーザーへ出さない固定卓。
 # 一般公開するときは対象IDをこの集合から外す。
 VARIANT_ROLLOUT_ROOM_IDS = frozenset({
     "open_13_turn",
-    "open_9_cross",
-    "open_9_turn",
 })
 ADMIN_ONLY_ROOM_IDS = frozenset({
     "beginner",
@@ -398,8 +394,7 @@ ADMIN_ONLY_ROOM_IDS = frozenset({
     "advanced",
 })
 
-# 9人村は「ねいと」ロール保持者だけへの試験公開、13人ターン制は実装のみで
-# 完全未公開とする。どの新規変種も募集導線は実地試験が済むまで停止する。
+# 13人ターン制だけは実装のみで完全未公開とし、募集も停止する。
 RECRUITMENT_DISABLED_ROOM_IDS = VARIANT_ROLLOUT_ROOM_IDS
 
 # 村長制度を一般公開するときはFalseへ戻す。
@@ -423,14 +418,12 @@ _BUILTIN_ROOM_DEFINITIONS = [
         "総合-9クロストーク",
         variant_id="v9_cross",
         enabled=True,
-        strict_access_role_names=frozenset({"ねいと"}),
     ),
     RoomDefinition(
         "open_9_turn",
         "総合-9ターン",
         variant_id="v9_turn",
         enabled=True,
-        strict_access_role_names=frozenset({"ねいと"}),
     ),
 ]
 

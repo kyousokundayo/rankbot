@@ -130,6 +130,7 @@ class TestFakeDiscordFidelity(unittest.IsolatedAsyncioTestCase):
         runner._post_lobby_ui = AsyncMock()
         snapshot = {
             "phase": Phase.NIGHT.name,
+            "public_log_archive_allowed": True,
             "channel_ids": {
                 "category": category.id,
                 "lobby": lobby.id,
@@ -143,6 +144,63 @@ class TestFakeDiscordFidelity(unittest.IsolatedAsyncioTestCase):
         self.assertIs(runner.state.category, category)
         self.assertIs(runner.state.lobby_channel, lobby)
         self.assertIs(runner.state.voice_channel, voice)
+
+    async def test_legacy_restricted_active_snapshot_keeps_existing_visibility(self):
+        """限定中に始まったゲームは、公開設定への更新後もVCを公開しない。"""
+        controller = SimpleNamespace(on_channel_message=lambda _message: None)
+        guild = FakeGuild(1, "guild", controller)
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        manager.bulk_api_interval = 0
+        manager._apply_room_visibility = AsyncMock()
+        runner = RoomRunner(
+            SimpleNamespace(user=SimpleNamespace(id=999)),
+            manager,
+            RoomDefinition("open_9_cross", "総合-9クロストーク", variant_id="v9_cross"),
+        )
+        restricted = discord.PermissionOverwrite(
+            view_channel=False, read_messages=False, connect=False,
+        )
+        category = await guild.create_category(
+            "総合-9クロストーク", overwrites={guild.default_role: restricted},
+        )
+        lobby = await guild.create_text_channel("参加受付", category=category)
+        voice = await guild.create_voice_channel("人狼ゲーム", category=category)
+        runner._post_lobby_ui = AsyncMock()
+        # public_log_archive_allowed がない旧snapshotも安全側（限定）として扱う。
+        snapshot = {
+            "phase": Phase.NIGHT.name,
+            "channel_ids": {
+                "category": category.id,
+                "lobby": lobby.id,
+                "voice": voice.id,
+            },
+        }
+
+        await runner.setup_channels(guild, snapshot=snapshot)
+
+        manager._apply_room_visibility.assert_not_awaited()
+        self.assertIs(category.overwrites[guild.default_role.id], restricted)
+        self.assertIs(runner.state.voice_channel, voice)
+
+    async def test_legacy_restricted_active_snapshot_without_category_fails_closed(self):
+        """旧限定ゲームの所有カテゴリがないとき、公開カテゴリを作成しない。"""
+        controller = SimpleNamespace(on_channel_message=lambda _message: None)
+        guild = FakeGuild(1, "guild", controller)
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        runner = RoomRunner(
+            SimpleNamespace(user=SimpleNamespace(id=999)),
+            manager,
+            RoomDefinition("open_9_turn", "総合-9ターン", variant_id="v9_turn"),
+        )
+        snapshot = {
+            "phase": Phase.DAY_DISCUSSION.name,
+            "channel_ids": {"category": 999999},
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "開始時アクセス境界"):
+            await runner.setup_channels(guild, snapshot=snapshot)
+
+        self.assertEqual(guild.categories, [])
 
 
 class TestStrictMorningGate(unittest.IsolatedAsyncioTestCase):
