@@ -1613,6 +1613,53 @@ async def get_latest_season_results(guild_id: int, limit: int = 20) -> tuple[int
     return (reset_id, result)
 
 
+async def get_grandmaster_history(
+    guild_id: int, *, limit_seasons: int = 10,
+) -> list[dict]:
+    """シーズンごとのグランドマスターを新しい順に返す。
+
+    現行ランキングは「今の順位」しか映さないので、歴代の到達者は
+    リセット時のスナップショットから別枠で拾う。
+    GMが1人もいなかったシーズン (母数不足など) は結果に含めない。
+    """
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT rs.season_reset_id, sr.reset_at, rs.player_id, "
+            "rs.rank_position, rs.rating_before, rs.season_games, rs.season_wins "
+            "FROM rating_snapshots rs "
+            "JOIN season_resets sr ON sr.id = rs.season_reset_id "
+            "WHERE rs.guild_id = ? AND rs.season_rank = 'グランドマスター' "
+            "ORDER BY rs.season_reset_id DESC, "
+            "rs.rank_position IS NULL, rs.rank_position, rs.player_id",
+            (guild_id,),
+        )
+    seasons: list[dict] = []
+    by_reset: dict[int, dict] = {}
+    for reset_id, reset_at, player_id, position, rating, games, wins in rows:
+        reset_id = int(reset_id)
+        season = by_reset.get(reset_id)
+        if season is None:
+            season = {
+                "season_reset_id": reset_id,
+                "reset_at": reset_at,
+                "members": [],
+            }
+            by_reset[reset_id] = season
+            seasons.append(season)
+        season["members"].append({
+            "player_id": int(player_id),
+            "position": int(position) if position is not None else None,
+            "rating": int(rating),
+            "season_games": int(games or 0),
+            "season_wins": int(wins or 0),
+        })
+    # 新しいシーズンから順に並ぶので、通し番号は総数から逆算する
+    total = len(seasons)
+    for index, season in enumerate(seasons):
+        season["season_number"] = total - index
+    return seasons[:limit_seasons]
+
+
 async def get_player_latest_season_result(player_id: int, guild_id: int) -> Optional[dict]:
     async with connect_db() as db:
         rows = await db.execute_fetchall(
@@ -3203,6 +3250,34 @@ async def list_player_blocks(guild_id: int, blocker_id: int) -> list[int]:
             "ORDER BY created_at, blocked_id", (guild_id, blocker_id)
         )
     return [int(r[0]) for r in rows]
+
+
+async def get_dropout_counts(guild_id: int, *, limit: int = 25) -> list[dict]:
+    """途中離脱 (death_cause='除外') の回数を多い順に返す。
+
+    運営が把握するための一覧なので、公開ランキングには出さない。
+    参加試合数も一緒に返し、「10戦中3回」と「100戦中3回」を区別できるようにする。
+    """
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT gp.player_id, "
+            "SUM(CASE WHEN gp.death_cause = '除外' THEN 1 ELSE 0 END) AS dropouts, "
+            "COUNT(*) AS games "
+            "FROM game_players gp JOIN games g ON gp.game_id = g.game_id "
+            "WHERE g.guild_id = ? "
+            "GROUP BY gp.player_id HAVING dropouts > 0 "
+            "ORDER BY dropouts DESC, games ASC, gp.player_id LIMIT ?",
+            (guild_id, limit),
+        )
+    return [
+        {
+            "player_id": int(row[0]),
+            "dropouts": int(row[1]),
+            "games": int(row[2]),
+            "rate": (int(row[1]) / int(row[2])) if row[2] else 0.0,
+        }
+        for row in rows
+    ]
 
 
 async def get_blocked_counts(guild_id: int) -> list[dict]:

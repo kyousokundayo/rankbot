@@ -22,6 +22,7 @@ from config import (
     PRIVATE_ROOM_CREATOR_ROLE_NAME,
     RECRUITMENT_BACKUP_CAPACITY,
     RECRUITMENT_CONTACT_COOLDOWN_SECONDS,
+    RECRUITMENT_IMMEDIATE_LEAD_MINUTES,
     RECRUITMENT_MAX_DAYS_AHEAD,
     RECRUITMENT_OCCUPANCY_MINUTES,
     RECRUITMENT_RANK_OPTIONS,
@@ -36,6 +37,8 @@ from models import Player, parse_select_id
 log = logging.getLogger(__name__)
 JST = ZoneInfo("Asia/Tokyo")
 WEEKDAY_JA = "月火水木金土日"
+# 開催日セレクトで「今すぐ」を表すマーカー。日付ISO文字列とは衝突しない値にする
+IMMEDIATE_DATE_VALUE = "now"
 
 
 def _utc_datetime(text: str) -> datetime:
@@ -635,7 +638,14 @@ class _DraftSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         self.parent_view.values[self.key] = self.values[0]
-        if len(self.parent_view.values) == 5:
+        if self.key == "date":
+            # 「今すぐ」なら時刻を選ばせない。選択肢を残すと、選んだ時刻が
+            # 無視されるのか反映されるのか分からなくなる
+            if self.values[0] == IMMEDIATE_DATE_VALUE:
+                self.parent_view.values.pop("hour", None)
+                self.parent_view.values.pop("minute", None)
+            self.parent_view.rebuild()
+        if self.parent_view.is_complete():
             is_open = self.parent_view.values["room"] == "open"
             await interaction.response.edit_message(
                 content=(
@@ -659,41 +669,95 @@ class RecruitmentScheduleView(discord.ui.View):
         self.manager = manager
         self.host_id = host_id
         self.values: dict[str, str] = {}
+        self.rebuild()
+
+    @property
+    def immediate(self) -> bool:
+        return self.values.get("date") == IMMEDIATE_DATE_VALUE
+
+    def is_complete(self) -> bool:
+        """「今すぐ」は時刻を選ばないので、必須項目が3つになる。"""
+        required = {"date", "room", "streaming"}
+        if not self.immediate:
+            required |= {"hour", "minute"}
+        return required <= self.values.keys()
+
+    def rebuild(self) -> None:
+        """「今すぐ」を選んだかどうかで時刻セレクトを出し分ける。"""
+        self.clear_items()
         now = datetime.now(JST)
         date_options = [
+            discord.SelectOption(
+                label=f"今すぐ（約{RECRUITMENT_IMMEDIATE_LEAD_MINUTES}分後に開始）",
+                value=IMMEDIATE_DATE_VALUE,
+                emoji="⚡",
+                default=self.immediate,
+            )
+        ] + [
             discord.SelectOption(
                 label=(
                     (now + timedelta(days=offset)).strftime("%m月%d日")
                     + f" ({WEEKDAY_JA[(now + timedelta(days=offset)).weekday()]})"
                 ),
                 value=(now + timedelta(days=offset)).date().isoformat(),
+                default=(
+                    self.values.get("date")
+                    == (now + timedelta(days=offset)).date().isoformat()
+                ),
             )
             for offset in range(RECRUITMENT_MAX_DAYS_AHEAD + 1)
         ]
-        self.add_item(_DraftSelect(self, "date", placeholder="開催日", options=date_options, row=0))
-        self.add_item(_DraftSelect(
-            self, "hour", placeholder="開始時（0〜23時）",
-            options=[discord.SelectOption(label=f"{hour:02d}時", value=str(hour)) for hour in range(24)],
-            row=1,
-        ))
-        self.add_item(_DraftSelect(
-            self, "minute", placeholder="開始分",
-            options=[discord.SelectOption(label="00分", value="0"), discord.SelectOption(label="30分", value="30")],
-            row=2,
-        ))
+        row = 0
+        self.add_item(_DraftSelect(self, "date", placeholder="開催日", options=date_options, row=row))
+        row += 1
+        if not self.immediate:
+            self.add_item(_DraftSelect(
+                self, "hour", placeholder="開始時（0〜23時）",
+                options=[
+                    discord.SelectOption(
+                        label=f"{hour:02d}時", value=str(hour),
+                        default=self.values.get("hour") == str(hour),
+                    )
+                    for hour in range(24)
+                ],
+                row=row,
+            ))
+            row += 1
+            self.add_item(_DraftSelect(
+                self, "minute", placeholder="開始分",
+                options=[
+                    discord.SelectOption(
+                        label=f"{minute:02d}分", value=str(minute),
+                        default=self.values.get("minute") == str(minute),
+                    )
+                    for minute in (0, 30)
+                ],
+                row=row,
+            ))
+            row += 1
         self.add_item(_DraftSelect(
             self, "room", placeholder="卓種別",
             options=[
-                discord.SelectOption(label=room.name, value=room.room_id)
+                discord.SelectOption(
+                    label=room.name, value=room.room_id,
+                    default=self.values.get("room") == room.room_id,
+                )
                 for room in ROOM_DEFINITIONS
                 if room.room_id in RECRUITMENT_ROOM_IDS
             ],
-            row=3,
+            row=row,
         ))
+        row += 1
         self.add_item(_DraftSelect(
             self, "streaming", placeholder="配信",
-            options=[discord.SelectOption(label="配信あり", value="1"), discord.SelectOption(label="配信なし", value="0")],
-            row=4,
+            options=[
+                discord.SelectOption(
+                    label=label, value=value,
+                    default=self.values.get("streaming") == value,
+                )
+                for label, value in (("配信あり", "1"), ("配信なし", "0"))
+            ],
+            row=row,
         ))
 
 
@@ -764,10 +828,18 @@ class RecruitmentCreateModal(discord.ui.Modal, title="募集内容"):
                 f"**{PRIVATE_ROOM_CREATOR_ROLE_NAME}** ロールが無いため作成できません。",
                 ephemeral=True,
             )
-        local_start = datetime.fromisoformat(self.values["date"]).replace(
-            hour=int(self.values["hour"]), minute=int(self.values["minute"]), tzinfo=JST,
-        )
         now = datetime.now(JST)
+        if self.values["date"] == IMMEDIATE_DATE_VALUE:
+            # 「今すぐ」。_schedule_out_of_range が「現在より後」を要求するので
+            # 0分後にはできない。秒は落として占有区間の端を安定させる
+            local_start = (
+                now + timedelta(minutes=RECRUITMENT_IMMEDIATE_LEAD_MINUTES)
+            ).replace(second=0, microsecond=0)
+        else:
+            local_start = datetime.fromisoformat(self.values["date"]).replace(
+                hour=int(self.values["hour"]), minute=int(self.values["minute"]),
+                tzinfo=JST,
+            )
         if _schedule_out_of_range(local_start, now):
             return await interaction.response.send_message(
                 f"開催日時は現在より後、{RECRUITMENT_MAX_DAYS_AHEAD}日以内を選んでください。",
@@ -1184,6 +1256,27 @@ class OperationsView(discord.ui.View):
         rows = await database.get_blocked_counts(interaction.guild.id)
         lines = [f"{_plain_identity(interaction.guild, row['blocked_id'])}: {row['count']}人" for row in rows]
         await interaction.response.send_message("\n".join(lines) or "登録はありません。", ephemeral=True)
+
+    @discord.ui.button(label="途中離脱の一覧", style=discord.ButtonStyle.secondary, custom_id="operations:dropouts")
+    async def dropouts(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self._is_admin(interaction) or interaction.guild is None:
+            return await interaction.response.send_message("管理者のみ操作できます。", ephemeral=True)
+        rows = await database.get_dropout_counts(interaction.guild.id)
+        if not rows:
+            return await interaction.response.send_message(
+                "途中離脱の記録はありません。", ephemeral=True
+            )
+        lines = [
+            f"{_plain_identity(interaction.guild, row['player_id'])}: "
+            f"{row['dropouts']}回 / {row['games']}戦 ({row['rate'] * 100:.0f}%)"
+            for row in rows
+        ]
+        await interaction.response.send_message(
+            "🚪 **途中離脱 (GM除外) の回数**\n"
+            "離脱の多い順。回数が同じなら試合数の少ない人が上です。\n"
+            + "\n".join(lines),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="GM解除", style=discord.ButtonStyle.danger, custom_id="operations:release_gm")
     async def release_gm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:

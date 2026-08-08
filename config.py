@@ -161,6 +161,11 @@ OPERATIONS_CATEGORY_NAME = "開発"
 # 終端と次の開始が同時刻なら重複扱いにしない。
 RECRUITMENT_OCCUPANCY_MINUTES = 90
 RECRUITMENT_MAX_DAYS_AHEAD = 7
+# 「今すぐ」募集の開始までの猶予 (分)。
+# _schedule_out_of_range が「現在より後」を要求するので0にはできない。
+# 通知は開催15分以内で飛ぶので、この値を15より小さくしておくと
+# 作成直後の巡回で参加者へDMが届く。
+RECRUITMENT_IMMEDIATE_LEAD_MINUTES = 10
 RECRUITMENT_MAX_PER_HOST = 3
 RECRUITMENT_CAPACITY = MAX_PLAYERS
 RECRUITMENT_BACKUP_CAPACITY = 3

@@ -268,3 +268,81 @@ class TestLeaderboardShape(LeaderboardTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDropoutCounts(LeaderboardTestBase):
+    """途中離脱 (GM除外) の集計。運営メニューだけに出す指標"""
+
+    async def test_counts_only_removals(self):
+        await self.play(Team.WOLF, {8: (2, "除外"), 9: (1, "処刑")})
+        await self.play(Team.WOLF, {8: (1, "除外")})
+        await self.play(Team.WOLF, {10: (3, "除外")})
+        await self.play(Team.VILLAGE)
+        rows = await database.get_dropout_counts(GUILD_ID)
+        by_id = {row["player_id"]: row for row in rows}
+        self.assertEqual(by_id[8]["dropouts"], 2)
+        self.assertEqual(by_id[8]["games"], 4)
+        self.assertAlmostEqual(by_id[8]["rate"], 0.5)
+        self.assertEqual(by_id[10]["dropouts"], 1)
+        # 処刑死しかしていない9は載らない
+        self.assertNotIn(9, by_id)
+
+    async def test_sorted_by_count_then_fewer_games(self):
+        await self.play(Team.WOLF, {8: (1, "除外"), 9: (1, "除外")})
+        await self.play(Team.WOLF, {8: (1, "除外")})
+        rows = await database.get_dropout_counts(GUILD_ID)
+        self.assertEqual([row["player_id"] for row in rows], [8, 9])
+
+    async def test_empty_when_nobody_dropped(self):
+        await self.play(Team.WOLF, {8: (1, "処刑")})
+        self.assertEqual(await database.get_dropout_counts(GUILD_ID), [])
+
+
+class TestGrandmasterHistory(LeaderboardTestBase):
+    """シーズンごとのグランドマスター (現行ランキングとは別枠)"""
+
+    async def _add_season(self, reset_id: int, reset_at: str, rows: list[tuple]) -> None:
+        async with database.connect_db() as db:
+            await db.execute(
+                "INSERT INTO season_resets (id, guild_id, executed_by, reset_at, "
+                "affected_players) VALUES (?, ?, ?, ?, ?)",
+                (reset_id, GUILD_ID, 1, reset_at, len(rows)),
+            )
+            for player_id, rating, rank_name, position in rows:
+                await db.execute(
+                    "INSERT INTO rating_snapshots (season_reset_id, player_id, guild_id, "
+                    "rating_before, rating_after, season_rank, rank_position, "
+                    "top_percent, season_games, season_wins) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (reset_id, player_id, GUILD_ID, rating, 1500 + (rating - 1500) // 2,
+                     rank_name, position, 1.0, 40, 25),
+                )
+            await db.commit()
+
+    async def test_groups_by_season_newest_first(self):
+        await self._add_season(1, "2026-02-01T00:00:00", [
+            (101, 2100, "グランドマスター", 1),
+            (102, 2050, "グランドマスター", 2),
+            (103, 1900, "マスター", 3),
+        ])
+        await self._add_season(2, "2026-05-01T00:00:00", [
+            (102, 2200, "グランドマスター", 1),
+        ])
+        seasons = await database.get_grandmaster_history(GUILD_ID)
+        self.assertEqual([s["season_number"] for s in seasons], [2, 1])
+        self.assertEqual(
+            [m["player_id"] for m in seasons[0]["members"]], [102],
+        )
+        # 同シーズン内は順位順。マスターは含まない
+        self.assertEqual(
+            [m["player_id"] for m in seasons[1]["members"]], [101, 102],
+        )
+
+    async def test_season_without_grandmasters_is_skipped(self):
+        await self._add_season(1, "2026-02-01T00:00:00", [
+            (101, 1900, "マスター", 1),
+        ])
+        self.assertEqual(await database.get_grandmaster_history(GUILD_ID), [])
+
+    async def test_empty_before_any_reset(self):
+        self.assertEqual(await database.get_grandmaster_history(GUILD_ID), [])

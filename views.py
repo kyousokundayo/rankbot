@@ -2552,6 +2552,133 @@ def build_metric_leaderboard_embed(board: dict, guild: discord.Guild) -> discord
     return embed
 
 
+_SEASON_MODE_PREVIOUS = "previous"
+_SEASON_MODE_GRANDMASTERS = "grandmasters"
+
+
+async def _build_previous_season_embed(guild: discord.Guild) -> discord.Embed:
+    reset_id, rows = await database.get_latest_season_results(guild.id, limit=20)
+    if reset_id == 0 or not rows:
+        return discord.Embed(
+            title="前シーズン最終順位",
+            description="前シーズンの結果はまだありません。",
+            color=discord.Color.purple(),
+        )
+    lines = []
+    for i, row in enumerate(rows, 1):
+        member = guild.get_member(row["player_id"])
+        name = member.display_name if member else f"ID:{row['player_id']}"
+        top_pct = (
+            f" / 上位{row['top_percent']:.1f}%"
+            if row["top_percent"] is not None else ""
+        )
+        lines.append(
+            f"`{i:>2}.` {row['emoji']} **{row['final_rating']}** [{row['rank_name']}] "
+            f"{name} — {row['season_winrate']}% ({row['season_wins']}/{row['season_games']}){top_pct}"
+        )
+    embed = discord.Embed(
+        title="前シーズン最終順位",
+        description="\n".join(lines),
+        color=discord.Color.purple(),
+    )
+    embed.set_footer(text=f"シーズンリセットID: {reset_id}")
+    return embed
+
+
+async def _build_grandmaster_history_embed(guild: discord.Guild) -> discord.Embed:
+    seasons = await database.get_grandmaster_history(guild.id)
+    gm_emoji = rating_lib.get_rank_emoji_by_name("グランドマスター")
+    if not seasons:
+        return discord.Embed(
+            title=f"{gm_emoji} 歴代グランドマスター",
+            description=(
+                "まだシーズンが終了していません。\n"
+                "シーズンリセットの時点でグランドマスターだった人がここに残ります。"
+            ),
+            color=discord.Color.red(),
+        )
+    blocks = []
+    for season in seasons:
+        header = f"**シーズン{season['season_number']}**"
+        reset_at = str(season.get("reset_at") or "")[:10]
+        if reset_at:
+            header += f"（{reset_at} 終了）"
+        lines = [header]
+        for member_row in season["members"]:
+            member = guild.get_member(member_row["player_id"])
+            name = member.display_name if member else f"ID:{member_row['player_id']}"
+            position = (
+                f"`{member_row['position']:>2}.`"
+                if member_row["position"] is not None else "`  -`"
+            )
+            lines.append(
+                f"{position} {name} — **{member_row['rating']}** "
+                f"({member_row['season_wins']}/{member_row['season_games']})"
+            )
+        blocks.append("\n".join(lines))
+    embed = discord.Embed(
+        title=f"{gm_emoji} 歴代グランドマスター",
+        description="\n\n".join(blocks),
+        color=discord.Color.red(),
+    )
+    embed.set_footer(
+        text="各シーズンのリセット時点で グランドマスター だった人。レートはリセット前の値"
+    )
+    return embed
+
+
+class SeasonHistorySelect(discord.ui.Select):
+    def __init__(self, parent: "SeasonHistoryView") -> None:
+        self.parent_view = parent
+        super().__init__(
+            placeholder="見たいものを選ぶ",
+            options=[
+                discord.SelectOption(
+                    label="前シーズン最終順位",
+                    value=_SEASON_MODE_PREVIOUS,
+                    description="直前のシーズンの上位20人",
+                    default=parent.mode == _SEASON_MODE_PREVIOUS,
+                ),
+                discord.SelectOption(
+                    label="歴代グランドマスター",
+                    value=_SEASON_MODE_GRANDMASTERS,
+                    description="シーズンごとの到達者",
+                    default=parent.mode == _SEASON_MODE_GRANDMASTERS,
+                ),
+            ],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.parent_view.mode = self.values[0]
+        await self.parent_view.refresh(interaction)
+
+
+class SeasonHistoryView(discord.ui.View):
+    """「前シーズン」の中身。現行ランキングとは別枠で歴代GMも見られる。"""
+
+    def __init__(self) -> None:
+        super().__init__(timeout=300)
+        self.mode: str = _SEASON_MODE_PREVIOUS
+        self.add_item(SeasonHistorySelect(self))
+
+    async def load_embed(self, guild: discord.Guild) -> discord.Embed:
+        if self.mode == _SEASON_MODE_GRANDMASTERS:
+            return await _build_grandmaster_history_embed(guild)
+        return await _build_previous_season_embed(guild)
+
+    async def refresh(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "❌ サーバー内でのみ使用できます。", ephemeral=True,
+            )
+        await interaction.response.defer()
+        self.clear_items()
+        self.add_item(SeasonHistorySelect(self))
+        embed = await self.load_embed(interaction.guild)
+        await interaction.edit_original_response(embed=embed, view=self)
+
+
 class LeaderboardMetricSelect(discord.ui.Select):
     """見たい指標を選ぶ。ボタンを増やさずここで切り替える。"""
 
@@ -2735,29 +2862,9 @@ class StatsView(discord.ui.View):
     async def previous_season(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await self._defer_ephemeral_query(interaction):
             return
-        from database import get_latest_season_results
-
-        reset_id, rows = await get_latest_season_results(interaction.guild.id, limit=20)
-        if reset_id == 0 or not rows:
-            return await interaction.followup.send("前シーズンの結果はまだありません。", ephemeral=True)
-
-        lines = []
-        for i, row in enumerate(rows, 1):
-            member = interaction.guild.get_member(row["player_id"])
-            name = member.display_name if member else f"ID:{row['player_id']}"
-            top_pct = f" / 上位{row['top_percent']:.1f}%" if row["top_percent"] is not None else ""
-            lines.append(
-                f"`{i:>2}.` {row['emoji']} **{row['final_rating']}** [{row['rank_name']}] "
-                f"{name} — {row['season_winrate']}% ({row['season_wins']}/{row['season_games']}){top_pct}"
-            )
-
-        embed = discord.Embed(
-            title="前シーズン最終順位",
-            description="\n".join(lines),
-            color=discord.Color.purple(),
-        )
-        embed.set_footer(text=f"シーズンリセットID: {reset_id}")
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        view = SeasonHistoryView()
+        embed = await view.load_embed(interaction.guild)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @discord.ui.button(label="最近の試合", style=discord.ButtonStyle.secondary, custom_id="stats_recent_games", row=1)
     async def recent_games(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
