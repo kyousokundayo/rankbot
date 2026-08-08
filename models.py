@@ -108,6 +108,10 @@ class GameState:
         self.game_run_id: str = ""
         # 募集経由で組まれたゲームだけ設定。直接ロビー参加はNone。
         self.recruitment_id: Optional[int] = None
+        # 開始時に公開卓だったか。終了ログの公開可否と、設定変更後の再起動中に
+        # カテゴリ/VCのアクセス境界を保つためsnapshotへ保存する。旧snapshotは
+        # 復元時にFalseとして扱う。
+        self.public_log_archive_allowed: bool = False
         self.day_generation: int = 0
         self.night_generation: int = 0
 

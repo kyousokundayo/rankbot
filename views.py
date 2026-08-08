@@ -4028,7 +4028,7 @@ def build_help_embeds(
     embed3.add_field(
         name=f"{BOT_VERSION}の変更",
         value=(
-            "`ねいと`限定で9人クロストーク／ターン制を試験中。"
+            "9人クロストーク／ターン制を公開。"
             "9人は13人村と別レート・統計です。13人ターン制は準備中です。"
         ),
         inline=False,
@@ -4078,10 +4078,9 @@ def build_help_embeds(
     embed3.add_field(
         name="終わった試合を読み返す",
         value=(
-            f"通常卓は `#{CH_VILLAGE}` / `#{CH_SPIRIT}` を"
+            f"公開卓は `#{CH_VILLAGE}` / `#{CH_SPIRIT}` を"
             f"**{LOG_CATEGORY_VILLAGE}** / **{LOG_CATEGORY_SPIRIT}** へ保存します。\n"
             f"試合番号で `#統計` と照合できます（直近{LOG_CATEGORY_LIMIT}試合）。"
-            "**ねいと限定の9人試験卓は公開せず削除します。**"
         ),
         inline=False,
     )

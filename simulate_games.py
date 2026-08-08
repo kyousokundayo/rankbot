@@ -1112,9 +1112,8 @@ async def _simulate_selected_game_inner(
         cog = room_runner_module.RoomRunner(fake_bot, manager, room_def)
         manager.rooms[room_def.room_id] = cog
 
-    # 実サーバーでは9人村を「ねいと」ロール限定にする。シミュレーションは
-    # その閲覧境界も通したうえでゲーム本体を検証するため、必要なロールを
-    # 参加者とGMへ明示的に付与する。
+    # 厳格ロール限定の卓もシミュレーションできるよう、必要なロールがあれば
+    # 参加者とGMへ明示的に付与する。標準の9人卓は一般公開なので不要。
     for role_name in sorted(cog.room_def.strict_access_role_names or ()):
         access_role = FakeRole(role_name)
         guild.roles.append(access_role)

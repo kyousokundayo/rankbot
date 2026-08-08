@@ -1164,7 +1164,9 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.state.guild = guild
         channel = SimpleNamespace(name="昼", id=500, edit=AsyncMock())
 
-        moved = await runner._archive_game_channel(channel, "ログ-昼", 4)
+        moved = await runner._archive_game_channel(
+            channel, "ログ-昼", 4, public_log_archive_allowed=True,
+        )
 
         self.assertTrue(moved)
         guild.create_category.assert_not_awaited()  # 既存を使い回す
@@ -1189,7 +1191,9 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         )
         channel = SimpleNamespace(name="昼", id=500, edit=AsyncMock())
 
-        moved = await runner._archive_game_channel(channel, "ログ-昼", 4)
+        moved = await runner._archive_game_channel(
+            channel, "ログ-昼", 4, public_log_archive_allowed=False,
+        )
 
         self.assertFalse(moved)
         runner.state.guild.create_category.assert_not_awaited()
@@ -1206,7 +1210,9 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         )
         channel = SimpleNamespace(name="昼", id=9999, edit=AsyncMock())
 
-        await runner._archive_game_channel(channel, "ログ-昼", 51)
+        await runner._archive_game_channel(
+            channel, "ログ-昼", 51, public_log_archive_allowed=True,
+        )
 
         deleted = [ch for ch in old if ch.delete.await_count]
         self.assertEqual(len(deleted), LOG_CATEGORY_LIMIT - LOG_CATEGORY_TRIM_TO)
@@ -1223,10 +1229,78 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         )
         channel = SimpleNamespace(name="昼", id=500, edit=AsyncMock())
 
-        moved = await runner._archive_game_channel(channel, "ログ-昼", 4)
+        moved = await runner._archive_game_channel(
+            channel, "ログ-昼", 4, public_log_archive_allowed=True,
+        )
 
         self.assertFalse(moved)
         channel.edit.assert_not_awaited()
+
+    async def test_game_start_snapshots_public_log_archive_permission(self) -> None:
+        """公開可否は、開始時のアクセス境界から保存する。"""
+        for strict, expected in ((False, True), (True, False)):
+            with self.subTest(strict=strict):
+                room = RoomDefinition(
+                    "test",
+                    "テスト村",
+                    strict_access_role_names=(frozenset({"ねいと"}) if strict else None),
+                )
+                runner = RoomRunner(None, FakeManager(), room)
+                for user_id in range(1, 14):
+                    add_player(runner, user_id)
+                runner._create_game_channels = AsyncMock(
+                    side_effect=RuntimeError("test stop"),
+                )
+                runner._post_lobby_ui = AsyncMock()
+                interaction = SimpleNamespace(
+                    guild=SimpleNamespace(),
+                    followup=SimpleNamespace(send=AsyncMock()),
+                )
+
+                await runner._start_game_locked(interaction)
+
+                self.assertEqual(runner.state.public_log_archive_allowed, expected)
+                self.assertEqual(
+                    runner._build_room_snapshot()["public_log_archive_allowed"],
+                    expected,
+                )
+
+    async def test_restricted_snapshot_stays_private_after_room_is_published(self) -> None:
+        """限定中に開始した卓は、公開後の復元でもログを公開しない。"""
+        source = RoomRunner(
+            None,
+            FakeManager(),
+            RoomDefinition(
+                "test", "テスト村", strict_access_role_names=frozenset({"ねいと"}),
+            ),
+        )
+        source.state.public_log_archive_allowed = False
+        snapshot = source._build_room_snapshot()
+        snapshot["phase"] = Phase.LOBBY.name
+
+        restored = make_runner()
+        restored._delete_alive_role = AsyncMock()
+        restored._post_lobby_ui = AsyncMock()
+
+        await restored.restore_from_snapshot(snapshot)
+
+        self.assertFalse(restored.state.public_log_archive_allowed)
+        self.assertFalse(restored._can_archive_to_public_log())
+
+    async def test_legacy_snapshot_never_enables_public_log_archive(self) -> None:
+        """公開可否を持たない旧snapshotは、ログ漏洩を避けて削除へ倒す。"""
+        runner = make_runner()
+        runner.state.public_log_archive_allowed = True
+        runner._delete_alive_role = AsyncMock()
+        runner._post_lobby_ui = AsyncMock()
+
+        await runner.restore_from_snapshot({
+            "variant_id": "v13_cross",
+            "phase": Phase.LOBBY.name,
+        })
+
+        self.assertFalse(runner.state.public_log_archive_allowed)
+        self.assertFalse(runner._can_archive_to_public_log())
 
     async def test_provisional_vote_can_be_changed_but_the_final_one_cannot(self) -> None:
         """議論中の仮投票は入れ替え自由、投票フェーズでは確定。

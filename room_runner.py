@@ -509,14 +509,36 @@ class RoomRunner:
             await self.manager._sync_private_room_member_roles(guild, self.room_def)
 
         channel_ids = snapshot.get("channel_ids", {}) if snapshot else {}
+        active_snapshot = (
+            snapshot is not None
+            and snapshot.get("phase") not in (Phase.LOBBY.name, Phase.GAME_OVER.name)
+        )
+        # 公開可否を持たない旧snapshotは、限定卓だった可能性を否定できない。
+        # 設定を一般公開へ切り替えた直後に進行中のVCを公開しないよう、開始時の
+        # アクセス境界を保存済みカテゴリのまま維持する。新方式で公開卓として開始
+        # したゲームだけが明示的なTrueを持つため、通常どおり公開権限を再同期する。
+        preserve_snapshot_access_boundary = (
+            active_snapshot
+            and snapshot.get("public_log_archive_allowed") is not True
+        )
 
         # 保存済みIDを所有境界の正本にする。新規導入先の同名カテゴリは、
         # 明示採用なしに権限変更・残骸削除の対象へしない。
         saved_category_id = channel_ids.get("category")
+        if preserve_snapshot_access_boundary and saved_category_id is None:
+            raise RuntimeError(
+                "進行中ゲームの開始時アクセス境界を確認できません "
+                "(保存済みカテゴリIDがありません)。安全のため起動を停止しました"
+            )
         category = next(
             (item for item in guild.categories if item.id == saved_category_id),
             None,
         )
+        if preserve_snapshot_access_boundary and category is None:
+            raise RuntimeError(
+                "進行中ゲームの開始時アクセス境界を保つ保存済みカテゴリが見つかりません。"
+                "限定中のVCを公開しないため起動を停止しました"
+            )
         if category is None:
             named_category = discord.utils.get(guild.categories, name=self.room_def.name)
             if named_category is not None and snapshot is None and not ADOPT_EXISTING_LAYOUT:
@@ -536,11 +558,16 @@ class RoomRunner:
                 overwrites=self.manager._build_room_overwrites(guild, self.room_def),
             )
         self.state.category = category
-        await self.manager._apply_room_visibility(guild, category, self.room_def)
+        if preserve_snapshot_access_boundary:
+            log.warning(
+                "進行中ゲームの開始時アクセス境界を維持します (%s)",
+                self.room_def.name,
+            )
+        else:
+            await self.manager._apply_room_visibility(guild, category, self.room_def)
 
         # 起動時の孤立 #昼 / #霊界 チャンネル削除 (同名の重複残骸も全て掃除する)
         # (前回起動でクラッシュ等によりゲーム途中終了した場合、残骸が残っている可能性)
-        active_snapshot = snapshot is not None and snapshot.get("phase") not in (Phase.LOBBY.name, Phase.GAME_OVER.name)
         if not active_snapshot:
             orphans = [
                 ch for ch in guild.text_channels
@@ -880,6 +907,7 @@ class RoomRunner:
             "gm_id": state.gm_id,
             "game_run_id": state.game_run_id,
             "recruitment_id": state.recruitment_id,
+            "public_log_archive_allowed": state.public_log_archive_allowed,
             "day_generation": state.day_generation,
             "night_generation": state.night_generation,
             "day_execution_resolved": state.day_execution_resolved,
@@ -1190,6 +1218,11 @@ class RoomRunner:
         state.gm_id = payload.get("gm_id")
         state.game_run_id = payload.get("game_run_id") or secrets.token_hex(16)
         state.recruitment_id = payload.get("recruitment_id")
+        # 旧snapshotにこの項目はない。現在の卓設定から推測すると、限定試験中に
+        # 開始された卓を公開後に復元したとき終了ログが漏れるため、安全側へ倒す。
+        state.public_log_archive_allowed = (
+            payload.get("public_log_archive_allowed") is True
+        )
         state.day_generation = int(payload.get("day_generation", state.day_number or 0))
         state.night_generation = int(payload.get("night_generation", 0))
         state.day_execution_resolved = bool(payload.get("day_execution_resolved", False))
@@ -1801,6 +1834,11 @@ class RoomRunner:
             return
         state.guild = guild
         state.game_run_id = secrets.token_hex(16)
+        # 終了ログの公開可否は、ゲーム開始時のアクセス境界で固定する。途中で
+        # 限定卓を一般公開しても、進行中だった試験卓の会話を公開しない。
+        state.public_log_archive_allowed = not bool(
+            getattr(self.room_def, "strict_access_role_names", None) or ()
+        )
         state.day_generation = 0
         state.night_generation = 0
         state.day_execution_resolved = False
@@ -3590,14 +3628,11 @@ class RoomRunner:
     def _can_archive_to_public_log(self) -> bool:
         """終了ログを共通の公開ログカテゴリへ退避してよいか。
 
-        ``strict_access_role_names`` の卓は、試合中だけでなく終了後も
-        指定ロールだけが閲覧できる境界である。共通ログカテゴリは全員へ
-        公開する設計なので、そこへ同期移動すると限定卓の会話が漏れる。
-        限定卓は従来どおりの遅延削除へ倒す。
+        可否はゲーム開始時にsnapshotへ保存した値を使う。設定変更後に終了する
+        進行中の限定卓を公開カテゴリへ移さないためであり、旧snapshotもFalseで
+        復元される。Falseなら従来どおり遅延削除へ倒す。
         """
-        return not bool(
-            getattr(self.room_def, "strict_access_role_names", None) or ()
-        )
+        return bool(getattr(self.state, "public_log_archive_allowed", False))
 
     async def _ensure_log_category(self, name: str) -> Optional[discord.CategoryChannel]:
         """ログカテゴリを用意する (全員が読めて、誰も書き込めない)。"""
@@ -3639,7 +3674,12 @@ class RoomRunner:
                 log.warning(f"古いログチャンネルの削除失敗 (#{ch.name}): {e}")
 
     async def _archive_game_channel(
-        self, channel: discord.TextChannel, category_name: str, seq: int
+        self,
+        channel: discord.TextChannel,
+        category_name: str,
+        seq: int,
+        *,
+        public_log_archive_allowed: bool,
     ) -> bool:
         """終了した卓チャンネルをログカテゴリへ移す。成功したらTrue。
 
@@ -3647,9 +3687,9 @@ class RoomRunner:
         名前順に並べるため、番号が前にあると自然に試合順で並ぶ。
         権限はカテゴリへ同期させる (書き込み不可・全員閲覧可)。
         """
-        # 限定卓を誤って呼び出しても、公開ログへの退避だけは絶対にしない。
-        # 呼び出し元は False を受けて削除へフォールバックする。
-        if not self._can_archive_to_public_log():
+        # 呼び出し元がゲーム終了前に捕捉した開始時の値を渡す。遅延タスクは
+        # その間にself.stateが次のロビーへ差し替わるため、ここで再読しない。
+        if not public_log_archive_allowed:
             return False
         category = await self._ensure_log_category(category_name)
         if category is None:
@@ -5410,7 +5450,12 @@ class RoomRunner:
                 if (
                     archive_to_public_log
                     and seq is not None
-                    and await self._archive_game_channel(ch, category_name, seq)
+                    and await self._archive_game_channel(
+                        ch,
+                        category_name,
+                        seq,
+                        public_log_archive_allowed=archive_to_public_log,
+                    )
                 ):
                     continue
                 try:
