@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from config import Phase, SLOW_INTERACTION_SECONDS
+from config import BOT_VERSION, Phase, SLOW_INTERACTION_SECONDS
 from views import (
     DangerConfirmView,
     GMControlView,
@@ -136,6 +136,13 @@ class HelpAndRuleEmbedTest(unittest.TestCase):
                     r"DM[^\n]*朝を迎える|朝を迎える[^\n]*DM",
                     f"{embed.title}/{field.name}",
                 )
+
+    def test_help_shows_current_release_and_restricted_log_policy(self) -> None:
+        help_embed = build_help_embeds()[0]
+        fields = {field.name: field.value for field in help_embed.fields}
+        self.assertIn(f"{BOT_VERSION}の変更", fields)
+        self.assertIn("9人クロストーク／ターン制", fields[f"{BOT_VERSION}の変更"])
+        self.assertIn("ねいと限定の9人試験卓は公開せず削除", fields["終わった試合を読み返す"])
 
 
 class InteractionTimerTest(unittest.TestCase):
