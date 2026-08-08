@@ -8,7 +8,15 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import database
-from config import Role, Team
+from config import Role, Team, VARIANT_DEFINITIONS
+
+
+NINE_WOLF_IDS = (2000, 2001)
+NINE_MADMAN_ID = 2002
+NINE_SEER_ID = 2003
+NINE_MEDIUM_ID = 2004
+NINE_GUARD_ID = 2005
+NINE_VILLAGER_IDS = (2006, 2007, 2008)
 
 
 class GameStatsDatabaseTest(unittest.IsolatedAsyncioTestCase):
@@ -42,6 +50,32 @@ class GameStatsDatabaseTest(unittest.IsolatedAsyncioTestCase):
                 "rank_at_game": None,
                 "rank_provisional": None,
             })
+        return records
+
+    @staticmethod
+    def _nine_records(deaths: dict[int, dict] | None = None) -> list[dict]:
+        """9人村の実配役。13人 fixture の先頭9人を流用しない。"""
+        layout = (
+            [(player_id, Role.WEREWOLF) for player_id in NINE_WOLF_IDS]
+            + [(NINE_MADMAN_ID, Role.MADMAN), (NINE_SEER_ID, Role.SEER)]
+            + [(NINE_MEDIUM_ID, Role.MEDIUM), (NINE_GUARD_ID, Role.GUARD)]
+            + [(player_id, Role.VILLAGER) for player_id in NINE_VILLAGER_IDS]
+        )
+        records = []
+        for player_id, role in layout:
+            team = Team.WOLF if role in {Role.WEREWOLF, Role.MADMAN} else Team.VILLAGE
+            record = {
+                "player_id": player_id,
+                "role": role.value,
+                "team": team.value,
+                "won": int(team is Team.VILLAGE),
+                "died_on_day": None,
+                "death_cause": None,
+                "rank_at_game": None,
+                "rank_provisional": None,
+            }
+            record.update((deaths or {}).get(player_id, {}))
+            records.append(record)
         return records
 
     @staticmethod
@@ -164,6 +198,286 @@ class GameStatsDatabaseTest(unittest.IsolatedAsyncioTestCase):
             ))[0][0]
         self.assertEqual(ranks, [("ダイヤ",)])
         self.assertEqual(bucket, "ダイヤ")
+
+    async def test_nine_player_settlement_isolated_in_l9_ladder(self) -> None:
+        records = self._nine_records()
+        primary_player_id = NINE_WOLF_IDS[0]
+        voter_id = NINE_WOLF_IDS[1]
+        variant = VARIANT_DEFINITIONS["v9_cross"]
+        await database.stage_game_settlement(
+            1,
+            "open_9_cross",
+            "run-nine",
+            room_name="総合-9クロストーク",
+            rated=True,
+            winner_team=Team.VILLAGE.value,
+            player_records=records,
+            variant_id="v9_cross",
+        )
+        game_id, _results, created = await database.settle_game_settlement(
+            1, "open_9_cross", "run-nine",
+        )
+        self.assertTrue(created)
+        async with database.connect_db() as db:
+            game = (await db.execute_fetchall(
+                "SELECT variant_id, ladder_id FROM games WHERE game_id=?",
+                (game_id,),
+            ))[0]
+            history = await db.execute_fetchall(
+                "SELECT DISTINCT variant_id, ladder_id FROM rating_history "
+                "WHERE game_id=?",
+                (game_id,),
+            )
+            settlement_parameters = (await db.execute_fetchall(
+                "SELECT village_win_pool, wolf_win_pool, wolf_guess_slots, "
+                "final_day_threshold FROM game_settlements "
+                "WHERE guild_id=1 AND room_id='open_9_cross' AND game_run_id='run-nine'"
+            ))[0]
+            elo_sum = (await db.execute_fetchall(
+                "SELECT SUM(elo_delta) FROM rating_history WHERE game_id=?",
+                (game_id,),
+            ))[0][0]
+        self.assertEqual(game, ("v9_cross", "l9"))
+        self.assertEqual(history, [("v9_cross", "l9")])
+        self.assertEqual(
+            settlement_parameters,
+            (
+                variant.village_win_pool,
+                variant.wolf_win_pool,
+                variant.wolf_guess_slots,
+                variant.final_day_threshold,
+            ),
+        )
+        self.assertEqual(elo_sum, 0)
+        self.assertEqual(len(await database.get_all_player_ratings(1, "l9")), 9)
+        self.assertEqual(await database.get_all_player_ratings(1), [])
+
+        async with database.connect_db() as db:
+            await db.execute(
+                "INSERT INTO player_ratings "
+                "(player_id, guild_id, ladder_id, rating, peak_rating) "
+                "VALUES (?, 1, 'l13', 2222, 2222)",
+                (primary_player_id,),
+            )
+            await db.execute(
+                "INSERT INTO game_recommendations "
+                "(game_id, guild_id, voter_id, kind, recipient_id, status, expires_at) "
+                "VALUES (?, 1, ?, 'recommend', ?, 'confirmed', '2026-01-01')",
+                (game_id, voter_id, primary_player_id),
+            )
+            before_l9 = (await db.execute_fetchall(
+                "SELECT rating FROM player_ratings "
+                "WHERE player_id=? AND guild_id=1 AND ladder_id='l9'",
+                (primary_player_id,),
+            ))[0][0]
+            await db.commit()
+
+        await database.finalize_game_recommendations(game_id, 1)
+        async with database.connect_db() as db:
+            ratings = await db.execute_fetchall(
+                "SELECT ladder_id, rating FROM player_ratings "
+                "WHERE player_id=? AND guild_id=1 ORDER BY ladder_id",
+                (primary_player_id,),
+            )
+            histories = await db.execute_fetchall(
+                "SELECT ladder_id, recommendation_bonus FROM rating_history "
+                "WHERE game_id=? AND player_id=?",
+                (game_id, primary_player_id),
+            )
+        self.assertEqual(ratings, [("l13", 2222), ("l9", before_l9 + 1)])
+        self.assertEqual(histories, [("l9", 1)])
+
+    async def test_nine_variants_share_rated_settlement_play_and_postgame_bonuses(self) -> None:
+        """9人クロストークとターン制は、実配役でも精算ルールを共有する。"""
+        outcomes: dict[str, dict] = {}
+        deaths = {
+            NINE_SEER_ID: {"died_on_day": 1, "death_cause": "襲撃"},
+            NINE_VILLAGER_IDS[0]: {"died_on_day": 1, "death_cause": "処刑"},
+        }
+        bonus_facts = {
+            "days": 4,
+            "guard_successes": 1,
+            "night1_kill_target": NINE_SEER_ID,
+            "executions": [
+                {"day": 2, "target": NINE_WOLF_IDS[0], "voters": [NINE_VILLAGER_IDS[1]]},
+            ],
+            "wolf_guesses": {
+                NINE_VILLAGER_IDS[0]: list(NINE_WOLF_IDS),
+            },
+        }
+
+        for guild_id, variant_id in enumerate(("v9_cross", "v9_turn"), start=1):
+            room_id = {
+                "v9_cross": "open_9_cross",
+                "v9_turn": "open_9_turn",
+            }[variant_id]
+            await database.stage_game_settlement(
+                guild_id,
+                room_id,
+                f"run-{variant_id}-bonuses",
+                room_name=variant_id,
+                rated=True,
+                winner_team=Team.VILLAGE.value,
+                player_records=self._nine_records(deaths),
+                variant_id=variant_id,
+                bonus_facts=bonus_facts,
+            )
+            game_id, settlement_results, created = await database.settle_game_settlement(
+                guild_id,
+                room_id,
+                f"run-{variant_id}-bonuses",
+            )
+            self.assertTrue(created)
+            self.assertIsNotNone(settlement_results)
+
+            await database.create_game_recommendation_ballots(
+                game_id, guild_id, {NINE_VILLAGER_IDS[1]},
+                timeout_seconds=60, kind="postgame",
+            )
+            self.assertEqual(
+                await database.confirm_game_recommendation(
+                    game_id, guild_id, NINE_VILLAGER_IDS[1], NINE_WOLF_IDS[0],
+                    kind="postgame",
+                ),
+                "confirmed",
+            )
+            postgame_results = await database.finalize_game_recommendations(game_id, guild_id)
+
+            async with database.connect_db() as db:
+                game = (await db.execute_fetchall(
+                    "SELECT variant_id, ladder_id FROM games WHERE game_id=?",
+                    (game_id,),
+                ))[0]
+                parameters = (await db.execute_fetchall(
+                    "SELECT village_win_pool, wolf_win_pool, wolf_guess_slots, "
+                    "final_day_threshold FROM game_settlements "
+                    "WHERE guild_id=? AND room_id=? AND game_run_id=?",
+                    (guild_id, room_id, f"run-{variant_id}-bonuses"),
+                ))[0]
+                history = await db.execute_fetchall(
+                    "SELECT player_id, rating_before, rating_after, elo_delta, bonus, "
+                    "play_bonus, recommendation_bonus FROM rating_history "
+                    "WHERE game_id=? ORDER BY player_id",
+                    (game_id,),
+                )
+                wolf_guess_hits = (await db.execute_fetchall(
+                    "SELECT wolf_guess_hits FROM game_players "
+                    "WHERE game_id=? AND player_id=?",
+                    (game_id, NINE_VILLAGER_IDS[0]),
+                ))[0][0]
+
+            self.assertEqual(game, (variant_id, "l9"))
+            self.assertEqual(parameters[2:], (2, 4))
+            self.assertEqual(wolf_guess_hits, 2)
+            outcomes[variant_id] = {
+                "parameters": parameters,
+                "settlement_results": settlement_results,
+                "history": history,
+                "postgame_results": postgame_results,
+            }
+
+        cross = outcomes["v9_cross"]
+        turn = outcomes["v9_turn"]
+        self.assertEqual(cross["parameters"], turn["parameters"])
+        self.assertEqual(cross["settlement_results"], turn["settlement_results"])
+        self.assertEqual(cross["history"], turn["history"])
+        self.assertEqual(cross["postgame_results"], turn["postgame_results"])
+
+        play_bonuses = {
+            player_id: play_bonus
+            for player_id, _before, _after, _elo, _bonus, play_bonus, _recommendation
+            in cross["history"]
+            if play_bonus
+        }
+        self.assertEqual(
+            play_bonuses,
+            {
+                NINE_WOLF_IDS[0]: 3,  # 4日目到達 + 初夜占い師襲撃
+                NINE_WOLF_IDS[1]: 3,
+                NINE_GUARD_ID: 1,
+                NINE_VILLAGER_IDS[0]: 4,  # 早期の狼2人全的中
+                NINE_VILLAGER_IDS[1]: 2,  # 人狼への処刑投票
+            },
+        )
+        self.assertEqual(len(cross["postgame_results"]), 1)
+        postgame = cross["postgame_results"][0]
+        self.assertEqual(postgame["player_id"], NINE_WOLF_IDS[0])
+        self.assertEqual(postgame["bonus"], 1)
+        self.assertEqual(postgame["rating_after"], postgame["rating_before"] + 1)
+
+    async def test_restaging_same_run_cannot_change_variant_or_parameters(self) -> None:
+        records = self._nine_records()
+        await database.stage_game_settlement(
+            1,
+            "open_9_cross",
+            "immutable-run",
+            room_name="総合-9クロストーク",
+            rated=True,
+            winner_team=Team.VILLAGE.value,
+            player_records=records,
+            variant_id="v9_cross",
+        )
+        with self.assertRaisesRegex(ValueError, "cannot change"):
+            await database.stage_game_settlement(
+                1,
+                "open_9_cross",
+                "immutable-run",
+                room_name="総合-9クロストーク",
+                rated=True,
+                winner_team=Team.VILLAGE.value,
+                player_records=records,
+                variant_id="v9_cross",
+                village_win_pool=VARIANT_DEFINITIONS["v9_cross"].village_win_pool + 1,
+            )
+        with self.assertRaisesRegex(ValueError, "cannot change"):
+            await database.stage_game_settlement(
+                1,
+                "open_9_cross",
+                "immutable-run",
+                room_name="総合-9クロストーク",
+                rated=True,
+                winner_team=Team.VILLAGE.value,
+                player_records=records,
+                variant_id="v13_cross",
+            )
+
+    async def test_stats_and_recent_history_filter_variants(self) -> None:
+        await database.stage_game_settlement(
+            1, "open", "run-v13", room_name="総合", rated=False,
+            winner_team=Team.VILLAGE.value, player_records=self._records(),
+        )
+        await database.settle_game_settlement(1, "open", "run-v13")
+        await database.stage_game_settlement(
+            1,
+            "open_9_cross",
+            "run-v9-stats",
+            room_name="総合-9クロストーク",
+            rated=False,
+            winner_team=Team.VILLAGE.value,
+            player_records=self._nine_records(),
+            variant_id="v9_cross",
+        )
+        await database.settle_game_settlement(
+            1, "open_9_cross", "run-v9-stats",
+        )
+
+        self.assertEqual((await database.get_overall_game_stats(1))["games"], 1)
+        self.assertEqual(
+            (await database.get_overall_game_stats(
+                1, variant_id="v9_cross",
+            ))["games"],
+            1,
+        )
+        self.assertEqual(len(await database.get_recent_games(1)), 1)
+        recent_nine = await database.get_recent_games(1, variant_id="v9_cross")
+        self.assertEqual(recent_nine[0]["room_name"], "総合-9クロストーク")
+        self.assertIsNone(await database.get_player_stats(NINE_WOLF_IDS[0], 1))
+        self.assertEqual(
+            (await database.get_player_stats(
+                NINE_WOLF_IDS[0], 1, variant_id="v9_cross",
+            ))["total"],
+            1,
+        )
 
     async def test_stats_write_failure_does_not_rollback_core_settlement(self) -> None:
         await database.stage_game_settlement(

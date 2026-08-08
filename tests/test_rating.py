@@ -78,6 +78,19 @@ class TestCalculateGameResults(unittest.TestCase):
         )
         self.assertAlmostEqual(break_even, 0.60)
 
+    def test_nine_player_pool_ratio_implies_forty_five_percent_wolf_winrate(self):
+        """9人村は狼勝率45%を前提に、両進行方式で同じプールを使う。"""
+        parameters = {
+            variant_id: rating_lib.resolve_variant_rating_parameters(variant_id)
+            for variant_id in NINE_VARIANT_IDS
+        }
+        self.assertEqual(parameters["v9_cross"], parameters["v9_turn"])
+        break_even = parameters["v9_cross"]["village_win_pool"] / (
+            parameters["v9_cross"]["village_win_pool"]
+            + parameters["v9_cross"]["wolf_win_pool"]
+        )
+        self.assertAlmostEqual(break_even, 0.45)
+
     def test_wolf_win_pool_is_zero_sum_except_bonus(self):
         """狼勝ち (勝者4/敗者9): elo_deltaはゼロサム、deltaはボーナス分だけ正"""
         results = rating_lib.calculate_game_results(
@@ -97,6 +110,60 @@ class TestCalculateGameResults(unittest.TestCase):
         delta_sum = sum(r["delta"] for r in results)
         self.assertEqual(elo_sum, 0)
         self.assertEqual(delta_sum, 9 * WIN_PARTICIPATION_BONUS)
+
+    def test_nine_player_variant_uses_its_own_zero_sum_pool(self):
+        parameters = rating_lib.resolve_variant_rating_parameters("v9_cross")
+        players = [
+            {
+                "player_id": record["player_id"],
+                "rating": INITIAL_RATING,
+                "won": record["won"],
+            }
+            for record in make_nine_records()
+        ]
+        results = rating_lib.calculate_game_results(
+            players,
+            winner_team=Team.VILLAGE,
+            variant_id="v9_cross",
+        )
+        self.assertEqual(sum(row["elo_delta"] for row in results), 0)
+        self.assertEqual(
+            sum(row["elo_delta"] for row in results if row["elo_delta"] > 0),
+            parameters["village_win_pool"],
+        )
+        self.assertEqual(
+            sum(row["elo_delta"] for row in results if row["elo_delta"] < 0),
+            -parameters["village_win_pool"],
+        )
+
+    def test_nine_variants_share_the_same_base_rating_rules(self):
+        """進行方式の違いで9人村のレート精算が変わらない。"""
+        players = [
+            {
+                "player_id": record["player_id"],
+                "rating": INITIAL_RATING,
+                "won": record["won"],
+                # 卓帯補正を通した結果も比較する。
+                "rank_name": "プラチナ" if record["won"] else "シルバー",
+            }
+            for record in make_nine_records()
+        ]
+        parameters = {
+            variant_id: rating_lib.resolve_variant_rating_parameters(variant_id)
+            for variant_id in NINE_VARIANT_IDS
+        }
+        results = {
+            variant_id: rating_lib.calculate_game_results(
+                players,
+                winner_team=Team.VILLAGE,
+                variant_id=variant_id,
+            )
+            for variant_id in NINE_VARIANT_IDS
+        }
+
+        self.assertEqual(parameters["v9_cross"], parameters["v9_turn"])
+        self.assertEqual(results["v9_cross"], results["v9_turn"])
+        self.assertEqual(sum(row["elo_delta"] for row in results["v9_cross"]), 0)
 
     def test_pool_selection_by_winner_count(self):
         """勝者が少数側 (狼勝ち) なら120プール、多数側 (村勝ち) なら180プール"""
@@ -321,6 +388,16 @@ MEDIUM_ID = 6
 GUARD_ID = 7
 VILLAGER_IDS = (8, 9, 10, 11, 12, 13)
 
+# 9人村の実配役。13人用の fixture を切り詰めると人狼3人になってしまうため、
+# 9人固有の加点・精算は必ずこの構成で検証する。
+NINE_WOLF_IDS = (21, 22)
+NINE_MADMAN_ID = 23
+NINE_SEER_ID = 24
+NINE_MEDIUM_ID = 25
+NINE_GUARD_ID = 26
+NINE_VILLAGER_IDS = (27, 28, 29)
+NINE_VARIANT_IDS = ("v9_cross", "v9_turn")
+
 
 def make_records(deaths: dict[int, dict] | None = None) -> list[dict]:
     """13人固定構成の参加者レコード。deaths で死亡日と死因を差し込む"""
@@ -329,6 +406,30 @@ def make_records(deaths: dict[int, dict] | None = None) -> list[dict]:
         + [(MADMAN_ID, Role.MADMAN), (SEER_ID, Role.SEER)]
         + [(MEDIUM_ID, Role.MEDIUM), (GUARD_ID, Role.GUARD)]
         + [(pid, Role.VILLAGER) for pid in VILLAGER_IDS]
+    )
+    records = []
+    for player_id, role in layout:
+        team = ROLE_TEAM[role]
+        record = {
+            "player_id": player_id,
+            "role": role.value,
+            "team": team.value,
+            "won": team is Team.VILLAGE,
+            "died_on_day": None,
+            "death_cause": None,
+        }
+        record.update((deaths or {}).get(player_id, {}))
+        records.append(record)
+    return records
+
+
+def make_nine_records(deaths: dict[int, dict] | None = None) -> list[dict]:
+    """9人固定構成（狼2・狂1・占霊狩各1・村3）の参加者レコード。"""
+    layout = (
+        [(pid, Role.WEREWOLF) for pid in NINE_WOLF_IDS]
+        + [(NINE_MADMAN_ID, Role.MADMAN), (NINE_SEER_ID, Role.SEER)]
+        + [(NINE_MEDIUM_ID, Role.MEDIUM), (NINE_GUARD_ID, Role.GUARD)]
+        + [(pid, Role.VILLAGER) for pid in NINE_VILLAGER_IDS]
     )
     records = []
     for player_id, role in layout:
@@ -453,6 +554,109 @@ class TestCalculatePlayBonuses(unittest.TestCase):
             records, {"wolf_guesses": {8: list(WOLF_IDS) + [MADMAN_ID, SEER_ID]}},
         )
         self.assertEqual(bonuses.get(8), 3)
+
+    def test_guess_slots_and_final_day_threshold_are_arguments(self):
+        records = make_records({8: {"died_on_day": 3, "death_cause": "襲撃"}})
+        facts = {"days": 4, "wolf_guesses": {"8": [1, 2, 3]}}
+        hits = rating_lib.count_wolf_guess_hits(
+            records, facts, wolf_guess_slots=2,
+        )
+        bonuses = rating_lib.calculate_play_bonuses(
+            records,
+            facts,
+            wolf_guess_slots=2,
+            final_day_threshold=4,
+        )
+        self.assertEqual(hits[8], 2)
+        self.assertEqual(bonuses[8], 2)
+        for wolf_id in WOLF_IDS:
+            self.assertEqual(bonuses[wolf_id], 2)
+
+    def test_nine_early_wolf_guess_is_capped_at_two_hits_and_doubled_to_four(self):
+        """9人村の早期狼予想は実狼2人を全的中して最大+4。"""
+        records = make_nine_records({
+            NINE_VILLAGER_IDS[0]: {"died_on_day": 1, "death_cause": "処刑"},
+        })
+        facts = {
+            "wolf_guesses": {
+                NINE_VILLAGER_IDS[0]: [*NINE_WOLF_IDS, NINE_MADMAN_ID],
+            },
+        }
+        bonuses_by_variant = {}
+        for variant_id in NINE_VARIANT_IDS:
+            params = rating_lib.resolve_variant_rating_parameters(variant_id)
+            hits = rating_lib.count_wolf_guess_hits(
+                records,
+                facts,
+                wolf_guess_slots=params["wolf_guess_slots"],
+            )
+            bonuses_by_variant[variant_id] = rating_lib.calculate_play_bonuses(
+                records,
+                facts,
+                wolf_guess_slots=params["wolf_guess_slots"],
+                final_day_threshold=params["final_day_threshold"],
+            )
+            self.assertEqual(hits[NINE_VILLAGER_IDS[0]], 2)
+            self.assertEqual(bonuses_by_variant[variant_id][NINE_VILLAGER_IDS[0]], 4)
+        self.assertEqual(bonuses_by_variant["v9_cross"], bonuses_by_variant["v9_turn"])
+
+    def test_nine_wolf_execution_votes_max_out_at_four(self):
+        """9人村では実狼2人への投票を両方当てた村陣営が最大+4。"""
+        voter_id = NINE_VILLAGER_IDS[1]
+        facts = {
+            "executions": [
+                {"day": 1, "target": NINE_WOLF_IDS[0], "voters": [voter_id]},
+                {"day": 2, "target": NINE_WOLF_IDS[1], "voters": [voter_id]},
+            ],
+        }
+        bonuses_by_variant = {}
+        for variant_id in NINE_VARIANT_IDS:
+            params = rating_lib.resolve_variant_rating_parameters(variant_id)
+            bonuses_by_variant[variant_id] = rating_lib.calculate_play_bonuses(
+                make_nine_records(),
+                facts,
+                wolf_guess_slots=params["wolf_guess_slots"],
+                final_day_threshold=params["final_day_threshold"],
+            )
+            self.assertEqual(bonuses_by_variant[variant_id][voter_id], 4)
+        self.assertEqual(bonuses_by_variant["v9_cross"], bonuses_by_variant["v9_turn"])
+
+    def test_nine_day_four_pays_each_real_wolf_two(self):
+        """9人村の終盤到達ボーナスは4日目に狼2人だけへ各+2。"""
+        bonuses_by_variant = {}
+        for variant_id in NINE_VARIANT_IDS:
+            params = rating_lib.resolve_variant_rating_parameters(variant_id)
+            bonuses_by_variant[variant_id] = rating_lib.calculate_play_bonuses(
+                make_nine_records(),
+                {"days": 4},
+                wolf_guess_slots=params["wolf_guess_slots"],
+                final_day_threshold=params["final_day_threshold"],
+            )
+            self.assertEqual(
+                bonuses_by_variant[variant_id],
+                {wolf_id: 2 for wolf_id in NINE_WOLF_IDS},
+            )
+        self.assertEqual(bonuses_by_variant["v9_cross"], bonuses_by_variant["v9_turn"])
+
+    def test_nine_night_one_seer_kill_pays_exactly_two_wolves(self):
+        """初夜の占い師襲撃成功は、9人村の狼2人へだけ各+1。"""
+        records = make_nine_records({
+            NINE_SEER_ID: {"died_on_day": 1, "death_cause": "襲撃"},
+        })
+        bonuses_by_variant = {}
+        for variant_id in NINE_VARIANT_IDS:
+            params = rating_lib.resolve_variant_rating_parameters(variant_id)
+            bonuses_by_variant[variant_id] = rating_lib.calculate_play_bonuses(
+                records,
+                {"night1_kill_target": NINE_SEER_ID},
+                wolf_guess_slots=params["wolf_guess_slots"],
+                final_day_threshold=params["final_day_threshold"],
+            )
+            self.assertEqual(
+                bonuses_by_variant[variant_id],
+                {wolf_id: 1 for wolf_id in NINE_WOLF_IDS},
+            )
+        self.assertEqual(bonuses_by_variant["v9_cross"], bonuses_by_variant["v9_turn"])
 
     def test_guard_success_pays_the_guard(self):
         bonuses = rating_lib.calculate_play_bonuses(
@@ -661,6 +865,19 @@ class TestBuildRankContextMap(unittest.TestCase):
         ratings = [rows[c.player_id - 1]["rating"] for c in by_position]
         self.assertEqual(ratings, sorted(ratings, reverse=True))
 
+    def test_ladder_specific_grandmaster_roles_do_not_expand_rank_specs(self):
+        self.assertEqual(
+            rating_lib.special_grandmaster_role_name("l13"),
+            rating_lib.get_rank_role_name("グランドマスター"),
+        )
+        l9_role = rating_lib.get_rank_role_name("グランドマスター（9人村）")
+        self.assertEqual(rating_lib.special_grandmaster_role_name("l9"), l9_role)
+        self.assertIn(l9_role, rating_lib.all_rank_role_names())
+        self.assertNotIn(
+            "グランドマスター（9人村）",
+            {row[0] for row in RANK_SPECS},
+        )
+
 
 class TestSeasonHalfResetProduction(unittest.IsolatedAsyncioTestCase):
     """式の写しではなく、本番DB処理を実行して検証する。"""
@@ -728,6 +945,256 @@ class TestSeasonHalfResetProduction(unittest.IsolatedAsyncioTestCase):
             await database.season_half_reset(9876, executed_by=999),
             (0, 0),
         )
+
+    async def test_one_boundary_resets_each_ladder_and_counts_people_once(self):
+        guild_id = 4321
+        async with database.connect_db() as db:
+            await db.executemany(
+                "INSERT INTO player_ratings "
+                "(player_id, guild_id, ladder_id, rating, peak_rating, games, "
+                "season_games, season_wins) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (1, guild_id, "l13", 1900, 1900, 10, 10, 6),
+                    (1, guild_id, "l9", 1700, 1700, 4, 4, 2),
+                ],
+            )
+            await db.commit()
+
+        reset_id, affected = await database.season_half_reset(
+            guild_id, executed_by=999,
+        )
+        self.assertEqual(affected, 1)
+        async with database.connect_db() as db:
+            current = await db.execute_fetchall(
+                "SELECT ladder_id, rating, season_games FROM player_ratings "
+                "WHERE guild_id=? ORDER BY ladder_id",
+                (guild_id,),
+            )
+            snapshots = await db.execute_fetchall(
+                "SELECT ladder_id, rating_before, rating_after FROM rating_snapshots "
+                "WHERE season_reset_id=? ORDER BY ladder_id",
+                (reset_id,),
+            )
+        self.assertEqual(current, [("l13", 1700, 0), ("l9", 1600, 0)])
+        self.assertEqual(
+            snapshots,
+            [("l13", 1900, 1700), ("l9", 1700, 1600)],
+        )
+
+
+class TestLadderSchemaMigration(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="werewolf-ladder-migration-")
+        self.original_db_path = database.DB_PATH
+        database.DB_PATH = str(Path(self.temp_dir.name) / "ladder.db")
+
+    async def asyncTearDown(self):
+        database.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+
+    async def test_legacy_rating_pk_migrates_to_l13_idempotently(self):
+        async with database.connect_db() as db:
+            await db.execute(
+                "CREATE TABLE player_ratings ("
+                "player_id INTEGER NOT NULL, guild_id INTEGER NOT NULL, "
+                "rating INTEGER NOT NULL, peak_rating INTEGER NOT NULL, "
+                "games INTEGER NOT NULL DEFAULT 0, wins INTEGER NOT NULL DEFAULT 0, "
+                "last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+                "PRIMARY KEY (player_id, guild_id))"
+            )
+            await db.execute(
+                "INSERT INTO player_ratings "
+                "(player_id, guild_id, rating, peak_rating, games, wins) "
+                "VALUES (10, 1, 1600, 1700, 5, 3)"
+            )
+            await db.commit()
+
+        await database.init_db()
+        await database.init_db()
+        async with database.connect_db() as db:
+            pk_columns = [
+                row[1]
+                for row in sorted(
+                    await db.execute_fetchall("PRAGMA table_info(player_ratings)"),
+                    key=lambda row: int(row[5] or 0),
+                )
+                if row[5]
+            ]
+            migrated = await db.execute_fetchall(
+                "SELECT player_id, guild_id, ladder_id, rating, peak_rating, games, wins "
+                "FROM player_ratings"
+            )
+            await db.execute(
+                "INSERT INTO player_ratings "
+                "(player_id, guild_id, ladder_id, rating, peak_rating) "
+                "VALUES (10, 1, 'l9', 1500, 1500)"
+            )
+            await db.commit()
+        self.assertEqual(pk_columns, ["player_id", "guild_id", "ladder_id"])
+        self.assertEqual(migrated, [(10, 1, "l13", 1600, 1700, 5, 3)])
+
+    @staticmethod
+    async def _create_legacy_table(db) -> None:
+        await db.execute(
+            "CREATE TABLE player_ratings ("
+            "player_id INTEGER NOT NULL, guild_id INTEGER NOT NULL, "
+            "rating INTEGER NOT NULL, peak_rating INTEGER NOT NULL, "
+            "games INTEGER NOT NULL DEFAULT 0, wins INTEGER NOT NULL DEFAULT 0, "
+            "season_games INTEGER NOT NULL DEFAULT 0, "
+            "season_wins INTEGER NOT NULL DEFAULT 0, "
+            "last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+            "PRIMARY KEY (player_id, guild_id))"
+        )
+
+    @staticmethod
+    async def _create_migrated_table(db) -> None:
+        await db.execute(
+            "CREATE TABLE player_ratings_ladder_migrated ("
+            "player_id INTEGER NOT NULL, guild_id INTEGER NOT NULL, "
+            "ladder_id TEXT NOT NULL DEFAULT 'l13', "
+            "rating INTEGER NOT NULL, peak_rating INTEGER NOT NULL, "
+            "games INTEGER NOT NULL DEFAULT 0, wins INTEGER NOT NULL DEFAULT 0, "
+            "season_games INTEGER NOT NULL DEFAULT 0, "
+            "season_wins INTEGER NOT NULL DEFAULT 0, "
+            "last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+            "PRIMARY KEY (player_id, guild_id, ladder_id))"
+        )
+
+    async def test_matching_interrupted_copy_is_completed_safely(self):
+        async with database.connect_db() as db:
+            await self._create_legacy_table(db)
+            await self._create_migrated_table(db)
+            await db.execute(
+                "INSERT INTO player_ratings VALUES "
+                "(10, 1, 1600, 1700, 5, 3, 2, 1, '2026-01-01')"
+            )
+            await db.execute(
+                "INSERT INTO player_ratings_ladder_migrated VALUES "
+                "(10, 1, 'l13', 1600, 1700, 5, 3, 2, 1, '2026-01-01')"
+            )
+            await db.commit()
+
+        await database.init_db()
+        async with database.connect_db() as db:
+            tables = {
+                row[0] for row in await db.execute_fetchall(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            rows = await db.execute_fetchall(
+                "SELECT player_id, ladder_id, rating FROM player_ratings"
+            )
+        self.assertNotIn("player_ratings_ladder_migrated", tables)
+        self.assertEqual(rows, [(10, "l13", 1600)])
+
+    async def test_temp_table_recovers_drop_before_rename_interruption(self):
+        async with database.connect_db() as db:
+            await self._create_migrated_table(db)
+            await db.execute(
+                "INSERT INTO player_ratings_ladder_migrated VALUES "
+                "(10, 1, 'l13', 1600, 1700, 5, 3, 2, 1, '2026-01-01')"
+            )
+            await db.commit()
+
+        await database.init_db()
+        async with database.connect_db() as db:
+            rows = await db.execute_fetchall(
+                "SELECT player_id, ladder_id, rating FROM player_ratings"
+            )
+            temp_count = (await db.execute_fetchall(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type='table' AND name='player_ratings_ladder_migrated'"
+            ))[0][0]
+        self.assertEqual(rows, [(10, "l13", 1600)])
+        self.assertEqual(temp_count, 0)
+
+    async def test_mismatched_interrupted_copy_stops_without_deleting_either(self):
+        async with database.connect_db() as db:
+            await self._create_legacy_table(db)
+            await self._create_migrated_table(db)
+            await db.execute(
+                "INSERT INTO player_ratings VALUES "
+                "(10, 1, 1600, 1700, 5, 3, 2, 1, '2026-01-01')"
+            )
+            await db.execute(
+                "INSERT INTO player_ratings_ladder_migrated VALUES "
+                "(11, 1, 'l13', 1500, 1500, 1, 1, 1, 1, '2026-01-01')"
+            )
+            await db.commit()
+
+        with self.assertRaisesRegex(RuntimeError, "一致しません"):
+            await database.init_db()
+        async with database.connect_db() as db:
+            main = await db.execute_fetchall(
+                "SELECT player_id, rating FROM player_ratings"
+            )
+            temp = await db.execute_fetchall(
+                "SELECT player_id, rating FROM player_ratings_ladder_migrated"
+            )
+        self.assertEqual(main, [(10, 1600)])
+        self.assertEqual(temp, [(11, 1500)])
+
+    async def test_savepoint_restores_old_table_if_rename_fails(self):
+        async with database.connect_db() as db:
+            await self._create_legacy_table(db)
+            await db.execute(
+                "INSERT INTO player_ratings VALUES "
+                "(10, 1, 1600, 1700, 5, 3, 2, 1, '2026-01-01')"
+            )
+            await db.commit()
+
+            class RenameFailingConnection:
+                async def execute(self, sql, *args):
+                    if sql.startswith(
+                        "ALTER TABLE player_ratings_ladder_migrated RENAME"
+                    ):
+                        raise RuntimeError("simulated rename failure")
+                    return await db.execute(sql, *args)
+
+                async def execute_fetchall(self, sql, *args):
+                    return await db.execute_fetchall(sql, *args)
+
+            with self.assertRaisesRegex(RuntimeError, "simulated rename failure"):
+                await database._migrate_player_ratings_ladder_pk(
+                    RenameFailingConnection()
+                )
+            main = await db.execute_fetchall(
+                "SELECT player_id, rating FROM player_ratings"
+            )
+            temp_count = (await db.execute_fetchall(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type='table' AND name='player_ratings_ladder_migrated'"
+            ))[0][0]
+        self.assertEqual(main, [(10, 1600)])
+        self.assertEqual(temp_count, 0)
+
+    async def test_snapshot_keeps_id_pk_and_is_unique_per_ladder(self):
+        await database.init_db()
+        async with database.connect_db() as db:
+            reset = await db.execute(
+                "INSERT INTO season_resets (guild_id, executed_by) VALUES (1, 999)"
+            )
+            reset_id = int(reset.lastrowid)
+            await db.executemany(
+                "INSERT INTO rating_snapshots "
+                "(season_reset_id, player_id, guild_id, ladder_id, "
+                "rating_before, rating_after) VALUES (?, 10, 1, ?, 1600, 1550)",
+                [(reset_id, "l13"), (reset_id, "l9")],
+            )
+            with self.assertRaises(database.aiosqlite.IntegrityError):
+                await db.execute(
+                    "INSERT INTO rating_snapshots "
+                    "(season_reset_id, player_id, guild_id, ladder_id, "
+                    "rating_before, rating_after) "
+                    "VALUES (?, 10, 1, 'l13', 1700, 1600)",
+                    (reset_id,),
+                )
+            table_info = await db.execute_fetchall(
+                "PRAGMA table_info(rating_snapshots)"
+            )
+            await db.rollback()
+        id_info = next(row for row in table_info if row[1] == "id")
+        self.assertEqual(id_info[5], 1)
 
 
 class TestRatingScaleMigration(unittest.IsolatedAsyncioTestCase):

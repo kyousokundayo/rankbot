@@ -43,6 +43,15 @@ class RoomDefinition:
     private_role_name: str | None = None
     # 指定ロール・サーバー管理者だけにカテゴリ全体を表示する固定卓。
     access_role_names: frozenset[str] | None = None
+    # 既存の位置引数を壊さないよう末尾へ追加。省略時は従来どおり13人
+    # クロストークとし、ローカル卓・専用村も暗黙に別ルールへ変えない。
+    variant_id: str = "v13_cross"
+    # False の固定卓はRunnerを作らず、カテゴリ・VC・募集導線も起動しない。
+    # 定義自体は統計・履歴・シミュレーションのため残す。
+    enabled: bool = True
+    # 通常の閲覧許可とは別に、指定ロールだけへ厳格に公開する固定卓用。
+    # 実際の権限適用は permissions.py が担う。
+    strict_access_role_names: frozenset[str] | None = None
 
 
 @dataclass(frozen=True)

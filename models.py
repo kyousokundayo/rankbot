@@ -163,8 +163,35 @@ class GameState:
         self.votes: dict[int, int] = {}          # voter_id -> target_id
         self.runoff_candidates: list[int] = []
 
-        # 決戦弁明: 現在弁明中のプレイヤー (古い弁明ボタンの誤爆防止)
+        # 決戦弁明・遺言・ターン制議論の現在話者。
+        # ターン制では turn_slot_token も併用し、同じ人が2巡目に回ったときに
+        # 1巡目の古いボタンが現在の発言を終了させないようにする。
         self.current_speaker_id: Optional[int] = None
+
+        # ターン制議論のdurable cursor。完了したslotだけをcheckpointし、
+        # 再起動時は進行中だったslotだけを満額でやり直す。
+        self.turn_day_generation: int = 0
+        self.turn_anchor_number: Optional[int] = None
+        self.next_turn_anchor_number: Optional[int] = None
+        self.turn_order: list[int] = []
+        self.turn_round_index: int = 0
+        self.turn_slot_index: int = 0
+        self.turn_slot_token: int = 0
+        self.turn_slot_active: bool = False
+        self.turn_original_speaker_id: Optional[int] = None
+        self.turn_interrupt_active: bool = False
+        self.turn_interrupt_pending_id: Optional[int] = None
+        self.turn_interrupts_used: int = 0
+        # ターン制の公開CO。役職・内容は持たず、押下した人の当日一覧だけを
+        # 保存する。退出・除外後も表示を保てるよう、当時の表示名も記録する。
+        self.turn_co_declarations: list[dict[str, object]] = []
+        # 1日1枚の話者パネル。再起動後に同じメッセージから再開し、
+        # 古いボタンだけが残るパネルを増殖させない。
+        self.turn_panel_message_id: Optional[int] = None
+        # ボタン受付窓と残り時間はプロセス内だけの状態。クラッシュ復旧では
+        # slotの規定時間を満額で再実行するため、snapshotへは保存しない。
+        self.turn_window_open: bool = False
+        self.turn_remaining_seconds: float = 0.0
 
         # 夜アクション
         self.wolf_target: Optional[int] = None
@@ -233,6 +260,12 @@ class GameState:
         # 弁明終了イベント
         self.speech_done_event: asyncio.Event = asyncio.Event()
 
+        # ターン制の現在発言終了・割り込み要求。turn_signal_eventへ集約して
+        # タイマー側が0.5秒ごとに複数Taskを作らず即座に起きられるようにする。
+        self.turn_done_event: asyncio.Event = asyncio.Event()
+        self.turn_interrupt_event: asyncio.Event = asyncio.Event()
+        self.turn_signal_event: asyncio.Event = asyncio.Event()
+
         # 朝ログ追跡
         self._last_executed: Optional[object] = None
         self._last_killed: Optional[object] = None
@@ -278,10 +311,14 @@ class GameState:
     def get_player(self, user_id: int) -> Optional[Player]:
         return self.players.get(user_id)
 
-    def get_day_discussion_time(self) -> int:
-        from config import DAY_DISCUSSION_BASE, DAY_DISCUSSION_DECREASE, DAY_DISCUSSION_MIN
-        t = DAY_DISCUSSION_BASE - (self.day_number - 1) * DAY_DISCUSSION_DECREASE
-        return max(t, DAY_DISCUSSION_MIN)
+    def get_day_discussion_time(
+        self,
+        discussion_seconds: tuple[int, int, int],
+    ) -> int:
+        """選択変種のクロストーク昼時間を当日ぶん返す。"""
+        base, decrease, minimum = discussion_seconds
+        t = base - (self.day_number - 1) * decrease
+        return max(t, minimum)
 
     def get_night_time(self) -> int:
         from config import NIGHT_BASE, NIGHT_DECREASE, NIGHT_MIN

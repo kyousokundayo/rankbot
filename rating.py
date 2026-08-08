@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import config as config_lib
 from config import (
     BONUS_FINAL_DAY_THRESHOLD,
     BONUS_FINAL_DAY_WOLF,
@@ -24,12 +25,89 @@ from config import (
     RATING_FLOOR,
     SEASON_RANK_MIN_GAMES,
     SEASON_RANK_PERCENTAGES,
-    VILLAGE_WIN_FIXED_POOL,
     WIN_PARTICIPATION_BONUS,
-    WOLF_WIN_FIXED_POOL,
     Role,
     Team,
 )
+
+
+DEFAULT_VARIANT_ID = config_lib.DEFAULT_VARIANT_ID
+DEFAULT_LADDER_ID = config_lib.DEFAULT_LADDER_ID
+
+
+def ladder_id_for_variant(variant_id: str) -> str:
+    """永続化する変種IDに対応するラダーIDを返す。"""
+    try:
+        return str(config_lib.VARIANT_TO_LADDER[variant_id])
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"unknown variant_id: {variant_id}") from exc
+
+
+def grandmaster_slots_for_ladder(ladder_id: str) -> int:
+    """configに定義されたラダーごとのGM上限を返す。"""
+    try:
+        slots = int(config_lib.LADDER_DEFINITIONS[ladder_id].grandmaster_slots)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"unknown ladder_id: {ladder_id}") from exc
+    if slots <= 0:
+        raise ValueError("grandmaster_slots must be positive")
+    return slots
+
+
+def special_grandmaster_role_name(ladder_id: str) -> str:
+    """ラダー固有のGM Discordロール名を返す。
+
+    l13 は従来ロール、l9 は ``グランドマスター（9人村）`` を使う。
+    通常ランク9段の ``RANK_SPECS`` 自体は増やさない。
+    """
+    try:
+        rank_name = str(config_lib.LADDER_DEFINITIONS[ladder_id].grandmaster_role_name)
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"unknown ladder_id: {ladder_id}") from exc
+    return get_rank_role_name(rank_name)
+
+
+def _special_grandmaster_role_color(ladder_id: str) -> int:
+    try:
+        return int(config_lib.LADDER_DEFINITIONS[ladder_id].grandmaster_role_color)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"unknown ladder_id: {ladder_id}") from exc
+
+
+def resolve_variant_rating_parameters(
+    variant_id: str = DEFAULT_VARIANT_ID,
+    *,
+    village_win_pool: int | None = None,
+    wolf_win_pool: int | None = None,
+    wolf_guess_slots: int | None = None,
+    final_day_threshold: int | None = None,
+) -> dict[str, int]:
+    """変種ごとの精算値を検証し、未指定値を確定する。
+
+    呼び出し側が卓定義の値を渡せばそれを優先する。省略時は既存の
+    13人クロストークと同じ値になり、旧APIの挙動を維持する。
+    """
+    definition = config_lib.get_variant_definition(variant_id)
+    defaults = {
+        "village_win_pool": int(definition.village_win_pool),
+        "wolf_win_pool": int(definition.wolf_win_pool),
+        "wolf_guess_slots": int(definition.wolf_guess_slots),
+        "final_day_threshold": int(definition.final_day_threshold),
+    }
+    resolved = {
+        "village_win_pool": defaults["village_win_pool"]
+        if village_win_pool is None else village_win_pool,
+        "wolf_win_pool": defaults["wolf_win_pool"]
+        if wolf_win_pool is None else wolf_win_pool,
+        "wolf_guess_slots": defaults["wolf_guess_slots"]
+        if wolf_guess_slots is None else wolf_guess_slots,
+        "final_day_threshold": defaults["final_day_threshold"]
+        if final_day_threshold is None else final_day_threshold,
+    }
+    for key, value in resolved.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"{key} must be a positive integer")
+    return resolved
 
 
 @dataclass(frozen=True)
@@ -135,18 +213,25 @@ def calculate_game_results(
     player_data: list[dict],
     *,
     winner_team: Team | str,
+    variant_id: str = DEFAULT_VARIANT_ID,
+    village_win_pool: int | None = None,
+    wolf_win_pool: int | None = None,
 ) -> list[dict]:
     """
-    6:4 環境を前提にした固定プール方式。
+    変種定義ごとの固定プール方式。
 
-    狼勝ち:
-      本体 +120 / -120 を勝敗人数で配分し、勝者へ参加ボーナス
-    村勝ち:
-      本体 +180 / -180 を勝敗人数で配分し、勝者へ参加ボーナス
+    既定の13人クロストークでは、狼勝ち120・村勝ち180の本体を
+    勝敗人数で配分し、勝者へ参加ボーナスを加える。別変種はconfigの
+    プール値を使い、いずれも本体部分のゼロサム性を保つ。
 
     player_data に "rank_name" (試合時表示ランク) があれば、陣営ごとの
     卓帯の中央値差から係数 (0.8〜1.2) をプールへ掛ける。無ければ等倍。
     """
+    parameters = resolve_variant_rating_parameters(
+        variant_id,
+        village_win_pool=village_win_pool,
+        wolf_win_pool=wolf_win_pool,
+    )
     winners = [p for p in player_data if p["won"]]
     losers = [p for p in player_data if not p["won"]]
 
@@ -165,10 +250,10 @@ def calculate_game_results(
     winner_value = winner_team.value if isinstance(winner_team, Team) else str(winner_team)
     if winner_value == Team.WOLF.value or winner_value == Team.WOLF.name:
         wolf_won = True
-        pool = WOLF_WIN_FIXED_POOL
+        pool = parameters["wolf_win_pool"]
     elif winner_value == Team.VILLAGE.value or winner_value == Team.VILLAGE.name:
         wolf_won = False
-        pool = VILLAGE_WIN_FIXED_POOL
+        pool = parameters["village_win_pool"]
     else:
         raise ValueError(f"unknown winner_team: {winner_team}")
 
@@ -238,6 +323,8 @@ def _index_records(player_records: list[dict]) -> dict[int, dict]:
 def count_wolf_guess_hits(
     player_records: list[dict],
     facts: dict | None,
+    *,
+    wolf_guess_slots: int = BONUS_WOLF_GUESS_SLOTS,
 ) -> dict[int, int]:
     """3狼提出の的中数を player_id -> 的中数 で返す。
 
@@ -245,6 +332,8 @@ def count_wolf_guess_hits(
     ボーナス計算と「3狼予想の的中率」の両方から使うので、
     誰の提出を有効とみなすかの判定はここへ集約する。
     """
+    if isinstance(wolf_guess_slots, bool) or not isinstance(wolf_guess_slots, int) or wolf_guess_slots <= 0:
+        raise ValueError("wolf_guess_slots must be a positive integer")
     by_id = _index_records(player_records)
     facts = facts or {}
     wolf_ids = {
@@ -265,13 +354,16 @@ def count_wolf_guess_hits(
             value for value in (_as_int(v) for v in (raw_guess or []))
             if value is not None
         }
-        hits[guesser_id] = min(len(guessed & wolf_ids), BONUS_WOLF_GUESS_SLOTS)
+        hits[guesser_id] = min(len(guessed & wolf_ids), wolf_guess_slots)
     return hits
 
 
 def calculate_play_bonuses(
     player_records: list[dict],
     facts: dict | None,
+    *,
+    wolf_guess_slots: int = BONUS_WOLF_GUESS_SLOTS,
+    final_day_threshold: int = BONUS_FINAL_DAY_THRESHOLD,
 ) -> dict[int, int]:
     """
     1試合ぶんのプレイボーナスを player_id -> 合計点 で返す。
@@ -286,6 +378,12 @@ def calculate_play_bonuses(
 
     本体プールと違い**非ゼロサム**なので、必ず別枠で加算し履歴にも分けて残す。
     """
+    if (
+        isinstance(final_day_threshold, bool)
+        or not isinstance(final_day_threshold, int)
+        or final_day_threshold <= 0
+    ):
+        raise ValueError("final_day_threshold must be a positive integer")
     bonuses: dict[int, int] = {}
     by_id = _index_records(player_records)
     if not by_id:
@@ -316,12 +414,14 @@ def calculate_play_bonuses(
             add(voter_id, BONUS_WOLF_EXECUTION_VOTE)
 
     # 6回目の議論へ到達した試合の人狼
-    if (_as_int(facts.get("days")) or 0) >= BONUS_FINAL_DAY_THRESHOLD:
+    if (_as_int(facts.get("days")) or 0) >= final_day_threshold:
         for wolf_id in wolf_ids:
             add(wolf_id, BONUS_FINAL_DAY_WOLF)
 
     # 3狼提出 (村陣営限定)。情報が少ない初日・2日目の死亡ほど倍率が高い
-    for guesser_id, hits in count_wolf_guess_hits(player_records, facts).items():
+    for guesser_id, hits in count_wolf_guess_hits(
+        player_records, facts, wolf_guess_slots=wolf_guess_slots,
+    ).items():
         if not hits:
             continue
         points = hits * BONUS_WOLF_GUESS_HIT
@@ -370,7 +470,11 @@ def _largest_remainder_counts(total: int, percentages: dict[str, float]) -> dict
     return counts
 
 
-def build_rank_context_map(player_rows: list[dict]) -> dict[int, RankContext]:
+def build_rank_context_map(
+    player_rows: list[dict],
+    *,
+    grandmaster_slots: int = GRANDMASTER_SLOTS,
+) -> dict[int, RankContext]:
     """
     レート順の相対ランクを返す。
 
@@ -385,6 +489,12 @@ def build_rank_context_map(player_rows: list[dict]) -> dict[int, RankContext]:
     player_rows:
       [{"player_id", "rating", "games", "season_games", "season_wins"}]
     """
+    if (
+        isinstance(grandmaster_slots, bool)
+        or not isinstance(grandmaster_slots, int)
+        or grandmaster_slots <= 0
+    ):
+        raise ValueError("grandmaster_slots must be a positive integer")
     contexts: dict[int, RankContext] = {}
     active_rows = [
         row for row in player_rows
@@ -398,12 +508,14 @@ def build_rank_context_map(player_rows: list[dict]) -> dict[int, RankContext]:
     if active_rows:
         base_counts = _largest_remainder_counts(active_count, SEASON_RANK_PERCENTAGES)
         master_zone = base_counts["マスター"]
-        gm_target = math.ceil(active_count * GRANDMASTER_PERCENTAGE)
-        gm_count = min(GRANDMASTER_SLOTS, master_zone, gm_target)
-        master_count = max(master_zone - gm_count, 0)
+        # 「GM」はこのコードベースではゲームマスターを指すため、
+        # グランドマスターの変数は略さない (database.gm_counts はGM=ゲームマスター)
+        grandmaster_target = math.ceil(active_count * GRANDMASTER_PERCENTAGE)
+        grandmaster_count = min(grandmaster_slots, master_zone, grandmaster_target)
+        master_count = max(master_zone - grandmaster_count, 0)
 
         segments = [
-            ("グランドマスター", gm_count),
+            ("グランドマスター", grandmaster_count),
             ("マスター", master_count),
             ("ダイヤ", base_counts["ダイヤ"]),
             ("エメラルド", base_counts["エメラルド"]),
@@ -459,7 +571,7 @@ def build_rank_context_map(player_rows: list[dict]) -> dict[int, RankContext]:
         )
         for rank_name, upper in segment_bounds:
             if virtual_position <= upper:
-                # グランドマスターはアクティブ上位5%相当・最大13人の専有枠。
+                # グランドマスターはアクティブ上位5%相当・ラダー別上限の専有枠。
                 # 暫定表示がGMを名乗れないようマスター止まりにする
                 return "マスター" if rank_name == "グランドマスター" else rank_name
         return segment_bounds[-1][0] if segment_bounds else "ブロンズ"
@@ -510,10 +622,23 @@ def get_rank_role_name(rank_name: str) -> str:
 
 
 def all_rank_role_names() -> list[str]:
-    return [get_rank_role_name(name) for name, _, _ in RANK_SPECS]
+    names = [get_rank_role_name(name) for name, _, _ in RANK_SPECS]
+    for ladder_id in config_lib.LADDER_DEFINITIONS:
+        role_name = special_grandmaster_role_name(str(ladder_id))
+        if role_name not in names:
+            names.append(role_name)
+    return names
 
 
 def all_rank_role_specs() -> list[tuple[str, int]]:
-    return [(get_rank_role_name(name), get_rank_color_by_name(name)) for name, _, _ in RANK_SPECS]
-
-
+    specs = [
+        (get_rank_role_name(name), get_rank_color_by_name(name))
+        for name, _, _ in RANK_SPECS
+    ]
+    known_names = {name for name, _color in specs}
+    for ladder_id in config_lib.LADDER_DEFINITIONS:
+        role_name = special_grandmaster_role_name(str(ladder_id))
+        if role_name not in known_names:
+            specs.append((role_name, _special_grandmaster_role_color(str(ladder_id))))
+            known_names.add(role_name)
+    return specs

@@ -19,6 +19,8 @@ from config import (
     MAYOR_INFO_CATEGORY_NAME, MAYOR_INFO_ADMIN_ONLY,
     PRIVATE_ROOM_CREATOR_ROLE_NAME,
     BULK_DISCORD_API_INTERVAL,
+    DEFAULT_LADDER_ID, LADDER_DEFINITIONS,
+    ACTIVE_ROOM_DEFINITIONS,
     ROOM_DEFINITIONS, RATED_ROOM_NAMES, RoomDefinition,
 )
 from permissions import RoomPermissionMixin, RoomVisibilityError
@@ -80,7 +82,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         self.sound_player = sounds.SoundPlayer()
         self.rooms: dict[str, RoomRunner] = {
             room.room_id: RoomRunner(bot, self, room)
-            for room in ROOM_DEFINITIONS
+            for room in ACTIVE_ROOM_DEFINITIONS
         }
         self.recruitment_manager = RecruitmentManager(bot, self)
 
@@ -149,6 +151,91 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             guild is not None
             and self.managed_guild_id is not None
             and guild.id == self.managed_guild_id
+        )
+
+    @staticmethod
+    def _disabled_fixed_room_snapshot_conflicts(
+        snapshots: dict[str, dict],
+        quarantined_room_ids: set[str],
+    ) -> dict[str, set[str]]:
+        """無効固定卓に復旧が必要な状態が残っていないか判定する。
+
+        無効卓はRunnerを作らないため、空のLOBBY/GAME_OVER以外を見落とすと
+        復元・ミュート回収・募集移行を失う。隔離snapshotも手掛かりを失わない
+        よう常に停止理由にする。
+        """
+        disabled_room_ids = {
+            room.room_id
+            for room in ROOM_DEFINITIONS
+            if not room.enabled and room.private_owner_id is None
+        }
+        conflicts: dict[str, set[str]] = {}
+        for room_id in disabled_room_ids & set(quarantined_room_ids):
+            conflicts.setdefault(room_id, set()).add("隔離snapshot")
+        for room_id in disabled_room_ids:
+            payload = snapshots.get(room_id)
+            if payload is None:
+                continue
+            phase = payload.get("phase")
+            reasons: set[str] = set()
+            if phase not in (Phase.LOBBY.name, Phase.GAME_OVER.name):
+                reasons.add(f"進行中snapshot ({phase})")
+            if payload.get("players"):
+                reasons.add("参加者を含むsnapshot")
+            if payload.get("gm_id") is not None:
+                reasons.add("GMを含むsnapshot")
+            if payload.get("recruitment_id") is not None:
+                reasons.add("募集紐付きsnapshot")
+            # 一度有効化した卓は、ロビー状態でもBot所有のカテゴリ・受付・VCの
+            # IDをsnapshotへ残す。Runnerを外すだけではそのDiscord資源を
+            # 非公開化できず、空の見える卓が残るため、完全未公開へ切り替える
+            # 場合は手動で安全に回収するまで起動を止める。
+            channel_ids = payload.get("channel_ids")
+            if isinstance(channel_ids, dict) and any(
+                channel_ids.get(name) is not None
+                for name in ("category", "lobby", "voice", "village", "spirit")
+            ):
+                reasons.add("Bot所有Discordチャンネルを含むsnapshot")
+            if reasons:
+                conflicts.setdefault(room_id, set()).update(reasons)
+        return conflicts
+
+    async def _assert_disabled_fixed_rooms_safe_to_skip(
+        self,
+        guild_id: int,
+        snapshots: dict[str, dict],
+        quarantined_room_ids: set[str],
+    ) -> None:
+        """Discordへの副作用より先に、無効卓を安全にスキップできるか確認する。"""
+        conflicts = self._disabled_fixed_room_snapshot_conflicts(
+            snapshots,
+            quarantined_room_ids,
+        )
+        disabled_room_ids = {
+            room.room_id
+            for room in ROOM_DEFINITIONS
+            if not room.enabled and room.private_owner_id is None
+        }
+        active_recruitments = await database.list_active_recruitments_for_room_ids(
+            guild_id,
+            disabled_room_ids,
+        )
+        for recruitment in active_recruitments:
+            room_id = str(recruitment["room_id"])
+            conflicts.setdefault(room_id, set()).add(
+                f"未終了募集 #{recruitment['id']} ({recruitment['status']})"
+            )
+        if not conflicts:
+            return
+        detail = " | ".join(
+            f"{room_id}: {', '.join(sorted(reasons))}"
+            for room_id, reasons in sorted(conflicts.items())
+        )
+        raise RuntimeError(
+            "無効固定卓に復旧が必要な状態が残っているため起動を停止しました。"
+            "卓を一時的に有効化して復旧・募集終了を行うか、Bot所有のカテゴリ/受付/VCを"
+            "手動で回収し、空のLOBBY/GAME_OVER snapshotだけにしてから再起動してください: "
+            f"{detail}"
         )
 
     # ============================================================
@@ -894,22 +981,50 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         進行中ゲームのニックネーム変更等を遅らせないために使う。
         """
         roles_map = await self._ensure_rank_roles(guild)
-        all_rows = await database.get_all_player_ratings(guild.id)
-        # get_current_rank_map は内部で get_all_player_ratings を呼び直すため、
-        # 取得済みの all_rows から直接ランクを組み立てて全件読み出しの重複を避ける
-        rank_map = rating_lib.build_rank_context_map(all_rows)
+        # 同じplayer_idが2ラダーに存在するため、単一dictへ混ぜない。各ラダーの
+        # 母集団で独立にランクを確定してから、プレイヤー単位へ合流する。
+        rows_by_ladder = {
+            ladder_id: await database.get_all_player_ratings(
+                guild.id, ladder_id=ladder_id,
+            )
+            for ladder_id in LADDER_DEFINITIONS
+        }
+        rank_maps = {
+            ladder_id: rating_lib.build_rank_context_map(
+                rows,
+                grandmaster_slots=definition.grandmaster_slots,
+            )
+            for ladder_id, definition in LADDER_DEFINITIONS.items()
+            for rows in (rows_by_ladder[ladder_id],)
+        }
+        player_ids = {
+            int(row["player_id"])
+            for rows in rows_by_ladder.values()
+            for row in rows
+        }
         synced = 0
         skipped = 0
         failed = 0
 
-        for row in all_rows:
-            member = guild.get_member(row["player_id"])
-            rank_ctx = rank_map.get(row["player_id"])
-            if member is None or rank_ctx is None:
+        for player_id in sorted(player_ids):
+            member = guild.get_member(player_id)
+            rank_names = {
+                ladder_id: (
+                    context.rank_name
+                    if (context := rank_map.get(player_id)) is not None
+                    else None
+                )
+                for ladder_id, rank_map in rank_maps.items()
+            }
+            if member is None:
                 skipped += 1
                 continue
             try:
-                outcome = await self._sync_rank_role(member, rank_ctx.rank_name, roles_map=roles_map)
+                outcome = await self._sync_rank_role(
+                    member,
+                    roles_map=roles_map,
+                    rank_names_by_ladder=rank_names,
+                )
                 if outcome == "updated":
                     synced += 1
                 elif outcome == "skipped":
@@ -1032,6 +1147,20 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             self.managed_guild_id = guild.id
         if not self._is_managed_guild(guild):
             raise RuntimeError(f"管理対象外サーバーのセットアップを拒否しました: {guild.id}")
+
+        # 無効固定卓にはRunnerを作らない。Discordへチャンネル作成・ロール更新・
+        # DM送信等を行う前に、復旧すべき状態を取り残さないことをDBだけで確認する。
+        # load_room_states は壊れた行を隔離する場合があるが、Discord副作用は持たない。
+        snapshots = await database.load_room_states(guild.id)
+        quarantined_room_ids = await database.load_unresolved_room_state_quarantine_ids(
+            guild.id
+        )
+        await self._assert_disabled_fixed_rooms_safe_to_skip(
+            guild.id,
+            snapshots,
+            quarantined_room_ids,
+        )
+
         log.info("チャンネルセットアップ開始")
         await self._recover_pending_settlements(guild)
         await self.load_pending_unmutes(guild)
@@ -1039,10 +1168,6 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         log.info("村長ロール未保持の専用村クリーンアップ完了")
         await self._load_private_room_runners(guild)
         log.info("専用村読み込み完了")
-        snapshots = await database.load_room_states(guild.id)
-        quarantined_room_ids = await database.load_unresolved_room_state_quarantine_ids(
-            guild.id
-        )
         self._startup_active_vc_rooms = {
             int(payload.get("channel_ids", {}).get("voice")): room_id
             for room_id, payload in snapshots.items()
@@ -1195,27 +1320,71 @@ class GameCog(RoomPermissionMixin, commands.Cog):
     async def _ensure_rank_roles(self, guild: discord.Guild) -> dict[str, discord.Role]:
         existing = {r.name: r for r in guild.roles}
         result: dict[str, discord.Role] = {}
+        gm_role_names = {
+            rating_lib.special_grandmaster_role_name(ladder_id)
+            for ladder_id in LADDER_DEFINITIONS
+        }
         for role_name, color_int in rating_lib.all_rank_role_specs():
             role = existing.get(role_name)
+            hoist = role_name in gm_role_names
             if role is None:
                 try:
                     role = await self.paced_discord_api_call(
                         guild.create_role,
                         name=role_name,
                         color=discord.Color(color_int),
+                        hoist=hoist,
                         reason="人狼ランク自動作成",
                     )
                 except (discord.Forbidden, discord.HTTPException) as e:
                     log.warning(f"ロール作成失敗 ({role_name}): {e}")
                     continue
+            # 既存の通常ランクロールを管理者がhoistしていても戻さない。
+            # 今回Botが保証するのは、2つのグランドマスターロールを
+            # hoistすることだけで、ほかの手動レイアウトには触れない。
+            elif hoist and not bool(getattr(role, "hoist", False)):
+                try:
+                    role = await self.paced_discord_api_call(
+                        role.edit,
+                        hoist=hoist,
+                        reason="人狼GMロール表示設定",
+                    )
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    log.warning(f"ロール表示設定失敗 ({role_name}): {e}")
             result[role_name] = role
+
+        # 両方保持者はDiscordの仕様上1欄だけに出る。13人村GMを上位に置き、
+        # 一覧では13人村側へ、プロフィールでは両ロールを確認できるようにする。
+        l13_role = result.get(rating_lib.special_grandmaster_role_name("l13"))
+        l9_role = result.get(rating_lib.special_grandmaster_role_name("l9"))
+        if (
+            l13_role is not None
+            and l9_role is not None
+            and isinstance(getattr(l13_role, "position", None), int)
+            and isinstance(getattr(l9_role, "position", None), int)
+            and l13_role.position <= l9_role.position
+            and callable(getattr(l13_role, "edit", None))
+        ):
+            try:
+                moved = await self.paced_discord_api_call(
+                    l13_role.edit,
+                    position=l9_role.position,
+                    reason="13人村GMを9人村GMより上位に配置",
+                )
+                if moved is not None:
+                    result[l13_role.name] = moved
+            except (discord.Forbidden, discord.HTTPException) as e:
+                log.warning(f"GMロール順序更新失敗: {e}")
         return result
 
     async def _sync_rank_role(
         self,
         member: discord.Member,
-        rank_name: str,
+        rank_name: Optional[str] = None,
         roles_map: Optional[dict[str, discord.Role]] = None,
+        *,
+        ladder_id: str = DEFAULT_LADDER_ID,
+        rank_names_by_ladder: Optional[dict[str, Optional[str]]] = None,
     ) -> str:
         # ゲーム進行中のメンバーはロールを触らない。
         # 制限卓の表示権限はランクロールで制御されているため、別卓の終了に
@@ -1231,17 +1400,64 @@ class GameCog(RoomPermissionMixin, commands.Cog):
 
         guild = member.guild
         all_role_names = set(rating_lib.all_rank_role_names())
-        target_role_name = rating_lib.get_rank_role_name(rank_name)
+        if ladder_id not in LADDER_DEFINITIONS:
+            raise ValueError(f"unknown ladder_id: {ladder_id}")
+
+        if rank_names_by_ladder is None:
+            rank_names: dict[str, Optional[str]] = {}
+            if rank_name is not None:
+                rank_names[ladder_id] = rank_name
+            # 片方の試合終了でも、もう片方のGMロールを消さず1PATCHへ合流する。
+            # 取得不能時に既存ロールを推測で剥がすのは危険なので更新自体を止める。
+            for other_ladder_id in LADDER_DEFINITIONS:
+                if other_ladder_id in rank_names:
+                    continue
+                try:
+                    info = await database.get_player_current_rank_info(
+                        member.id,
+                        guild.id,
+                        ladder_id=other_ladder_id,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "別ラダー取得失敗のためロール同期を保留 (%s/%s): %s",
+                        member.display_name,
+                        other_ladder_id,
+                        e,
+                    )
+                    return "failed"
+                rank_names[other_ladder_id] = (
+                    info["rank_name"] if info is not None else None
+                )
+        else:
+            rank_names = {
+                ladder: rank_names_by_ladder.get(ladder)
+                for ladder in LADDER_DEFINITIONS
+            }
+
+        desired_role_names: set[str] = set()
+        l13_rank = rank_names.get("l13")
+        if l13_rank is not None:
+            desired_role_names.add(rating_lib.get_rank_role_name(l13_rank))
+        if rank_names.get("l9") == "グランドマスター":
+            desired_role_names.add(
+                rating_lib.special_grandmaster_role_name("l9")
+            )
 
         if roles_map is None:
             roles_map = await self._ensure_rank_roles(guild)
-        target_role = roles_map.get(target_role_name)
-        if target_role is None:
+        desired_rank_roles = [
+            roles_map[name]
+            for name in sorted(desired_role_names)
+            if name in roles_map
+        ]
+        if len(desired_rank_roles) != len(desired_role_names):
             return "failed"
 
         current_rank_roles = [r for r in member.roles if r.name in all_role_names]
         current_rank_ids = {r.id for r in current_rank_roles}
-        if current_rank_ids == {target_role.id}:
+        desired_rank_ids = {role.id for role in desired_rank_roles}
+        if current_rank_ids == desired_rank_ids:
             return "updated"
 
         # 目標ランクの付与と旧ランクの剥奪を1回のPATCHへ統合する。
@@ -1251,7 +1467,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             role for role in member_roles_for_edit(member)
             if role.name not in all_role_names
         ]
-        desired_roles.append(target_role)
+        desired_roles.extend(desired_rank_roles)
         try:
             await self.paced_discord_api_call(
                 member.edit, roles=desired_roles, reason="ランク更新"

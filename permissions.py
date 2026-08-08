@@ -26,8 +26,65 @@ class RoomPermissionMixin:
     def _rank_role_by_name(self, guild: discord.Guild) -> dict[str, discord.Role]:
         return {role.name: role for role in guild.roles}
 
+    @staticmethod
+    def _strict_access_role_names(room_def) -> frozenset[str]:
+        """管理権限では迂回できない閲覧ロール名を返す。"""
+        return frozenset(
+            getattr(room_def, "strict_access_role_names", None) or ()
+        )
+
+    def _resolve_strict_access_roles(
+        self,
+        guild: discord.Guild,
+        room_def,
+    ) -> dict[str, discord.Role]:
+        """厳格閲覧ロールを一意に解決する。
+
+        同名ロールを ``dict`` へ畳み込むと、誰に許可したかを設定者が
+        判別できず、ロールの付け替え時に意図しない許可を残しかねない。
+        厳格卓では欠損・重複とも、Discord APIを呼ぶ前に止める。
+        """
+        required = self._strict_access_role_names(room_def)
+        if not required:
+            return {}
+
+        matches_by_name: dict[str, list[discord.Role]] = {
+            name: [] for name in required
+        }
+        for role in guild.roles:
+            if role.name in matches_by_name:
+                matches_by_name[role.name].append(role)
+
+        missing = sorted(
+            name for name, matches in matches_by_name.items() if not matches
+        )
+        duplicated = sorted(
+            name for name, matches in matches_by_name.items()
+            if len(matches) > 1
+        )
+        if missing or duplicated:
+            details: list[str] = []
+            if missing:
+                details.append("見つかりません: " + " / ".join(missing))
+            if duplicated:
+                details.append("同名ロールが複数あります: " + " / ".join(duplicated))
+            raise RoomVisibilityError(
+                f"{room_def.name} の厳格許可ロールを確認できません ("
+                + "; ".join(details)
+                + ")"
+            )
+        return {
+            name: matches[0]
+            for name, matches in matches_by_name.items()
+        }
+
     def _validate_room_access_roles(self, guild: discord.Guild, room_def) -> None:
         """ローカル卓の閲覧ロールをDiscord副作用より前に検証する。"""
+        # strict_access_role_names は、名前の一意性まで安全境界の一部。
+        # ``_build_room_overwrites`` 側でも再検証するが、カテゴリ作成より前に
+        # 明示しておくことで失敗時に何も作らない。
+        self._resolve_strict_access_roles(guild, room_def)
+
         required = frozenset(getattr(room_def, "access_role_names", None) or ())
         if not required:
             return
@@ -148,7 +205,14 @@ class RoomPermissionMixin:
         send_messages: Optional[bool] = None,
     ) -> dict[discord.abc.Snowflake, discord.PermissionOverwrite]:
         private_room = room_def.private_owner_id is not None and room_def.private_role_name is not None
-        admin_only = room_def.room_id in ADMIN_ONLY_ROOM_IDS and not private_room
+        strict_access_role_names = self._strict_access_role_names(room_def)
+        # strict卓はADMIN_ONLYより優先する。管理権限ロールへの明示allowを
+        # 付けず、指定ロールだけを許可するためである。
+        admin_only = (
+            room_def.room_id in ADMIN_ONLY_ROOM_IDS
+            and not private_room
+            and not strict_access_role_names
+        )
         access_role_names = frozenset(
             getattr(room_def, "access_role_names", None) or ()
         )
@@ -157,6 +221,7 @@ class RoomPermissionMixin:
             and not private_room
             and not admin_only
             and not access_role_names
+            and not strict_access_role_names
         )
         default_overwrite = discord.PermissionOverwrite(
             view_channel=public_room,
@@ -185,6 +250,21 @@ class RoomPermissionMixin:
         # Administrator権限保持者とサーバー所有者だけがDiscord側で拒否を
         # バイパスできる。manage_guildだけのロールも閲覧不可にする。
         if admin_only:
+            return overwrites
+
+        if strict_access_role_names:
+            strict_roles = self._resolve_strict_access_roles(guild, room_def)
+            for role in strict_roles.values():
+                overwrite = discord.PermissionOverwrite(
+                    view_channel=True,
+                    read_messages=True,
+                    connect=True,
+                )
+                if send_messages is not None:
+                    overwrite.send_messages = send_messages
+                overwrites[role] = overwrite
+            # access_role_names の通常ルールや manage_guild ロールによる
+            # バイパスは、この卓では一切足さない。
             return overwrites
 
         if access_role_names:
@@ -259,9 +339,11 @@ class RoomPermissionMixin:
         room_def,
     ) -> None:
         overwrites = self._build_room_overwrites(guild, room_def)
+        strict_access_role_names = self._strict_access_role_names(room_def)
         admin_only = (
             room_def.room_id in ADMIN_ONLY_ROOM_IDS
             and room_def.private_owner_id is None
+            and not strict_access_role_names
         )
         restricted = overwrites[guild.default_role].view_channel is False
         managed_rank_role_names = set(rating_lib.all_rank_role_names())
@@ -296,11 +378,15 @@ class RoomPermissionMixin:
             )
 
         # ゲーム中チャンネル (#昼/#霊界) は通常RoomRunnerに任せるが、
-        # 管理者限定カテゴリでは例外なく全子チャンネルを非公開に揃える。
+        # 管理者限定・厳格ロール限定カテゴリでは例外なく同じ閲覧境界に揃える。
         children = [
             ch for ch in [*guild.text_channels, *guild.voice_channels]
             if ch.category and ch.category.id == category.id
-            and (admin_only or ch.name not in (CH_VILLAGE, CH_SPIRIT))
+            and (
+                admin_only
+                or strict_access_role_names
+                or ch.name not in (CH_VILLAGE, CH_SPIRIT)
+            )
         ]
         for ch in children:
             for target, overwrite in overwrites.items():

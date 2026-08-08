@@ -1,7 +1,7 @@
 """Local simulation harness for the werewolf bot.
 
 This runs the real GameCog / View logic with fake Discord objects so we can
-exercise a full 13-player game loop without touching a live server.
+exercise every configured game variant without touching a live server.
 """
 from __future__ import annotations
 
@@ -510,6 +510,8 @@ class FakeBot:
 @dataclass
 class SimulationResult:
     seed: int
+    variant_id: str
+    ladder_id: str
     winner: str
     days: int
     runoffs: int
@@ -521,6 +523,71 @@ class SimulationResult:
     action_totals: dict[str, int]
     rated: bool
     rank_lookup_failed: bool
+
+
+@dataclass(frozen=True)
+class SimulationScenario:
+    """1試合ぶんの再現可能な実行条件。"""
+
+    seed: int
+    variant_id: str
+    force_runoff: bool = False
+    rated: bool = True
+    fail_rank_lookup: bool = False
+
+
+def build_simulation_scenarios(
+    runs: int,
+    variant_ids: Optional[list[str] | tuple[str, ...]] = None,
+) -> list[SimulationScenario]:
+    """全対象変種を最低1戦ずつ含む、決定的な実行順を返す。
+
+    ``runs`` は従来どおり追加の通常戦数。これとは別に、先頭変種の
+    強制再投票・残り変種の最低1戦・非レート1戦を必ず組み込む。
+    """
+    if runs < 0:
+        raise ValueError("runs must be non-negative")
+
+    selected = tuple(variant_ids or tuple(config.VARIANT_DEFINITIONS))
+    if not selected:
+        raise ValueError("at least one variant_id is required")
+    if len(set(selected)) != len(selected):
+        raise ValueError("variant_ids must not contain duplicates")
+    unknown = [
+        variant_id for variant_id in selected
+        if variant_id not in config.VARIANT_DEFINITIONS
+    ]
+    if unknown:
+        raise ValueError(f"unknown variant_id: {', '.join(unknown)}")
+
+    scenarios = [
+        SimulationScenario(
+            seed=0,
+            variant_id=selected[0],
+            force_runoff=True,
+            fail_rank_lookup=True,
+        )
+    ]
+    scenarios.extend(
+        SimulationScenario(seed=index, variant_id=variant_id)
+        for index, variant_id in enumerate(selected[1:], 1)
+    )
+    next_seed = len(selected)
+    scenarios.extend(
+        SimulationScenario(
+            seed=next_seed + offset,
+            variant_id=selected[offset % len(selected)],
+        )
+        for offset in range(runs)
+    )
+    scenarios.append(
+        SimulationScenario(
+            seed=10_000,
+            variant_id=selected[0],
+            rated=False,
+        )
+    )
+    return scenarios
 
 
 class SimulationController:
@@ -622,11 +689,19 @@ class SimulationController:
         return mapping
 
     def _forced_tie_mapping(self, voters: list[int], candidates: list[int]) -> dict[int, int]:
-        if len(candidates) < 3 or len(voters) != 13:
+        if len(candidates) < 3 or len(voters) < 3:
             return self._random_vote_mapping(voters, candidates)
 
         a, b, c = candidates[:3]
-        desired = {a: 5, b: 5, c: 3}
+        quotient, remainder = divmod(len(voters), 3)
+        if remainder == 0:
+            counts = (quotient, quotient, quotient)
+        elif remainder == 1:
+            # 13人なら 5-5-3。最多票を必ず2人以上へ揃える。
+            counts = (quotient + 1, quotient + 1, quotient - 1)
+        else:
+            counts = (quotient + 1, quotient + 1, quotient)
+        desired = dict(zip((a, b, c), counts))
         voter_pool = voters[:]
 
         for _ in range(50):
@@ -872,9 +947,29 @@ def _make_fast_game_methods(cog: Any, controller: "SimulationController") -> Non
             f"missing={sorted(required - ready)}"
         )
 
+    async def fast_turn_segment_countdown(
+        message: Any,
+        speaker: Any,
+        seconds: float,
+        *,
+        allow_interrupt: bool,
+    ) -> tuple[str, float, Any]:
+        """ターン順・ミュート・永続化は実経路のまま、実時間待ちだけ省く。"""
+        del allow_interrupt
+        if message is not None:
+            await message.edit(
+                content=cog._turn_segment_content(
+                    speaker, 0, interrupt=bool(cog.state.turn_interrupt_active),
+                )
+            )
+        await controller.drain()
+        return "timeout", 0.0, message
+
     cog._pausable_sleep = fast_sleep  # type: ignore[assignment]
     cog._pausable_countdown = fast_countdown  # type: ignore[assignment]
     cog._pausable_wait_forever = fast_wait_forever  # type: ignore[assignment]
+    if hasattr(cog, "_turn_segment_countdown"):
+        cog._turn_segment_countdown = fast_turn_segment_countdown  # type: ignore[assignment]
 
 
 async def simulate_one_game(
@@ -882,10 +977,12 @@ async def simulate_one_game(
     seed: int,
     guild_id: int,
     force_runoff: bool,
+    variant_id: str = config.DEFAULT_VARIANT_ID,
     rated: bool = True,
     fail_rank_lookup: bool = False,
 ) -> SimulationResult:
-    player_ids = [20_000 + idx for idx in range(config.MAX_PLAYERS)]
+    variant = config.get_variant_definition(variant_id)
+    player_ids = [20_000 + idx for idx in range(variant.player_count)]
     population_ids = player_ids
     return await simulate_selected_game(
         seed=seed,
@@ -893,6 +990,7 @@ async def simulate_one_game(
         player_ids=player_ids,
         population_ids=population_ids,
         force_runoff=force_runoff,
+        variant_id=variant_id,
         rated=rated,
         fail_rank_lookup=fail_rank_lookup,
     )
@@ -905,13 +1003,18 @@ async def simulate_selected_game(
     player_ids: list[int],
     population_ids: list[int],
     force_runoff: bool,
+    variant_id: str = config.DEFAULT_VARIANT_ID,
     rated: bool = True,
     fail_rank_lookup: bool = False,
 ) -> SimulationResult:
     _assert_sandbox_db()
     rng = Random(seed)
-    if len(player_ids) != config.MAX_PLAYERS:
-        raise ValueError(f"expected {config.MAX_PLAYERS} player_ids, got {len(player_ids)}")
+    variant = config.get_variant_definition(variant_id)
+    if len(player_ids) != variant.player_count:
+        raise ValueError(
+            f"expected {variant.player_count} player_ids for {variant_id}, "
+            f"got {len(player_ids)}"
+        )
 
     # 役職配布などの secrets / random をシード付きに差し替えて再現性を担保する
     original_delete_delay = room_runner_module.CHANNEL_DELETE_DELAY
@@ -924,6 +1027,7 @@ async def simulate_selected_game(
                 population_ids=population_ids,
                 rng=rng,
                 force_runoff=force_runoff,
+                variant_id=variant_id,
                 rated=rated,
                 fail_rank_lookup=fail_rank_lookup,
             )
@@ -939,11 +1043,17 @@ async def _simulate_selected_game_inner(
     population_ids: list[int],
     rng: Random,
     force_runoff: bool,
+    variant_id: str,
     rated: bool,
     fail_rank_lookup: bool,
 ) -> SimulationResult:
 
-    guild = FakeGuild(guild_id, f"SimGuild-{seed}", controller=None)  # type: ignore[arg-type]
+    variant = config.get_variant_definition(variant_id)
+    guild = FakeGuild(
+        guild_id,
+        f"SimGuild-{variant_id}-{seed}",
+        controller=None,
+    )  # type: ignore[arg-type]
     gm = FakeMember(guild, 10_000, "GM")
     population_members: dict[int, FakeMember] = {}
     for idx, player_id in enumerate(population_ids, 1):
@@ -963,11 +1073,53 @@ async def _simulate_selected_game_inner(
     # 実サーバー用の1.1秒ペーシングは、外部APIを呼ばないシミュレーションでは省く。
     manager.bulk_api_interval = 0.0
     if rated:
-        cog = manager.rooms["open"]
-    else:
-        room_def = config.RoomDefinition("simulation-unrated", "検証用非レート卓")
+        candidates = [
+            room_def
+            for room_def in config.ROOM_DEFINITIONS
+            if (
+                room_def.variant_id == variant_id
+                and room_def.room_id in config.RATED_ROOM_IDS
+            )
+        ]
+        candidates.sort(
+            key=lambda room_def: (
+                room_def.room_id not in config.PUBLIC_ROOM_IDS,
+                room_def.room_id != "open",
+                room_def.room_id,
+            )
+        )
+        if candidates:
+            room_def = candidates[0]
+        else:
+            # enabled=False の変種も本物のレート精算まで検証する。ライブ用の
+            # RATED_ROOM_IDS は無効卓を含めないため、ここだけ既存のレート卓ID
+            # を借りたシミュレーション専用定義を使う。
+            if "open" not in config.RATED_ROOM_IDS:
+                raise AssertionError("simulation requires an active rated room ID")
+            room_def = config.RoomDefinition(
+                "open",
+                f"検証用-{variant.label}",
+                variant_id=variant_id,
+            )
         cog = room_runner_module.RoomRunner(fake_bot, manager, room_def)
         manager.rooms[room_def.room_id] = cog
+    else:
+        room_def = config.RoomDefinition(
+            "simulation-unrated",
+            "検証用非レート卓",
+            variant_id=variant_id,
+        )
+        cog = room_runner_module.RoomRunner(fake_bot, manager, room_def)
+        manager.rooms[room_def.room_id] = cog
+
+    # 実サーバーでは9人村を「ねいと」ロール限定にする。シミュレーションは
+    # その閲覧境界も通したうえでゲーム本体を検証するため、必要なロールを
+    # 参加者とGMへ明示的に付与する。
+    for role_name in sorted(cog.room_def.strict_access_role_names or ()):
+        access_role = FakeRole(role_name)
+        guild.roles.append(access_role)
+        for member in [gm, *players]:
+            member.roles.append(access_role)
     controller = SimulationController(cog, guild, players, gm, rng, force_runoff=force_runoff)
     guild.controller = controller
     guild.me.controller = controller
@@ -1111,14 +1263,20 @@ async def _simulate_selected_game_inner(
         for player in players for call in player.edit_calls
     ), "開始PATCHにnick/mute/rolesが揃っていません"
     role_counts = Counter(player.role.value for player in active_state.players.values())
-    expected_counts = {role.value: count for role, count in config.ROLE_DISTRIBUTION.items()}
+    expected_counts = {
+        role.value: count for role, count in variant.role_distribution.items()
+    }
     assert dict(role_counts) == expected_counts, (role_counts, expected_counts)
     assert all(player.sent_messages for player in players), "some player did not receive any DM"
 
     game_task = active_state.game_task
     original_rank_lookup = database.get_current_rank_map
     if fail_rank_lookup:
-        async def failed_rank_lookup(_guild_id: int):
+        async def failed_rank_lookup(
+            _guild_id: int,
+            ladder_id: str = config.DEFAULT_LADDER_ID,
+        ):
+            del ladder_id
             raise RuntimeError("simulated rank lookup failure")
         database.get_current_rank_map = failed_rank_lookup
     try:
@@ -1148,6 +1306,8 @@ async def _simulate_selected_game_inner(
 
     return SimulationResult(
         seed=seed,
+        variant_id=variant_id,
+        ladder_id=variant.ladder_id,
         winner=result_meta["winner"],
         days=result_meta["days"],
         runoffs=result_meta["runoffs"],
@@ -1261,13 +1421,20 @@ async def sandbox_db(prefix: str = "werewolf-sim-"):
         temp_dir.cleanup()
 
 
-async def run_simulations(runs: int) -> None:
+async def run_simulations(
+    runs: int,
+    variant_ids: Optional[list[str] | tuple[str, ...]] = None,
+) -> None:
     # CLI経路も必ず共通ガードを通し、本番DBを指したまま下位処理へ入れない。
     async with sandbox_db(prefix="werewolf-cli-guard-"):
-        await _run_simulations_with_private_temp(runs)
+        await _run_simulations_with_private_temp(runs, variant_ids=variant_ids)
 
 
-async def _run_simulations_with_private_temp(runs: int) -> None:
+async def _run_simulations_with_private_temp(
+    runs: int,
+    *,
+    variant_ids: Optional[list[str] | tuple[str, ...]] = None,
+) -> None:
     temp_dir = tempfile.TemporaryDirectory(prefix="werewolf-sim-")
     tmp_dir = Path(temp_dir.name)
     original_db_path = database.DB_PATH
@@ -1275,36 +1442,46 @@ async def _run_simulations_with_private_temp(runs: int) -> None:
     await database.init_db()
 
     try:
+        scenarios = build_simulation_scenarios(runs, variant_ids)
+        results = [
+            await simulate_one_game(
+                seed=scenario.seed,
+                guild_id=777,
+                force_runoff=scenario.force_runoff,
+                variant_id=scenario.variant_id,
+                rated=scenario.rated,
+                fail_rank_lookup=scenario.fail_rank_lookup,
+            )
+            for scenario in scenarios
+        ]
         # 最初の試合ではランク取得を意図的に壊す。勝敗精算とゲーム終了は
         # 成功し、ランク列だけNULLになることを実ゲームループで確認する。
-        forced = await simulate_one_game(
-            seed=0, guild_id=777, force_runoff=True, fail_rank_lookup=True,
-        )
-        results = [forced]
-        for seed in range(1, runs + 1):
-            results.append(await simulate_one_game(seed=seed, guild_id=777, force_runoff=False))
-        # is_rated_room=Falseの完全なゲームも1戦流し、ランクが付かないことを確認する。
-        results.append(await simulate_one_game(
-            seed=10_000, guild_id=777, force_runoff=False, rated=False,
-        ))
+        forced = results[0]
 
         total_games = len(results)
         winner_counts = Counter(result.winner for result in results)
+        variant_counts = Counter(result.variant_id for result in results)
         total_runoffs = sum(result.runoffs for result in results)
         avg_days = sum(result.days for result in results) / total_games
 
         rows = await _read_game_count()
         assert rows == total_games, (rows, total_games)
         assert forced.runoffs >= 1, "forced runoff scenario did not reach runoff path"
+        expected_variants = set(variant_ids or config.VARIANT_DEFINITIONS)
+        assert expected_variants <= set(variant_counts), (
+            expected_variants, variant_counts,
+        )
         await _verify_recorded_game_stats(results)
 
         print(f"simulations: {total_games}")
         print(f"db_games: {rows}")
+        print(f"variants: {dict(variant_counts)}")
         print(f"winners: {dict(winner_counts)}")
         print(f"total_runoffs: {total_runoffs}")
         print(f"average_days: {avg_days:.2f}")
         print("forced_runoff: OK")
         print("recorded_game_stats: OK")
+        print("elo_delta_zero_sum: OK")
         print("rank_lookup_failure: OK")
         print("non_rated_rank_null: OK")
         print("simulation_status: OK")
@@ -1321,10 +1498,12 @@ async def _read_game_count() -> int:
 
 async def _verify_recorded_game_stats(results: list[SimulationResult]) -> None:
     """実ゲームループの既知状態と、精算後DBを独立に突き合わせる。"""
+    seen_rated_ladders: set[str] = set()
     async with database.connect_db() as db:
         for result in results:
             game_rows = await db.execute_fetchall(
-                "SELECT g.game_id, g.gm_id, gs.days, gs.peaceful_mornings, "
+                "SELECT g.game_id, g.gm_id, g.variant_id, g.ladder_id, "
+                "gs.days, gs.peaceful_mornings, "
                 "gs.guard_successes, gs.guard_checks, gs.seer_checks, gs.seer_wolf_hits, "
                 "gs.executions_total, gs.executions_wolf, gs.wolf_alive_by_day, "
                 "gs.rank_bucket FROM games g JOIN game_stats gs ON gs.game_id = g.game_id "
@@ -1333,11 +1512,18 @@ async def _verify_recorded_game_stats(results: list[SimulationResult]) -> None:
             )
             assert len(game_rows) == 1, (result.game_run_id, game_rows)
             (
-                game_id, gm_id, days, peaceful, guard_successes, guard_checks,
+                game_id, gm_id, variant_id, ladder_id, days, peaceful,
+                guard_successes, guard_checks,
                 seer_checks, seer_hits, executions_total, executions_wolf,
                 wolf_json, rank_bucket,
             ) = game_rows[0]
             assert gm_id == 10_000, (gm_id, result.game_run_id)
+            assert variant_id == result.variant_id, (
+                variant_id, result.variant_id, result.game_run_id,
+            )
+            assert ladder_id == result.ladder_id, (
+                ladder_id, result.ladder_id, result.game_run_id,
+            )
             assert days == result.days, (days, result.days, result.game_run_id)
             assert peaceful == result.action_totals["peaceful_mornings"]
             assert guard_successes == result.action_totals["guard_successes"]
@@ -1358,6 +1544,9 @@ async def _verify_recorded_game_stats(results: list[SimulationResult]) -> None:
                 "WHERE game_id = ? ORDER BY player_id",
                 (game_id,),
             )
+            assert len(player_rows) == len(result.player_ids), (
+                len(player_rows), len(result.player_ids), result.game_run_id,
+            )
             stored_survivors = {
                 int(player_id) for player_id, died_on_day, _rank in player_rows
                 if died_on_day is None
@@ -1367,8 +1556,15 @@ async def _verify_recorded_game_stats(results: list[SimulationResult]) -> None:
             )
 
             rank_names = [rank for _pid, _day, rank in player_rows if rank is not None]
-            if result.rated and not result.rank_lookup_failed:
-                assert len(rank_names) == len(result.player_ids), rank_names
+            expect_rank_names = (
+                result.rated
+                and not result.rank_lookup_failed
+                and result.ladder_id in seen_rated_ladders
+            )
+            if expect_rank_names:
+                assert len(rank_names) == len(result.player_ids), (
+                    result.variant_id, result.game_run_id, rank_names,
+                )
                 ordered = sorted(rank_names, key=rating_lib.rank_order_value)
                 expected_bucket = ordered[(len(ordered) - 1) // 2]
                 assert rank_bucket == expected_bucket, (rank_bucket, expected_bucket)
@@ -1376,14 +1572,40 @@ async def _verify_recorded_game_stats(results: list[SimulationResult]) -> None:
                 assert not rank_names, rank_names
                 assert rank_bucket is None, rank_bucket
 
+            rating_rows = await db.execute_fetchall(
+                "SELECT variant_id, ladder_id, elo_delta FROM rating_history "
+                "WHERE game_id = ? ORDER BY id",
+                (game_id,),
+            )
+            if result.rated:
+                assert len(rating_rows) == len(result.player_ids), (
+                    len(rating_rows), len(result.player_ids), result.game_run_id,
+                )
+                assert {str(row[0]) for row in rating_rows} == {result.variant_id}
+                assert {str(row[1]) for row in rating_rows} == {result.ladder_id}
+                # 勝利参加・プレイ・推薦ボーナスを含む総deltaは非ゼロサム。
+                # 固定プール本体のelo_deltaだけが必ず卓内で0になる。
+                assert sum(int(row[2]) for row in rating_rows) == 0, (
+                    result.game_run_id, rating_rows,
+                )
+            else:
+                assert not rating_rows, (result.game_run_id, rating_rows)
+            if result.rated:
+                seen_rated_ladders.add(result.ladder_id)
+
 
 def _select_balanced_players(
     *,
     rng: Random,
     player_ids: list[int],
     games_played: dict[int, int],
+    player_count: int = config.MAX_PLAYERS,
 ) -> list[int]:
-    remaining = config.MAX_PLAYERS
+    if player_count <= 0:
+        raise ValueError("player_count must be positive")
+    if len(player_ids) < player_count:
+        raise ValueError("not enough player_ids for player_count")
+    remaining = player_count
     selected: list[int] = []
     current_level = min(games_played.values())
 
@@ -1400,12 +1622,16 @@ def _select_balanced_players(
     return selected
 
 
-async def _read_population_ratings(guild_id: int) -> list[dict[str, int]]:
+async def _read_population_ratings(
+    guild_id: int,
+    ladder_id: str = config.DEFAULT_LADDER_ID,
+) -> list[dict[str, int]]:
     async with database.aiosqlite.connect(database.DB_PATH) as db:
         rows = await db.execute_fetchall(
             "SELECT player_id, rating, peak_rating, games, wins "
-            "FROM player_ratings WHERE guild_id = ? ORDER BY rating DESC",
-            (guild_id,),
+            "FROM player_ratings WHERE guild_id = ? AND ladder_id = ? "
+            "ORDER BY rating DESC",
+            (guild_id, ladder_id),
         )
     return [
         {
@@ -1458,6 +1684,7 @@ def build_fixed_pool_calculator(
         player_data: list[dict[str, int | bool]],
         *,
         winner_team: config.Team | str,
+        **_rating_context: Any,
     ) -> list[dict[str, int]]:
         winners = [p for p in player_data if p["won"]]
         losers = [p for p in player_data if not p["won"]]
@@ -1524,6 +1751,7 @@ async def run_population_simulation(
     population_size: int,
     min_games: int,
     seed: int,
+    variant_id: str = config.DEFAULT_VARIANT_ID,
     rating_label: str = "default",
     calculator: Optional[Callable[..., list[dict[str, int]]]] = None,
 ) -> None:
@@ -1533,6 +1761,7 @@ async def run_population_simulation(
             population_size=population_size,
             min_games=min_games,
             seed=seed,
+            variant_id=variant_id,
             rating_label=rating_label,
             calculator=calculator,
         )
@@ -1543,11 +1772,16 @@ async def _run_population_simulation_with_private_temp(
     population_size: int,
     min_games: int,
     seed: int,
+    variant_id: str = config.DEFAULT_VARIANT_ID,
     rating_label: str = "default",
     calculator: Optional[Callable[..., list[dict[str, int]]]] = None,
 ) -> None:
-    if population_size < config.MAX_PLAYERS:
-        raise ValueError("population_size must be at least MAX_PLAYERS")
+    variant = config.get_variant_definition(variant_id)
+    if population_size < variant.player_count:
+        raise ValueError(
+            f"population_size must be at least {variant.player_count} "
+            f"for {variant_id}"
+        )
 
     temp_dir = tempfile.TemporaryDirectory(prefix="werewolf-pop-")
     tmp_dir = Path(temp_dir.name)
@@ -1569,6 +1803,7 @@ async def _run_population_simulation_with_private_temp(
                     rng=rng,
                     player_ids=player_ids,
                     games_played=games_played,
+                    player_count=variant.player_count,
                 )
                 result = await simulate_selected_game(
                     seed=game_seed,
@@ -1576,17 +1811,20 @@ async def _run_population_simulation_with_private_temp(
                     player_ids=selected,
                     population_ids=player_ids,
                     force_runoff=(game_seed == seed),
+                    variant_id=variant_id,
                 )
                 results.append(result)
                 for player_id in selected:
                     games_played[player_id] += 1
                 game_seed += 1
 
-            ratings = await _read_population_ratings(guild_id)
+            ratings = await _read_population_ratings(guild_id, variant.ladder_id)
             if len(ratings) != population_size:
                 raise AssertionError(f"expected {population_size} ratings, got {len(ratings)}")
 
-            rank_map = await database.get_current_rank_map(guild_id)
+            rank_map = await database.get_current_rank_map(
+                guild_id, variant.ladder_id,
+            )
             rank_counts = Counter(rank_map[row["player_id"]].rank_name for row in ratings)
             winner_counts = Counter(result.winner for result in results)
             total_games = len(results)
@@ -1597,6 +1835,8 @@ async def _run_population_simulation_with_private_temp(
             avg_rating = sum(row["rating"] for row in ratings) / len(ratings)
 
             print(f"rating_system: {rating_label}")
+            print(f"variant: {variant_id}")
+            print(f"ladder: {variant.ladder_id}")
             print(f"population_size: {population_size}")
             print(f"target_min_games: {min_games}")
             print(f"simulated_games: {total_games}")
@@ -1647,7 +1887,16 @@ def main() -> None:
         "--mode",
         choices=("single", "population"),
         default="single",
-        help="single: standalone 13-player games, population: persistent player pool",
+        help="single: standalone games, population: persistent player pool",
+    )
+    parser.add_argument(
+        "--variant",
+        choices=("all", *tuple(config.VARIANT_DEFINITIONS)),
+        default="all",
+        help=(
+            "single mode defaults to every variant; population mode uses "
+            f"{config.DEFAULT_VARIANT_ID} when 'all' is selected"
+        ),
     )
     parser.add_argument("--population-size", type=int, default=200, help="population size for population mode")
     parser.add_argument("--min-games", type=int, default=200, help="minimum games per player in population mode")
@@ -1672,13 +1921,24 @@ def main() -> None:
         rating_label = f"fixed-pool:{args.fixed_pool}+bonus:{args.win_bonus}"
 
     if args.mode == "single":
-        asyncio.run(run_simulations(args.runs))
+        variant_ids = (
+            tuple(config.VARIANT_DEFINITIONS)
+            if args.variant == "all"
+            else (args.variant,)
+        )
+        asyncio.run(run_simulations(args.runs, variant_ids=variant_ids))
     else:
+        population_variant = (
+            config.DEFAULT_VARIANT_ID
+            if args.variant == "all"
+            else args.variant
+        )
         asyncio.run(
             run_population_simulation(
                 population_size=args.population_size,
                 min_games=args.min_games,
                 seed=args.seed,
+                variant_id=population_variant,
                 rating_label=rating_label,
                 calculator=calculator,
             )

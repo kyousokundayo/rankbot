@@ -37,21 +37,21 @@ class StatsViewInteractionTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_every_database_button_defers_before_query_and_uses_ephemeral_followup(self):
         cases = (
-            ("stats_self", "database.get_player_stats", None),
-            ("stats_all", "database.get_current_season_leaderboard", []),
-            ("stats_previous", "database.get_latest_season_results", (0, [])),
-            ("stats_recent_games", "database.get_recent_games", []),
-            ("stats_my_history", "database.get_player_recent_games", []),
+            ("stats_self", "views.PlayerStatsVariantView.load_embed"),
+            ("stats_all", "views.LeaderboardView.load_embed"),
+            ("stats_previous", "views.SeasonHistoryView.load_embed"),
+            ("stats_recent_games", "views.RecentGamesVariantView.load_embed"),
+            ("stats_my_history", "views.PlayerHistoryVariantView.load_embed"),
         )
 
-        for custom_id, target, result in cases:
+        for custom_id, target in cases:
             with self.subTest(custom_id=custom_id):
                 interaction, events = self._interaction()
 
                 async def query(*args, **kwargs):
                     self.assertEqual(events, ["defer"])
                     events.append("query")
-                    return result
+                    return discord.Embed(title="検証")
 
                 view = StatsView(SimpleNamespace())
                 with patch(target, new=AsyncMock(side_effect=query)) as db_query:
@@ -78,10 +78,11 @@ class StatsViewInteractionTest(unittest.IsolatedAsyncioTestCase):
         async def query(*args, **kwargs):
             self.assertEqual(events, ["defer"])
             events.append("query")
-            return None
+            return discord.Embed(title="検証")
 
         with patch(
-            "database.get_player_stats", new=AsyncMock(side_effect=query)
+            "views.PlayerStatsVariantView.load_embed",
+            new=AsyncMock(side_effect=query),
         ) as db_query:
             await select.callback(interaction)
 

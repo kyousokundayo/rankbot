@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
+from types import MappingProxyType
+from typing import Mapping
 
 from room_config import (
     RoomDefinition,
@@ -12,7 +15,7 @@ from room_config import (
 )
 
 # Botのバージョン (ヘルプに表示。ソース公開された派生でも識別できるように)
-BOT_VERSION = "v0.36"
+BOT_VERSION = "v0.37"
 
 # 新規導入先に同名カテゴリが既にある場合、無関係なDiscord構成をBot所有と
 # 誤認しない。既存運用は保存済みchannel IDで自動再利用できる。
@@ -58,17 +61,214 @@ ROLE_TEAM = {
     Role.VILLAGER: Team.VILLAGE,
 }
 
-# 役職配分 (13人固定)
-ROLE_DISTRIBUTION = {
+
+DEFAULT_VARIANT_ID = "v13_cross"
+DEFAULT_LADDER_ID = "l13"
+
+# ターン制の持ち時間。実運用で長すぎると判明しても、進行コードへ触れず
+# この3値だけを調整できるよう独立した名前を維持する。
+TURN_DAY1_ROUND1_SECONDS = 50
+TURN_DAY1_ROUND2_SECONDS = 80
+TURN_LATER_DAY_SECONDS = 90
+
+# クロストークの昼時間 (初日、日ごとの短縮、下限)。
+# 9人村は13人村より各日1分短く、初日7分・下限2分とする。
+CROSSTALK_DISCUSSION_SECONDS_13 = (480, 60, 180)
+CROSSTALK_DISCUSSION_SECONDS_9 = (420, 60, 120)
+
+
+@dataclass(frozen=True)
+class VariantDefinition:
+    """人数・進行・レート調整値を1か所で定義する。
+
+    ``crosstalk_discussion_seconds`` はクロストークだけ
+    ``(初日、日ごとの短縮、下限)``。
+    ``turn_round_seconds`` はターン制だけ ``(50, 80, 90)``。
+    先頭2値が初日の2巡、末尾が2日目以降の1巡を表す。
+    """
+
+    variant_id: str
+    label: str
+    ladder_id: str
+    player_count: int
+    role_distribution: Mapping[Role, int]
+    discussion_mode: str
+    village_win_pool: int
+    wolf_win_pool: int
+    wolf_guess_slots: int
+    final_day_threshold: int
+    turn_round_seconds: tuple[int, ...] = ()
+    recruitment_occupancy_minutes: int = 90
+    turn_interrupts_per_day: int = 0
+    crosstalk_discussion_seconds: tuple[int, ...] = ()
+
+    @property
+    def wolf_team_size(self) -> int:
+        return sum(
+            count
+            for role, count in self.role_distribution.items()
+            if ROLE_TEAM[role] is Team.WOLF
+        )
+
+    @property
+    def village_team_size(self) -> int:
+        return self.player_count - self.wolf_team_size
+
+
+@dataclass(frozen=True)
+class LadderDefinition:
+    ladder_id: str
+    label: str
+    grandmaster_slots: int
+    grandmaster_role_name: str
+    grandmaster_role_color: int
+    # Discordのメンバー一覧では最上位hoist欄1件だけに表示される。
+    role_position_priority: int
+
+
+_ROLE_DISTRIBUTION_13 = MappingProxyType({
     Role.WEREWOLF: 3,
     Role.MADMAN: 1,
     Role.SEER: 1,
     Role.MEDIUM: 1,
     Role.GUARD: 1,
     Role.VILLAGER: 6,
+})
+_ROLE_DISTRIBUTION_9 = MappingProxyType({
+    Role.WEREWOLF: 2,
+    Role.MADMAN: 1,
+    Role.SEER: 1,
+    Role.MEDIUM: 1,
+    Role.GUARD: 1,
+    Role.VILLAGER: 3,
+})
+
+VARIANT_DEFINITIONS = {
+    "v13_cross": VariantDefinition(
+        "v13_cross", "13人クロストーク", "l13", 13,
+        _ROLE_DISTRIBUTION_13, "crosstalk", 180, 120, 3, 6,
+        crosstalk_discussion_seconds=CROSSTALK_DISCUSSION_SECONDS_13,
+    ),
+    "v13_turn": VariantDefinition(
+        "v13_turn", "13人ターン制", "l13", 13,
+        _ROLE_DISTRIBUTION_13, "turn", 180, 120, 3, 6,
+        turn_round_seconds=(
+            TURN_DAY1_ROUND1_SECONDS,
+            TURN_DAY1_ROUND2_SECONDS,
+            TURN_LATER_DAY_SECONDS,
+        ),
+        recruitment_occupancy_minutes=150,
+        turn_interrupts_per_day=2,
+    ),
+    "v9_cross": VariantDefinition(
+        "v9_cross", "9人クロストーク", "l9", 9,
+        # 9人村は狼陣営勝率45%を基準に、W/V=11/9となるよう設定する。
+        # ターン制とクロストークでレート・加点条件を分けない。
+        _ROLE_DISTRIBUTION_9, "crosstalk", 90, 110, 2, 4,
+        crosstalk_discussion_seconds=CROSSTALK_DISCUSSION_SECONDS_9,
+    ),
+    "v9_turn": VariantDefinition(
+        "v9_turn", "9人ターン制", "l9", 9,
+        _ROLE_DISTRIBUTION_9, "turn", 90, 110, 2, 4,
+        turn_round_seconds=(
+            TURN_DAY1_ROUND1_SECONDS,
+            TURN_DAY1_ROUND2_SECONDS,
+            TURN_LATER_DAY_SECONDS,
+        ),
+        turn_interrupts_per_day=1,
+    ),
+}
+VARIANT_TO_LADDER = {
+    variant_id: definition.ladder_id
+    for variant_id, definition in VARIANT_DEFINITIONS.items()
+}
+LADDER_DEFINITIONS = {
+    "l13": LadderDefinition(
+        "l13", "13人村", 13, "グランドマスター", 0xE74C3C, 2,
+    ),
+    "l9": LadderDefinition(
+        "l9", "9人村", 9, "グランドマスター（9人村）", 0xF39C12, 1,
+    ),
 }
 
-MAX_PLAYERS = 13
+# ラダーは共通でも、変種ごとに狼勝率が違えばプール比も違う。比率を
+# 揃えると勝ちやすい変種でレートを稼げてしまう。実測が30〜50試合
+# たまったら変種ごとに W/V = (1-p)/p で直すこと。倍率を一律に
+# 変えても均衡勝率は動かない。
+
+
+def _validate_variant_definitions() -> None:
+    for variant_id, definition in VARIANT_DEFINITIONS.items():
+        if definition.variant_id != variant_id:
+            raise RuntimeError(f"variant key mismatch: {variant_id}")
+        if definition.ladder_id not in LADDER_DEFINITIONS:
+            raise RuntimeError(
+                f"unknown ladder for {variant_id}: {definition.ladder_id}"
+            )
+        if sum(definition.role_distribution.values()) != definition.player_count:
+            raise RuntimeError(f"role distribution mismatch: {variant_id}")
+        if definition.wolf_guess_slots != definition.role_distribution[Role.WEREWOLF]:
+            raise RuntimeError(f"wolf guess slots mismatch: {variant_id}")
+        if definition.discussion_mode == "turn":
+            if len(definition.turn_round_seconds) != 3:
+                raise RuntimeError(f"turn timer mismatch: {variant_id}")
+            if definition.turn_interrupts_per_day <= 0:
+                raise RuntimeError(f"turn interrupts mismatch: {variant_id}")
+            if definition.crosstalk_discussion_seconds:
+                raise RuntimeError(f"turn has crosstalk settings: {variant_id}")
+        elif definition.discussion_mode == "crosstalk":
+            if definition.turn_round_seconds or definition.turn_interrupts_per_day:
+                raise RuntimeError(f"crosstalk has turn settings: {variant_id}")
+            discussion_seconds = definition.crosstalk_discussion_seconds
+            if len(discussion_seconds) != 3:
+                raise RuntimeError(f"crosstalk timer mismatch: {variant_id}")
+            base, decrease, minimum = discussion_seconds
+            if (
+                any(not isinstance(seconds, int) for seconds in discussion_seconds)
+                or min(base, decrease, minimum) <= 0
+                or base < minimum
+            ):
+                raise RuntimeError(f"invalid crosstalk timer: {variant_id}")
+        else:
+            raise RuntimeError(
+                f"unknown discussion mode: {definition.discussion_mode}"
+            )
+        if min(definition.village_win_pool, definition.wolf_win_pool) <= 0:
+            raise RuntimeError(f"invalid rating pool: {variant_id}")
+
+    # 9人クロストークと9人ターン制は同一ラダーを共有する。進行方式によって
+    # レート・活躍ボーナスの入口が変わらないよう、変種ごとの値も固定する。
+    nine_rating_fields = (
+        "village_win_pool",
+        "wolf_win_pool",
+        "wolf_guess_slots",
+        "final_day_threshold",
+    )
+    nine_cross = VARIANT_DEFINITIONS["v9_cross"]
+    nine_turn = VARIANT_DEFINITIONS["v9_turn"]
+    if any(
+        getattr(nine_cross, field) != getattr(nine_turn, field)
+        for field in nine_rating_fields
+    ):
+        raise RuntimeError("v9 rating settings must match across discussion modes")
+
+
+_validate_variant_definitions()
+
+
+def get_variant_definition(variant_id: str) -> VariantDefinition:
+    """未知の変種を従来ルールとして黙って実行せず、起動・復元を安全に止める。"""
+    try:
+        return VARIANT_DEFINITIONS[variant_id]
+    except KeyError as exc:
+        raise ValueError(f"unknown variant_id: {variant_id}") from exc
+
+
+# 従来APIは13人クロストークのエイリアスとして残す。
+ROLE_DISTRIBUTION = dict(
+    VARIANT_DEFINITIONS[DEFAULT_VARIANT_ID].role_distribution
+)
+MAX_PLAYERS = VARIANT_DEFINITIONS[DEFAULT_VARIANT_ID].player_count
 
 # 陣営ごとの人数。プール配分の説明や表示で手書きするとズレるので配分から導く
 WOLF_TEAM_SIZE = sum(
@@ -84,9 +284,11 @@ DISCORD_MESSAGE_LIMIT = 2000
 
 # タイマー設定 (秒)
 PREPARATION_TIME = 30
-DAY_DISCUSSION_BASE = 480      # 8分
-DAY_DISCUSSION_DECREASE = 60   # 毎日60秒減少
-DAY_DISCUSSION_MIN = 180       # 最低3分
+# 13人クロストークの従来互換エイリアス。ゲーム進行は各変種の
+# ``crosstalk_discussion_seconds`` を使うため、新規の変種設定には使わない。
+DAY_DISCUSSION_BASE, DAY_DISCUSSION_DECREASE, DAY_DISCUSSION_MIN = (
+    CROSSTALK_DISCUSSION_SECONDS_13
+)
 NIGHT_BASE = 80                # 初日の夜は80秒
 NIGHT_DECREASE = 20            # 2日目以降は60秒固定 (80-20, 下限60)
 NIGHT_MIN = 60
@@ -185,7 +387,20 @@ FEEDBACK_MAX_PER_DAY = 10
 # @everyone と全ロールへの閲覧許可を外す。DiscordのAdministrator権限を
 # 持つメンバーはチャンネル上書きをバイパスするため閲覧できる。
 # 一般公開するときは対象IDをこの集合から外す。
-ADMIN_ONLY_ROOM_IDS = frozenset({"beginner", "intermediate", "advanced"})
+VARIANT_ROLLOUT_ROOM_IDS = frozenset({
+    "open_13_turn",
+    "open_9_cross",
+    "open_9_turn",
+})
+ADMIN_ONLY_ROOM_IDS = frozenset({
+    "beginner",
+    "intermediate",
+    "advanced",
+})
+
+# 9人村は「ねいと」ロール保持者だけへの試験公開、13人ターン制は実装のみで
+# 完全未公開とする。どの新規変種も募集導線は実地試験が済むまで停止する。
+RECRUITMENT_DISABLED_ROOM_IDS = VARIANT_ROLLOUT_ROOM_IDS
 
 # 村長制度を一般公開するときはFalseへ戻す。
 MAYOR_INFO_ADMIN_ONLY = True
@@ -200,6 +415,23 @@ _BUILTIN_ROOM_DEFINITIONS = [
     ),
     RoomDefinition("advanced", "上級者", frozenset({"ダイヤ", "マスター", "グランドマスター"})),
     RoomDefinition("open", "総合"),
+    RoomDefinition(
+        "open_13_turn", "総合-13ターン", variant_id="v13_turn", enabled=False,
+    ),
+    RoomDefinition(
+        "open_9_cross",
+        "総合-9クロストーク",
+        variant_id="v9_cross",
+        enabled=True,
+        strict_access_role_names=frozenset({"ねいと"}),
+    ),
+    RoomDefinition(
+        "open_9_turn",
+        "総合-9ターン",
+        variant_id="v9_turn",
+        enabled=True,
+        strict_access_role_names=frozenset({"ねいと"}),
+    ),
 ]
 
 # 公開コードには個別サーバーの卓名・ID・ユーザーID・ロール名を含めない。
@@ -219,28 +451,59 @@ ROOM_DEFINITIONS = [
     *(registration.room for registration in _LOCAL_ROOM_REGISTRATIONS),
 ]
 ROOM_DEFINITION_MAP = {room.room_id: room for room in ROOM_DEFINITIONS}
+if len(ROOM_DEFINITION_MAP) != len(ROOM_DEFINITIONS):
+    raise RuntimeError("room_id is duplicated")
+for _room_definition in ROOM_DEFINITIONS:
+    get_variant_definition(_room_definition.variant_id)
 
-# 全員に表示される公開卓 / レート変動の対象卓
-PUBLIC_ROOM_IDS = frozenset({"open"})
+# ROOM_DEFINITIONS/MAP は全定義を保持する。統計・履歴・シミュレーションでは
+# 無効な変種も参照するため、ここで落とさない。Discord上のRunner作成と各ライブ
+# 導線だけが ACTIVE_* を使う。
+ACTIVE_ROOM_DEFINITIONS = tuple(
+    room for room in ROOM_DEFINITIONS if room.enabled
+)
+ACTIVE_ROOM_IDS = frozenset(room.room_id for room in ACTIVE_ROOM_DEFINITIONS)
+# 利用者向けの変種選択も、有効な固定卓に対応するものだけを出す。無効卓の
+# 定義・履歴・シミュレーションは残るが、将来 enabled を戻すまでUIでは公開しない。
+USER_VISIBLE_VARIANT_IDS = tuple(
+    dict.fromkeys(room.variant_id for room in ACTIVE_ROOM_DEFINITIONS)
+)
+
+# 全員に表示される公開卓 / レート変動の対象卓。無効卓はカテゴリ・VC・参加受付を
+# 作らず、これらのライブ集合にも含めない。
+_OPEN_ROOM_CANDIDATE_IDS = frozenset({
+    "open", "open_13_turn", "open_9_cross", "open_9_turn",
+})
+OPEN_ROOM_IDS = _OPEN_ROOM_CANDIDATE_IDS & ACTIVE_ROOM_IDS
+PUBLIC_ROOM_IDS = OPEN_ROOM_IDS
 RATED_ROOM_IDS = frozenset(
-    [room.room_id for room in _BUILTIN_ROOM_DEFINITIONS]
+    [room.room_id for room in _BUILTIN_ROOM_DEFINITIONS if room.enabled]
     + [
         registration.room.room_id
         for registration in _LOCAL_ROOM_REGISTRATIONS
-        if registration.rated
+        if registration.rated and registration.room.enabled
     ]
 )
 RECRUITMENT_ROOM_IDS = frozenset(
-    [room.room_id for room in _BUILTIN_ROOM_DEFINITIONS]
+    [room.room_id for room in _BUILTIN_ROOM_DEFINITIONS if room.enabled]
     + [
         registration.room.room_id
         for registration in _LOCAL_ROOM_REGISTRATIONS
-        if registration.recruitment_enabled
+        if registration.recruitment_enabled and registration.room.enabled
     ]
 )
 RATED_ROOM_NAMES = tuple(
-    room.name for room in ROOM_DEFINITIONS if room.room_id in RATED_ROOM_IDS
+    room.name for room in ACTIVE_ROOM_DEFINITIONS if room.room_id in RATED_ROOM_IDS
 )
+
+if not (OPEN_ROOM_IDS <= ACTIVE_ROOM_IDS):
+    raise RuntimeError("OPEN_ROOM_IDS contains a disabled room")
+if not (PUBLIC_ROOM_IDS <= ACTIVE_ROOM_IDS):
+    raise RuntimeError("PUBLIC_ROOM_IDS contains a disabled room")
+if not (RATED_ROOM_IDS <= ACTIVE_ROOM_IDS):
+    raise RuntimeError("RATED_ROOM_IDS contains a disabled room")
+if not (RECRUITMENT_ROOM_IDS <= ACTIVE_ROOM_IDS):
+    raise RuntimeError("RECRUITMENT_ROOM_IDS contains a disabled room")
 
 PRIVATE_ROOM_CREATOR_ROLE_NAME = "村長"
 
@@ -252,10 +515,11 @@ INITIAL_RATING = 1500
 # 勝利陣営への参加ボーナス（本体ゼロサムとは別枠でレートに加算）
 WIN_PARTICIPATION_BONUS = 1
 
-# 6:4 の環境を基準にした固定プール。
+# 13人村 (狼勝率60%を基準) の従来互換固定プール。
 # 狼勝ち: 狼4人で +120 / 村9人で -120
 # 村勝ち: 村9人で +180 / 狼4人で -180
-# 比 120:180 は「狼勝率60%で全体EV=0」を意味する。勝率の実測が溜まったら
+# 比 120:180 は「狼勝率60%で全体EV=0」を意味する。9人村は変種定義内で
+# 狼勝率45%を基準に 110:90 としている。勝率の実測が溜まったら変種ごとに
 # W/V = (1-p)/p に合わせ直す。倍率だけを変えても均衡勝率は動かない。
 WOLF_WIN_FIXED_POOL = 120
 VILLAGE_WIN_FIXED_POOL = 180
@@ -311,6 +575,10 @@ GRANDMASTER_SLOTS = 13
 # マスター帯（上位10%）のうち、上位5%相当をGMにする。
 # 人数が増えてもGMは最大13人まで。
 GRANDMASTER_PERCENTAGE = 0.05
+GRANDMASTER_SLOTS_BY_LADDER = {
+    ladder_id: definition.grandmaster_slots
+    for ladder_id, definition in LADDER_DEFINITIONS.items()
+}
 
 # シーズン長 (日)。経過すると #統計 に管理者向けのリセットリマインダーを出す。
 # リセット自体は /season_reset で手動実行する

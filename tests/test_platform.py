@@ -12,7 +12,7 @@ import database
 import rating as rating_lib
 from config import RoomDefinition, Team
 from game import GameCog
-from permissions import RoomPermissionMixin
+from permissions import RoomPermissionMixin, RoomVisibilityError
 
 
 class _PermissionTarget:
@@ -253,6 +253,113 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(overwrites[manager_role].view_channel)
         self.assertNotIn(outsider_role, overwrites)
 
+    async def test_strict_role_room_allows_only_named_role_not_managers(self) -> None:
+        default = _PermissionTarget(1, "@everyone")
+        bot_member = _PermissionTarget(2, "bot")
+        naito_role = _PermissionTarget(3, "ねいと")
+        manager_role = _PermissionTarget(4, "運営")
+        outsider_role = _PermissionTarget(5, "一般")
+        manager_role.permissions = SimpleNamespace(manage_guild=True)
+        guild = SimpleNamespace(
+            default_role=default,
+            me=bot_member,
+            roles=[default, naito_role, manager_role, outsider_role],
+        )
+        room_def = SimpleNamespace(
+            room_id="open_9_turn",
+            name="総合-9ターン",
+            private_owner_id=None,
+            private_role_name=None,
+            allowed_ranks=None,
+            access_role_names=None,
+            strict_access_role_names=frozenset({"ねいと"}),
+        )
+
+        overwrites = _PermissionManager()._build_room_overwrites(guild, room_def)
+
+        self.assertFalse(overwrites[default].view_channel)
+        self.assertTrue(overwrites[naito_role].view_channel)
+        self.assertNotIn(manager_role, overwrites)
+        self.assertNotIn(outsider_role, overwrites)
+
+    async def test_strict_role_room_rejects_missing_or_duplicate_role_before_writes(self) -> None:
+        default = _PermissionTarget(1, "@everyone")
+        bot_member = _PermissionTarget(2, "bot")
+        stale_role = _PermissionTarget(3, "過去の許可")
+        room_def = SimpleNamespace(
+            room_id="open_9_cross",
+            name="総合-9クロストーク",
+            private_owner_id=None,
+            private_role_name=None,
+            allowed_ranks=None,
+            access_role_names=None,
+            strict_access_role_names=frozenset({"ねいと"}),
+        )
+
+        for roles in (
+            [default],
+            [default, _PermissionTarget(4, "ねいと"), _PermissionTarget(5, "ねいと")],
+        ):
+            with self.subTest(roles=[role.name for role in roles]):
+                category = _PermissionChannel(100, "総合-9")
+                category.overwrites[stale_role] = discord.PermissionOverwrite(
+                    view_channel=True
+                )
+                guild = SimpleNamespace(
+                    default_role=default,
+                    me=bot_member,
+                    roles=roles,
+                    text_channels=[],
+                    voice_channels=[],
+                )
+
+                with self.assertRaises(RoomVisibilityError):
+                    await _PermissionManager()._apply_room_visibility(
+                        guild, category, room_def,
+                    )
+
+                self.assertEqual(
+                    category.overwrites[stale_role].view_channel, True,
+                )
+                self.assertEqual(len(category.overwrites), 1)
+
+    async def test_strict_role_room_keeps_village_and_spirit_restricted(self) -> None:
+        default = _PermissionTarget(1, "@everyone")
+        bot_member = _PermissionTarget(2, "bot")
+        naito_role = _PermissionTarget(3, "ねいと")
+        manager_role = _PermissionTarget(4, "運営")
+        manager_role.permissions = SimpleNamespace(manage_guild=True)
+        category = _PermissionChannel(100, "総合-9")
+        village = _PermissionChannel(101, "昼", category=category)
+        spirit = _PermissionChannel(102, "霊界", category=category)
+        for channel in (category, village, spirit):
+            channel.overwrites[manager_role] = discord.PermissionOverwrite(
+                view_channel=True
+            )
+        guild = SimpleNamespace(
+            default_role=default,
+            me=bot_member,
+            roles=[default, naito_role, manager_role],
+            text_channels=[village, spirit],
+            voice_channels=[],
+        )
+        room_def = SimpleNamespace(
+            room_id="open_9_cross",
+            name="総合-9クロストーク",
+            private_owner_id=None,
+            private_role_name=None,
+            allowed_ranks=None,
+            access_role_names=None,
+            strict_access_role_names=frozenset({"ねいと"}),
+        )
+
+        await _PermissionManager()._apply_room_visibility(guild, category, room_def)
+
+        for channel in (category, village, spirit):
+            self.assertFalse(channel.overwrites[default].view_channel)
+            self.assertTrue(channel.overwrites[naito_role].view_channel)
+            self.assertNotIn(manager_role, channel.overwrites)
+
     async def test_local_room_invited_role_can_join_but_outsider_cannot(self) -> None:
         from room_runner import RoomRunner
 
@@ -281,6 +388,41 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(await runner.validate_join(member([])))
         self.assertIsNone(await runner.validate_join(member(["コミュニティ参加者"])))
+
+    async def test_strict_role_is_required_for_both_join_and_gm_claim(self) -> None:
+        from room_runner import RoomRunner
+
+        naito_role = _PermissionTarget(10, "ねいと")
+        manager = SimpleNamespace(find_user_room=lambda *_args, **_kwargs: None)
+        runner = RoomRunner(
+            None,
+            manager,
+            RoomDefinition(
+                "open_9_turn",
+                "総合-9ターン",
+                strict_access_role_names=frozenset({"ねいと"}),
+            ),
+        )
+        runner.state.guild = SimpleNamespace(owner_id=999, roles=[naito_role])
+
+        def member(*, has_naito: bool, manage_guild: bool):
+            roles = [naito_role] if has_naito else []
+            return SimpleNamespace(
+                id=10 if has_naito else 11,
+                roles=roles,
+                guild_permissions=SimpleNamespace(
+                    administrator=False,
+                    manage_guild=manage_guild,
+                ),
+            )
+
+        manager_only = member(has_naito=False, manage_guild=True)
+        self.assertIn("ねいと", await runner.validate_join(manager_only))
+        self.assertIn("ねいと", await runner.validate_gm_claim(manager_only))
+
+        allowed = member(has_naito=True, manage_guild=False)
+        self.assertIsNone(await runner.validate_join(allowed))
+        self.assertIsNone(await runner.validate_gm_claim(allowed))
 
     async def test_private_room_owner_and_name_queries(self) -> None:
         await database.save_private_room(1, "private_10", 10, "十村", "十村")
@@ -648,6 +790,110 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome, "updated")
         self.assertEqual(len(member.edit_calls), 1)
         self.assertEqual(member.roles, [ordinary, target_rank])
+
+    async def test_both_ladder_rank_roles_are_merged_into_one_member_patch(self) -> None:
+        ordinary = _PermissionTarget(110, "通常ロール")
+        old_l13_rank = _PermissionTarget(
+            111, rating_lib.get_rank_role_name("アイアン")
+        )
+        target_l13_rank = _PermissionTarget(
+            112, rating_lib.get_rank_role_name("シルバー")
+        )
+        target_l9_gm = _PermissionTarget(
+            113, rating_lib.special_grandmaster_role_name("l9")
+        )
+        guild = SimpleNamespace(
+            id=1,
+            roles=[ordinary, old_l13_rank, target_l13_rank, target_l9_gm],
+            members=[],
+        )
+        member = _PrivateMember(
+            guild, 10, "player", roles=[ordinary, old_l13_rank]
+        )
+        guild.members = [member]
+        guild.get_member = lambda member_id: member if member_id == member.id else None
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        manager.bulk_api_interval = 0
+
+        outcome = await manager._sync_rank_role(
+            member,
+            roles_map={
+                target_l13_rank.name: target_l13_rank,
+                target_l9_gm.name: target_l9_gm,
+            },
+            rank_names_by_ladder={
+                "l13": "シルバー",
+                "l9": "グランドマスター",
+            },
+        )
+
+        self.assertEqual(outcome, "updated")
+        self.assertEqual(len(member.edit_calls), 1)
+        self.assertEqual(member.roles[0], ordinary)
+        self.assertCountEqual(member.roles[1:], [target_l13_rank, target_l9_gm])
+
+    async def test_only_grandmaster_roles_are_forced_to_hoist(self) -> None:
+        class EditableRole(_PermissionTarget):
+            def __init__(
+                self, target_id: int, name: str, *, hoist: bool, position: int
+            ) -> None:
+                super().__init__(target_id, name)
+                self.hoist = hoist
+                self.position = position
+                self.edit_calls: list[dict] = []
+
+            async def edit(self, **kwargs):
+                self.edit_calls.append(dict(kwargs))
+                if "hoist" in kwargs:
+                    self.hoist = bool(kwargs["hoist"])
+                if "position" in kwargs:
+                    self.position = int(kwargs["position"])
+                return self
+
+        roles = []
+        for index, (name, _color) in enumerate(rating_lib.all_rank_role_specs(), 1):
+            roles.append(
+                EditableRole(
+                    200 + index,
+                    name,
+                    # 通常ロールの手動hoistはBotが勝手に戻さない。
+                    hoist=name == rating_lib.get_rank_role_name("シルバー"),
+                    position=index,
+                )
+            )
+        roles_by_name = {role.name: role for role in roles}
+        l13_gm = roles_by_name[
+            rating_lib.special_grandmaster_role_name("l13")
+        ]
+        l9_gm = roles_by_name[
+            rating_lib.special_grandmaster_role_name("l9")
+        ]
+        # 並びも逆にし、13人村側を上へ直す経路を同時に確認する。
+        l13_gm.position = 5
+        l9_gm.position = 10
+        silver = roles_by_name[rating_lib.get_rank_role_name("シルバー")]
+
+        async def unexpected_create_role(**_kwargs):
+            self.fail("全ランクロールを用意済みなのにcreate_roleが呼ばれました")
+
+        guild = SimpleNamespace(
+            id=1,
+            roles=roles,
+            create_role=unexpected_create_role,
+        )
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        manager.bulk_api_interval = 0
+
+        result = await manager._ensure_rank_roles(guild)
+
+        self.assertEqual(set(result), set(roles_by_name))
+        self.assertTrue(l13_gm.hoist)
+        self.assertTrue(l9_gm.hoist)
+        self.assertTrue(silver.hoist)
+        self.assertEqual(silver.edit_calls, [])
+        self.assertTrue(any(call.get("hoist") is True for call in l13_gm.edit_calls))
+        self.assertTrue(any(call.get("hoist") is True for call in l9_gm.edit_calls))
+        self.assertTrue(any("position" in call for call in l13_gm.edit_calls))
 
     async def test_legacy_duplicate_history_does_not_block_migration(self) -> None:
         async with database.connect_db() as db:
