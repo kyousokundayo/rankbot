@@ -1,0 +1,270 @@
+"""項目別ランキング (database.get_metric_leaderboard) の単体テスト
+
+実行: .venv/bin/python -m unittest discover -s tests -v
+(scripts/run_checks.sh と CI からも実行される)
+
+値は決め打ちで作る。乱数で作ると「0人しか載らない」のがデータ都合なのか
+クエリの誤りなのか切り分けられないため。
+"""
+from __future__ import annotations
+
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import database
+from config import Role, Team
+
+GUILD_ID = 999
+
+# 13人固定構成。player_id は役職ごとに固定し、各試合で使い回す
+WOLF_IDS = (1, 2, 3)
+MADMAN_ID = 4
+SEER_ID = 5
+MEDIUM_ID = 6
+GUARD_ID = 7
+VILLAGER_IDS = (8, 9, 10, 11, 12, 13)
+
+_ROLE_BY_ID = {
+    **{pid: Role.WEREWOLF for pid in WOLF_IDS},
+    MADMAN_ID: Role.MADMAN,
+    SEER_ID: Role.SEER,
+    MEDIUM_ID: Role.MEDIUM,
+    GUARD_ID: Role.GUARD,
+    **{pid: Role.VILLAGER for pid in VILLAGER_IDS},
+}
+_WOLF_TEAM_IDS = set(WOLF_IDS) | {MADMAN_ID}
+
+
+def build_records(
+    winner: Team,
+    deaths: dict[int, tuple[int, str]] | None = None,
+) -> list[dict]:
+    """deaths は player_id -> (死亡日, 死因)。載らない人は最後まで生存。"""
+    deaths = deaths or {}
+    records = []
+    for player_id, role in _ROLE_BY_ID.items():
+        team = Team.WOLF if player_id in _WOLF_TEAM_IDS else Team.VILLAGE
+        died_on_day, death_cause = deaths.get(player_id, (None, None))
+        records.append({
+            "player_id": player_id,
+            "role": role.value,
+            "team": team.value,
+            "won": team is winner,
+            "died_on_day": died_on_day,
+            "death_cause": death_cause,
+            "rank_at_game": "ゴールド",
+            "rank_provisional": False,
+        })
+    return records
+
+
+class LeaderboardTestBase(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="werewolf-leaderboard-")
+        self.original_db_path = database.DB_PATH
+        database.DB_PATH = str(Path(self.temp_dir.name) / "leaderboard.db")
+        await database.init_db()
+        self.run_seq = 0
+
+    async def asyncTearDown(self):
+        database.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+
+    async def play(
+        self,
+        winner: Team,
+        deaths: dict[int, tuple[int, str]] | None = None,
+        *,
+        wolf_guesses: dict[int, list[int]] | None = None,
+    ) -> int:
+        self.run_seq += 1
+        run_id = f"run-{self.run_seq}"
+        records = build_records(winner, deaths)
+        await database.stage_game_settlement(
+            GUILD_ID, "open", run_id,
+            room_name="総合", rated=True, winner_team=winner.value,
+            player_records=records,
+            bonus_facts={
+                "days": 5,
+                "wolf_guesses": {
+                    str(pid): list(targets)
+                    for pid, targets in (wolf_guesses or {}).items()
+                },
+            },
+        )
+        game_id, _results, _created = await database.settle_game_settlement(
+            GUILD_ID, "open", run_id,
+        )
+        return game_id
+
+    async def board(self, metric: str, **kwargs) -> dict:
+        kwargs.setdefault("min_samples", 1)
+        return await database.get_metric_leaderboard(GUILD_ID, metric, **kwargs)
+
+    @staticmethod
+    def value_of(board: dict, player_id: int) -> float | None:
+        for entry in board["top"]:
+            if entry["player_id"] == player_id:
+                return entry["value"]
+        return None
+
+
+class TestVillageDay1Executed(LeaderboardTestBase):
+    async def test_counts_only_day1_executions_of_village_side(self):
+        # 村人8: 初日処刑 / 初日襲撃 / 2日目処刑 / 生存 の4戦 → 1/4
+        await self.play(Team.WOLF, {8: (1, "処刑")})
+        await self.play(Team.WOLF, {8: (1, "襲撃")})
+        await self.play(Team.WOLF, {8: (2, "処刑")})
+        await self.play(Team.VILLAGE)
+        board = await self.board("village_day1_executed")
+        self.assertAlmostEqual(self.value_of(board, 8), 0.25)
+
+    async def test_wolf_side_is_excluded(self):
+        """狼陣営で初日に吊られても、この指標には入らない (狂人も含む)"""
+        await self.play(Team.VILLAGE, {WOLF_IDS[0]: (1, "処刑")})
+        await self.play(Team.VILLAGE, {MADMAN_ID: (1, "処刑")})
+        board = await self.board("village_day1_executed")
+        listed = {entry["player_id"] for entry in board["top"]}
+        self.assertNotIn(WOLF_IDS[0], listed)
+        self.assertNotIn(MADMAN_ID, listed)
+        self.assertIn(SEER_ID, listed)
+
+
+class TestWolfSurviveOnWin(LeaderboardTestBase):
+    async def test_survival_rate_among_wolf_wins(self):
+        # 人狼1: 狼勝ち2戦のうち1戦だけ生存 → 0.5
+        await self.play(Team.WOLF)                              # 生存で勝ち
+        await self.play(Team.WOLF, {WOLF_IDS[0]: (3, "処刑")})   # 死んで勝ち
+        board = await self.board("wolf_survive_on_win")
+        self.assertAlmostEqual(self.value_of(board, WOLF_IDS[0]), 0.5)
+
+    async def test_losses_are_not_counted(self):
+        """負けた試合は分母に入らない (狼勝利時に限る指標のため)"""
+        await self.play(Team.VILLAGE)   # 狼は生存しているが敗北
+        await self.play(Team.WOLF)      # 生存で勝ち
+        board = await self.board("wolf_survive_on_win")
+        entry = next(e for e in board["top"] if e["player_id"] == WOLF_IDS[0])
+        self.assertEqual(entry["denominator"], 1)
+        self.assertAlmostEqual(entry["value"], 1.0)
+
+    async def test_madman_is_not_included(self):
+        """狂人は人狼ではないのでこの指標に入らない"""
+        await self.play(Team.WOLF)
+        board = await self.board("wolf_survive_on_win")
+        listed = {entry["player_id"] for entry in board["top"]}
+        self.assertEqual(listed, set(WOLF_IDS))
+
+
+class TestRoleWinrate(LeaderboardTestBase):
+    async def test_win_rate_for_the_selected_role(self):
+        await self.play(Team.WOLF)
+        await self.play(Team.WOLF)
+        await self.play(Team.VILLAGE)
+        wolf_board = await self.board("role_winrate", role=Role.WEREWOLF.value)
+        self.assertAlmostEqual(self.value_of(wolf_board, WOLF_IDS[0]), 2 / 3)
+        seer_board = await self.board("role_winrate", role=Role.SEER.value)
+        self.assertAlmostEqual(self.value_of(seer_board, SEER_ID), 1 / 3)
+
+    async def test_role_is_required(self):
+        with self.assertRaises(ValueError):
+            await database.get_metric_leaderboard(GUILD_ID, "role_winrate")
+
+
+class TestVotesReceived(LeaderboardTestBase):
+    async def test_average_votes_per_game(self):
+        game_id = await self.play(Team.VILLAGE)
+        await self.play(Team.VILLAGE)
+        voters = {SEER_ID, MEDIUM_ID, GUARD_ID}
+        await database.create_game_recommendation_ballots(
+            game_id, GUILD_ID, voters, timeout_seconds=180, kind="postgame",
+        )
+        for voter_id in voters:
+            await database.confirm_game_recommendation(
+                game_id, GUILD_ID, voter_id, WOLF_IDS[0], kind="postgame",
+            )
+        await database.finalize_game_recommendations(game_id, GUILD_ID)
+
+        board = await self.board("votes_received")
+        # 3票を2戦で割る
+        self.assertAlmostEqual(self.value_of(board, WOLF_IDS[0]), 1.5)
+        self.assertAlmostEqual(self.value_of(board, VILLAGER_IDS[0]), 0.0)
+
+
+class TestWolfGuessAccuracy(LeaderboardTestBase):
+    async def test_hits_over_slots(self):
+        # 村人8: 1戦目は3人中2人的中、2戦目は0人的中 → 2/6
+        await self.play(
+            Team.WOLF, {8: (2, "襲撃")},
+            wolf_guesses={8: [WOLF_IDS[0], WOLF_IDS[1], MADMAN_ID]},
+        )
+        await self.play(
+            Team.WOLF, {8: (3, "処刑")},
+            wolf_guesses={8: [MADMAN_ID, SEER_ID, GUARD_ID]},
+        )
+        board = await self.board("wolf_guess_accuracy")
+        entry = next(e for e in board["top"] if e["player_id"] == 8)
+        self.assertEqual(entry["numerator"], 2)
+        self.assertEqual(entry["denominator"], 6)
+        self.assertEqual(entry["samples"], 2)
+
+    async def test_non_submitters_are_absent(self):
+        """未提出は分母にも入らない (NULLのまま)"""
+        await self.play(
+            Team.WOLF, {8: (2, "襲撃"), 9: (2, "襲撃")},
+            wolf_guesses={8: list(WOLF_IDS)},
+        )
+        board = await self.board("wolf_guess_accuracy")
+        listed = {entry["player_id"] for entry in board["top"]}
+        self.assertEqual(listed, {8})
+
+    async def test_madman_never_counts_as_a_hit(self):
+        await self.play(
+            Team.WOLF, {8: (2, "襲撃")},
+            wolf_guesses={8: [WOLF_IDS[0], MADMAN_ID, SEER_ID]},
+        )
+        board = await self.board("wolf_guess_accuracy")
+        self.assertEqual(board["top"][0]["numerator"], 1)
+
+
+class TestLeaderboardShape(LeaderboardTestBase):
+    async def test_min_samples_filters_but_viewer_still_gets_own_value(self):
+        """掲載外でも本人の生データは返す (あと何回で載るかを出すため)"""
+        await self.play(Team.WOLF, {8: (1, "処刑")})
+        board = await database.get_metric_leaderboard(
+            GUILD_ID, "village_day1_executed", viewer_id=8, min_samples=5,
+        )
+        self.assertEqual(board["top"], [])
+        self.assertIsNone(board["viewer_position"])
+        self.assertIsNotNone(board["viewer"])
+        self.assertEqual(board["viewer"]["samples"], 1)
+
+    async def test_ties_break_by_sample_size_then_id(self):
+        """同率なら母数の多い順。試行回数が多いほうが確からしいため"""
+        await self.play(Team.VILLAGE, {8: (1, "処刑"), 9: (1, "処刑")})
+        await self.play(Team.VILLAGE, {8: (1, "処刑")})
+        # 8は2/2、9は1/2。9より8が上
+        board = await self.board("village_day1_executed")
+        order = [entry["player_id"] for entry in board["top"]]
+        self.assertLess(order.index(8), order.index(9))
+
+    async def test_unknown_metric_raises(self):
+        with self.assertRaises(ValueError):
+            await database.get_metric_leaderboard(GUILD_ID, "nope")
+
+    async def test_every_metric_runs_on_an_empty_guild(self):
+        for metric, spec in database.LEADERBOARD_METRICS.items():
+            with self.subTest(metric=metric):
+                kwargs = {"role": Role.WEREWOLF.value} if spec.get("needs_role") else {}
+                board = await database.get_metric_leaderboard(
+                    GUILD_ID, metric, viewer_id=8, **kwargs,
+                )
+                self.assertEqual(board["top"], [])
+                self.assertIsNone(board["viewer"])
+
+
+if __name__ == "__main__":
+    unittest.main()

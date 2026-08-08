@@ -11,7 +11,7 @@ import discord
 import database
 import rating as rating_lib
 from config import (
-    MAX_PLAYERS, Role, Team, Phase,
+    MAX_PLAYERS, Role, Team, Phase, ROLE_DISTRIBUTION,
     RUNOFF_SPEECH_TIME, LAST_WILL_TIME, DAY_DISCUSSION_BASE,
     DAY_DISCUSSION_DECREASE, DAY_DISCUSSION_MIN, VOTE_TIMEOUT,
     NIGHT_BASE, NIGHT_MIN,
@@ -2454,6 +2454,195 @@ class OverallStatsFilterView(discord.ui.View):
         await interaction.edit_original_response(embed=embed, view=self)
 
 
+_RATING_METRIC = "rating"
+
+
+async def _build_rating_leaderboard_embed(guild: discord.Guild) -> discord.Embed:
+    """従来の「今シーズンランキング」(レート順)。"""
+    top = await database.get_current_season_leaderboard(guild.id, limit=20)
+    if not top:
+        return discord.Embed(
+            title="今シーズンランキング",
+            description="レーティングデータがありません。",
+            color=discord.Color.gold(),
+        )
+    lines = []
+    for i, d in enumerate(top, 1):
+        member = guild.get_member(d["player_id"])
+        name = member.display_name if member else f"ID:{d['player_id']}"
+        provisional_txt = " 暫定" if d["provisional"] else ""
+        if d["top_percent"] is None:
+            rank_meta = " / 計測中"
+        else:
+            rank_meta = f" / {d['position']}位 / 上位{d['top_percent']:.1f}%"
+        lines.append(
+            f"`{i:>2}.` {d['emoji']} **{d['rating']}** [{d['rank_name']}{provisional_txt}] "
+            f"{name} — 今季{d['season_winrate']}% ({d['season_wins']}/{d['season_games']}){rank_meta}"
+        )
+    embed = discord.Embed(
+        title="今シーズンランキング",
+        description="\n".join(lines),
+        color=discord.Color.gold(),
+    )
+    embed.set_footer(
+        text=f"相対ランクは通算{SEASON_RANK_MIN_GAMES}戦以上のプレイヤーのみ対象"
+    )
+    return embed
+
+
+def _format_metric_value(value: float, unit: str) -> str:
+    if unit == "per_game":
+        return f"{value:.2f}票/試合"
+    return f"{value * 100:.1f}%"
+
+
+def _format_metric_detail(entry: dict, unit: str) -> str:
+    if unit == "per_game":
+        return f"{entry['numerator']}票 / {entry['denominator']}戦"
+    return f"{entry['numerator']}/{entry['denominator']}"
+
+
+def build_metric_leaderboard_embed(board: dict, guild: discord.Guild) -> discord.Embed:
+    """項目別ランキング + 閲覧者自身の位置。"""
+    unit = board["unit"]
+    title = board["label"]
+    if board.get("role"):
+        title = f"{title}（{board['role']}）"
+
+    if board["top"]:
+        lines = []
+        for entry in board["top"]:
+            member = guild.get_member(entry["player_id"])
+            name = member.display_name if member else f"ID:{entry['player_id']}"
+            lines.append(
+                f"`{entry['position']:>2}.` **{_format_metric_value(entry['value'], unit)}** "
+                f"{name} — {_format_metric_detail(entry, unit)}"
+            )
+        description = "\n".join(lines)
+    else:
+        description = (
+            f"まだ{board['min_samples']}回以上の記録を持つプレイヤーがいません。"
+        )
+
+    embed = discord.Embed(
+        title=title, description=description, color=discord.Color.gold(),
+    )
+    embed.add_field(name="この項目について", value=board["note"], inline=False)
+
+    viewer = board.get("viewer")
+    if viewer is None:
+        own = "この項目の記録がまだありません。"
+    elif board.get("viewer_position") is not None:
+        own = (
+            f"**{_format_metric_value(viewer['value'], unit)}** "
+            f"（{_format_metric_detail(viewer, unit)}） — "
+            f"**{board['viewer_position']}位 / {board['ranked_count']}人中**"
+        )
+    else:
+        need = board["min_samples"] - viewer["samples"]
+        own = (
+            f"**{_format_metric_value(viewer['value'], unit)}** "
+            f"（{_format_metric_detail(viewer, unit)}）\n"
+            f"ランキング掲載まであと **{need}回**（{board['min_samples']}回以上で掲載）"
+        )
+    embed.add_field(name="あなた", value=own, inline=False)
+    embed.set_footer(
+        text=f"掲載は{board['min_samples']}回以上。同率は母数の多い順"
+    )
+    return embed
+
+
+class LeaderboardMetricSelect(discord.ui.Select):
+    """見たい指標を選ぶ。ボタンを増やさずここで切り替える。"""
+
+    def __init__(self, parent: "LeaderboardView") -> None:
+        self.parent_view = parent
+        options = [
+            discord.SelectOption(
+                label="レート順位",
+                value=_RATING_METRIC,
+                description="今シーズンの相対ランク順",
+                default=parent.metric == _RATING_METRIC,
+            )
+        ] + [
+            discord.SelectOption(
+                label=spec["label"][:100],
+                value=metric,
+                description=spec["note"][:100],
+                default=parent.metric == metric,
+            )
+            for metric, spec in database.LEADERBOARD_METRICS.items()
+        ]
+        super().__init__(placeholder="見たい項目を選ぶ", options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.parent_view.metric = self.values[0]
+        await self.parent_view.refresh(interaction)
+
+
+class LeaderboardRoleSelect(discord.ui.Select):
+    """役職別勝率のときだけ出す絞り込み。"""
+
+    def __init__(self, parent: "LeaderboardView") -> None:
+        self.parent_view = parent
+        super().__init__(
+            placeholder="役職を選ぶ",
+            options=[
+                discord.SelectOption(
+                    label=role.value,
+                    value=role.value,
+                    default=parent.role == role.value,
+                )
+                for role in ROLE_DISTRIBUTION
+            ],
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.parent_view.role = self.values[0]
+        await self.parent_view.refresh(interaction)
+
+
+class LeaderboardView(discord.ui.View):
+    """「全体ランキング」の中身。項目をセレクトで切り替える。"""
+
+    def __init__(self, guild_id: int, viewer_id: int) -> None:
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.viewer_id = viewer_id
+        self.metric: str = _RATING_METRIC
+        self.role: str = Role.WEREWOLF.value
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        self.clear_items()
+        self.add_item(LeaderboardMetricSelect(self))
+        needs_role = database.LEADERBOARD_METRICS.get(self.metric, {}).get("needs_role")
+        if needs_role:
+            self.add_item(LeaderboardRoleSelect(self))
+
+    async def load_embed(self, guild: discord.Guild) -> discord.Embed:
+        if self.metric == _RATING_METRIC:
+            return await _build_rating_leaderboard_embed(guild)
+        board = await database.get_metric_leaderboard(
+            self.guild_id,
+            self.metric,
+            role=self.role,
+            viewer_id=self.viewer_id,
+        )
+        return build_metric_leaderboard_embed(board, guild)
+
+    async def refresh(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "❌ サーバー内でのみ使用できます。", ephemeral=True,
+            )
+        await interaction.response.defer()
+        self._rebuild()
+        embed = await self.load_embed(interaction.guild)
+        await interaction.edit_original_response(embed=embed, view=self)
+
+
 class StatsView(discord.ui.View):
     def __init__(self, cog: GameCog) -> None:
         super().__init__(timeout=None)
@@ -2514,33 +2703,9 @@ class StatsView(discord.ui.View):
     async def all_stats(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await self._defer_ephemeral_query(interaction):
             return
-        from database import get_current_season_leaderboard
-
-        top = await get_current_season_leaderboard(interaction.guild.id, limit=20)
-        if not top:
-            return await interaction.followup.send("レーティングデータがありません。", ephemeral=True)
-
-        lines = []
-        for i, d in enumerate(top, 1):
-            member = interaction.guild.get_member(d["player_id"])
-            name = member.display_name if member else f"ID:{d['player_id']}"
-            provisional_txt = " 暫定" if d["provisional"] else ""
-            if d["top_percent"] is None:
-                rank_meta = " / 計測中"
-            else:
-                rank_meta = f" / {d['position']}位 / 上位{d['top_percent']:.1f}%"
-            lines.append(
-                f"`{i:>2}.` {d['emoji']} **{d['rating']}** [{d['rank_name']}{provisional_txt}] "
-                f"{name} — 今季{d['season_winrate']}% ({d['season_wins']}/{d['season_games']}){rank_meta}"
-            )
-
-        embed = discord.Embed(
-            title="今シーズンランキング",
-            description="\n".join(lines),
-            color=discord.Color.gold(),
-        )
-        embed.set_footer(text=f"相対ランクは通算{SEASON_RANK_MIN_GAMES}戦以上のプレイヤーのみ対象")
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        view = LeaderboardView(interaction.guild.id, interaction.user.id)
+        embed = await view.load_embed(interaction.guild)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @discord.ui.button(label="全体データ", style=discord.ButtonStyle.secondary, custom_id="stats_overall_data", row=0)
     async def overall_data(

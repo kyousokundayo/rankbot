@@ -11,8 +11,11 @@ from pathlib import Path
 from typing import Optional
 
 from config import (
+    BONUS_WOLF_GUESS_SLOTS,
     FEEDBACK_MAX_PER_DAY,
     INITIAL_RATING,
+    LEADERBOARD_LIMIT,
+    LEADERBOARD_MIN_SAMPLES,
     PLAYER_BLOCK_LIMIT,
     RECRUITMENT_BACKUP_CAPACITY,
     RECRUITMENT_ARCHIVE_RETENTION_DAYS,
@@ -574,6 +577,10 @@ async def init_db() -> None:
         await _ensure_column(db, "game_players", "died_on_day", "died_on_day INTEGER")
         await _ensure_column(db, "game_players", "death_cause", "death_cause TEXT")
         await _ensure_column(db, "game_players", "rank_at_game", "rank_at_game TEXT")
+        # 3狼提出の的中数。NULLは「提出していない/対象外」で、統計の分母にも入らない
+        await _ensure_column(
+            db, "game_players", "wolf_guess_hits", "wolf_guess_hits INTEGER",
+        )
         await _ensure_column(
             db, "game_players", "rank_provisional", "rank_provisional INTEGER",
         )
@@ -1069,6 +1076,27 @@ async def settle_game_settlement(
             ),
         )
         game_id = int(cursor.lastrowid)
+
+        # プレイボーナスの材料。的中数は game_players へも残して統計に使う
+        bonus_facts: Optional[dict] = None
+        if bonus_payload is not None:
+            try:
+                bonus_facts = json.loads(bonus_payload)
+            except (TypeError, ValueError) as exc:
+                log.exception(
+                    "プレイボーナスのpayloadを読めませんでした (game_id=%s): %s",
+                    game_id, exc,
+                )
+        try:
+            wolf_guess_hits = rating_lib.count_wolf_guess_hits(
+                player_records, bonus_facts,
+            )
+        except Exception as exc:
+            log.exception(
+                "3狼提出の的中集計に失敗しました (game_id=%s): %s", game_id, exc,
+            )
+            wolf_guess_hits = {}
+
         # 試合時表示ランクはレート計算の卓帯補正でも使うので控えておく
         rank_at_game_map: dict[int, Optional[str]] = {}
         for rec in player_records:
@@ -1088,11 +1116,13 @@ async def settle_game_settlement(
             await db.execute(
                 "INSERT INTO game_players "
                 "(game_id, player_id, role, team, won, died_on_day, death_cause, "
-                "rank_at_game, rank_provisional) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "rank_at_game, rank_provisional, wolf_guess_hits) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     game_id, player_id, rec["role"], rec["team"], int(bool(rec["won"])),
                     rec.get("died_on_day"), rec.get("death_cause"),
                     rank_at_game, rank_provisional,
+                    wolf_guess_hits.get(player_id),
                 ),
             )
 
@@ -1131,16 +1161,8 @@ async def settle_game_settlement(
             )
 
             # プレイボーナスは非ゼロサムの別枠。壊れた payload でレート精算を
-            # 止めないよう、読めなければ加点なしで続行する
-            bonus_facts: Optional[dict] = None
-            if bonus_payload is not None:
-                try:
-                    bonus_facts = json.loads(bonus_payload)
-                except (TypeError, ValueError) as exc:
-                    log.exception(
-                        "プレイボーナスのpayloadを読めませんでした (game_id=%s): %s",
-                        game_id, exc,
-                    )
+            # 止めないよう、読めなければ加点なしで続行する (bonus_facts は
+            # game_players を書く前に読んである)
             try:
                 play_bonuses = rating_lib.calculate_play_bonuses(
                     player_records, bonus_facts,
@@ -2426,6 +2448,151 @@ async def get_rank_player_stats(
                 sum(wolf_survival) / len(wolf_survival) if wolf_survival else None
             ),
         },
+    }
+
+
+# ============================================================
+# 項目別ランキング
+# ============================================================
+#
+# 各SQLは (player_id, 分子, 分母, サンプル数) を返す。
+# サンプル数は指標ごとに母数が違う (村での試合数 / 狼勝利数 / 提出回数…) ため、
+# 全体の試合数ではなくこの値へ LEADERBOARD_MIN_SAMPLES を掛ける。
+_LEADERBOARD_BASE = (
+    "FROM game_players gp JOIN games g ON gp.game_id = g.game_id "
+    "WHERE g.guild_id = ? "
+)
+
+LEADERBOARD_METRICS: dict[str, dict] = {
+    "village_day1_executed": {
+        "label": "村で初日に吊られた率",
+        "unit": "percent",
+        "note": "村陣営で参加した試合のうち、初日の処刑で死亡した割合",
+        "sql": (
+            "SELECT gp.player_id, "
+            "SUM(CASE WHEN gp.died_on_day = 1 AND gp.death_cause = '処刑' "
+            "THEN 1 ELSE 0 END), COUNT(*), COUNT(*) "
+            + _LEADERBOARD_BASE
+            + "AND gp.team = '村陣営' GROUP BY gp.player_id"
+        ),
+    },
+    "wolf_survive_on_win": {
+        "label": "人狼で勝った試合の生存率",
+        "unit": "percent",
+        "note": "人狼を引いて狼陣営が勝った試合のうち、最後まで生き残った割合",
+        "sql": (
+            "SELECT gp.player_id, "
+            "SUM(CASE WHEN gp.died_on_day IS NULL THEN 1 ELSE 0 END), "
+            "COUNT(*), COUNT(*) "
+            + _LEADERBOARD_BASE
+            + "AND gp.role = '人狼' AND gp.won = 1 GROUP BY gp.player_id"
+        ),
+    },
+    "role_winrate": {
+        "label": "役職別の勝率",
+        "unit": "percent",
+        "note": "選んだ役職を引いた試合の勝率",
+        "needs_role": True,
+        "sql": (
+            "SELECT gp.player_id, SUM(gp.won), COUNT(*), COUNT(*) "
+            + _LEADERBOARD_BASE
+            + "AND gp.role = ? GROUP BY gp.player_id"
+        ),
+    },
+    "votes_received": {
+        "label": "終了後投票の獲得票 (1試合あたり)",
+        "unit": "per_game",
+        "note": "終了後投票で受け取った票の合計 ÷ 参加した試合数",
+        "sql": (
+            "SELECT gp.player_id, COALESCE(SUM(rh.recommendation_bonus), 0), "
+            "COUNT(*), COUNT(*) "
+            "FROM game_players gp JOIN games g ON gp.game_id = g.game_id "
+            "LEFT JOIN rating_history rh ON rh.game_id = g.game_id "
+            "AND rh.player_id = gp.player_id AND rh.guild_id = g.guild_id "
+            "WHERE g.guild_id = ? GROUP BY gp.player_id"
+        ),
+    },
+    "wolf_guess_accuracy": {
+        "label": "3狼予想の的中率",
+        "unit": "percent",
+        "note": "提出した人 × 3枠のうち、実際に人狼だった割合",
+        "sql": (
+            "SELECT gp.player_id, COALESCE(SUM(gp.wolf_guess_hits), 0), "
+            f"COUNT(*) * {BONUS_WOLF_GUESS_SLOTS}, COUNT(*) "
+            + _LEADERBOARD_BASE
+            + "AND gp.wolf_guess_hits IS NOT NULL GROUP BY gp.player_id"
+        ),
+    },
+}
+
+
+async def get_metric_leaderboard(
+    guild_id: int,
+    metric: str,
+    *,
+    role: Optional[str] = None,
+    viewer_id: Optional[int] = None,
+    limit: int = LEADERBOARD_LIMIT,
+    min_samples: int = LEADERBOARD_MIN_SAMPLES,
+) -> dict:
+    """指標ごとの順位表と、閲覧者自身の値・順位を返す。
+
+    閲覧者がサンプル数不足で圏外でも、本人の生データだけは返す
+    (「あと何戦でランキングに載るか」が分かるようにするため)。
+    """
+    spec = LEADERBOARD_METRICS.get(metric)
+    if spec is None:
+        raise ValueError(f"unknown metric: {metric}")
+    params: list = [guild_id]
+    if spec.get("needs_role"):
+        if not role:
+            raise ValueError("role is required for this metric")
+        params.append(role)
+
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(spec["sql"], tuple(params))
+
+    entries = []
+    viewer_entry: Optional[dict] = None
+    for player_id, numerator, denominator, samples in rows:
+        numerator = int(numerator or 0)
+        denominator = int(denominator or 0)
+        samples = int(samples or 0)
+        if denominator <= 0:
+            continue
+        entry = {
+            "player_id": int(player_id),
+            "numerator": numerator,
+            "denominator": denominator,
+            "samples": samples,
+            "value": numerator / denominator,
+        }
+        if viewer_id is not None and entry["player_id"] == int(viewer_id):
+            viewer_entry = entry
+        if samples >= min_samples:
+            entries.append(entry)
+
+    # 値が同じなら母数の多い順 (試行回数が多いほうが確からしい) → ID順で安定させる
+    entries.sort(key=lambda e: (-e["value"], -e["samples"], e["player_id"]))
+    for position, entry in enumerate(entries, 1):
+        entry["position"] = position
+
+    viewer_position = next(
+        (e["position"] for e in entries
+         if viewer_id is not None and e["player_id"] == int(viewer_id)),
+        None,
+    )
+    return {
+        "metric": metric,
+        "label": spec["label"],
+        "unit": spec["unit"],
+        "note": spec["note"],
+        "role": role,
+        "top": entries[:limit],
+        "ranked_count": len(entries),
+        "min_samples": min_samples,
+        "viewer": viewer_entry,
+        "viewer_position": viewer_position,
     }
 
 
