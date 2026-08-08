@@ -349,7 +349,12 @@ class TestGrandmasterHistory(LeaderboardTestBase):
 
 
 class TestFeedbackOperationsNotice(unittest.IsolatedAsyncioTestCase):
-    """報告を #運営 へ流すときの整形。本文は利用者が自由に書けるので囲いを検証する"""
+    """報告を #運営 へ流すときの整形。
+
+    本文は利用者が自由に書けるので、通知本体に見える文面を自作されないよう
+    囲いが効いているかを見る。メンションの到達範囲はチャンネルの可視性で
+    閉じているため、allowed_mentions はノイズ対策として確認するだけ。
+    """
 
     def setUp(self) -> None:
         import recruitment
@@ -359,7 +364,7 @@ class TestFeedbackOperationsNotice(unittest.IsolatedAsyncioTestCase):
         block = self.recruitment._as_quoted_block("普通の本文", 900)
         self.assertEqual(block, "```\n普通の本文\n```")
 
-    def test_neutralises_backticks_so_the_block_cannot_be_escaped(self):
+    def test_neutralises_backticks_so_the_notice_cannot_be_forged(self):
         block = self.recruitment._as_quoted_block("```py\nimport os\n```", 900)
         self.assertNotIn("```py", block)
         self.assertEqual(block.count("```"), 2)
@@ -374,7 +379,7 @@ class TestFeedbackOperationsNotice(unittest.IsolatedAsyncioTestCase):
             with self.subTest(value=value):
                 self.assertEqual(self.recruitment._as_quoted_block(value, 900), "")
 
-    async def test_notice_drops_all_mentions_and_fits_one_message(self):
+    async def test_notice_suppresses_mention_pings_and_fits_one_message(self):
         sent: list[tuple] = []
 
         class FakeChannel:
