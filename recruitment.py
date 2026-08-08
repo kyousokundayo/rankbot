@@ -68,6 +68,20 @@ def _plain_identity(guild: discord.Guild, user_id: int) -> str:
     return f"{_display_name(guild, user_id)} (ID: {user_id})"
 
 
+def _as_quoted_block(text: object, limit: int) -> str:
+    """利用者が書いた文章をコードブロックへ安全に収める。
+
+    ``` をそのまま通すとブロックを閉じられて外へ抜け出せるので潰す。
+    メンション対策は送信側の allowed_mentions と二重にかける。
+    """
+    body = str(text or "").strip()
+    if not body:
+        return ""
+    if len(body) > limit:
+        body = body[:limit] + "…"
+    return "```\n" + body.replace("`", "'") + "\n```"
+
+
 def build_recruitment_help_embed() -> discord.Embed:
     """#募集 の利用者向けクイックヘルプ。"""
     embed = discord.Embed(
@@ -560,6 +574,45 @@ class RecruitmentManager:
         for recruitment_id in await database.archive_expired_recruitments(guild.id, now):
             await self.refresh_message(recruitment_id)
         await self.cleanup_old_messages(guild)
+
+    async def notify_feedback_report(
+        self, guild: discord.Guild, report: dict,
+    ) -> None:
+        """不具合・改善の報告を #運営 へ流す。
+
+        本文は一般公開しないが、`#運営` は Administrator 限定なので中身まで載せる
+        (毎回「報告の一覧」を開かないと読めない形だと見落とされるため)。
+
+        本文は利用者が自由に書けるので、**コードブロックで囲んだうえで
+        allowed_mentions も落とす**。片方だけだと ``` を含む本文や
+        @everyone で通知を撒かれる。報告者もメンションしない。
+        """
+        channel = self.operations_channel
+        if channel is None:
+            return
+        lines = [
+            f"📮 **報告が届きました**（ID: `{report['report_id']}` / {report['category']}）",
+            f"報告者: {_plain_identity(guild, report['user_id'])}",
+        ]
+        context = " / ".join(
+            str(part) for part in (
+                report.get("room_name"), report.get("phase"), report.get("bot_version"),
+            ) if part
+        )
+        if context:
+            lines.append(f"状況: {context}")
+        lines.append(_as_quoted_block(report.get("summary"), 900))
+        details = _as_quoted_block(report.get("details"), 500)
+        if details:
+            lines.append("補足:")
+            lines.append(details)
+        try:
+            await channel.send(
+                "\n".join(part for part in lines if part),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("報告の運営通知失敗: %s", exc)
 
     async def notify_block_added(
         self, guild: discord.Guild, blocker_id: int, blocked_id: int, count: int,
@@ -1256,6 +1309,43 @@ class OperationsView(discord.ui.View):
         rows = await database.get_blocked_counts(interaction.guild.id)
         lines = [f"{_plain_identity(interaction.guild, row['blocked_id'])}: {row['count']}人" for row in rows]
         await interaction.response.send_message("\n".join(lines) or "登録はありません。", ephemeral=True)
+
+    @discord.ui.button(label="報告の一覧", style=discord.ButtonStyle.secondary, custom_id="operations:feedback")
+    async def feedback_list(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self._is_admin(interaction) or interaction.guild is None:
+            return await interaction.response.send_message("管理者のみ操作できます。", ephemeral=True)
+        rows = await database.load_recent_feedback_reports(interaction.guild.id, limit=10)
+        if not rows:
+            return await interaction.response.send_message(
+                "不具合・改善の報告はまだありません。", ephemeral=True
+            )
+        embed = discord.Embed(
+            title="📮 直近の報告",
+            description="全文はこのチャンネルの通知に残っています。",
+            color=discord.Color.blurple(),
+        )
+        for row in rows:
+            context = " / ".join(
+                str(part) for part in (
+                    row.get("room_name"), row.get("phase"), row.get("bot_version"),
+                ) if part
+            )
+            summary = str(row.get("summary") or "").strip().replace("`", "'")
+            if len(summary) > 300:
+                summary = summary[:300] + "…"
+            embed.add_field(
+                name=f"#{row['report_id']} [{row['category']}] {str(row['created_at'])[:16]}",
+                value=(
+                    f"{_plain_identity(interaction.guild, row['user_id'])}"
+                    + (f"\n{context}" if context else "")
+                    + f"\n{summary or '(本文なし)'}"
+                )[:1024],
+                inline=False,
+            )
+        await interaction.response.send_message(
+            embed=embed, ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     @discord.ui.button(label="途中離脱の一覧", style=discord.ButtonStyle.secondary, custom_id="operations:dropouts")
     async def dropouts(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
