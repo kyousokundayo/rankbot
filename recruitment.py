@@ -16,20 +16,20 @@ from config import (
     BOT_VERSION,
     CH_OPERATIONS,
     CH_RECRUITMENT,
-    MAX_PLAYERS,
+    OPEN_ROOM_IDS,
     OPERATIONS_CATEGORY_NAME,
     PLAYER_BLOCK_LIMIT,
     PRIVATE_ROOM_CREATOR_ROLE_NAME,
-    RECRUITMENT_BACKUP_CAPACITY,
     RECRUITMENT_CONTACT_COOLDOWN_SECONDS,
     RECRUITMENT_IMMEDIATE_LEAD_MINUTES,
+    RECRUITMENT_DISABLED_ROOM_IDS,
     RECRUITMENT_MAX_DAYS_AHEAD,
-    RECRUITMENT_OCCUPANCY_MINUTES,
     RECRUITMENT_RANK_OPTIONS,
     RECRUITMENT_UNRANKED_LABEL,
     ROOM_DEFINITION_MAP,
     ROOM_DEFINITIONS,
     RECRUITMENT_ROOM_IDS,
+    VARIANT_DEFINITIONS,
     Phase,
 )
 from models import Player, parse_select_id
@@ -39,6 +39,88 @@ JST = ZoneInfo("Asia/Tokyo")
 WEEKDAY_JA = "月火水木金土日"
 # 開催日セレクトで「今すぐ」を表すマーカー。日付ISO文字列とは衝突しない値にする
 IMMEDIATE_DATE_VALUE = "now"
+
+
+def _is_open_room(room_id: str) -> bool:
+    return room_id in OPEN_ROOM_IDS
+
+
+def _strict_access_role_names(room) -> frozenset[str]:
+    """管理権限で迂回しない、卓の限定ロール名を返す。"""
+    return frozenset(getattr(room, "strict_access_role_names", None) or ())
+
+
+def _strict_room_access_error(
+    guild: discord.Guild,
+    room,
+    member: discord.Member,
+    *,
+    action: str,
+) -> Optional[str]:
+    """厳格ロール限定卓での操作資格を確認する。
+
+    権限上書きの作成時と同じく、同名ロールの重複・欠損は安全側に倒す。
+    ``manage_guild`` は通常のローカル卓だけのバイパスであり、ここでは
+    一切参照しない。
+    """
+    required = _strict_access_role_names(room)
+    if not required:
+        return None
+
+    matches_by_name: dict[str, list] = {name: [] for name in required}
+    for role in getattr(guild, "roles", ()) or ():
+        role_name = getattr(role, "name", None)
+        if role_name in matches_by_name:
+            matches_by_name[role_name].append(role)
+    if any(len(matches) != 1 for matches in matches_by_name.values()):
+        return (
+            "この卓の限定ロール設定を確認できないため、"
+            f"{action}できません。運営へ連絡してください。"
+        )
+
+    member_role_names = {
+        getattr(role, "name", None) for role in getattr(member, "roles", ())
+    }
+    if required.isdisjoint(member_role_names):
+        allowed = " / ".join(sorted(required))
+        return f"この卓への{action}には **{allowed}** のロールが必要です。"
+    return None
+
+
+class RecruitmentSnapshotMismatch(RuntimeError):
+    """保存済み募集ルールと現在設定が一致せず、安全に続行できない。"""
+
+
+def _recruitment_snapshot(row: dict):
+    """予約時snapshotを正本として返し、現在設定との不一致は拒否する。"""
+    room_id = str(row.get("room_id") or "")
+    room = ROOM_DEFINITION_MAP.get(room_id)
+    if room is None:
+        raise RecruitmentSnapshotMismatch("対象卓の現在設定が見つかりません。")
+    variant_id = str(row.get("variant_id") or "")
+    variant = VARIANT_DEFINITIONS.get(variant_id)
+    if variant is None:
+        raise RecruitmentSnapshotMismatch("募集作成時の変種設定を確認できません。")
+    try:
+        capacity = int(row["capacity"])
+        backup_capacity = int(row["backup_capacity"])
+        occupancy_minutes = int(row["occupancy_minutes"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RecruitmentSnapshotMismatch(
+            "募集作成時の定員・占有時間を確認できません。"
+        ) from exc
+    if min(capacity, backup_capacity, occupancy_minutes) <= 0:
+        raise RecruitmentSnapshotMismatch("募集作成時の定員・占有時間が不正です。")
+    if (
+        room.variant_id != variant_id
+        or variant.player_count != capacity
+        or variant.recruitment_occupancy_minutes != occupancy_minutes
+    ):
+        raise RecruitmentSnapshotMismatch(
+            "募集作成時のルールと現在の卓設定が一致しません。"
+            "安全のため、この募集は操作できません。"
+        )
+    return room, variant, capacity, backup_capacity, occupancy_minutes
 
 
 def _utc_datetime(text: str) -> datetime:
@@ -94,7 +176,8 @@ def build_recruitment_help_embed() -> discord.Embed:
     embed.add_field(
         name="参加する",
         value=(
-            "募集カードの **「参加」** を押します。13人を超えると補欠になり、"
+            "募集カードの **「参加」** を押します。卓の定員（9人または13人）を"
+            "超えると補欠になり、"
             "空きが出ると自動で繰り上がります。参加と繰り上げの連絡にDMを使います。"
         ),
         inline=False,
@@ -110,12 +193,12 @@ def build_recruitment_help_embed() -> discord.Embed:
     embed.add_field(
         name="開催する",
         value=(
-            "参加者13人とGMが揃ったら、主催者が **「卓へ移行」** を押します。"
+            "卓ごとの定員とGMが揃ったら、主催者が **「卓へ移行」** を押します。"
             "開催15分前には参加者へDMが届きます。"
         ),
         inline=False,
     )
-    embed.set_footer(text=f"{BOT_VERSION} / 募集の占有時間は{RECRUITMENT_OCCUPANCY_MINUTES}分")
+    embed.set_footer(text=f"{BOT_VERSION} / 占有時間は卓ごとに90分または150分")
     return embed
 
 
@@ -237,7 +320,25 @@ class RecruitmentManager:
         )
         for recruitment_id in expired:
             await self.refresh_message(recruitment_id)
+
+        # 公開試験後に卓を再び段階導入中へ戻した場合、開催済み・
+        # アーカイブ済みのカードも30日の通常保存期限を待たず回収する。
+        # 募集中だけを見る下の復元ループでは拾えないため、message_idを
+        # 持つ全状態を先に走査する。
+        for row in await database.list_recruitments_with_messages(guild.id):
+            if row["room_id"] in RECRUITMENT_DISABLED_ROOM_IDS:
+                await self._remove_hidden_recruitment_message(row)
+
         for row in await database.list_open_recruitments(guild.id):
+            if row["room_id"] in RECRUITMENT_DISABLED_ROOM_IDS:
+                log.warning(
+                    "段階導入中卓の公開募集をアーカイブします: %s/%s",
+                    row["id"], row["room_id"],
+                )
+                await database.set_recruitment_status(
+                    row["id"], database.RECRUITMENT_ARCHIVED,
+                )
+                row = await database.get_recruitment(row["id"]) or row
             await self.ensure_recruitment_message(guild, row)
         await self.cleanup_old_messages(guild)
 
@@ -262,6 +363,9 @@ class RecruitmentManager:
 
     async def ensure_recruitment_message(self, guild: discord.Guild, row: dict) -> None:
         if self.channel is None:
+            return
+        if row["room_id"] in RECRUITMENT_DISABLED_ROOM_IDS:
+            await self._remove_hidden_recruitment_message(row)
             return
         view = RecruitmentCardView(self, row["id"], active=row["status"] == database.RECRUITMENT_OPEN)
         message = None
@@ -289,6 +393,28 @@ class RecruitmentManager:
         if callable(add_view) and row["status"] == database.RECRUITMENT_OPEN:
             add_view(view, message_id=message.id)
 
+    async def _remove_hidden_recruitment_message(self, row: dict) -> None:
+        """段階導入中卓のカードが既にあれば公開チャンネルから回収する。"""
+        if self.channel is None or not row.get("message_id"):
+            return
+        fetch = getattr(self.channel, "fetch_message", None)
+        if not callable(fetch):
+            log.error(
+                "段階導入中卓の募集カードを回収できません: %s", row["id"]
+            )
+            return
+        try:
+            message = await fetch(row["message_id"])
+            await message.delete()
+        except discord.NotFound:
+            pass
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.error(
+                "段階導入中卓の募集カード削除失敗 (%s): %s", row["id"], exc,
+            )
+            return
+        await database.clear_recruitment_message_id(row["id"])
+
     async def publish_new_recruitment(
         self, guild: discord.Guild, recruitment_id: int
     ) -> None:
@@ -296,8 +422,13 @@ class RecruitmentManager:
         row = await database.get_recruitment(recruitment_id)
         if row is None:
             raise RuntimeError("作成した募集を読み直せませんでした。")
-        if self.channel is None:
-            published_error: Exception = RuntimeError("募集チャンネルがありません。")
+        if row["room_id"] in RECRUITMENT_DISABLED_ROOM_IDS:
+            await self._remove_hidden_recruitment_message(row)
+            published_error: Exception = RuntimeError(
+                "この卓は段階導入中のため募集を公開できません。"
+            )
+        elif self.channel is None:
+            published_error = RuntimeError("募集チャンネルがありません。")
         else:
             try:
                 await self.ensure_recruitment_message(guild, row)
@@ -335,10 +466,20 @@ class RecruitmentManager:
         row = await database.get_recruitment(recruitment_id)
         if row is None:
             return discord.Embed(title="募集が見つかりません", color=discord.Color.red())
+        try:
+            (
+                room, variant, capacity, backup_capacity, occupancy_minutes,
+            ) = _recruitment_snapshot(row)
+        except RecruitmentSnapshotMismatch as exc:
+            log.error("募集snapshot不整合 (%s): %s", recruitment_id, exc)
+            return discord.Embed(
+                title="募集設定エラー",
+                description=str(exc),
+                color=discord.Color.red(),
+            )
         entries = await database.list_recruitment_entries(recruitment_id)
         participants = [e["user_id"] for e in entries if e["kind"] == "参加"]
         backups = [e["user_id"] for e in entries if e["kind"] == "補欠"]
-        room = ROOM_DEFINITION_MAP.get(row["room_id"])
         start = _utc_datetime(row["scheduled_at"])
         color = discord.Color.dark_gold() if row["status"] == database.RECRUITMENT_OPEN else discord.Color.dark_grey()
         embed = discord.Embed(
@@ -347,7 +488,8 @@ class RecruitmentManager:
                 f"主催者: <@{row['host_id']}>\n"
                 f"開催: {discord.utils.format_dt(start, style='F')} "
                 f"({discord.utils.format_dt(start, style='R')})\n"
-                f"卓: **{room.name if room else row['room_id']}** / "
+                f"卓: **{room.name}** / "
+                f"変種: **{variant.label}** / 定員: **{capacity}人**\n"
                 f"配信: **{'あり' if row['streaming'] else 'なし'}**\n"
                 f"状態: **{row['status']}**"
             ),
@@ -358,17 +500,17 @@ class RecruitmentManager:
             for index, uid in enumerate(participants, 1)
         ]
         embed.add_field(
-            name=f"参加者 ({len(participants)}/{MAX_PLAYERS})",
+            name=f"参加者 ({len(participants)}/{capacity})",
             value="\n".join(participant_lines) or "なし", inline=False,
         )
         embed.add_field(
-            name=f"補欠 ({len(backups)}/{RECRUITMENT_BACKUP_CAPACITY})",
+            name=f"補欠 ({len(backups)}/{backup_capacity})",
             value="\n".join(_display_name(guild, uid) for uid in backups) or "なし",
             inline=False,
         )
         gm_text = _display_name(guild, row["gm_id"]) if row["gm_id"] else "未登録（移行時は主催者がGM）"
         embed.add_field(name="GM", value=gm_text, inline=False)
-        if row["room_id"] == "open":
+        if _is_open_room(row["room_id"]):
             allowed_ranks = row["allowed_ranks"]
             if allowed_ranks is None:
                 rank_condition = "制限なし"
@@ -391,7 +533,10 @@ class RecruitmentManager:
                 inline=False,
             )
         try:
-            rank_map = await database.get_current_rank_map(guild.id)
+            rank_map = await database.get_current_rank_map(
+                guild.id,
+                ladder_id=variant.ladder_id,
+            )
             rank_names = [
                 rank_map[uid].rank_name if uid in rank_map else "ランク未設定"
                 for uid in participants
@@ -410,31 +555,71 @@ class RecruitmentManager:
             log.warning("募集ランク範囲の表示失敗 (%s): %s", recruitment_id, exc)
         if row["note"]:
             embed.add_field(name="備考", value=row["note"][:1024], inline=False)
-        embed.set_footer(text=f"募集ID: {recruitment_id} / 占有時間: {RECRUITMENT_OCCUPANCY_MINUTES}分")
+        embed.set_footer(text=f"募集ID: {recruitment_id} / 占有時間: {occupancy_minutes}分")
         return embed
 
     async def validate_candidate(self, guild: discord.Guild, row: dict, member: discord.Member) -> Optional[str]:
         if member.id == guild.owner_id or member.guild_permissions.administrator:
             return "サーバーオーナーと管理者権限保持者はプレイヤー参加できません。"
-        room = ROOM_DEFINITION_MAP.get(row["room_id"])
-        if room is None:
-            return "対象卓が見つかりません。"
-        if room.access_role_names:
+        access_error = self.validate_existing_card_action(
+            guild, row, member, action="参加"
+        )
+        if access_error:
+            return access_error
+        try:
+            room, variant, _capacity, _backup, _occupancy = _recruitment_snapshot(row)
+        except RecruitmentSnapshotMismatch as exc:
+            log.error("募集snapshot不整合 (%s): %s", row.get("id"), exc)
+            return str(exc)
+        if room.access_role_names and not _strict_access_role_names(room):
             roles = {role.name for role in member.roles}
             if not member.guild_permissions.manage_guild and not roles.intersection(room.access_role_names):
                 return "この卓へ参加するための指定ロールがありません。"
-        info = await database.get_player_current_rank_info(member.id, guild.id)
+        info = await database.get_player_current_rank_info(
+            member.id, guild.id, ladder_id=variant.ladder_id,
+        )
         current_rank = info["rank_name"] if info else RECRUITMENT_UNRANKED_LABEL
         room_rank = info["rank_name"] if info else "ブロンズ"
         if room.allowed_ranks is not None and room_rank not in room.allowed_ranks:
             return f"現在ランク **{room_rank}** はこの卓の参加条件外です。"
-        if row["room_id"] == "open":
+        if _is_open_room(row["room_id"]):
             allowed_ranks = row["allowed_ranks"]
             if allowed_ranks is not None and current_rank not in allowed_ranks:
                 return f"現在ランク **{current_rank}** はこの募集の参加条件外です。"
         return None
 
+    @staticmethod
+    def validate_existing_card_action(
+        guild: discord.Guild,
+        row: dict,
+        member: discord.Member,
+        *,
+        action: str,
+    ) -> Optional[str]:
+        """残った募集カードを操作する資格を再検証する。
+
+        段階導入中へ戻した直後は、Discord APIの一時失敗で古いカード/Viewが
+        数分残ることがある。表示を隠すだけでは古いボタンを押せるため、参加・
+        GM・主催者操作・移行のすべてで同じ境界を通す。
+        """
+        if row["room_id"] in RECRUITMENT_DISABLED_ROOM_IDS:
+            return f"この卓は段階導入中のため{action}できません。"
+        try:
+            room, _variant, _capacity, _backup, _occupancy = _recruitment_snapshot(row)
+        except RecruitmentSnapshotMismatch as exc:
+            log.error("募集操作をsnapshot不整合で抑止 (%s): %s", row.get("id"), exc)
+            return str(exc)
+        return _strict_room_access_error(guild, room, member, action=action)
+
     async def notify_ready_if_needed(self, row: dict) -> None:
+        if row["room_id"] in RECRUITMENT_DISABLED_ROOM_IDS:
+            log.warning("段階導入中卓の募集成立DMを抑止: %s", row["id"])
+            return
+        try:
+            _room, _variant, capacity, _backup, _occupancy = _recruitment_snapshot(row)
+        except RecruitmentSnapshotMismatch as exc:
+            log.error("募集成立DMをsnapshot不整合で抑止 (%s): %s", row["id"], exc)
+            return
         if not await database.recruitment_ready_notification_needed(row["id"]):
             return
         guild = self.channel.guild if self.channel else None
@@ -442,7 +627,9 @@ class RecruitmentManager:
         if host is None:
             return
         try:
-            await host.send(f"✅ 募集「{row['title']}」は参加者13人とGMが揃いました。")
+            await host.send(
+                f"✅ 募集「{row['title']}」は参加者{capacity}人とGMが揃いました。"
+            )
         except (discord.Forbidden, discord.HTTPException) as exc:
             log.warning("募集成立DM失敗 (%s): %s", row["id"], exc)
             return
@@ -457,6 +644,21 @@ class RecruitmentManager:
             return "この募集は終了しています。"
         if interaction.user.id != row["host_id"]:
             return "卓へ移行できるのは主催者だけです。"
+        guild = interaction.guild
+        if guild is None:
+            return "サーバー内でのみ操作できます。"
+        access_error = self.validate_existing_card_action(
+            guild, row, interaction.user, action="移行"
+        )
+        if access_error:
+            return access_error
+        try:
+            _room_def, _variant, capacity, _backup, _occupancy = (
+                _recruitment_snapshot(row)
+            )
+        except RecruitmentSnapshotMismatch as exc:
+            log.error("募集移行をsnapshot不整合で抑止 (%s): %s", row["id"], exc)
+            return str(exc)
         room = self.game_cog.rooms.get(row["room_id"])
         if room is None:
             return "対象卓が見つかりません。"
@@ -464,11 +666,8 @@ class RecruitmentManager:
             return "対象卓はゲーム進行中のため移行できません。"
         entries = await database.list_recruitment_entries(recruitment_id)
         participant_ids = [e["user_id"] for e in entries if e["kind"] == "参加"]
-        if len(participant_ids) != MAX_PLAYERS:
-            return f"参加者が揃っていません ({len(participant_ids)}/{MAX_PLAYERS})。"
-        guild = interaction.guild
-        if guild is None:
-            return "サーバー内でのみ操作できます。"
+        if len(participant_ids) != capacity:
+            return f"参加者が揃っていません ({len(participant_ids)}/{capacity})。"
         members: list[discord.Member] = []
         invalid: list[str] = []
         for user_id in participant_ids:
@@ -486,9 +685,15 @@ class RecruitmentManager:
         if gm is None:
             invalid.append(f"GM ID:{gm_id}（サーバー不在）")
         else:
-            gm_error = await room.validate_gm_claim(gm)
-            if gm_error:
-                invalid.append(f"GM {gm.display_name}: {gm_error}")
+            strict_access_error = _strict_room_access_error(
+                guild, _room_def, gm, action="GM登録"
+            )
+            if strict_access_error:
+                invalid.append(f"GM {gm.display_name}: {strict_access_error}")
+            else:
+                gm_error = await room.validate_gm_claim(gm)
+                if gm_error:
+                    invalid.append(f"GM {gm.display_name}: {gm_error}")
         if invalid:
             return "開催時の条件確認で移行を中止しました。\n" + "\n".join(f"・{x}" for x in invalid)
         async with room.action_lock:
@@ -544,11 +749,29 @@ class RecruitmentManager:
                 except (discord.Forbidden, discord.HTTPException) as exc:
                     log.warning("募集移行の受付リセット告知失敗: %s", exc)
         await self.refresh_message(recruitment_id)
-        return f"✅ **{room.state.room_name}** の参加受付へ13人とGMを登録しました。"
+        return f"✅ **{room.state.room_name}** の参加受付へ{capacity}人とGMを登録しました。"
 
     async def process_notifications(self, guild: discord.Guild) -> None:
         now = datetime.now(timezone.utc)
+        # setup時の削除がDiscordの一時エラーで失敗しても、公開カードを
+        # 30日の通常保存期限まで残さない。定期ループごとに状態を問わず
+        # message_id付きの段階導入中卓を再回収する。
+        for row in await database.list_recruitments_with_messages(guild.id):
+            if row["room_id"] in RECRUITMENT_DISABLED_ROOM_IDS:
+                await self._remove_hidden_recruitment_message(row)
         for row in await database.list_due_recruitment_notifications(guild.id, now):
+            if row["room_id"] in RECRUITMENT_DISABLED_ROOM_IDS:
+                log.warning("段階導入中卓の開催前DMを抑止: %s", row["id"])
+                await database.set_recruitment_status(
+                    row["id"], database.RECRUITMENT_ARCHIVED,
+                )
+                await self.refresh_message(row["id"])
+                continue
+            try:
+                _recruitment_snapshot(row)
+            except RecruitmentSnapshotMismatch as exc:
+                log.error("開催前DMをsnapshot不整合で抑止 (%s): %s", row["id"], exc)
+                continue
             entries = await database.list_recruitment_entries(row["id"])
             participant_ids = [e["user_id"] for e in entries if e["kind"] == "参加"]
             for user_id in participant_ids:
@@ -669,7 +892,10 @@ class RecruitmentHomeView(discord.ui.View):
             )
         await interaction.followup.send(
             "開催日、時刻、卓、配信の有無を順に選択してください。",
-            view=RecruitmentScheduleView(self.manager, interaction.user.id),
+            view=RecruitmentScheduleView(
+                self.manager,
+                interaction.user.id,
+            ),
             ephemeral=True,
         )
 
@@ -699,7 +925,7 @@ class _DraftSelect(discord.ui.Select):
                 self.parent_view.values.pop("minute", None)
             self.parent_view.rebuild()
         if self.parent_view.is_complete():
-            is_open = self.parent_view.values["room"] == "open"
+            is_open = _is_open_room(self.parent_view.values["room"])
             await interaction.response.edit_message(
                 content=(
                     "必要なら参加可能ランクを複数選び、タイトル・備考を入力してください。"
@@ -717,10 +943,18 @@ class _DraftSelect(discord.ui.Select):
 
 
 class RecruitmentScheduleView(discord.ui.View):
-    def __init__(self, manager: RecruitmentManager, host_id: int) -> None:
+    def __init__(
+        self,
+        manager: RecruitmentManager,
+        host_id: int,
+        *,
+        allow_admin_rooms: bool = False,
+    ) -> None:
         super().__init__(timeout=300)
         self.manager = manager
         self.host_id = host_id
+        # 引数は旧呼び出し互換のため残すが、段階導入中卓は管理者にも公開しない。
+        self.allow_admin_rooms = False
         self.values: dict[str, str] = {}
         self.rebuild()
 
@@ -797,6 +1031,7 @@ class RecruitmentScheduleView(discord.ui.View):
                 )
                 for room in ROOM_DEFINITIONS
                 if room.room_id in RECRUITMENT_ROOM_IDS
+                and room.room_id not in RECRUITMENT_DISABLED_ROOM_IDS
             ],
             row=row,
         ))
@@ -850,7 +1085,7 @@ class RecruitmentOptionsView(discord.ui.View):
         super().__init__(timeout=300)
         self.manager, self.host_id, self.values = manager, host_id, dict(values)
         self.values.setdefault("allowed_ranks", [])
-        if self.values["room"] == "open":
+        if _is_open_room(str(self.values["room"])):
             self.add_item(_RankOptionSelect(self))
 
     @discord.ui.button(label="タイトル・備考を入力", style=discord.ButtonStyle.primary, row=2)
@@ -899,7 +1134,17 @@ class RecruitmentCreateModal(discord.ui.Modal, title="募集内容"):
                 ephemeral=True,
             )
         room_id = self.values["room"]
-        is_open = room_id == "open"
+        room = ROOM_DEFINITION_MAP.get(str(room_id))
+        if room is None or room.room_id not in RECRUITMENT_ROOM_IDS:
+            return await interaction.response.send_message(
+                "対象卓が見つからないため作成できません。", ephemeral=True,
+            )
+        if room.room_id in RECRUITMENT_DISABLED_ROOM_IDS:
+            return await interaction.response.send_message(
+                "この卓は段階導入中のため募集を作成できません。",
+                ephemeral=True,
+            )
+        is_open = _is_open_room(str(room_id))
         selected_ranks = self.values.get("allowed_ranks", [])
         allowed_ranks = (
             list(selected_ranks)
@@ -973,7 +1218,19 @@ class RecruitmentCardView(discord.ui.View):
         await self.manager.notify_ready_if_needed(await database.get_recruitment(self.recruitment_id))
 
     async def leave(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "サーバー内でのみ使えます。", ephemeral=True
+            )
         await interaction.response.defer(ephemeral=True, thinking=True)
+        row = await database.get_recruitment(self.recruitment_id)
+        if row is None:
+            return await interaction.followup.send("募集が見つかりません。", ephemeral=True)
+        access_error = self.manager.validate_existing_card_action(
+            interaction.guild, row, interaction.user, action="参加取消"
+        )
+        if access_error:
+            return await interaction.followup.send(access_error, ephemeral=True)
         try:
             _kind, promoted = await database.remove_recruitment_entry(
                 self.recruitment_id, interaction.user.id,
@@ -1000,6 +1257,11 @@ class RecruitmentCardView(discord.ui.View):
         row = await database.get_recruitment(self.recruitment_id)
         if row is None:
             return await interaction.followup.send("募集が見つかりません。", ephemeral=True)
+        access_error = self.manager.validate_existing_card_action(
+            interaction.guild, row, interaction.user, action="GM登録"
+        )
+        if access_error:
+            return await interaction.followup.send(access_error, ephemeral=True)
         if row["gm_id"] == interaction.user.id:
             try:
                 await database.set_recruitment_gm(
@@ -1012,12 +1274,40 @@ class RecruitmentCardView(discord.ui.View):
         elif row["gm_id"] is not None:
             return await interaction.followup.send("GMは既に登録されています。", ephemeral=True)
         else:
+            if row["room_id"] in RECRUITMENT_DISABLED_ROOM_IDS:
+                return await interaction.followup.send(
+                    "この卓は段階導入中のため募集へGM登録できません。",
+                    ephemeral=True,
+                )
+            try:
+                (
+                    _snapshot_room, variant, _capacity, _backup, _occupancy,
+                ) = _recruitment_snapshot(row)
+            except RecruitmentSnapshotMismatch as exc:
+                log.error(
+                    "募集GM登録をsnapshot不整合で抑止 (%s): %s", row["id"], exc,
+                )
+                return await interaction.followup.send(str(exc), ephemeral=True)
+            strict_access_error = _strict_room_access_error(
+                interaction.guild,
+                _snapshot_room,
+                interaction.user,
+                action="GM登録",
+            )
+            if strict_access_error:
+                return await interaction.followup.send(
+                    strict_access_error, ephemeral=True,
+                )
             room = self.manager.game_cog.rooms.get(row["room_id"])
             if room is None:
                 return await interaction.followup.send("対象卓が見つかりません。", ephemeral=True)
             # 予約時点では他卓の現在ロビー重複ではなく、卓固有のGM資格だけを確認する。
             room_def = room.room_def
-            info = await database.get_player_current_rank_info(interaction.user.id, interaction.guild.id)
+            info = await database.get_player_current_rank_info(
+                interaction.user.id,
+                interaction.guild.id,
+                ladder_id=variant.ladder_id,
+            )
             rank_name = info["rank_name"] if info else "ブロンズ"
             if room_def.allowed_gm_user_ids and interaction.user.id not in room_def.allowed_gm_user_ids:
                 return await interaction.followup.send("この卓のGMは指定ユーザー専用です。", ephemeral=True)
@@ -1051,9 +1341,18 @@ class RecruitmentCardView(discord.ui.View):
         await interaction.followup.send(result, ephemeral=True)
 
     async def host_menu(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "サーバー内でのみ使えます。", ephemeral=True
+            )
         row = await database.get_recruitment(self.recruitment_id)
         if row is None or interaction.user.id != row["host_id"]:
             return await interaction.response.send_message("主催者だけ操作できます。", ephemeral=True)
+        access_error = self.manager.validate_existing_card_action(
+            interaction.guild, row, interaction.user, action="主催者メニューの利用"
+        )
+        if access_error:
+            return await interaction.response.send_message(access_error, ephemeral=True)
         await interaction.response.send_message(
             "主催者メニューです。日時・卓種別などは変更できません。",
             view=RecruitmentHostView(self.manager, self.recruitment_id, interaction.user.id),
@@ -1088,29 +1387,52 @@ class RecruitmentHostView(discord.ui.View):
     def _allowed(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.host_id
 
+    async def _authorized_row(
+        self,
+        interaction: discord.Interaction,
+        *,
+        action: str,
+    ) -> tuple[Optional[dict], Optional[str]]:
+        """古い主催者Viewでも現在の公開境界を再検証する。"""
+        if not self._allowed(interaction):
+            return None, "主催者だけ操作できます。"
+        if interaction.guild is None:
+            return None, "サーバー内でのみ使えます。"
+        row = await database.get_recruitment(self.recruitment_id)
+        if row is None or row["host_id"] != self.host_id:
+            return None, "募集が見つかりません。"
+        access_error = self.manager.validate_existing_card_action(
+            interaction.guild, row, interaction.user, action=action
+        )
+        return row, access_error
+
     @discord.ui.button(label="備考を変更", style=discord.ButtonStyle.secondary)
     async def note(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not self._allowed(interaction):
-            return await interaction.response.send_message("主催者だけ操作できます。", ephemeral=True)
-        row = await database.get_recruitment(self.recruitment_id)
+        row, error = await self._authorized_row(interaction, action="備考変更")
+        if error:
+            return await interaction.response.send_message(error, ephemeral=True)
+        assert row is not None
         await interaction.response.send_modal(RecruitmentNoteModal(self.manager, self.recruitment_id, self.host_id, row["note"]))
 
     @discord.ui.button(label="複製", style=discord.ButtonStyle.primary)
     async def duplicate(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not self._allowed(interaction):
-            return await interaction.response.send_message("主催者だけ操作できます。", ephemeral=True)
+        _row, error = await self._authorized_row(interaction, action="募集の複製")
+        if error:
+            return await interaction.response.send_message(error, ephemeral=True)
         await interaction.response.send_modal(RecruitmentDuplicateModal(self.manager, self.recruitment_id, self.host_id))
 
     @discord.ui.button(label="一括連絡", style=discord.ButtonStyle.primary)
     async def contact(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not self._allowed(interaction):
-            return await interaction.response.send_message("主催者だけ操作できます。", ephemeral=True)
+        _row, error = await self._authorized_row(interaction, action="一括連絡")
+        if error:
+            return await interaction.response.send_message(error, ephemeral=True)
         await interaction.response.send_modal(RecruitmentContactModal(self.manager, self.recruitment_id, self.host_id))
 
     @discord.ui.button(label="募集を廃止", style=discord.ButtonStyle.danger)
     async def archive(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not self._allowed(interaction):
-            return await interaction.response.send_message("主催者だけ操作できます。", ephemeral=True)
+        _row, error = await self._authorized_row(interaction, action="募集の廃止")
+        if error:
+            return await interaction.response.send_message(error, ephemeral=True)
         await interaction.response.defer(ephemeral=True, thinking=True)
         changed = await database.set_recruitment_status(self.recruitment_id, database.RECRUITMENT_ARCHIVED)
         await self.manager.refresh_message(self.recruitment_id)
@@ -1129,6 +1451,18 @@ class RecruitmentNoteModal(discord.ui.Modal, title="備考を変更"):
         self.note.default = current
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "サーバー内でのみ使えます。", ephemeral=True
+            )
+        row = await database.get_recruitment(self.recruitment_id)
+        if row is None or interaction.user.id != self.host_id or row["host_id"] != self.host_id:
+            return await interaction.response.send_message("主催者だけ操作できます。", ephemeral=True)
+        access_error = self.manager.validate_existing_card_action(
+            interaction.guild, row, interaction.user, action="備考変更"
+        )
+        if access_error:
+            return await interaction.response.send_message(access_error, ephemeral=True)
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             await database.update_recruitment_note(self.recruitment_id, self.host_id, str(self.note))
@@ -1156,6 +1490,16 @@ class RecruitmentDuplicateModal(discord.ui.Modal, title="募集を複製"):
                 f"**{PRIVATE_ROOM_CREATOR_ROLE_NAME}** ロールが無いため複製できません。",
                 ephemeral=True,
             )
+        access_error = self.manager.validate_existing_card_action(
+            interaction.guild, row, interaction.user, action="募集の複製"
+        )
+        if access_error:
+            return await interaction.response.send_message(access_error, ephemeral=True)
+        try:
+            _recruitment_snapshot(row)
+        except RecruitmentSnapshotMismatch as exc:
+            log.error("募集複製をsnapshot不整合で抑止 (%s): %s", row["id"], exc)
+            return await interaction.response.send_message(str(exc), ephemeral=True)
         try:
             local_start = datetime.strptime(str(self.scheduled_at), "%Y-%m-%d %H:%M").replace(tzinfo=JST)
         except ValueError:
@@ -1193,6 +1537,11 @@ class RecruitmentContactModal(discord.ui.Modal, title="参加者へ一括連絡"
         row = await database.get_recruitment(self.recruitment_id)
         if row is None or interaction.user.id != self.host_id or interaction.guild is None:
             return await interaction.response.send_message("主催者だけ操作できます。", ephemeral=True)
+        access_error = self.manager.validate_existing_card_action(
+            interaction.guild, row, interaction.user, action="一括連絡"
+        )
+        if access_error:
+            return await interaction.response.send_message(access_error, ephemeral=True)
 
         # 連打・誤操作で参加者のDMが埋まらないよう間隔を空ける
         now = time.monotonic()

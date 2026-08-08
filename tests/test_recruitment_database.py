@@ -76,6 +76,47 @@ class RecruitmentDatabaseTest(unittest.IsolatedAsyncioTestCase):
         other_room = await self._create(host=3, room="beginner", offset=30)
         self.assertGreater(other_room, 0)
 
+    async def test_enabled_variant_capacity_and_occupancy_are_snapshotted(self) -> None:
+        nine = await self._create(host=1, room="open_9_cross")
+        row = await database.get_recruitment(nine)
+        self.assertEqual(row["variant_id"], "v9_cross")
+        self.assertEqual(row["capacity"], 9)
+        self.assertEqual(row["occupancy_minutes"], 90)
+        for user_id in range(100, 109):
+            self.assertEqual(
+                await database.add_recruitment_entry(nine, user_id),
+                "参加",
+            )
+        self.assertEqual(await database.add_recruitment_entry(nine, 200), "補欠")
+
+        with self.assertRaisesRegex(database.RecruitmentConflict, "未公開"):
+            await self._create(host=2, room="open_13_turn", offset=120)
+
+    async def test_all_standard_open_variants_allow_rank_filters(self) -> None:
+        recruitment_id = await database.create_recruitment(
+            1,
+            1,
+            title="9人ランク指定",
+            scheduled_at=self.base,
+            room_id="open_9_turn",
+            streaming=False,
+            allowed_ranks={"ゴールド"},
+        )
+        row = await database.get_recruitment(recruitment_id)
+        self.assertEqual(row["allowed_ranks"], frozenset({"ゴールド"}))
+
+    async def test_unknown_room_is_rejected_before_booking(self) -> None:
+        with self.assertRaisesRegex(database.RecruitmentConflict, "確認できません"):
+            await self._create(host=1, room="unknown-room")
+
+    async def test_archive_uses_each_recruitments_occupancy(self) -> None:
+        first = await self._create(host=1, room="open")
+        cross = await self._create(host=2, room="open_9_cross")
+        archived = await database.archive_expired_recruitments(
+            1, self.base + timedelta(minutes=91),
+        )
+        self.assertCountEqual(archived, [first, cross])
+
     async def test_held_recruitment_still_occupies_room_and_participant_time(self) -> None:
         held = await self._create(host=1, room="open")
         await database.add_recruitment_entry(held, 999)

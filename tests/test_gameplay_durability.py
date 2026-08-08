@@ -95,8 +95,12 @@ class FakeGuild:
         return next((member for member in self.members if member.id == user_id), None)
 
 
-def make_runner() -> RoomRunner:
-    runner = RoomRunner(None, FakeManager(), RoomDefinition("test", "テスト村"))
+def make_runner(variant_id: str = "v13_cross") -> RoomRunner:
+    runner = RoomRunner(
+        None,
+        FakeManager(),
+        RoomDefinition("test", "テスト村", variant_id=variant_id),
+    )
     runner.state.game_run_id = "run-1"
     runner.state.phase = Phase.NIGHT
     runner.state.night_generation = 3
@@ -160,6 +164,210 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(runner.state.morning_ready_event.is_set())
         self.assertFalse(runner.night_actions_open())
         runner._persist_room_state.assert_awaited()
+
+    async def test_v9_initial_seer_white_candidates_exclude_two_wolves_and_seer(self) -> None:
+        """9人配役の初日白は、狼2人と占い師本人を除く6人から選ぶ。"""
+        for variant_id in ("v9_cross", "v9_turn"):
+            with self.subTest(variant_id=variant_id):
+                runner = make_runner(variant_id)
+                seer = add_player(runner, 1, Role.SEER)
+                wolves = [
+                    add_player(runner, 2, Role.WEREWOLF),
+                    add_player(runner, 3, Role.WEREWOLF),
+                ]
+                expected = {
+                    add_player(runner, 4, Role.MADMAN).user_id,
+                    add_player(runner, 5, Role.MEDIUM).user_id,
+                    add_player(runner, 6, Role.GUARD).user_id,
+                    add_player(runner, 7, Role.VILLAGER).user_id,
+                    add_player(runner, 8, Role.VILLAGER).user_id,
+                    add_player(runner, 9, Role.VILLAGER).user_id,
+                }
+
+                candidates = runner._initial_seer_white_candidates(seer)
+
+                self.assertEqual({player.user_id for player in candidates}, expected)
+                self.assertEqual(len(candidates), 6)
+                self.assertNotIn(seer.user_id, {player.user_id for player in candidates})
+                self.assertTrue(
+                    all(wolf.user_id not in {player.user_id for player in candidates}
+                        for wolf in wolves)
+                )
+
+    async def test_v9_guard_cannot_declare_morning_without_guarding_even_twice(self) -> None:
+        for variant_id in ("v9_cross", "v9_turn"):
+            with self.subTest(variant_id=variant_id):
+                runner = make_runner(variant_id)
+                guard = add_player(runner, 1, Role.GUARD)
+                target = add_player(runner, 2, Role.VILLAGER)
+
+                for _ in range(2):
+                    _, error = await runner.toggle_morning_ready(guard.member)
+                    self.assertIsNotNone(error)
+                    self.assertIn("護衛先を確定", error)
+                    self.assertNotIn(guard.user_id, runner.state.morning_ready_ids)
+                    self.assertNotIn(guard.user_id, runner.state.morning_warned_ids)
+                    self.assertFalse(runner.state.morning_confirmed)
+                    self.assertFalse(runner.state.morning_ready_event.is_set())
+
+                runner.state.guard_target = target.user_id
+                _, error = await runner.toggle_morning_ready(guard.member)
+                self.assertIsNone(error)
+                self.assertIn(guard.user_id, runner.state.morning_ready_ids)
+
+    async def test_v9_force_morning_rejects_unprotected_guard(self) -> None:
+        for variant_id in ("v9_cross", "v9_turn"):
+            with self.subTest(variant_id=variant_id):
+                runner = make_runner(variant_id)
+                gm = add_player(runner, 1, Role.VILLAGER)
+                guard = add_player(runner, 2, Role.GUARD)
+                target = add_player(runner, 3, Role.VILLAGER)
+                runner.state.gm_id = gm.user_id
+
+                _, error = await runner.force_morning(gm.member)
+
+                self.assertIsNotNone(error)
+                self.assertIn("必須の夜行動", error)
+                self.assertFalse(runner.state.morning_confirmed)
+                self.assertFalse(runner.state.morning_ready_event.is_set())
+                runner._persist_room_state.assert_not_awaited()
+
+                runner.state.guard_target = target.user_id
+                _, error = await runner.force_morning(gm.member)
+                self.assertIsNone(error)
+                self.assertTrue(runner.state.morning_confirmed)
+                self.assertTrue(runner.state.morning_ready_event.is_set())
+                self.assertTrue(guard.alive)
+
+    async def test_v9_invalid_guard_targets_remain_pending(self) -> None:
+        for variant_id in ("v9_cross", "v9_turn"):
+            with self.subTest(variant_id=variant_id):
+                runner = make_runner(variant_id)
+                guard = add_player(runner, 1, Role.GUARD)
+                previous = add_player(runner, 2, Role.VILLAGER)
+                dead = add_player(runner, 3, Role.VILLAGER)
+                dead.alive = False
+                runner.state.guard_previous = previous.user_id
+
+                for target_id in (-1, guard.user_id, previous.user_id, dead.user_id, 999):
+                    with self.subTest(target_id=target_id):
+                        runner.state.guard_target = target_id
+                        self.assertIs(runner._pending_guard_player(), guard)
+
+                runner.state.guard_target = None
+                self.assertIs(runner._pending_guard_player(), guard)
+
+    async def test_v9_guard_view_rejects_self_previous_and_offered_out_targets(self) -> None:
+        for variant_id in ("v9_cross", "v9_turn"):
+            with self.subTest(variant_id=variant_id):
+                runner = make_runner(variant_id)
+                guard = add_player(runner, 1, Role.GUARD)
+                allowed = add_player(runner, 2, Role.VILLAGER)
+                previous = add_player(runner, 3, Role.VILLAGER)
+                outside = add_player(runner, 4, Role.VILLAGER)
+                # 通常の候補生成では自己/前夜対象を含めない。ここでは確認UIを
+                # 迂回された場合の最終検証を直接通すため、意図的に含める。
+                view = GuardView(runner, [guard, allowed, previous])
+                view.actor_id = guard.user_id
+
+                text, committed = await view.commit(guard)
+                self.assertFalse(committed)
+                self.assertIn("自分", text)
+
+                runner.state.guard_previous = previous.user_id
+                text, committed = await view.commit(previous)
+                self.assertFalse(committed)
+                self.assertIn("前回", text)
+
+                runner.state.guard_previous = None
+                text, committed = await view.commit(outside)
+                self.assertFalse(committed)
+                self.assertIn("対象は護衛できません", text)
+                self.assertIsNone(runner.state.guard_target)
+
+                text, committed = await view.commit(allowed)
+                self.assertTrue(committed, text)
+                self.assertEqual(runner.state.guard_target, allowed.user_id)
+                view.stop()
+
+    async def test_v9_panel_failure_pauses_instead_of_skipping_unprotected_guard(self) -> None:
+        for variant_id in ("v9_cross", "v9_turn"):
+            with self.subTest(variant_id=variant_id):
+                runner = make_runner(variant_id)
+                add_player(runner, 1, Role.GUARD)
+                add_player(runner, 2, Role.VILLAGER)
+                runner.state.morning_panel_message = None
+                runner._post_morning_panel = AsyncMock()  # 再掲示しても出せない
+                runner.pause_game = AsyncMock()
+                runner._pausable_wait_forever = AsyncMock()
+
+                await runner._wait_for_morning()
+
+                runner.pause_game.assert_awaited_once()
+                runner._pausable_wait_forever.assert_awaited_once_with(
+                    runner.state.morning_ready_event
+                )
+                self.assertFalse(runner.state.morning_confirmed)
+                self.assertFalse(runner.state.morning_ready_event.is_set())
+
+    async def test_v9_legacy_morning_confirmation_reopens_before_unprotected_night_resolves(self) -> None:
+        """旧snapshotのmorning_confirmedでも、未護衛のまま解決しない。"""
+        for variant_id in ("v9_cross", "v9_turn"):
+            with self.subTest(variant_id=variant_id):
+                runner = make_runner(variant_id)
+                guard = add_player(runner, 1, Role.GUARD)
+                target = add_player(runner, 2, Role.VILLAGER)
+                runner.state.wolf_target = -1
+                runner.state.morning_ready_ids = {guard.user_id, target.user_id}
+                runner.state.morning_warned_ids = {guard.user_id}
+                runner.state.morning_confirmed = True
+                runner.state.morning_ready_event.set()
+                runner.state.night_complete_event.set()
+
+                async def reopen(*, resume_existing: bool) -> None:
+                    self.assertTrue(resume_existing)
+                    self.assertIsNone(runner.state.guard_target)
+                    self.assertFalse(runner.state.morning_confirmed)
+                    self.assertFalse(runner.state.morning_ready_event.is_set())
+                    self.assertFalse(runner.state.night_complete_event.is_set())
+                    self.assertNotIn(guard.user_id, runner.state.morning_ready_ids)
+                    self.assertNotIn(guard.user_id, runner.state.morning_warned_ids)
+                    runner.state.guard_target = target.user_id
+
+                runner._night_phase = AsyncMock(side_effect=reopen)
+
+                await runner._process_night()
+
+                runner._night_phase.assert_awaited_once_with(resume_existing=True)
+                self.assertTrue(runner.state.night_resolved)
+                self.assertEqual(runner.state.guard_previous, target.user_id)
+
+    async def test_v9_guard_reselects_when_gm_excludes_its_guard_target(self) -> None:
+        for variant_id in ("v9_cross", "v9_turn"):
+            with self.subTest(variant_id=variant_id):
+                runner = make_runner(variant_id)
+                guard = add_player(runner, 1, Role.GUARD)
+                target = add_player(runner, 2, Role.VILLAGER)
+                runner.state.guard_target = target.user_id
+                runner.state.morning_ready_ids = {guard.user_id, target.user_id}
+                runner.state.morning_warned_ids = {guard.user_id}
+                runner.state.morning_confirmed = True
+                runner.state.morning_ready_event.set()
+                runner.state.night_complete_event.set()
+                runner._apply_death_effect = AsyncMock()
+                runner._request_guard_reselection = AsyncMock()
+                runner.state.check_win = lambda: None
+
+                await runner._eliminate_player_mid_game(target, "GM除外")
+
+                self.assertFalse(target.alive)
+                self.assertIsNone(runner.state.guard_target)
+                self.assertNotIn(guard.user_id, runner.state.morning_ready_ids)
+                self.assertNotIn(guard.user_id, runner.state.morning_warned_ids)
+                self.assertFalse(runner.state.morning_confirmed)
+                self.assertFalse(runner.state.morning_ready_event.is_set())
+                self.assertFalse(runner.state.night_complete_event.is_set())
+                runner._request_guard_reselection.assert_awaited_once_with(guard)
 
     async def test_restore_falls_back_to_fetch_when_cache_is_cold(self) -> None:
         """起動直後のキャッシュ未反映を「サーバー退出」と誤判定しない。
@@ -965,6 +1173,27 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["name"], "04-昼")
         self.assertIs(kwargs["category"], category)
         self.assertTrue(kwargs["sync_permissions"])
+
+    async def test_strict_access_room_never_archives_to_public_log(self) -> None:
+        """ねいと限定卓の終了ログを共通ログカテゴリへ漏らさない。"""
+        runner = RoomRunner(
+            None,
+            FakeManager(),
+            RoomDefinition(
+                "strict", "限定卓",
+                strict_access_role_names=frozenset({"ねいと"}),
+            ),
+        )
+        runner.state.guild = SimpleNamespace(
+            id=1, categories=[], create_category=AsyncMock()
+        )
+        channel = SimpleNamespace(name="昼", id=500, edit=AsyncMock())
+
+        moved = await runner._archive_game_channel(channel, "ログ-昼", 4)
+
+        self.assertFalse(moved)
+        runner.state.guild.create_category.assert_not_awaited()
+        channel.edit.assert_not_awaited()
 
     async def test_log_category_is_trimmed_when_it_hits_the_limit(self) -> None:
         """上限50に達したら古い順に40まで減らす (IDの昇順 = 作成順)。"""

@@ -11,24 +11,24 @@ import discord
 import database
 import rating as rating_lib
 from config import (
-    MAX_PLAYERS, Role, Team, Phase, ROLE_DISTRIBUTION,
-    RUNOFF_SPEECH_TIME, LAST_WILL_TIME, DAY_DISCUSSION_BASE,
-    DAY_DISCUSSION_DECREASE, DAY_DISCUSSION_MIN, VOTE_TIMEOUT,
+    MAX_PLAYERS, Role, Team, Phase,
+    RUNOFF_SPEECH_TIME, LAST_WILL_TIME, VOTE_TIMEOUT,
     NIGHT_BASE, NIGHT_MIN,
     CH_LOBBY, CH_STATS, CH_VILLAGE, CH_SPIRIT,
     LOG_CATEGORY_VILLAGE, LOG_CATEGORY_SPIRIT, LOG_CATEGORY_LIMIT,
-    SEASON_RANK_MIN_GAMES, GRANDMASTER_PERCENTAGE, GRANDMASTER_SLOTS,
+    SEASON_RANK_MIN_GAMES, GRANDMASTER_PERCENTAGE,
     RANK_SPECS, SEASON_RANK_PERCENTAGES,
     RATING_FLOOR, INITIAL_RATING, WIN_PARTICIPATION_BONUS,
-    WOLF_TEAM_SIZE, VILLAGE_TEAM_SIZE,
     WOLF_GUESS_TIMEOUT, BONUS_WOLF_GUESS_SLOTS,
     POSTGAME_RECOMMENDATION_TIMEOUT,
-    BONUS_WOLF_EXECUTION_VOTE, BONUS_FINAL_DAY_WOLF, BONUS_FINAL_DAY_THRESHOLD,
+    BONUS_WOLF_EXECUTION_VOTE, BONUS_FINAL_DAY_WOLF,
     BONUS_WOLF_GUESS_HIT, BONUS_WOLF_GUESS_EARLY_MULTIPLIER,
     BONUS_WOLF_GUESS_EARLY_MAX_DAY, BONUS_GUARD_SUCCESS, BONUS_NIGHT1_SEER_KILL,
     PRIVATE_ROOM_CREATOR_ROLE_NAME, BOT_VERSION,
-    ROOM_DEFINITIONS, RATED_ROOM_NAMES, STATS_MIN_SAMPLES, PLAYER_BLOCK_LIMIT,
+    ACTIVE_ROOM_DEFINITIONS, RATED_ROOM_NAMES, STATS_MIN_SAMPLES, PLAYER_BLOCK_LIMIT,
     SLOW_INTERACTION_SECONDS,
+    DEFAULT_VARIANT_ID, VariantDefinition, get_variant_definition,
+    VARIANT_DEFINITIONS, LADDER_DEFINITIONS, USER_VISIBLE_VARIANT_IDS,
 )
 from models import by_number, parse_select_id
 
@@ -188,6 +188,12 @@ class LobbyView(discord.ui.View):
             for item in self.children:
                 item.disabled = True
 
+    @property
+    def player_count(self) -> int:
+        """卓の定員。簡易Viewテストでは従来値へフォールバックする。"""
+        variant = getattr(self.cog, "variant", None)
+        return int(getattr(variant, "player_count", MAX_PLAYERS))
+
     def _refresh_start_button(self) -> None:
         start_btn = discord.utils.get(self.children, custom_id="start_game")
         if start_btn:
@@ -196,7 +202,7 @@ class LobbyView(discord.ui.View):
             state = self.cog.state
             start_btn.disabled = not (
                 state.phase == Phase.LOBBY
-                and len(state.players) == MAX_PLAYERS
+                and len(state.players) == self.player_count
                 and state.gm_id is not None
             )
 
@@ -225,13 +231,13 @@ class LobbyView(discord.ui.View):
         embed = discord.Embed(
             title=f"{state.room_name} - 参加受付",
             description=(
-                f"参加者が13人揃ったらGMが「ゲーム開始」を押してください。\n"
+                f"参加者が{self.player_count}人揃ったらGMが「ゲーム開始」を押してください。\n"
                 f"参加条件: **{room_note}**"
             ),
             color=discord.Color.dark_gold(),
         )
         embed.add_field(
-            name=f"参加者 ({len(players)}/{MAX_PLAYERS})",
+            name=f"参加者 ({len(players)}/{self.player_count})",
             value=player_list,
             inline=False,
         )
@@ -267,8 +273,11 @@ class LobbyView(discord.ui.View):
                 return await interaction.followup.send("現在ゲーム中です。", ephemeral=True)
             if user_id in state.players:
                 return await interaction.followup.send("既に参加しています。", ephemeral=True)
-            if len(state.players) >= MAX_PLAYERS:
-                return await interaction.followup.send("参加者が上限（13人）に達しています。", ephemeral=True)
+            if len(state.players) >= self.player_count:
+                return await interaction.followup.send(
+                    f"参加者が上限（{self.player_count}人）に達しています。",
+                    ephemeral=True,
+                )
             join_error = await self.cog.validate_join(interaction.user)
             if join_error:
                 return await interaction.followup.send(join_error, ephemeral=True)
@@ -356,9 +365,10 @@ class LobbyView(discord.ui.View):
                 return await interaction.response.send_message("現在ゲーム中です。", ephemeral=True)
             if interaction.user.id != state.gm_id:
                 return await interaction.response.send_message("GMのみがゲームを開始できます。", ephemeral=True)
-            if len(state.players) != MAX_PLAYERS:
+            if len(state.players) != self.player_count:
                 return await interaction.response.send_message(
-                    f"参加者が揃っていません ({len(state.players)}/{MAX_PLAYERS})", ephemeral=True
+                    f"参加者が揃っていません ({len(state.players)}/{self.player_count})",
+                    ephemeral=True,
                 )
 
             # ボタン無効化
@@ -402,12 +412,12 @@ class LobbyView(discord.ui.View):
 
     @discord.ui.button(label="ルール", style=discord.ButtonStyle.secondary, custom_id="rule_btn", row=2)
     async def rule_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        embeds = build_rule_embeds()
+        embeds = build_rule_embeds(getattr(self.cog, "variant", None))
         await interaction.response.send_message(embeds=embeds, ephemeral=True)
 
     @discord.ui.button(label="ヘルプ", style=discord.ButtonStyle.secondary, custom_id="help_btn", row=2)
     async def help_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        embeds = build_help_embeds()
+        embeds = build_help_embeds(getattr(self.cog, "variant", None))
         await interaction.response.send_message(embeds=embeds, ephemeral=True)
 
     async def private_room_manage_button(self, interaction: discord.Interaction) -> None:
@@ -605,6 +615,28 @@ def build_gm_status_embed(cog: RoomRunner) -> discord.Embed:
         embed.add_field(
             name="役職確認の宣言", value=f"{ready} / {len(required)}人", inline=True
         )
+    elif effective_phase == Phase.DAY_DISCUSSION:
+        turn_mode = getattr(cog, "is_turn_discussion_mode", None)
+        if callable(turn_mode) and turn_mode():
+            speaker = state.get_player(getattr(state, "current_speaker_id", None))
+            durations = tuple(getattr(cog.variant, "turn_round_seconds", ()))
+            daily_rounds = durations[:2] if state.day_number == 1 else durations[-1:]
+            round_index = int(getattr(state, "turn_round_index", 0))
+            remaining_interrupts = max(
+                0,
+                cog.variant.turn_interrupts_per_day
+                - int(getattr(state, "turn_interrupts_used", 0)),
+            )
+            speaker_text = speaker.display_name if speaker is not None else "再開待ち"
+            embed.add_field(
+                name="ターン進行",
+                value=(
+                    f"話者: **{speaker_text}**\n"
+                    f"巡: {min(round_index + 1, len(daily_rounds))} / {len(daily_rounds)}"
+                    f" ／ 割り込み残り: {remaining_interrupts}回"
+                ),
+                inline=False,
+            )
 
     if state.disconnected_players:
         waiting = [
@@ -688,6 +720,7 @@ class GMControlView(discord.ui.View):
         self.cog = cog
         self.game_run_id = cog.state.game_run_id
         state = cog.state
+        self.turn_token = int(getattr(state, "turn_slot_token", 0))
         effective_phase = state.phase_before_pause if state.phase == Phase.PAUSED else state.phase
         self.pause_btn.disabled = state.paused or self._settlement_locked()
         self.resume_btn.disabled = not state.paused and state.pending_winner is None
@@ -696,6 +729,10 @@ class GMControlView(discord.ui.View):
             effective_phase != Phase.PREPARATION
             or state.paused
             or self._settlement_locked()
+        )
+        turn_actions_open = getattr(cog, "turn_actions_open", None)
+        self.next_turn_btn.disabled = not (
+            callable(turn_actions_open) and turn_actions_open()
         )
         for item in (self.remove_btn, self.end_btn, self.reset_btn):
             item.disabled = self._settlement_locked()
@@ -807,6 +844,27 @@ class GMControlView(discord.ui.View):
                 interaction.user.id, execute, confirm_label="締め切って開始"
             ),
             ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="次の発言へ",
+        style=discord.ButtonStyle.secondary,
+        custom_id="gm_force_next_turn",
+        row=1,
+    )
+    async def next_turn_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not self._is_current() or not self._is_gm(interaction):
+            return await interaction.response.send_message(
+                "現在のGMだけが操作できます。", ephemeral=True
+            )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        result = await self.cog.force_next_turn(
+            interaction.user.id, self.turn_token
+        )
+        await interaction.followup.send(
+            result or "⏭️ 現在の発言を終了しました。", ephemeral=True
         )
 
     @discord.ui.button(label="強制終了", style=discord.ButtonStyle.danger, custom_id="gm_end", row=1)
@@ -1631,6 +1689,9 @@ class GuardView(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
         self.targets = targets
+        # Discordのセレクト表示だけを信頼せず、確認確定時にもこの夜に
+        # 提示した候補だけを受け付ける。
+        self.target_ids = frozenset(player.user_id for player in targets)
         self.game_run_id = cog.state.game_run_id
         self.night_generation = cog.state.night_generation
         # 確認UIから確定するときの操作者 (このViewは本人のDMにしか届かない)
@@ -1664,6 +1725,19 @@ class GuardView(discord.ui.View):
             return "✅ 今夜の護衛は既に確定しています。変更はできません。"
         return None
 
+    def _validate_target(self, actor_id: int, target) -> Optional[str]:
+        """表示候補を迂回した護衛先も最終的に拒否する。"""
+        state = self.cog.state
+        if target is None or target.user_id not in self.target_ids:
+            return "❌ その対象は護衛できません。"
+        if target.user_id == actor_id:
+            return "⚠️ 自分は護衛できません。"
+        if target.user_id == state.guard_previous:
+            return "⚠️ 前回と同じ対象は護衛できません。"
+        if not target.alive:
+            return "❌ その対象は護衛できません (既に死亡しています)。"
+        return None
+
     async def select_callback(self, interaction: discord.Interaction) -> None:
         state = self.cog.state
 
@@ -1677,15 +1751,11 @@ class GuardView(discord.ui.View):
                 "❌ 不正な対象です。", ephemeral=True
             )
 
-        if target_id == state.guard_previous:
-            return await interaction.response.send_message(
-                "⚠️ 前回と同じ対象は選択できません。別の対象を選んでください。", ephemeral=True
-            )
-
         target = state.get_player(target_id)
-        if target is None or not target.alive:
+        target_error = self._validate_target(interaction.user.id, target)
+        if target_error:
             return await interaction.response.send_message(
-                "❌ その対象は護衛できません (存在しないか、既に死亡しています)。", ephemeral=True
+                target_error, ephemeral=True
             )
 
         self.actor_id = interaction.user.id
@@ -1705,10 +1775,9 @@ class GuardView(discord.ui.View):
         error = self._validate(self.actor_id)
         if error:
             return error, False
-        if target.user_id == state.guard_previous:
-            return "⚠️ 前回と同じ対象は護衛できません。", False
-        if not target.alive:
-            return "❌ その対象は護衛できません (既に死亡しています)。", False
+        target_error = self._validate_target(self.actor_id, target)
+        if target_error:
+            return target_error, False
 
         old_action_log_len = len(state.action_log)
         state.guard_target = target.user_id
@@ -1839,12 +1908,15 @@ class MorningReadyView(discord.ui.View):
 # ============================================================
 
 class WolfGuessSelectView(discord.ui.View):
-    """3狼提出の選択UI。押した本人にしか見えない ephemeral として出す。"""
+    """人狼予想の選択UI。押した本人にしか見えない ephemeral として出す。"""
 
     def __init__(self, cog: RoomRunner, user_id: int) -> None:
         super().__init__(timeout=WOLF_GUESS_TIMEOUT)
         self.cog = cog
         self.user_id = user_id
+        self.guess_slots = int(
+            getattr(getattr(cog, "variant", None), "wolf_guess_slots", BONUS_WOLF_GUESS_SLOTS)
+        )
         options = [
             discord.SelectOption(
                 label=f"{player.number:02d}. {player.display_name}"[:100],
@@ -1854,9 +1926,9 @@ class WolfGuessSelectView(discord.ui.View):
             if player.user_id != user_id
         ]
         self.select = discord.ui.Select(
-            placeholder=f"人狼だと思う{BONUS_WOLF_GUESS_SLOTS}人を選ぶ",
-            min_values=BONUS_WOLF_GUESS_SLOTS,
-            max_values=BONUS_WOLF_GUESS_SLOTS,
+            placeholder=f"人狼だと思う{self.guess_slots}人を選ぶ",
+            min_values=self.guess_slots,
+            max_values=self.guess_slots,
             options=options[:25],
         )
         self.select.callback = self._on_select
@@ -1891,7 +1963,7 @@ class WolfGuessSelectView(discord.ui.View):
 
 
 class WolfGuessView(discord.ui.View):
-    """死亡告知に添える3狼提出ボタン。
+    """死亡告知に添える人狼予想提出ボタン。
 
     霊界の閲覧解放を止めているあいだ (WOLF_GUESS_TIMEOUT 秒) だけ有効。
     霊界へ入ると先に死んだ人から答えを聞けてしまうので、提出はその前に締める。
@@ -1905,9 +1977,13 @@ class WolfGuessView(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
         self.game_run_id = cog.state.game_run_id
+        self.guess_slots = int(
+            getattr(getattr(cog, "variant", None), "wolf_guess_slots", BONUS_WOLF_GUESS_SLOTS)
+        )
+        self.submit_btn.label = f"🐺 {self.guess_slots}狼予想を提出"
         cog.register_game_view(self)
 
-    @discord.ui.button(label="🐺 3狼予想を提出", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="🐺 人狼予想を提出", style=discord.ButtonStyle.primary)
     async def submit_btn(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
@@ -1921,18 +1997,18 @@ class WolfGuessView(discord.ui.View):
         user_id = interaction.user.id
         if user_id in state.wolf_guesses:
             await interaction.response.send_message(
-                "この試合の3狼予想は提出済みです。", ephemeral=True
+                "この試合の人狼予想は提出済みです。", ephemeral=True
             )
             return
         if user_id not in state.spirit_hold_ids:
             await interaction.response.send_message(
-                "3狼予想は**亡くなった直後の村側プレイヤー**だけが提出できます。\n"
+                "人狼予想は**亡くなった直後の村側プレイヤー**だけが提出できます。\n"
                 f"受付は死亡から{WOLF_GUESS_TIMEOUT // 60}分間です。",
                 ephemeral=True,
             )
             return
         await interaction.response.send_message(
-            f"人狼だと思う{BONUS_WOLF_GUESS_SLOTS}人を選んでください。\n"
+            f"人狼だと思う{self.guess_slots}人を選んでください。\n"
             "**確定すると変更できません。** 確定するとすぐ霊界へ入れます。",
             view=WolfGuessSelectView(cog, user_id),
             ephemeral=True,
@@ -1979,6 +2055,98 @@ class SpeechDoneView(discord.ui.View):
         except (discord.NotFound, discord.HTTPException):
             pass
         state.speech_done_event.set()
+
+
+class TurnSpeechView(discord.ui.View):
+    """ターン制の発言終了・公開CO・村全体の30秒割り込み。"""
+
+    def __init__(
+        self,
+        cog: RoomRunner,
+        speaker_id: int,
+        turn_token: int,
+        *,
+        allow_interrupt: bool,
+        allow_co_declaration: bool,
+    ) -> None:
+        # pause中にViewだけ失効しないよう、発言タイマーと同じく無期限にする。
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.speaker_id = speaker_id
+        self.turn_token = turn_token
+        self.game_run_id = cog.state.game_run_id
+        self.day_generation = cog.state.day_generation
+        self.interrupt_btn.disabled = not allow_interrupt
+        if not allow_co_declaration:
+            self.remove_item(self.co_declaration_btn)
+        cog.register_game_view(self)
+
+    def _is_current(self) -> bool:
+        return self.cog.is_current_day_view(
+            self.game_run_id, self.day_generation
+        )
+
+    @discord.ui.button(
+        label="発言終了（パス）",
+        style=discord.ButtonStyle.secondary,
+        custom_id="turn_speech_pass",
+    )
+    async def pass_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not self._is_current():
+            return await interaction.response.send_message(
+                "⏳ この発言枠は終了しています。", ephemeral=True
+            )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        error = await self.cog.request_turn_pass(
+            interaction.user.id, self.speaker_id, self.turn_token
+        )
+        await interaction.followup.send(
+            error or "✅ 発言を終了しました。", ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="30秒割り込み",
+        style=discord.ButtonStyle.primary,
+        custom_id="turn_speech_interrupt",
+    )
+    async def interrupt_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not self._is_current():
+            return await interaction.response.send_message(
+                "⏳ この発言枠は終了しています。", ephemeral=True
+            )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        error, remaining = await self.cog.request_turn_interrupt(
+            interaction.user.id, self.turn_token
+        )
+        await interaction.followup.send(
+            error or f"⚡ 割り込みを受け付けました（本日の残り **{remaining}回**）。",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="COを宣言",
+        style=discord.ButtonStyle.success,
+        custom_id="turn_speech_co_declaration",
+    )
+    async def co_declaration_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not self._is_current():
+            return await interaction.response.send_message(
+                "⏳ この発言枠は終了しています。", ephemeral=True
+            )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        error = await self.cog.request_turn_co_declaration(
+            interaction.user.id, self.turn_token
+        )
+        await interaction.followup.send(
+            error or "📣 COを公開しました。役職・内容はVCで話してください。",
+            ephemeral=True,
+        )
 
 
 # ============================================================
@@ -2388,18 +2556,347 @@ class FeedbackCategoryView(discord.ui.View):
         await self._open(interaction, "その他")
 
 
+def _stats_variant(variant_id: str) -> VariantDefinition:
+    """統計UIで未知の変種を既定値へ黙って混ぜず、明示的に検証する。"""
+    return get_variant_definition(variant_id)
+
+
+def _variant_scope_note(variant_id: str) -> str:
+    variant = _stats_variant(variant_id)
+    ladder = LADDER_DEFINITIONS[variant.ladder_id]
+    shared = " / ".join(
+        definition.label
+        for variant_id, definition in VARIANT_DEFINITIONS.items()
+        if variant_id in USER_VISIBLE_VARIANT_IDS
+        if definition.ladder_id == variant.ladder_id
+    )
+    return (
+        f"試合成績は **{variant.label}** だけを集計します。\n"
+        f"レート・順位は **{ladder.label}ラダーで共通** "
+        f"（{shared}）です。"
+    )
+
+
+def _variant_scope_footer(variant_id: str) -> str:
+    """Markdownを描画しないDiscord footer用の同内容テキスト。"""
+    return _variant_scope_note(variant_id).replace("**", "").replace("\n", " ")
+
+
+class StatsVariantSelect(discord.ui.Select):
+    """統計パネルを増やさず、公開中の変種を子Viewの先頭で切り替える。"""
+
+    def __init__(self, parent_view) -> None:
+        self.parent_view = parent_view
+        super().__init__(
+            placeholder="変種を選ぶ",
+            options=[
+                discord.SelectOption(
+                    label=definition.label,
+                    value=variant_id,
+                    description=(
+                        f"{definition.player_count}人 / "
+                        f"{LADDER_DEFINITIONS[definition.ladder_id].label}ラダー"
+                    ),
+                    default=parent_view.variant_id == variant_id,
+                )
+                for variant_id, definition in VARIANT_DEFINITIONS.items()
+                if variant_id in USER_VISIBLE_VARIANT_IDS
+            ],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.parent_view.set_variant(self.values[0])
+        await self.parent_view.refresh(interaction)
+
+
+def _rank_role_display(variant_id: str, rank_name: str) -> str:
+    variant = _stats_variant(variant_id)
+    if variant.ladder_id == "l13":
+        return rating_lib.get_rank_role_name(rank_name)
+    if rank_name == "グランドマスター":
+        return rating_lib.special_grandmaster_role_name(variant.ladder_id)
+    return "付与なし（9人村はグランドマスターのみ付与）"
+
+
+def _build_unplayed_variant_embed(
+    user: discord.abc.User,
+    variant_id: str,
+    rating_info: Optional[dict],
+) -> discord.Embed:
+    variant = _stats_variant(variant_id)
+    color = discord.Color(rating_info["color"]) if rating_info else discord.Color.blue()
+    embed = discord.Embed(
+        title=f"{user.display_name} の統計 — {variant.label}",
+        description=(
+            "**この変種はまだプレイしていません。**\n"
+            + _variant_scope_note(variant_id)
+        ),
+        color=color,
+    )
+    if rating_info is not None:
+        provisional = "（暫定）" if rating_info["provisional"] else ""
+        embed.add_field(
+            name=f"共通レート（{LADDER_DEFINITIONS[variant.ladder_id].label}）",
+            value=(
+                f"{rating_info['emoji']} **{rating_info['rating']}** "
+                f"[{rating_info['rank_name']}{provisional}]\n"
+                f"Discordロール: **{_rank_role_display(variant_id, rating_info['rank_name'])}**"
+            ),
+            inline=False,
+        )
+    return embed
+
+
+class PlayerStatsVariantView(discord.ui.View):
+    """自分/選択ユーザーの統計を変種別に表示する。"""
+
+    def __init__(
+        self,
+        cog: GameCog,
+        guild_id: int,
+        user: discord.abc.User,
+        *,
+        variant_id: str = DEFAULT_VARIANT_ID,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.guild_id = guild_id
+        self.user = user
+        self.variant_id = _stats_variant(variant_id).variant_id
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        self.clear_items()
+        self.add_item(StatsVariantSelect(self))
+
+    def set_variant(self, variant_id: str) -> None:
+        self.variant_id = _stats_variant(variant_id).variant_id
+        self._rebuild()
+
+    async def _sync_rank_role(
+        self,
+        guild: discord.Guild,
+        rating_info: Optional[dict],
+    ) -> None:
+        sync = getattr(self.cog, "_sync_rank_role", None)
+        if rating_info is None or not callable(sync):
+            return
+        member = guild.get_member(self.user.id)
+        if member is None and isinstance(self.user, discord.Member):
+            member = self.user
+        if member is None:
+            return
+        variant = _stats_variant(self.variant_id)
+        try:
+            await sync(
+                member,
+                rating_info["rank_name"],
+                ladder_id=variant.ladder_id,
+            )
+        except Exception as error:
+            log.warning(
+                "統計表示時のロール同期失敗 (%s/%s): %s",
+                member.display_name,
+                variant.ladder_id,
+                error,
+            )
+
+    async def load_embed(self, guild: discord.Guild) -> discord.Embed:
+        variant = _stats_variant(self.variant_id)
+        stats = await database.get_player_stats(
+            self.user.id,
+            self.guild_id,
+            variant_id=self.variant_id,
+        )
+        rating_info = await database.get_player_current_rank_info(
+            self.user.id,
+            self.guild_id,
+            ladder_id=variant.ladder_id,
+        )
+        last_season = await database.get_player_latest_season_result(
+            self.user.id,
+            self.guild_id,
+            ladder_id=variant.ladder_id,
+        )
+        await self._sync_rank_role(guild, rating_info)
+        if stats is None:
+            return _build_unplayed_variant_embed(
+                self.user, self.variant_id, rating_info,
+            )
+        return build_stats_embed(
+            self.user,
+            stats,
+            rating_info,
+            last_season,
+            variant_id=self.variant_id,
+        )
+
+    async def refresh(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "❌ サーバー内でのみ使用できます。", ephemeral=True,
+            )
+        await interaction.response.defer()
+        embed = await self.load_embed(interaction.guild)
+        await interaction.edit_original_response(embed=embed, view=self)
+
+
+def _history_delta_text(row: dict) -> str:
+    if row["rating_before"] is None or row["rating_after"] is None:
+        return ""
+    delta = row["rating_after"] - row["rating_before"]
+    sign = "+" if delta >= 0 else ""
+    elo_delta = row["elo_delta"] or 0
+    elo_sign = "+" if elo_delta >= 0 else ""
+    parts = [f"本体{elo_sign}{elo_delta}"]
+    for key, label in (
+        ("bonus", "勝利"),
+        ("play_bonus", "活躍"),
+        ("recommendation_bonus", "投票"),
+    ):
+        value = row[key] or 0
+        if value:
+            parts.append(f"{label}+{value}")
+    return (
+        f" / {row['rating_before']}→{row['rating_after']} ({sign}{delta}; "
+        + " / ".join(parts) + ")"
+    )
+
+
+class RecentGamesVariantView(discord.ui.View):
+    def __init__(
+        self,
+        guild_id: int,
+        *,
+        variant_id: str = DEFAULT_VARIANT_ID,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.variant_id = _stats_variant(variant_id).variant_id
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        self.clear_items()
+        self.add_item(StatsVariantSelect(self))
+
+    def set_variant(self, variant_id: str) -> None:
+        self.variant_id = _stats_variant(variant_id).variant_id
+        self._rebuild()
+
+    async def load_embed(self, guild: discord.Guild) -> discord.Embed:
+        del guild
+        variant = _stats_variant(self.variant_id)
+        rows = await database.get_recent_games(
+            self.guild_id, limit=10, variant_id=self.variant_id,
+        )
+        description = "\n".join(
+            f"`{row['seq']:>4}` {row['room_name']} / {row['winner_team']} / "
+            f"{format_played_at(row['played_at'])}"
+            for row in rows
+        )
+        if not description:
+            description = "この変種の試合履歴はまだありません。"
+        embed = discord.Embed(
+            title=f"最近の試合 — {variant.label}",
+            description=description,
+            color=discord.Color.blurple(),
+        )
+        embed.set_footer(text=_variant_scope_footer(self.variant_id))
+        return embed
+
+    async def refresh(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "❌ サーバー内でのみ使用できます。", ephemeral=True,
+            )
+        await interaction.response.defer()
+        embed = await self.load_embed(interaction.guild)
+        await interaction.edit_original_response(embed=embed, view=self)
+
+
+class PlayerHistoryVariantView(discord.ui.View):
+    def __init__(
+        self,
+        guild_id: int,
+        player_id: int,
+        *,
+        variant_id: str = DEFAULT_VARIANT_ID,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.player_id = player_id
+        self.variant_id = _stats_variant(variant_id).variant_id
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        self.clear_items()
+        self.add_item(StatsVariantSelect(self))
+
+    def set_variant(self, variant_id: str) -> None:
+        self.variant_id = _stats_variant(variant_id).variant_id
+        self._rebuild()
+
+    async def load_embed(self, guild: discord.Guild) -> discord.Embed:
+        del guild
+        variant = _stats_variant(self.variant_id)
+        rows = await database.get_player_recent_games(
+            self.player_id,
+            self.guild_id,
+            limit=10,
+            variant_id=self.variant_id,
+        )
+        lines = []
+        for row in rows:
+            result = "勝利" if row["won"] else "敗北"
+            lines.append(
+                f"`{row['seq']:>4}` {row['room_name']} / {row['role']} / "
+                f"{result}{_history_delta_text(row)}"
+            )
+        embed = discord.Embed(
+            title=f"自分の最近の試合 — {variant.label}",
+            description=(
+                "\n".join(lines)
+                if lines else "この変種はまだプレイしていません。"
+            ),
+            color=discord.Color.blue(),
+        )
+        embed.set_footer(text=_variant_scope_footer(self.variant_id))
+        return embed
+
+    async def refresh(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "❌ サーバー内でのみ使用できます。", ephemeral=True,
+            )
+        await interaction.response.defer()
+        embed = await self.load_embed(interaction.guild)
+        await interaction.edit_original_response(embed=embed, view=self)
+
+
 class OverallRoomStatsSelect(discord.ui.Select):
     def __init__(self, owner: "OverallStatsFilterView") -> None:
         self.owner = owner
-        options = [discord.SelectOption(label="全卓", value="all", default=True)]
+        options = [
+            discord.SelectOption(
+                label="全卓",
+                value="all",
+                default=owner.room_id is None,
+            )
+        ]
         options.extend(
-            discord.SelectOption(label=room.name, value=room.room_id)
-            for room in ROOM_DEFINITIONS
+            discord.SelectOption(
+                label=room.name,
+                value=room.room_id,
+                default=owner.room_id == room.room_id,
+            )
+            for room in ACTIVE_ROOM_DEFINITIONS
+            if room.variant_id == owner.variant_id
         )
         super().__init__(
             placeholder="試合指標を表示する卓",
             options=options,
-            row=0,
+            row=1,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -2423,7 +2920,7 @@ class OverallRankStatsSelect(discord.ui.Select):
         super().__init__(
             placeholder="プレイヤー指標を表示する試合時ランク",
             options=options,
-            row=1,
+            row=2,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -2435,31 +2932,60 @@ class OverallRankStatsSelect(discord.ui.Select):
 
 
 class OverallStatsFilterView(discord.ui.View):
-    """試合指標は卓、プレイヤー指標は試合時表示ランクで独立に絞る。"""
+    """変種を先に選び、卓/試合時表示ランクの2軸で絞る。"""
 
-    def __init__(self, guild_id: int) -> None:
+    def __init__(
+        self,
+        guild_id: int,
+        *,
+        variant_id: str = DEFAULT_VARIANT_ID,
+    ) -> None:
         super().__init__(timeout=300)
         self.guild_id = guild_id
+        self.variant_id = _stats_variant(variant_id).variant_id
         self.room_id: Optional[str] = None
         self.rank_name: Optional[str] = None
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        self.clear_items()
+        self.add_item(StatsVariantSelect(self))
         self.add_item(OverallRoomStatsSelect(self))
         self.add_item(OverallRankStatsSelect(self))
 
+    def set_variant(self, variant_id: str) -> None:
+        self.variant_id = _stats_variant(variant_id).variant_id
+        valid_rooms = {
+            room.room_id
+            for room in ACTIVE_ROOM_DEFINITIONS
+            if room.variant_id == self.variant_id
+        }
+        if self.room_id not in valid_rooms:
+            self.room_id = None
+        self._rebuild()
+
     async def load_embed(self, guild: discord.Guild) -> discord.Embed:
         game_stats = await database.get_overall_game_stats(
-            self.guild_id, room_id=self.room_id,
+            self.guild_id,
+            room_id=self.room_id,
+            variant_id=self.variant_id,
         )
         rank_stats = await database.get_rank_player_stats(
-            self.guild_id, rank_name=self.rank_name,
+            self.guild_id,
+            rank_name=self.rank_name,
+            variant_id=self.variant_id,
         )
         room_label = "全卓" if self.room_id is None else next(
-            (room.name for room in ROOM_DEFINITIONS if room.room_id == self.room_id),
+            (room.name for room in ACTIVE_ROOM_DEFINITIONS if room.room_id == self.room_id),
             self.room_id,
         )
         rank_label = self.rank_name or "確定ランク全体"
         return build_overall_stats_embed(
             game_stats, rank_stats,
-            room_label=room_label, rank_label=rank_label, guild=guild,
+            room_label=room_label,
+            rank_label=rank_label,
+            guild=guild,
+            variant_id=self.variant_id,
         )
 
     async def refresh(self, interaction: discord.Interaction) -> None:
@@ -2475,13 +3001,22 @@ class OverallStatsFilterView(discord.ui.View):
 _RATING_METRIC = "rating"
 
 
-async def _build_rating_leaderboard_embed(guild: discord.Guild) -> discord.Embed:
-    """従来の「今シーズンランキング」(レート順)。"""
-    top = await database.get_current_season_leaderboard(guild.id, limit=20)
+async def _build_rating_leaderboard_embed(
+    guild: discord.Guild,
+    variant_id: str = DEFAULT_VARIANT_ID,
+) -> discord.Embed:
+    """選択変種に対応するラダーの「今シーズンランキング」。"""
+    variant = _stats_variant(variant_id)
+    top = await database.get_current_season_leaderboard(
+        guild.id, limit=20, ladder_id=variant.ladder_id,
+    )
     if not top:
         return discord.Embed(
-            title="今シーズンランキング",
-            description="レーティングデータがありません。",
+            title=f"今シーズンランキング — {variant.label}",
+            description=(
+                "レーティングデータがありません。\n"
+                + _variant_scope_note(variant_id)
+            ),
             color=discord.Color.gold(),
         )
     lines = []
@@ -2498,8 +3033,8 @@ async def _build_rating_leaderboard_embed(guild: discord.Guild) -> discord.Embed
             f"{name} — 今季{d['season_winrate']}% ({d['season_wins']}/{d['season_games']}){rank_meta}"
         )
     embed = discord.Embed(
-        title="今シーズンランキング",
-        description="\n".join(lines),
+        title=f"今シーズンランキング — {variant.label}",
+        description=_variant_scope_note(variant_id) + "\n\n" + "\n".join(lines),
         color=discord.Color.gold(),
     )
     embed.set_footer(
@@ -2522,8 +3057,10 @@ def _format_metric_detail(entry: dict, unit: str) -> str:
 
 def build_metric_leaderboard_embed(board: dict, guild: discord.Guild) -> discord.Embed:
     """項目別ランキング + 閲覧者自身の位置。"""
+    variant_id = str(board.get("variant_id", DEFAULT_VARIANT_ID))
+    variant = _stats_variant(variant_id)
     unit = board["unit"]
-    title = board["label"]
+    title = f"{board['label']} — {variant.label}"
     if board.get("role"):
         title = f"{title}（{board['role']}）"
 
@@ -2543,7 +3080,9 @@ def build_metric_leaderboard_embed(board: dict, guild: discord.Guild) -> discord
         )
 
     embed = discord.Embed(
-        title=title, description=description, color=discord.Color.gold(),
+        title=title,
+        description=_variant_scope_note(variant_id) + "\n\n" + description,
+        color=discord.Color.gold(),
     )
     embed.add_field(name="この項目について", value=board["note"], inline=False)
 
@@ -2574,12 +3113,21 @@ _SEASON_MODE_PREVIOUS = "previous"
 _SEASON_MODE_GRANDMASTERS = "grandmasters"
 
 
-async def _build_previous_season_embed(guild: discord.Guild) -> discord.Embed:
-    reset_id, rows = await database.get_latest_season_results(guild.id, limit=20)
+async def _build_previous_season_embed(
+    guild: discord.Guild,
+    variant_id: str = DEFAULT_VARIANT_ID,
+) -> discord.Embed:
+    variant = _stats_variant(variant_id)
+    reset_id, rows = await database.get_latest_season_results(
+        guild.id, limit=20, ladder_id=variant.ladder_id,
+    )
     if reset_id == 0 or not rows:
         return discord.Embed(
-            title="前シーズン最終順位",
-            description="前シーズンの結果はまだありません。",
+            title=f"前シーズン最終順位 — {variant.label}",
+            description=(
+                "前シーズンの結果はまだありません。\n"
+                + _variant_scope_note(variant_id)
+            ),
             color=discord.Color.purple(),
         )
     lines = []
@@ -2595,23 +3143,31 @@ async def _build_previous_season_embed(guild: discord.Guild) -> discord.Embed:
             f"{name} — {row['season_winrate']}% ({row['season_wins']}/{row['season_games']}){top_pct}"
         )
     embed = discord.Embed(
-        title="前シーズン最終順位",
-        description="\n".join(lines),
+        title=f"前シーズン最終順位 — {variant.label}",
+        description=_variant_scope_note(variant_id) + "\n\n" + "\n".join(lines),
         color=discord.Color.purple(),
     )
     embed.set_footer(text=f"シーズンリセットID: {reset_id}")
     return embed
 
 
-async def _build_grandmaster_history_embed(guild: discord.Guild) -> discord.Embed:
-    seasons = await database.get_grandmaster_history(guild.id)
-    gm_emoji = rating_lib.get_rank_emoji_by_name("グランドマスター")
+async def _build_grandmaster_history_embed(
+    guild: discord.Guild,
+    variant_id: str = DEFAULT_VARIANT_ID,
+) -> discord.Embed:
+    variant = _stats_variant(variant_id)
+    seasons = await database.get_grandmaster_history(
+        guild.id, ladder_id=variant.ladder_id,
+    )
+    grandmaster_emoji = rating_lib.get_rank_emoji_by_name("グランドマスター")
+    grandmaster_name = LADDER_DEFINITIONS[variant.ladder_id].grandmaster_role_name
     if not seasons:
         return discord.Embed(
-            title=f"{gm_emoji} 歴代グランドマスター",
+            title=f"{grandmaster_emoji} 歴代{grandmaster_name} — {variant.label}",
             description=(
                 "まだシーズンが終了していません。\n"
-                "シーズンリセットの時点でグランドマスターだった人がここに残ります。"
+                f"シーズンリセットの時点で{grandmaster_name}だった人がここに残ります。\n"
+                + _variant_scope_note(variant_id)
             ),
             color=discord.Color.red(),
         )
@@ -2635,12 +3191,15 @@ async def _build_grandmaster_history_embed(guild: discord.Guild) -> discord.Embe
             )
         blocks.append("\n".join(lines))
     embed = discord.Embed(
-        title=f"{gm_emoji} 歴代グランドマスター",
-        description="\n\n".join(blocks),
+        title=f"{grandmaster_emoji} 歴代{grandmaster_name} — {variant.label}",
+        description=_variant_scope_note(variant_id) + "\n\n" + "\n\n".join(blocks),
         color=discord.Color.red(),
     )
     embed.set_footer(
-        text="各シーズンのリセット時点で グランドマスター だった人。レートはリセット前の値"
+        text=(
+            f"各シーズンのリセット時点で {grandmaster_name} だった人。"
+            "レートはリセット前の値"
+        )
     )
     return embed
 
@@ -2664,7 +3223,7 @@ class SeasonHistorySelect(discord.ui.Select):
                     default=parent.mode == _SEASON_MODE_GRANDMASTERS,
                 ),
             ],
-            row=0,
+            row=1,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -2673,17 +3232,27 @@ class SeasonHistorySelect(discord.ui.Select):
 
 
 class SeasonHistoryView(discord.ui.View):
-    """「前シーズン」の中身。現行ランキングとは別枠で歴代GMも見られる。"""
+    """「前シーズン」の中身。変種を選び、対応ラダーの履歴を表示する。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, variant_id: str = DEFAULT_VARIANT_ID) -> None:
         super().__init__(timeout=300)
+        self.variant_id = _stats_variant(variant_id).variant_id
         self.mode: str = _SEASON_MODE_PREVIOUS
+        self._rebuild()
+
+    def _rebuild(self) -> None:
+        self.clear_items()
+        self.add_item(StatsVariantSelect(self))
         self.add_item(SeasonHistorySelect(self))
+
+    def set_variant(self, variant_id: str) -> None:
+        self.variant_id = _stats_variant(variant_id).variant_id
+        self._rebuild()
 
     async def load_embed(self, guild: discord.Guild) -> discord.Embed:
         if self.mode == _SEASON_MODE_GRANDMASTERS:
-            return await _build_grandmaster_history_embed(guild)
-        return await _build_previous_season_embed(guild)
+            return await _build_grandmaster_history_embed(guild, self.variant_id)
+        return await _build_previous_season_embed(guild, self.variant_id)
 
     async def refresh(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -2691,8 +3260,7 @@ class SeasonHistoryView(discord.ui.View):
                 "❌ サーバー内でのみ使用できます。", ephemeral=True,
             )
         await interaction.response.defer()
-        self.clear_items()
-        self.add_item(SeasonHistorySelect(self))
+        self._rebuild()
         embed = await self.load_embed(interaction.guild)
         await interaction.edit_original_response(embed=embed, view=self)
 
@@ -2718,7 +3286,7 @@ class LeaderboardMetricSelect(discord.ui.Select):
             )
             for metric, spec in database.LEADERBOARD_METRICS.items()
         ]
-        super().__init__(placeholder="見たい項目を選ぶ", options=options, row=0)
+        super().__init__(placeholder="見たい項目を選ぶ", options=options, row=1)
 
     async def callback(self, interaction: discord.Interaction) -> None:
         self.parent_view.metric = self.values[0]
@@ -2738,9 +3306,9 @@ class LeaderboardRoleSelect(discord.ui.Select):
                     value=role.value,
                     default=parent.role == role.value,
                 )
-                for role in ROLE_DISTRIBUTION
+                for role in _stats_variant(parent.variant_id).role_distribution
             ],
-            row=1,
+            row=2,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -2751,31 +3319,53 @@ class LeaderboardRoleSelect(discord.ui.Select):
 class LeaderboardView(discord.ui.View):
     """「全体ランキング」の中身。項目をセレクトで切り替える。"""
 
-    def __init__(self, guild_id: int, viewer_id: int) -> None:
+    def __init__(
+        self,
+        guild_id: int,
+        viewer_id: int,
+        *,
+        variant_id: str = DEFAULT_VARIANT_ID,
+    ) -> None:
         super().__init__(timeout=300)
         self.guild_id = guild_id
         self.viewer_id = viewer_id
+        self.variant_id = _stats_variant(variant_id).variant_id
         self.metric: str = _RATING_METRIC
         self.role: str = Role.WEREWOLF.value
         self._rebuild()
 
     def _rebuild(self) -> None:
         self.clear_items()
+        self.add_item(StatsVariantSelect(self))
         self.add_item(LeaderboardMetricSelect(self))
         needs_role = database.LEADERBOARD_METRICS.get(self.metric, {}).get("needs_role")
         if needs_role:
             self.add_item(LeaderboardRoleSelect(self))
 
+    def set_variant(self, variant_id: str) -> None:
+        variant = _stats_variant(variant_id)
+        self.variant_id = variant.variant_id
+        valid_roles = {role.value for role in variant.role_distribution}
+        if self.role not in valid_roles:
+            self.role = next(iter(variant.role_distribution)).value
+        self._rebuild()
+
     async def load_embed(self, guild: discord.Guild) -> discord.Embed:
         if self.metric == _RATING_METRIC:
-            return await _build_rating_leaderboard_embed(guild)
+            return await _build_rating_leaderboard_embed(guild, self.variant_id)
+        needs_role = bool(
+            database.LEADERBOARD_METRICS.get(self.metric, {}).get("needs_role")
+        )
         board = await database.get_metric_leaderboard(
             self.guild_id,
             self.metric,
-            role=self.role,
+            role=self.role if needs_role else None,
             viewer_id=self.viewer_id,
+            variant_id=self.variant_id,
         )
-        return build_metric_leaderboard_embed(board, guild)
+        return build_metric_leaderboard_embed(
+            {**board, "variant_id": self.variant_id}, guild,
+        )
 
     async def refresh(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -2813,36 +3403,15 @@ class StatsView(discord.ui.View):
         await interaction.response.defer(ephemeral=True, thinking=True)
         return True
 
-    async def _sync_member_rank_role(
-        self,
-        member: Optional[discord.Member],
-        rating_info: Optional[dict],
-    ) -> None:
-        if member is None or rating_info is None:
-            return
-        try:
-            await self.cog._sync_rank_role(member, rating_info["rank_name"])
-        except Exception as e:
-            log.warning(f"統計表示時のロール同期失敗 ({member.display_name}): {e}")
-
     @discord.ui.button(label="自分の統計", style=discord.ButtonStyle.secondary, custom_id="stats_self", row=0)
     async def self_stats(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await self._defer_ephemeral_query(interaction):
             return
-        from database import (
-            get_player_current_rank_info,
-            get_player_latest_season_result,
-            get_player_stats,
+        view = PlayerStatsVariantView(
+            self.cog, interaction.guild.id, interaction.user,
         )
-        stats = await get_player_stats(interaction.user.id, interaction.guild.id)
-        if stats is None:
-            return await interaction.followup.send("まだゲームに参加していません。", ephemeral=True)
-        rating_info = await get_player_current_rank_info(interaction.user.id, interaction.guild.id)
-        last_season = await get_player_latest_season_result(interaction.user.id, interaction.guild.id)
-        member = interaction.user if isinstance(interaction.user, discord.Member) else None
-        await self._sync_member_rank_role(member, rating_info)
-        embed = build_stats_embed(interaction.user, stats, rating_info, last_season)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        embed = await view.load_embed(interaction.guild)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @discord.ui.button(label="全体ランキング", style=discord.ButtonStyle.secondary, custom_id="stats_all", row=0)
     async def all_stats(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -2888,66 +3457,19 @@ class StatsView(discord.ui.View):
     async def recent_games(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await self._defer_ephemeral_query(interaction):
             return
-        from database import get_recent_games
-
-        rows = await get_recent_games(interaction.guild.id, limit=10)
-        if not rows:
-            return await interaction.followup.send("試合履歴はまだありません。", ephemeral=True)
-
-        lines = [
-            f"`{row['seq']:>4}` {row['room_name']} / {row['winner_team']} / {format_played_at(row['played_at'])}"
-            for row in rows
-        ]
-        embed = discord.Embed(
-            title="最近の試合",
-            description="\n".join(lines),
-            color=discord.Color.blurple(),
-        )
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        view = RecentGamesVariantView(interaction.guild.id)
+        embed = await view.load_embed(interaction.guild)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @discord.ui.button(label="自分の履歴", style=discord.ButtonStyle.secondary, custom_id="stats_my_history", row=1)
     async def my_history(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await self._defer_ephemeral_query(interaction):
             return
-        from database import get_player_recent_games
-
-        rows = await get_player_recent_games(interaction.user.id, interaction.guild.id, limit=10)
-        if not rows:
-            return await interaction.followup.send("まだ試合履歴がありません。", ephemeral=True)
-
-        lines = []
-        for row in rows:
-            result = "勝利" if row["won"] else "敗北"
-            delta_txt = ""
-            if row["rating_before"] is not None and row["rating_after"] is not None:
-                delta = row["rating_after"] - row["rating_before"]
-                sign = "+" if delta >= 0 else ""
-                elo_delta = row["elo_delta"] or 0
-                win_bonus = row["bonus"] or 0
-                play_bonus = row["play_bonus"] or 0
-                recommendation_bonus = row["recommendation_bonus"] or 0
-                elo_sign = "+" if elo_delta >= 0 else ""
-                parts = [f"本体{elo_sign}{elo_delta}"]
-                if win_bonus:
-                    parts.append(f"勝利+{win_bonus}")
-                if play_bonus:
-                    parts.append(f"活躍+{play_bonus}")
-                if recommendation_bonus:
-                    parts.append(f"投票+{recommendation_bonus}")
-                delta_txt = (
-                    f" / {row['rating_before']}→{row['rating_after']} ({sign}{delta}; "
-                    + " / ".join(parts) + ")"
-                )
-            lines.append(
-                f"`{row['seq']:>4}` {row['room_name']} / {row['role']} / {result}{delta_txt}"
-            )
-
-        embed = discord.Embed(
-            title="自分の最近の試合",
-            description="\n".join(lines),
-            color=discord.Color.blue(),
+        view = PlayerHistoryVariantView(
+            interaction.guild.id, interaction.user.id,
         )
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        embed = await view.load_embed(interaction.guild)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @discord.ui.button(label="ランク仕様", style=discord.ButtonStyle.secondary, custom_id="stats_rank_spec", row=1)
     async def rank_spec_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -2993,22 +3515,11 @@ class StatsView(discord.ui.View):
         if not await self._defer_ephemeral_query(interaction):
             return
         target = select.values[0]
-        from database import (
-            get_player_current_rank_info,
-            get_player_latest_season_result,
-            get_player_stats,
+        view = PlayerStatsVariantView(
+            self.cog, interaction.guild.id, target,
         )
-        stats = await get_player_stats(target.id, interaction.guild.id)
-        if stats is None:
-            return await interaction.followup.send(
-                f"{target.display_name} はまだゲームに参加していません。", ephemeral=True
-        )
-        rating_info = await get_player_current_rank_info(target.id, interaction.guild.id)
-        last_season = await get_player_latest_season_result(target.id, interaction.guild.id)
-        member = target if isinstance(target, discord.Member) else interaction.guild.get_member(target.id)
-        await self._sync_member_rank_role(member, rating_info)
-        embed = build_stats_embed(target, stats, rating_info, last_season)
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        embed = await view.load_embed(interaction.guild)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 # ============================================================
@@ -3067,16 +3578,20 @@ def build_overall_stats_embed(
     room_label: str,
     rank_label: str,
     guild: discord.Guild,
+    variant_id: str = DEFAULT_VARIANT_ID,
 ) -> discord.Embed:
     """卓単位の試合指標と、試合時ランク単位の個人指標を分けて表示する。"""
+    variant = _stats_variant(variant_id)
     games = int(game_stats["games"])
     detailed_games = int(game_stats["detailed_games"])
     village_wins = int(game_stats["wins"].get(Team.VILLAGE.value, 0))
     wolf_wins = int(game_stats["wins"].get(Team.WOLF.value, 0))
     embed = discord.Embed(
-        title=f"全体データ — {room_label}",
+        title=f"全体データ — {variant.label} / {room_label}",
         description=(
-            "試合指標は上のメニューで**卓別**、プレイヤー指標は下のメニューで"
+            ("**この変種の試合はまだありません。**\n" if games == 0 else "")
+            + _variant_scope_note(variant_id)
+            + "\n\n試合指標は卓メニューで**卓別**、プレイヤー指標はランクメニューで"
             "**その試合時点の表示ランク**別に切り替えます。\n"
             "表示ランクはシーズン内の相対評価（上位%）です。現在のランクロールとは"
             "時期によって異なる場合があります。暫定ランクはランク別集計から除外します。"
@@ -3170,7 +3685,11 @@ def build_stats_embed(
     stats: dict,
     rating_info: Optional[dict] = None,
     last_season: Optional[dict] = None,
+    *,
+    variant_id: str = DEFAULT_VARIANT_ID,
 ) -> discord.Embed:
+    variant = _stats_variant(variant_id)
+    ladder = LADDER_DEFINITIONS[variant.ladder_id]
     # ランクに合わせた色
     if rating_info:
         embed_color = discord.Color(rating_info["color"])
@@ -3178,14 +3697,15 @@ def build_stats_embed(
         embed_color = discord.Color.blue()
 
     embed = discord.Embed(
-        title=f"{user.display_name} の統計",
+        title=f"{user.display_name} の統計 — {variant.label}",
+        description=_variant_scope_note(variant_id),
         color=embed_color,
     )
 
     # レート/ランク (最上部)
     if rating_info:
         provisional_txt = " (暫定)" if rating_info["provisional"] else ""
-        role_name = rating_lib.get_rank_role_name(rating_info["rank_name"])
+        role_name = _rank_role_display(variant_id, rating_info["rank_name"])
         if rating_info["top_percent"] is None:
             top_txt = (
                 f"計測中 / 今季 {rating_info['season_games']}戦\n"
@@ -3199,7 +3719,7 @@ def build_stats_embed(
             if rating_info["rank_name"] in ("マスター", "グランドマスター"):
                 top_txt += "\nマスター帯の順位表示対象です"
         embed.add_field(
-            name="現在シーズン",
+            name=f"現在シーズン（{ladder.label}ラダー）",
             value=(
                 f"{rating_info['emoji']} **{rating_info['rating']}** [{rating_info['rank_name']}{provisional_txt}]\n"
                 f"Discordロール: **{role_name}**\n"
@@ -3216,7 +3736,7 @@ def build_stats_embed(
             if last_season["top_percent"] is not None else ""
         )
         embed.add_field(
-            name="前シーズン結果",
+            name=f"前シーズン結果（{ladder.label}ラダー）",
             value=(
                 f"{last_season['emoji']} {last_season['rank_name']} / 最終レート {last_season['final_rating']}{top_txt}\n"
                 f"勝率: {last_season['season_winrate']}% ({last_season['season_wins']}/{last_season['season_games']})"
@@ -3340,41 +3860,66 @@ def build_vote_result_embed(votes: dict, players: dict, title: str = "投票結�
     return embed
 
 
-def build_rule_embeds() -> list[discord.Embed]:
-    """ルールボタン用: ゲームに必要なレギュレーションだけをまとめる"""
-    day_base_min = DAY_DISCUSSION_BASE // 60
-    day_drop_min = DAY_DISCUSSION_DECREASE // 60
-    day_min_min = DAY_DISCUSSION_MIN // 60
+def _display_variant(
+    variant: Optional[VariantDefinition],
+) -> VariantDefinition:
+    return variant or get_variant_definition(DEFAULT_VARIANT_ID)
 
-    embed = discord.Embed(
-        title="レギュレーション",
-        description=f"**{MAX_PLAYERS}人固定**。昼はVCと `#{CH_VILLAGE}`、夜の役職行動はDMで進行します。",
-        color=discord.Color.dark_gold(),
+
+def _role_rule_lines(variant: VariantDefinition) -> str:
+    descriptions = {
+        Role.WEREWOLF: "夜に1人を襲撃。相方が誰か分かり、DMの発言は狼同士に中継",
+        Role.MADMAN: "能力なし。狼が誰かは分からない",
+        Role.SEER: "夜に1人を占い「人狼 / 村人」を判定。開始時に初日白が1件届く",
+        Role.MEDIUM: "処刑された人が「人狼 / 村人」かをDMで受信",
+        Role.GUARD: "毎夜1人を護衛（放棄不可）。自分と前夜と同じ人は選べない",
+        Role.VILLAGER: "能力なし",
+    }
+    return "\n".join(
+        f"**{role.value} ×{count}** — {descriptions[role]}"
+        for role, count in variant.role_distribution.items()
     )
-    embed.add_field(
-        name="勝利条件",
-        value=(
-            "**村陣営** — 人狼3人を全滅させる\n"
-            "**狼陣営** — 生存人狼数 ≧ 生存非人狼数\n"
-            "※ 狂人は狼陣営の勝ちですが、**占い・霊媒・襲撃・人数判定では「村人」扱い**です"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name=f"役職 ({MAX_PLAYERS}人)",
-        value=(
-            "**人狼 ×3** — 夜に1人を襲撃。相方が誰か分かり、DMの発言は狼同士に中継\n"
-            "**狂人 ×1** — 能力なし。狼が誰かは分からない\n"
-            "**占い師 ×1** — 夜に1人を占い「人狼 / 村人」を判定。開始時に初日白が1件届く\n"
-            "**霊媒師 ×1** — 処刑された人が「人狼 / 村人」かをDMで受信\n"
-            "**狩人 ×1** — 夜に1人を護衛。自分と前夜と同じ人は選べない\n"
-            "**村人 ×6** — 能力なし"
-        ),
-        inline=False,
-    )
-    embed.add_field(
-        name="1日の流れ",
-        value=(
+
+
+def build_rule_embeds(
+    variant: Optional[VariantDefinition] = None,
+) -> list[discord.Embed]:
+    """ルールボタン用: ゲームに必要なレギュレーションだけをまとめる"""
+    variant = _display_variant(variant)
+    wolf_count = int(variant.role_distribution.get(Role.WEREWOLF, 0))
+
+    if variant.discussion_mode == "turn":
+        first, second, later = variant.turn_round_seconds
+        channel_description = (
+            f"**{variant.player_count}人固定**。昼の議論はVCのみで、"
+            f"`#{CH_VILLAGE}` へのテキスト投稿はできません。夜の役職行動はDMです。"
+        )
+        discussion_rule = (
+            "朝の結果発表 → ターン制議論 → 投票 →（同票なら弁明と決戦投票）→ 遺言 → 処刑 → 夜\n"
+            "**議論中の仮投票はありません。** 規定の全発言が終わってから投票します。\n"
+            f"初日 **{first}秒を1巡 → 同じ順で{second}秒を1巡** ／ "
+            f"2日目以降 **{later}秒を1巡**。番号の昇順で進み、末尾の次は01へ戻ります。\n"
+            "初日はランダム起点。翌日以降は襲撃死ならその次の生存席、"
+            "護衛成功なら襲撃対象本人、噛みなし・未行動ならランダム起点です。\n"
+            "COは初日2巡目と2日目以降の唯一の巡だけ、`COを宣言`で名前のみ公開します。"
+            "役職・理由の詳細はVCで話し、偽COも同じ操作です。\n"
+            f"割り込みは村全体で1日 **{variant.turn_interrupts_per_day}回**、1回最大30秒。"
+            "元の話者の時間は止まり、割り込み終了後に残り時間から再開します。"
+            "割り込み中への再割り込みはできません。現在の話者はパスできます。\n"
+            f"投票 **{VOTE_TIMEOUT}秒**（全員投票で即開示） ／ "
+            f"弁明 **{RUNOFF_SPEECH_TIME}秒** ／ 遺言 **{LAST_WILL_TIME}秒**（本人かGMが短縮可）\n"
+            f"夜 **初日{NIGHT_BASE}秒 / 以降{NIGHT_MIN}秒**（目安。朝は全員の宣言で明ける）"
+        )
+    else:
+        day_base, day_drop, day_minimum = variant.crosstalk_discussion_seconds
+        day_base_min = day_base // 60
+        day_drop_min = day_drop // 60
+        day_min_min = day_minimum // 60
+        channel_description = (
+            f"**{variant.player_count}人固定**。昼はVCと `#{CH_VILLAGE}`、"
+            "夜の役職行動はDMで進行します。"
+        )
+        discussion_rule = (
             "朝の結果発表 → 議論 → 投票 →（同票なら弁明と決戦投票）→ 遺言 → 処刑 → 夜\n"
             "**議論中から投票できます**（投票フェーズまでは入れ替え自由。"
             "全員が入れ終わると議論を切り上げてそのまま開示します）\n"
@@ -3382,7 +3927,30 @@ def build_rule_embeds() -> list[discord.Embed]:
             f" ／ 投票 **{VOTE_TIMEOUT}秒**（全員投票で即開示）\n"
             f"弁明 **{RUNOFF_SPEECH_TIME}秒** ／ 遺言 **{LAST_WILL_TIME}秒**（本人かGMが短縮可）\n"
             f"夜 **初日{NIGHT_BASE}秒 / 以降{NIGHT_MIN}秒**（目安。朝は全員の宣言で明ける）"
+        )
+
+    embed = discord.Embed(
+        title="レギュレーション",
+        description=channel_description,
+        color=discord.Color.dark_gold(),
+    )
+    embed.add_field(
+        name="勝利条件",
+        value=(
+            f"**村陣営** — 人狼{wolf_count}人を全滅させる\n"
+            "**狼陣営** — 生存人狼数 ≧ 生存非人狼数\n"
+            "※ 狂人は狼陣営の勝ちですが、**占い・霊媒・襲撃・人数判定では「村人」扱い**です"
         ),
+        inline=False,
+    )
+    embed.add_field(
+        name=f"役職 ({variant.player_count}人)",
+        value=_role_rule_lines(variant),
+        inline=False,
+    )
+    embed.add_field(
+        name="1日の流れ",
+        value=discussion_rule,
         inline=False,
     )
     embed.add_field(
@@ -3397,7 +3965,7 @@ def build_rule_embeds() -> list[discord.Embed]:
     embed.add_field(
         name="亡くなったら（村side）",
         value=(
-            f"**人狼だと思う{BONUS_WOLF_GUESS_SLOTS}人**を提出できます"
+            f"**人狼だと思う{variant.wolf_guess_slots}人**を提出できます"
             "（当たるとレートに加点。既に亡くなった人を選んでも構いません）。\n"
             f"受付は**死亡から{WOLF_GUESS_TIMEOUT // 60}分**で、"
             f"**提出するか時間切れになるまで `#{CH_SPIRIT}` へ入れません。**\n"
@@ -3434,8 +4002,29 @@ def build_rule_embeds() -> list[discord.Embed]:
     return [embed]
 
 
-def build_help_embeds() -> list[discord.Embed]:
+def build_help_embeds(
+    variant: Optional[VariantDefinition] = None,
+) -> list[discord.Embed]:
     """ヘルプボタン用: Botの使い方と、統計・レート・ランク"""
+    variant = _display_variant(variant)
+    if variant.discussion_mode == "turn":
+        speech_help = (
+            "ターン制議論は**現在の話者だけ**発言できます。話し終えた本人は「発言終了（パス）」、"
+            f"ほかの生存者は村全体で1日{variant.turn_interrupts_per_day}回まで"
+            "「30秒割り込み」を使えます。投票と夜は全員ミュートです。\n"
+            "COは初日2巡目と2日目以降の唯一の巡に表示される「COを宣言」で、"
+            "名前だけを公開します。役職・内容はVCで話してください。\n"
+            "死亡者と観戦者はゲーム中発言できません（終了時に解除）。\n"
+            "**一時停止すると全員ミュートされます。** GMのミュートだけは手動です。"
+        )
+        gm_turn_help = " / 次の発言へ"
+    else:
+        speech_help = (
+            "議論中は生存者のみ、投票と夜は全員ミュート、弁明と遺言は本人だけ発言できます。\n"
+            "死亡者と観戦者はゲーム中発言できません（終了時に解除）。\n"
+            "**一時停止すると全員ミュートされます。** GMのミュートだけは手動です。"
+        )
+        gm_turn_help = ""
     embed3 = discord.Embed(
         title="ヘルプ",
         color=discord.Color.dark_gold(),
@@ -3445,20 +4034,18 @@ def build_help_embeds() -> list[discord.Embed]:
         name="DMに届くもの",
         value=(
             "役職の確認、人狼の相談と襲撃、占い・護衛の選択、霊媒結果。\n"
-            f"**3狼予想と終了後の投票はDMではなく `#{CH_VILLAGE}` のボタン**で行います"
+            f"**{variant.wolf_guess_slots}狼予想と終了後の投票はDMではなく "
+            f"`#{CH_VILLAGE}` のボタン**で行います"
             "（操作内容は本人にしか見えません）。\n"
-            "夜の行動を選んでいないまま「朝を迎える」を押すと警告が出て、"
-            "**もう一度押すと未行動のまま確定**します。"
+            "占い・襲撃などを選んでいないまま「朝を迎える」を押すと警告が出て、"
+            "**もう一度押すと未行動のまま確定**します。\n"
+            "ただし**狩人は護衛放棄不可**で、護衛先を確定するまで朝を迎えられません。"
         ),
         inline=False,
     )
     embed3.add_field(
         name="発言とミュート",
-        value=(
-            "議論中は生存者のみ、投票と夜は全員ミュート、弁明と遺言は本人だけ発言できます。\n"
-            "死亡者と観戦者はゲーム中発言できません（終了時に解除）。\n"
-            "**一時停止すると全員ミュートされます。** GMのミュートだけは手動です。"
-        ),
+        value=speech_help,
         inline=False,
     )
     embed3.add_field(
@@ -3477,7 +4064,8 @@ def build_help_embeds() -> list[discord.Embed]:
             f"**受付中** — `#{CH_LOBBY}` の「GM管理」から参加者を除外 / 受付をリセット。\n"
             f"**ゲーム中** — `#{CH_VILLAGE}` 末尾の「GMメニュー・状況」を押すとGM専用の画面が開き、"
             "フェーズ・日数・生存人数・投票や宣言の進捗・復帰待ちを確認しながら、"
-            "一時停止 / 再開 / 朝（強制で夜を明ける）/ 強制終了 / リセット / プレイヤー除外ができます。\n"
+            "一時停止 / 再開 / 朝（強制で夜を明ける）"
+            f"{gm_turn_help} / 強制終了 / リセット / プレイヤー除外ができます。\n"
             "（役職と夜の行動内容は表示されません）"
         ),
         inline=False,
@@ -3524,20 +4112,33 @@ def _format_delta_range(deltas: list[int]) -> str:
     return f"{ordered[0]:+d}〜{ordered[-1]:+d}"
 
 
-def _rating_swing(winner_team: Team) -> tuple[str, str]:
-    """標準構成での勝者側・敗者側のレート変動を表示用に返す。
+def _rating_swing(
+    variant: VariantDefinition,
+    winner_team: Team,
+) -> tuple[str, str]:
+    """変種の構成とプールでの勝者側・敗者側の変動を表示用に返す。
 
     手書きするとプール定数を変えたときに必ずズレるので、実際の計算関数から求める。
     卓帯補正はかからない状態 (同帯 = 等倍) の値。
     """
     village_won = winner_team is Team.VILLAGE
-    winner_count = VILLAGE_TEAM_SIZE if village_won else WOLF_TEAM_SIZE
-    loser_count = WOLF_TEAM_SIZE if village_won else VILLAGE_TEAM_SIZE
+    winner_count = (
+        variant.village_team_size if village_won else variant.wolf_team_size
+    )
+    loser_count = (
+        variant.wolf_team_size if village_won else variant.village_team_size
+    )
     sample = [
         {"player_id": i, "rating": INITIAL_RATING, "won": i < winner_count}
         for i in range(winner_count + loser_count)
     ]
-    results = rating_lib.calculate_game_results(sample, winner_team=winner_team)
+    results = rating_lib.calculate_game_results(
+        sample,
+        winner_team=winner_team,
+        variant_id=variant.variant_id,
+        village_win_pool=variant.village_win_pool,
+        wolf_win_pool=variant.wolf_win_pool,
+    )
     return (
         _format_delta_range(
             [r["delta"] for r in results if r["player_id"] < winner_count]
@@ -3554,19 +4155,37 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
         title="レート",
         color=discord.Color.blue(),
     )
-    village_win_village, village_win_wolf = _rating_swing(Team.VILLAGE)
-    wolf_win_wolf, wolf_win_village = _rating_swing(Team.WOLF)
     rate.add_field(
-        name="増減",
+        name="共通ルール",
         value=(
             f"初期値 **{INITIAL_RATING}**、下限 **{RATING_FLOOR}**（これ以上は下がりません）。\n"
-            f"**村が勝つ** → 村 {village_win_village} / 狼 {village_win_wolf}\n"
-            f"**狼が勝つ** → 狼 {wolf_win_wolf} / 村 {wolf_win_village}\n"
-            f"（勝った陣営へのボーナス +{WIN_PARTICIPATION_BONUS} を含む。"
-            "端数は決まったルールで分配）"
+            "試合成績は変種別、レート計算は対応する13人村 / 9人村ラダーで共通です。\n"
+            f"下の変動値は勝った陣営へのボーナス +{WIN_PARTICIPATION_BONUS} を含み、"
+            "端数は決まったルールで分配します。"
         ),
         inline=False,
     )
+    for variant_id in USER_VISIBLE_VARIANT_IDS:
+        variant = VARIANT_DEFINITIONS[variant_id]
+        village_win_village, village_win_wolf = _rating_swing(
+            variant, Team.VILLAGE,
+        )
+        wolf_win_wolf, wolf_win_village = _rating_swing(
+            variant, Team.WOLF,
+        )
+        ladder = LADDER_DEFINITIONS[variant.ladder_id]
+        rate.add_field(
+            name=f"{variant.label}（{ladder.label}ラダー）",
+            value=(
+                f"村勝ちプール **{variant.village_win_pool}**: "
+                f"村 {village_win_village} / 狼 {village_win_wolf}\n"
+                f"狼勝ちプール **{variant.wolf_win_pool}**: "
+                f"狼 {wolf_win_wolf} / 村 {wolf_win_village}\n"
+                f"人狼予想 **{variant.wolf_guess_slots}人** / "
+                f"終盤ボーナス **{variant.final_day_threshold}回目**の議論から"
+            ),
+            inline=False,
+        )
     rate.add_field(
         name="卓帯補正",
         value=(
@@ -3583,9 +4202,9 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
         value=(
             f"🗳️ **処刑された人狼に投票していた村side** … +{BONUS_WOLF_EXECUTION_VOTE}\n"
             "　（処刑を決めた最終ラウンドの票のみ。ランダム処刑は対象外）\n"
-            f"🐺 **{BONUS_FINAL_DAY_THRESHOLD}回目の議論に到達したときの人狼** … "
+            "🐺 **変種ごとの終盤回数に到達したときの人狼** … "
             f"+{BONUS_FINAL_DAY_WOLF}\n"
-            f"🔎 **3狼予想の的中1人につき** … +{BONUS_WOLF_GUESS_HIT}"
+            f"🔎 **人狼予想の的中1人につき** … +{BONUS_WOLF_GUESS_HIT}"
             f"（初日・{BONUS_WOLF_GUESS_EARLY_MAX_DAY}日目の死亡は"
             f"**{BONUS_WOLF_GUESS_EARLY_MULTIPLIER}倍**）\n"
             f"🛡️ **狩人の護衛成功1回につき** … +{BONUS_GUARD_SUCCESS}\n"
@@ -3594,10 +4213,10 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
         inline=False,
     )
     rate.add_field(
-        name="3狼予想",
+        name="人狼予想",
         value=(
             f"村sideで亡くなると、`#{CH_VILLAGE}` のボタンから"
-            f"**人狼だと思う{BONUS_WOLF_GUESS_SLOTS}人**を提出できます。\n"
+            "**人狼だと思う人数を変種ごとの枠数で**提出できます。\n"
             f"受付は**死亡から{WOLF_GUESS_TIMEOUT // 60}分**で、"
             "**提出するか時間切れになるまで霊界へ入れません**"
             "（霊界で答えを聞けてしまわないようにするためです）。\n"
@@ -3622,7 +4241,8 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
         value=(
             f"レートが動くのは **{' / '.join(RATED_ROOM_NAMES)}** "
             f"の{len(RATED_ROOM_NAMES)}卓です。\n"
-            "現在、初心者・中級者・上級者は準備中のため、サーバー管理者だけに表示されます。"
+            "各試合は変種に対応するラダーだけを更新します。シーズン境界は両ラダー共通ですが、"
+            "順位・レート・履歴は混ぜません。"
         ),
         inline=False,
     )
@@ -3642,13 +4262,16 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
         inline=False,
     )
     rank.add_field(
-        name="決まり方",
+        name="決まり方（ラダー別）",
         value=(
             f"レート順の**相対評価**で決まります（{ratios}）。\n"
             f"グランドマスターは全体上位{GRANDMASTER_PERCENTAGE * 100:g}%相当、"
-            f"最大{GRANDMASTER_SLOTS}人です。\n"
+            f"13人村ラダーは最大{LADDER_DEFINITIONS['l13'].grandmaster_slots}人、"
+            f"9人村ラダーは最大{LADDER_DEFINITIONS['l9'].grandmaster_slots}人です。\n"
             f"**1戦目からランクが付き**、通算{SEASON_RANK_MIN_GAMES}戦以上で順位と上位%も確定します。\n"
-            "ランクに応じたロールが自動で付き、見える卓もそれに連動します。\n"
+            "13人村は9段階のDiscordロールを同期します。9人村は"
+            f"**{LADDER_DEFINITIONS['l9'].grandmaster_role_name}**だけを付与し、"
+            "ほかの段階は統計画面に表示します。両方のグランドマスターを保持できます。\n"
             "**シーズンリセット後もランクは維持されます**"
             "（レートは半減しますが全員同じ比率なので順位関係は変わりません）。"
         ),

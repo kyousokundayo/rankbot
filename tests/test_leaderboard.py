@@ -80,6 +80,7 @@ class LeaderboardTestBase(unittest.IsolatedAsyncioTestCase):
         deaths: dict[int, tuple[int, str]] | None = None,
         *,
         wolf_guesses: dict[int, list[int]] | None = None,
+        variant_id: str = "v13_cross",
     ) -> int:
         self.run_seq += 1
         run_id = f"run-{self.run_seq}"
@@ -88,6 +89,7 @@ class LeaderboardTestBase(unittest.IsolatedAsyncioTestCase):
             GUILD_ID, "open", run_id,
             room_name="総合", rated=True, winner_team=winner.value,
             player_records=records,
+            variant_id=variant_id,
             bonus_facts={
                 "days": 5,
                 "wolf_guesses": {
@@ -228,6 +230,28 @@ class TestWolfGuessAccuracy(LeaderboardTestBase):
         )
         board = await self.board("wolf_guess_accuracy")
         self.assertEqual(board["top"][0]["numerator"], 1)
+
+    async def test_nine_player_variant_uses_two_guess_slots(self):
+        await self.play(
+            Team.WOLF,
+            {8: (2, "襲撃")},
+            wolf_guesses={8: [WOLF_IDS[0], WOLF_IDS[1], WOLF_IDS[2]]},
+            variant_id="v9_cross",
+        )
+        board = await self.board("wolf_guess_accuracy", variant_id="v9_cross")
+        entry = next(e for e in board["top"] if e["player_id"] == 8)
+        self.assertEqual(entry["numerator"], 2)
+        self.assertEqual(entry["denominator"], 2)
+        self.assertEqual(board["label"], "人狼予想の的中率")
+
+    async def test_default_board_does_not_mix_variants(self):
+        await self.play(
+            Team.WOLF,
+            {8: (2, "襲撃")},
+            wolf_guesses={8: [WOLF_IDS[0], WOLF_IDS[1]]},
+            variant_id="v9_cross",
+        )
+        self.assertEqual((await self.board("wolf_guess_accuracy"))["top"], [])
 
 
 class TestLeaderboardShape(LeaderboardTestBase):
