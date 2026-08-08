@@ -186,3 +186,70 @@ class RecruitmentDatabaseTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RecruitmentScheduleViewTest(unittest.TestCase):
+    """開催日セレクトの「今すぐ」で時刻選択が消えることを検証する。
+
+    View は Discord に依存しないので、DBを立てずに状態遷移だけを見る。
+    """
+
+    def setUp(self) -> None:
+        import recruitment
+        self.recruitment = recruitment
+        self.view = recruitment.RecruitmentScheduleView(object(), host_id=1)
+
+    def _keys(self) -> list[str]:
+        return [item.key for item in self.view.children]
+
+    def test_default_flow_needs_date_hour_minute_room_streaming(self):
+        self.assertEqual(
+            self._keys(), ["date", "hour", "minute", "room", "streaming"],
+        )
+        self.assertFalse(self.view.is_complete())
+        self.view.values.update({
+            "date": "2026-08-10", "hour": "20", "minute": "30",
+            "room": "open", "streaming": "0",
+        })
+        self.assertTrue(self.view.is_complete())
+
+    def test_immediate_hides_time_selects(self):
+        self.view.values["date"] = self.recruitment.IMMEDIATE_DATE_VALUE
+        self.view.rebuild()
+        self.assertEqual(self._keys(), ["date", "room", "streaming"])
+        self.assertTrue(self.view.immediate)
+        self.assertFalse(self.view.is_complete())
+        self.view.values.update({"room": "open", "streaming": "0"})
+        self.assertTrue(self.view.is_complete())
+
+    def test_switching_back_to_a_date_restores_time_selects(self):
+        self.view.values["date"] = self.recruitment.IMMEDIATE_DATE_VALUE
+        self.view.rebuild()
+        self.view.values["date"] = "2026-08-10"
+        self.view.rebuild()
+        self.assertEqual(
+            self._keys(), ["date", "hour", "minute", "room", "streaming"],
+        )
+        self.assertFalse(self.view.immediate)
+
+    def test_immediate_start_passes_the_range_check(self):
+        """「今すぐ」の開始時刻が「現在より後」を満たすこと。
+
+        _schedule_out_of_range は local_start <= now を弾くので、
+        猶予を0にすると作成できなくなる。
+        """
+        from config import (
+            RECRUITMENT_IMMEDIATE_LEAD_MINUTES,
+            RECRUITMENT_NOTIFICATION_WINDOW_MINUTES,
+        )
+        now = datetime(2026, 8, 8, 20, 55, 33, tzinfo=self.recruitment.JST)
+        start = (
+            now + timedelta(minutes=RECRUITMENT_IMMEDIATE_LEAD_MINUTES)
+        ).replace(second=0, microsecond=0)
+        self.assertGreater(start, now)
+        self.assertFalse(self.recruitment._schedule_out_of_range(start, now))
+        # 通知ウィンドウより内側なら、作成直後の巡回で参加者へDMが飛ぶ
+        self.assertLess(
+            RECRUITMENT_IMMEDIATE_LEAD_MINUTES,
+            RECRUITMENT_NOTIFICATION_WINDOW_MINUTES,
+        )
