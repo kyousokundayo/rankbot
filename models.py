@@ -140,6 +140,17 @@ class GameState:
         self.day1_executed_id: Optional[int] = None
         self.night1_killed_id: Optional[int] = None
 
+        # プレイボーナスの材料。精算キューへ載せるのでスナップショットにも保存する。
+        # decisive_executions: 投票で決まった処刑だけを積む
+        #   ({"day", "target", "voters"})。0票・再同票のランダム処刑は入れない
+        # wolf_guesses: 3狼提出。死亡確定時に凍結した「死亡者ID -> 選んだ3人」
+        # spirit_hold_ids: 3狼提出のため霊界の閲覧解放を保留している死亡者。
+        #   保留中だけ提出でき、提出か時間切れで解放する。霊界に入ってから
+        #   先住者に答えを聞けてしまうと提出の意味が無くなるための仕組み
+        self.decisive_executions: list[dict] = []
+        self.wolf_guesses: dict[int, list[int]] = {}
+        self.spirit_hold_ids: set[int] = set()
+
         # チャンネル
         self.village_channel: Optional[discord.TextChannel] = None
         self.spirit_channel: Optional[discord.TextChannel] = None  # 霊界 (死亡者+観戦者)

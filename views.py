@@ -20,6 +20,12 @@ from config import (
     SEASON_RANK_MIN_GAMES, GRANDMASTER_PERCENTAGE, GRANDMASTER_SLOTS,
     RANK_SPECS, SEASON_RANK_PERCENTAGES,
     RATING_FLOOR, INITIAL_RATING, WIN_PARTICIPATION_BONUS,
+    WOLF_TEAM_SIZE, VILLAGE_TEAM_SIZE,
+    WOLF_GUESS_TIMEOUT, BONUS_WOLF_GUESS_SLOTS,
+    POSTGAME_RECOMMENDATION_TIMEOUT,
+    BONUS_WOLF_EXECUTION_VOTE, BONUS_FINAL_DAY_WOLF, BONUS_FINAL_DAY_THRESHOLD,
+    BONUS_WOLF_GUESS_HIT, BONUS_WOLF_GUESS_EARLY_MULTIPLIER,
+    BONUS_WOLF_GUESS_EARLY_MAX_DAY, BONUS_GUARD_SUCCESS, BONUS_NIGHT1_SEER_KILL,
     PRIVATE_ROOM_CREATOR_ROLE_NAME, BOT_VERSION,
     ROOM_DEFINITIONS, RATED_ROOM_NAMES, STATS_MIN_SAMPLES, PLAYER_BLOCK_LIMIT,
     SLOW_INTERACTION_SECONDS,
@@ -1832,6 +1838,107 @@ class MorningReadyView(discord.ui.View):
 # 弁明終了ボタン
 # ============================================================
 
+class WolfGuessSelectView(discord.ui.View):
+    """3狼提出の選択UI。押した本人にしか見えない ephemeral として出す。"""
+
+    def __init__(self, cog: RoomRunner, user_id: int) -> None:
+        super().__init__(timeout=WOLF_GUESS_TIMEOUT)
+        self.cog = cog
+        self.user_id = user_id
+        options = [
+            discord.SelectOption(
+                label=f"{player.number:02d}. {player.display_name}"[:100],
+                value=str(player.user_id),
+            )
+            for player in sorted(cog.state.players.values(), key=lambda p: p.number)
+            if player.user_id != user_id
+        ]
+        self.select = discord.ui.Select(
+            placeholder=f"人狼だと思う{BONUS_WOLF_GUESS_SLOTS}人を選ぶ",
+            min_values=BONUS_WOLF_GUESS_SLOTS,
+            max_values=BONUS_WOLF_GUESS_SLOTS,
+            options=options[:25],
+        )
+        self.select.callback = self._on_select
+        self.add_item(self.select)
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "この提出は本人だけが操作できます。", ephemeral=True
+            )
+            return
+        targets = [int(value) for value in self.select.values]
+        accepted = await self.cog.submit_wolf_guess(self.user_id, targets)
+        self.stop()
+        if not accepted:
+            await interaction.response.edit_message(
+                content="⏳ 受付時間が終わっているか、既に提出済みです。", view=None
+            )
+            return
+        names = "、".join(
+            player.display_name
+            for player in (self.cog.state.get_player(pid) for pid in targets)
+            if player is not None
+        )
+        await interaction.response.edit_message(
+            content=(
+                f"✅ **{names}** で提出しました。\n"
+                "結果は試合終了後のレート変動に反映されます。霊界へどうぞ。"
+            ),
+            view=None,
+        )
+
+
+class WolfGuessView(discord.ui.View):
+    """死亡告知に添える3狼提出ボタン。
+
+    霊界の閲覧解放を止めているあいだ (WOLF_GUESS_TIMEOUT 秒) だけ有効。
+    霊界へ入ると先に死んだ人から答えを聞けてしまうので、提出はその前に締める。
+
+    **メッセージを増やさないため、処刑告知と朝の結果に相乗りさせる。**
+    ボタン自体は全員に見えるが、押せるのはいま保留中の死亡者だけで、
+    生存者・狼陣営・提出済みの人は ephemeral で弾く。
+    """
+
+    def __init__(self, cog: RoomRunner) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.game_run_id = cog.state.game_run_id
+        cog.register_game_view(self)
+
+    @discord.ui.button(label="🐺 3狼予想を提出", style=discord.ButtonStyle.primary)
+    async def submit_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        cog = self.cog
+        if not cog.is_current_game_view(self.game_run_id):
+            await interaction.response.send_message(
+                "この村は既に終了しています。", ephemeral=True
+            )
+            return
+        state = cog.state
+        user_id = interaction.user.id
+        if user_id in state.wolf_guesses:
+            await interaction.response.send_message(
+                "この試合の3狼予想は提出済みです。", ephemeral=True
+            )
+            return
+        if user_id not in state.spirit_hold_ids:
+            await interaction.response.send_message(
+                "3狼予想は**亡くなった直後の村側プレイヤー**だけが提出できます。\n"
+                f"受付は死亡から{WOLF_GUESS_TIMEOUT // 60}分間です。",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            f"人狼だと思う{BONUS_WOLF_GUESS_SLOTS}人を選んでください。\n"
+            "**確定すると変更できません。** 確定するとすぐ霊界へ入れます。",
+            view=WolfGuessSelectView(cog, user_id),
+            ephemeral=True,
+        )
+
+
 class SpeechDoneView(discord.ui.View):
     """決戦弁明・遺言の終了ボタン。
 
@@ -1879,7 +1986,13 @@ class SpeechDoneView(discord.ui.View):
 # ============================================================
 
 class PostgameRecommendationView(discord.ui.View):
-    """対象選択と最終確認を1つのDM内で完結させる推薦UI。"""
+    """対象選択と最終確認を1つの ephemeral 内で完結させる投票UI。
+
+    kind で2種類の票を使い分ける:
+      recommend — 霊媒師・初日処刑者・初夜襲撃死者が参加者の誰かへ+1
+      postgame  — 勝利陣営が敗北陣営の誰かへ+1
+    どちらも匿名で、1票につきレート+1。
+    """
 
     def __init__(
         self,
@@ -1889,12 +2002,16 @@ class PostgameRecommendationView(discord.ui.View):
         voter_id: int,
         candidates: list,
         timeout: float,
-        on_confirmed: Callable[[int], None],
+        on_confirmed: Callable[[int, str], None],
+        kind: str = "recommend",
+        title: str = "終了後推薦（+1レート）",
     ) -> None:
         super().__init__(timeout=timeout)
         self.game_id = game_id
         self.guild_id = guild_id
         self.voter_id = voter_id
+        self.kind = kind
+        self.title_text = title
         self.candidates = {player.user_id: player for player in candidates}
         self.selected_id: Optional[int] = None
         self.on_confirmed = on_confirmed
@@ -1954,9 +2071,9 @@ class PostgameRecommendationView(discord.ui.View):
         self.confirm_btn.disabled = False
         await interaction.response.edit_message(
             content=(
-                "👏 **終了後推薦（+1レート）**\n"
-                f"**{target.display_name}** に推薦を確定しますか？\n"
-                "確定後は変更できません。推薦者名は公開されません。"
+                f"👏 **{self.title_text}**\n"
+                f"**{target.display_name}** に確定しますか？\n"
+                "確定後は変更できません。投票者名は公開されません。"
             ),
             view=self,
         )
@@ -1980,6 +2097,7 @@ class PostgameRecommendationView(discord.ui.View):
                 self.guild_id,
                 self.voter_id,
                 self.selected_id,
+                kind=self.kind,
             )
         except Exception as e:
             log.exception("終了後推薦の確定保存に失敗: %s", e)
@@ -1995,7 +2113,7 @@ class PostgameRecommendationView(discord.ui.View):
             for item in self.children:
                 item.disabled = True
             self.stop()
-            self.on_confirmed(self.voter_id)
+            self.on_confirmed(self.voter_id, self.kind)
             target = self.candidates[self.selected_id]
             content = (
                 f"✅ **{target.display_name}** への推薦を確定しました。\n"
@@ -2116,6 +2234,105 @@ class FeedbackModal(discord.ui.Modal, title="不具合・改善を報告"):
         )
         await interaction.followup.send(
             f"✅ 報告を保存しました。ありがとうございます。（報告ID: `{report_id}`）",
+            ephemeral=True,
+        )
+
+
+class PostgameVotePanelView(discord.ui.View):
+    """終了後の投票を `#昼` の1枚のパネルで受ける。
+
+    **DMは送らない。** 投票権を持つのは最大13人になるので、DMだと1試合で
+    13通になる。パネルなら送信APIは1回で済み、押下は interaction 専用ルートを
+    通るのでグローバルのレート制限枠も使わない。
+
+    ボタン自体は全員に見えるが、押した人が持っている票だけを ephemeral で
+    出し分ける。2票持つ人 (勝利陣営の霊媒師など) は続けてもう一度押す。
+    """
+
+    def __init__(
+        self,
+        *,
+        game_id: int,
+        guild_id: int,
+        ballots: dict[int, list[str]],
+        players: list,
+        loser_ids: set[int],
+        timeout: float,
+        on_confirmed: Callable[[int, str], None],
+    ) -> None:
+        super().__init__(timeout=timeout)
+        self.game_id = game_id
+        self.guild_id = guild_id
+        self.ballots = ballots
+        self.players = list(players)
+        self.loser_ids = set(loser_ids)
+        self.on_confirmed = on_confirmed
+        self.used: set[tuple[int, str]] = set()
+        self.message: Optional[discord.Message] = None
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(view=self)
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+    @discord.ui.button(label="🗳️ 投票する", style=discord.ButtonStyle.primary)
+    async def vote_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        voter_id = interaction.user.id
+        remaining_kinds = [
+            kind for kind in self.ballots.get(voter_id, [])
+            if (voter_id, kind) not in self.used
+        ]
+        if not remaining_kinds:
+            await interaction.response.send_message(
+                "この試合であなたが使える票はありません（使用済みか、対象外です）。",
+                ephemeral=True,
+            )
+            return
+
+        kind = remaining_kinds[0]
+        if kind == "postgame":
+            candidates = [p for p in self.players if p.user_id in self.loser_ids]
+            title = "手強かった相手へ（+1レート）"
+            note = "**敗北陣営**から1人を選べます。"
+        else:
+            candidates = list(self.players)
+            title = "終了後推薦（+1レート）"
+            note = "**参加者**から1人を選べます。"
+        if not candidates:
+            await interaction.response.send_message(
+                "選べる相手がいません。", ephemeral=True
+            )
+            return
+
+        def mark_used(used_voter_id: int, used_kind: str) -> None:
+            self.used.add((used_voter_id, used_kind))
+            self.on_confirmed(used_voter_id, used_kind)
+
+        view = PostgameRecommendationView(
+            game_id=self.game_id,
+            guild_id=self.guild_id,
+            voter_id=voter_id,
+            candidates=candidates,
+            timeout=POSTGAME_RECOMMENDATION_TIMEOUT,
+            on_confirmed=mark_used,
+            kind=kind,
+            title=title,
+        )
+        extra = (
+            "\nこのあともう1票あります。確定したらもう一度パネルを押してください。"
+            if len(remaining_kinds) > 1 else ""
+        )
+        await interaction.response.send_message(
+            f"👏 **{title}**\n{note}自分自身は選べません。"
+            f"投票者名は公開されません。{extra}",
+            view=view,
             ephemeral=True,
         )
 
@@ -2417,13 +2634,16 @@ class StatsView(discord.ui.View):
                 sign = "+" if delta >= 0 else ""
                 elo_delta = row["elo_delta"] or 0
                 win_bonus = row["bonus"] or 0
+                play_bonus = row["play_bonus"] or 0
                 recommendation_bonus = row["recommendation_bonus"] or 0
                 elo_sign = "+" if elo_delta >= 0 else ""
                 parts = [f"本体{elo_sign}{elo_delta}"]
                 if win_bonus:
                     parts.append(f"勝利+{win_bonus}")
+                if play_bonus:
+                    parts.append(f"活躍+{play_bonus}")
                 if recommendation_bonus:
-                    parts.append(f"推薦+{recommendation_bonus}")
+                    parts.append(f"投票+{recommendation_bonus}")
                 delta_txt = (
                     f" / {row['rating_before']}→{row['rating_after']} ({sign}{delta}; "
                     + " / ".join(parts) + ")"
@@ -2885,6 +3105,17 @@ def build_rule_embeds() -> list[discord.Embed]:
         inline=False,
     )
     embed.add_field(
+        name="亡くなったら（村side）",
+        value=(
+            f"**人狼だと思う{BONUS_WOLF_GUESS_SLOTS}人**を提出できます"
+            "（当たるとレートに加点。既に亡くなった人を選んでも構いません）。\n"
+            f"受付は**死亡から{WOLF_GUESS_TIMEOUT // 60}分**で、"
+            f"**提出するか時間切れになるまで `#{CH_SPIRIT}` へ入れません。**\n"
+            "ボタンは処刑の告知と朝の結果に付いています。提出は本人にしか見えません。"
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name="夜の行動",
         value=(
             "占い・護衛は**実行確認**を挟んで確定し、今夜は変更できません。"
@@ -2924,6 +3155,8 @@ def build_help_embeds() -> list[discord.Embed]:
         name="DMに届くもの",
         value=(
             "役職の確認、人狼の相談と襲撃、占い・護衛の選択、霊媒結果。\n"
+            f"**3狼予想と終了後の投票はDMではなく `#{CH_VILLAGE}` のボタン**で行います"
+            "（操作内容は本人にしか見えません）。\n"
             "夜の行動を選んでいないまま「朝を迎える」を押すと警告が出て、"
             "**もう一度押すと未行動のまま確定**します。"
         ),
@@ -2993,30 +3226,104 @@ def build_help_embeds() -> list[discord.Embed]:
     return [embed3]
 
 
+def _format_delta_range(deltas: list[int]) -> str:
+    """変動値の集合を「+20」「-13〜-14」の形にする (絶対値の小さい側から)"""
+    ordered = sorted(deltas, key=abs)
+    if ordered[0] == ordered[-1]:
+        return f"{ordered[0]:+d}"
+    return f"{ordered[0]:+d}〜{ordered[-1]:+d}"
+
+
+def _rating_swing(winner_team: Team) -> tuple[str, str]:
+    """標準構成での勝者側・敗者側のレート変動を表示用に返す。
+
+    手書きするとプール定数を変えたときに必ずズレるので、実際の計算関数から求める。
+    卓帯補正はかからない状態 (同帯 = 等倍) の値。
+    """
+    village_won = winner_team is Team.VILLAGE
+    winner_count = VILLAGE_TEAM_SIZE if village_won else WOLF_TEAM_SIZE
+    loser_count = WOLF_TEAM_SIZE if village_won else VILLAGE_TEAM_SIZE
+    sample = [
+        {"player_id": i, "rating": INITIAL_RATING, "won": i < winner_count}
+        for i in range(winner_count + loser_count)
+    ]
+    results = rating_lib.calculate_game_results(sample, winner_team=winner_team)
+    return (
+        _format_delta_range(
+            [r["delta"] for r in results if r["player_id"] < winner_count]
+        ),
+        _format_delta_range(
+            [r["delta"] for r in results if r["player_id"] >= winner_count]
+        ),
+    )
+
+
 def build_rank_spec_embeds() -> list[discord.Embed]:
     """#統計 の「ランク仕様」ボタン用: レート / ランク / 対象とシーズン"""
     rate = discord.Embed(
         title="レート",
         color=discord.Color.blue(),
     )
+    village_win_village, village_win_wolf = _rating_swing(Team.VILLAGE)
+    wolf_win_wolf, wolf_win_village = _rating_swing(Team.WOLF)
     rate.add_field(
         name="増減",
         value=(
             f"初期値 **{INITIAL_RATING}**、下限 **{RATING_FLOOR}**（これ以上は下がりません）。\n"
-            "**村が勝つ** → 村 +11 / 狼 -22〜-23\n"
-            "**狼が勝つ** → 狼 +16 / 村 -6〜-7\n"
+            f"**村が勝つ** → 村 {village_win_village} / 狼 {village_win_wolf}\n"
+            f"**狼が勝つ** → 狼 {wolf_win_wolf} / 村 {wolf_win_village}\n"
             f"（勝った陣営へのボーナス +{WIN_PARTICIPATION_BONUS} を含む。"
             "端数は決まったルールで分配）"
         ),
         inline=False,
     )
     rate.add_field(
-        name="終了後推薦",
+        name="卓帯補正",
         value=(
-            "レート対象卓の終了後、**霊媒師・初日の処刑者・初夜の襲撃死者**にDMが届き、"
-            "自分以外の1人へ **+1** を贈れます。初夜が平和なら襲撃死者枠はありません。\n"
-            "同じ人が複数条件に当てはまっても1票です。GMもプレイヤー参加していれば対象です。\n"
-            "**3分以内に確定。推薦者名は公開されません。**"
+            "**格上の陣営が勝つと変動は小さく、格下の陣営が勝つと大きくなります。**\n"
+            "陣営ごとに所属ランクの帯（初心者 / 中級者 / 上級者）の中央値を出し、"
+            "その差で倍率が決まります。\n"
+            "同じ帯 **1.0倍** ／ 1段差 **0.9倍・1.1倍** ／ 2段差 **0.8倍・1.2倍**\n"
+            "初心者・中級者・上級者の卓は参加条件で帯が揃うため、常に1.0倍です。"
+        ),
+        inline=False,
+    )
+    rate.add_field(
+        name="活躍ボーナス（勝敗とは別枠）",
+        value=(
+            f"🗳️ **処刑された人狼に投票していた村side** … +{BONUS_WOLF_EXECUTION_VOTE}\n"
+            "　（処刑を決めた最終ラウンドの票のみ。ランダム処刑は対象外）\n"
+            f"🐺 **{BONUS_FINAL_DAY_THRESHOLD}回目の議論に到達したときの人狼** … "
+            f"+{BONUS_FINAL_DAY_WOLF}\n"
+            f"🔎 **3狼予想の的中1人につき** … +{BONUS_WOLF_GUESS_HIT}"
+            f"（初日・{BONUS_WOLF_GUESS_EARLY_MAX_DAY}日目の死亡は"
+            f"**{BONUS_WOLF_GUESS_EARLY_MULTIPLIER}倍**）\n"
+            f"🛡️ **狩人の護衛成功1回につき** … +{BONUS_GUARD_SUCCESS}\n"
+            f"🌙 **初夜に占い師を襲撃できた人狼** … +{BONUS_NIGHT1_SEER_KILL}"
+        ),
+        inline=False,
+    )
+    rate.add_field(
+        name="3狼予想",
+        value=(
+            f"村sideで亡くなると、`#{CH_VILLAGE}` のボタンから"
+            f"**人狼だと思う{BONUS_WOLF_GUESS_SLOTS}人**を提出できます。\n"
+            f"受付は**死亡から{WOLF_GUESS_TIMEOUT // 60}分**で、"
+            "**提出するか時間切れになるまで霊界へ入れません**"
+            "（霊界で答えを聞けてしまわないようにするためです）。\n"
+            "選ぶ相手は既に亡くなった人でも構いません。狂人は正解に含みません。"
+        ),
+        inline=False,
+    )
+    rate.add_field(
+        name="終了後の投票",
+        value=(
+            f"レート対象卓の終了後、`#{CH_VILLAGE}` にパネルが1枚出ます"
+            f"（受付 **{POSTGAME_RECOMMENDATION_TIMEOUT // 60}分**・1票につき **+1**）。\n"
+            "・**勝利陣営**は、手強かった**敗北陣営**の1人へ1票\n"
+            "・**霊媒師 / 初日の処刑者 / 初夜の襲撃死者**は、参加者の1人へ1票\n"
+            "両方に当てはまる人は2票持ちます。初夜が平和なら襲撃死者枠はありません。\n"
+            "GMもプレイヤー参加していれば対象です。**投票者名は公開されません。**"
         ),
         inline=False,
     )

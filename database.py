@@ -361,6 +361,7 @@ async def init_db() -> None:
                 rating_after INTEGER NOT NULL,
                 elo_delta INTEGER NOT NULL,
                 bonus INTEGER NOT NULL DEFAULT 0,
+                play_bonus INTEGER NOT NULL DEFAULT 0,
                 recommendation_bonus INTEGER NOT NULL DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (game_id) REFERENCES games(game_id)
@@ -449,6 +450,7 @@ async def init_db() -> None:
                 winner_team TEXT NOT NULL,
                 player_records TEXT NOT NULL,
                 stats_payload TEXT,
+                bonus_payload TEXT,
                 gm_id INTEGER,
                 base_room_id TEXT,
                 recruitment_id INTEGER,
@@ -466,13 +468,14 @@ async def init_db() -> None:
                 game_id INTEGER NOT NULL,
                 guild_id INTEGER NOT NULL,
                 voter_id INTEGER NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'recommend',
                 recipient_id INTEGER,
                 status TEXT NOT NULL DEFAULT 'pending',
                 expires_at TEXT NOT NULL,
                 confirmed_at TIMESTAMP,
                 awarded_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (game_id, voter_id),
+                PRIMARY KEY (game_id, voter_id, kind),
                 FOREIGN KEY (game_id) REFERENCES games(game_id)
             )
         """)
@@ -593,6 +596,49 @@ async def init_db() -> None:
         await _ensure_column(db, "private_room_members", "last_error", "last_error TEXT")
         await _ensure_column(db, "game_settlements", "room_name", "room_name TEXT NOT NULL DEFAULT ''")
         await _ensure_column(db, "game_settlements", "stats_payload", "stats_payload TEXT")
+        await _ensure_column(db, "game_settlements", "bonus_payload", "bonus_payload TEXT")
+        # 終了後の票を「推薦」と「勝利陣営→敗北陣営」の2種類へ広げる。
+        # 勝利陣営の霊媒師などは1人で両方を持つので、主キーに kind が要る。
+        # 列追加では主キーを変えられないため、ここだけ作り直しになる。
+        recommendation_columns = {
+            row[1] for row in await db.execute_fetchall(
+                "PRAGMA table_info(game_recommendations)"
+            )
+        }
+        if recommendation_columns and "kind" not in recommendation_columns:
+            await db.execute("""
+                CREATE TABLE game_recommendations_migrated (
+                    game_id INTEGER NOT NULL,
+                    guild_id INTEGER NOT NULL,
+                    voter_id INTEGER NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'recommend',
+                    recipient_id INTEGER,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    expires_at TEXT NOT NULL,
+                    confirmed_at TIMESTAMP,
+                    awarded_at TIMESTAMP,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (game_id, voter_id, kind),
+                    FOREIGN KEY (game_id) REFERENCES games(game_id)
+                )
+            """)
+            await db.execute(
+                "INSERT INTO game_recommendations_migrated "
+                "(game_id, guild_id, voter_id, kind, recipient_id, status, "
+                "expires_at, confirmed_at, awarded_at, created_at) "
+                "SELECT game_id, guild_id, voter_id, 'recommend', recipient_id, status, "
+                "expires_at, confirmed_at, awarded_at, created_at "
+                "FROM game_recommendations"
+            )
+            await db.execute("DROP TABLE game_recommendations")
+            await db.execute(
+                "ALTER TABLE game_recommendations_migrated "
+                "RENAME TO game_recommendations"
+            )
+        await _ensure_column(
+            db, "rating_history", "play_bonus",
+            "play_bonus INTEGER NOT NULL DEFAULT 0",
+        )
         await _ensure_column(db, "game_settlements", "gm_id", "gm_id INTEGER")
         await _ensure_column(
             db, "game_settlements", "base_room_id", "base_room_id TEXT",
@@ -846,6 +892,7 @@ async def stage_game_settlement(
     winner_team: str,
     player_records: list[dict],
     game_stats: Optional[dict] = None,
+    bonus_facts: Optional[dict] = None,
     gm_id: Optional[int] = None,
     base_room_id: Optional[str] = None,
     recruitment_id: Optional[int] = None,
@@ -864,21 +911,31 @@ async def stage_game_settlement(
         except (TypeError, ValueError) as exc:
             # 統計は付加情報。壊れた統計値で勝敗のdurable stageを止めない。
             log.exception("ゲーム統計のstage用JSON化に失敗しました: %s", exc)
+    bonus_payload: Optional[str] = None
+    if bonus_facts is not None:
+        try:
+            bonus_payload = json.dumps(bonus_facts, ensure_ascii=False)
+        except (TypeError, ValueError) as exc:
+            # ボーナスも付加要素。壊れた値で勝敗のdurable stageを止めない。
+            log.exception("プレイボーナスのstage用JSON化に失敗しました: %s", exc)
     async with connect_db() as db:
         await db.execute(
             "INSERT INTO game_settlements "
             "(guild_id, room_id, game_run_id, room_name, rated, winner_team, "
-            "player_records, stats_payload, gm_id, base_room_id, recruitment_id, status, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP) "
+            "player_records, stats_payload, bonus_payload, gm_id, base_room_id, "
+            "recruitment_id, status, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP) "
             "ON CONFLICT(guild_id, room_id, game_run_id) DO UPDATE SET "
             "room_name = excluded.room_name, rated = excluded.rated, winner_team = excluded.winner_team, "
             "player_records = excluded.player_records, stats_payload = excluded.stats_payload, "
+            "bonus_payload = excluded.bonus_payload, "
             "gm_id = excluded.gm_id, base_room_id = excluded.base_room_id, "
             "recruitment_id = excluded.recruitment_id, updated_at = CURRENT_TIMESTAMP "
             "WHERE game_settlements.status = 'pending'",
             (
                 guild_id, room_id, game_run_id, room_name, int(rated), winner_team,
-                payload, stats_payload, gm_id, base_room_id or room_id, recruitment_id,
+                payload, stats_payload, bonus_payload, gm_id,
+                base_room_id or room_id, recruitment_id,
             ),
         )
         await db.commit()
@@ -889,7 +946,8 @@ async def _load_rating_results_for_game(
     game_id: int,
 ) -> list[dict]:
     rows = await db.execute_fetchall(
-        "SELECT player_id, rating_before, rating_after, elo_delta, bonus, recommendation_bonus "
+        "SELECT player_id, rating_before, rating_after, elo_delta, bonus, "
+        "play_bonus, recommendation_bonus "
         "FROM rating_history WHERE game_id = ? ORDER BY id",
         (game_id,),
     )
@@ -901,7 +959,8 @@ async def _load_rating_results_for_game(
             "delta": row[2] - row[1],
             "elo_delta": row[3],
             "bonus": row[4],
-            "recommendation_bonus": row[5],
+            "play_bonus": row[5],
+            "recommendation_bonus": row[6],
         }
         for row in rows
     ]
@@ -966,7 +1025,8 @@ async def settle_game_settlement(
     async with connect_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         rows = await db.execute_fetchall(
-            "SELECT room_name, rated, winner_team, player_records, stats_payload, gm_id, "
+            "SELECT room_name, rated, winner_team, player_records, stats_payload, "
+            "bonus_payload, gm_id, "
             "base_room_id, recruitment_id, "
             "status, game_id "
             "FROM game_settlements WHERE guild_id = ? AND room_id = ? AND game_run_id = ?",
@@ -977,7 +1037,7 @@ async def settle_game_settlement(
             raise SettlementNotFound(f"settlement not found: {guild_id}/{room_id}/{game_run_id}")
         (
             room_name, rated_int, winner_team, records_text, stats_payload,
-            gm_id, base_room_id, recruitment_id, status, stored_game_id,
+            bonus_payload, gm_id, base_room_id, recruitment_id, status, stored_game_id,
         ) = rows[0]
         if status == "settled" and stored_game_id is not None:
             results = await _load_rating_results_for_game(db, int(stored_game_id)) if rated_int else None
@@ -1009,6 +1069,8 @@ async def settle_game_settlement(
             ),
         )
         game_id = int(cursor.lastrowid)
+        # 試合時表示ランクはレート計算の卓帯補正でも使うので控えておく
+        rank_at_game_map: dict[int, Optional[str]] = {}
         for rec in player_records:
             player_id = int(rec["player_id"])
             rank = (rank_records or {}).get(player_id)
@@ -1016,6 +1078,7 @@ async def settle_game_settlement(
                 rank.get("rank_at_game") if rank is not None
                 else rec.get("rank_at_game")
             )
+            rank_at_game_map[player_id] = rank_at_game
             rank_provisional = (
                 rank.get("rank_provisional") if rank is not None
                 else rec.get("rank_provisional")
@@ -1059,16 +1122,45 @@ async def settle_game_settlement(
                     "player_id": int(rec["player_id"]),
                     "rating": ratings_before.get(int(rec["player_id"]), INITIAL_RATING),
                     "won": bool(rec["won"]),
+                    "rank_name": rank_at_game_map.get(int(rec["player_id"])),
                 }
                 for rec in player_records
             ]
             rating_results = rating_lib.calculate_game_results(
                 calc_input, winner_team=winner_team
             )
+
+            # プレイボーナスは非ゼロサムの別枠。壊れた payload でレート精算を
+            # 止めないよう、読めなければ加点なしで続行する
+            bonus_facts: Optional[dict] = None
+            if bonus_payload is not None:
+                try:
+                    bonus_facts = json.loads(bonus_payload)
+                except (TypeError, ValueError) as exc:
+                    log.exception(
+                        "プレイボーナスのpayloadを読めませんでした (game_id=%s): %s",
+                        game_id, exc,
+                    )
+            try:
+                play_bonuses = rating_lib.calculate_play_bonuses(
+                    player_records, bonus_facts,
+                )
+            except Exception as exc:
+                log.exception(
+                    "プレイボーナスの計算に失敗しました (game_id=%s): %s", game_id, exc,
+                )
+                play_bonuses = {}
+
             won_map = {int(rec["player_id"]): bool(rec["won"]) for rec in player_records}
             for result in rating_results:
                 result["recommendation_bonus"] = 0
                 pid = result["player_id"]
+                # ボーナスは常に0以上なので、フロアの下限判定より後に足してよい
+                play_bonus = int(play_bonuses.get(pid, 0))
+                result["play_bonus"] = play_bonus
+                if play_bonus:
+                    result["rating_after"] += play_bonus
+                    result["delta"] += play_bonus
                 won_int = int(won_map.get(pid, False))
                 new_rating = result["rating_after"]
                 await db.execute(
@@ -1089,11 +1181,12 @@ async def settle_game_settlement(
                 )
                 await db.execute(
                     "INSERT INTO rating_history "
-                    "(player_id, guild_id, game_id, rating_before, rating_after, elo_delta, bonus) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "(player_id, guild_id, game_id, rating_before, rating_after, "
+                    "elo_delta, bonus, play_bonus) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         pid, guild_id, game_id, result["rating_before"], result["rating_after"],
-                        result["elo_delta"], result["bonus"],
+                        result["elo_delta"], result["bonus"], play_bonus,
                     ),
                 )
 
@@ -1137,8 +1230,14 @@ async def create_game_recommendation_ballots(
     voter_ids: set[int],
     *,
     timeout_seconds: int,
+    kind: str = "recommend",
 ) -> str:
-    """推薦権をDBへ作る。再実行しても同じ推薦者の行は増えない。"""
+    """終了後の票をDBへ作る。再実行しても同じ投票者の行は増えない。
+
+    kind は "recommend" (霊媒師・初日処刑者・初夜襲撃死者の推薦) と
+    "postgame" (勝利陣営から敗北陣営への1票) の2種類。1人が両方を
+    持つことがあるので、種別ごとに別の行になる。
+    """
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
     voters = {int(voter_id) for voter_id in voter_ids}
@@ -1167,9 +1266,9 @@ async def create_game_recommendation_ballots(
         for voter_id in voters:
             await db.execute(
                 "INSERT INTO game_recommendations "
-                "(game_id, guild_id, voter_id, expires_at) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(game_id, voter_id) DO NOTHING",
-                (game_id, guild_id, voter_id, expires_at),
+                "(game_id, guild_id, voter_id, kind, expires_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(game_id, voter_id, kind) DO NOTHING",
+                (game_id, guild_id, voter_id, kind, expires_at),
             )
         await db.commit()
     return expires_at
@@ -1179,13 +1278,16 @@ async def cancel_game_recommendation_ballot(
     game_id: int,
     guild_id: int,
     voter_id: int,
+    *,
+    kind: str = "recommend",
 ) -> None:
-    """DM不能など、投票できない推薦権を閉じる。"""
+    """投票できない票を閉じる (対象者が居ないなど)。"""
     async with connect_db() as db:
         await db.execute(
             "UPDATE game_recommendations SET status = 'unavailable' "
-            "WHERE game_id = ? AND guild_id = ? AND voter_id = ? AND status = 'pending'",
-            (game_id, guild_id, voter_id),
+            "WHERE game_id = ? AND guild_id = ? AND voter_id = ? AND kind = ? "
+            "AND status = 'pending'",
+            (game_id, guild_id, voter_id, kind),
         )
         await db.commit()
 
@@ -1195,8 +1297,10 @@ async def confirm_game_recommendation(
     guild_id: int,
     voter_id: int,
     recipient_id: int,
+    *,
+    kind: str = "recommend",
 ) -> str:
-    """推薦先を確定する。戻り値は confirmed/already/expired/invalid。"""
+    """投票先を確定する。戻り値は confirmed/already/expired/invalid。"""
     voter_id = int(voter_id)
     recipient_id = int(recipient_id)
     if voter_id == recipient_id:
@@ -1205,8 +1309,8 @@ async def confirm_game_recommendation(
         await db.execute("BEGIN IMMEDIATE")
         rows = await db.execute_fetchall(
             "SELECT status, recipient_id, expires_at FROM game_recommendations "
-            "WHERE game_id = ? AND guild_id = ? AND voter_id = ?",
-            (game_id, guild_id, voter_id),
+            "WHERE game_id = ? AND guild_id = ? AND voter_id = ? AND kind = ?",
+            (game_id, guild_id, voter_id, kind),
         )
         if not rows:
             await db.rollback()
@@ -1227,8 +1331,8 @@ async def confirm_game_recommendation(
         if datetime.now(timezone.utc) >= deadline:
             await db.execute(
                 "UPDATE game_recommendations SET status = 'expired' "
-                "WHERE game_id = ? AND voter_id = ? AND status = 'pending'",
-                (game_id, voter_id),
+                "WHERE game_id = ? AND voter_id = ? AND kind = ? AND status = 'pending'",
+                (game_id, voter_id, kind),
             )
             await db.commit()
             return "expired"
@@ -1242,8 +1346,9 @@ async def confirm_game_recommendation(
         cursor = await db.execute(
             "UPDATE game_recommendations "
             "SET recipient_id = ?, status = 'confirmed', confirmed_at = CURRENT_TIMESTAMP "
-            "WHERE game_id = ? AND guild_id = ? AND voter_id = ? AND status = 'pending'",
-            (recipient_id, game_id, guild_id, voter_id),
+            "WHERE game_id = ? AND guild_id = ? AND voter_id = ? AND kind = ? "
+            "AND status = 'pending'",
+            (recipient_id, game_id, guild_id, voter_id, kind),
         )
         await db.commit()
         return "confirmed" if cursor.rowcount == 1 else "already"
@@ -2078,7 +2183,8 @@ async def get_player_recent_games(player_id: int, guild_id: int, limit: int = 10
             _GAME_SEQ_CTE
             + "SELECT g.game_id, n.seq, g.room_name, g.winner_team, g.played_at, "
             "gp.role, gp.team, gp.won, "
-            "rh.rating_before, rh.rating_after, rh.elo_delta, rh.bonus, rh.recommendation_bonus "
+            "rh.rating_before, rh.rating_after, rh.elo_delta, rh.bonus, rh.play_bonus, "
+            "rh.recommendation_bonus "
             "FROM game_players gp "
             "JOIN games g ON gp.game_id = g.game_id "
             "JOIN numbered n ON n.game_id = g.game_id "
@@ -2102,7 +2208,8 @@ async def get_player_recent_games(player_id: int, guild_id: int, limit: int = 10
             "rating_after": row[9],
             "elo_delta": row[10],
             "bonus": row[11],
-            "recommendation_bonus": row[12],
+            "play_bonus": row[12],
+            "recommendation_bonus": row[13],
         }
         for row in rows
     ]

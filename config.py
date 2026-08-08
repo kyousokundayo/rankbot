@@ -12,7 +12,7 @@ from room_config import (
 )
 
 # Botのバージョン (ヘルプに表示。ソース公開された派生でも識別できるように)
-BOT_VERSION = "v0.35"
+BOT_VERSION = "v0.36"
 
 # 新規導入先に同名カテゴリが既にある場合、無関係なDiscord構成をBot所有と
 # 誤認しない。既存運用は保存済みchannel IDで自動再利用できる。
@@ -70,6 +70,13 @@ ROLE_DISTRIBUTION = {
 
 MAX_PLAYERS = 13
 
+# 陣営ごとの人数。プール配分の説明や表示で手書きするとズレるので配分から導く
+WOLF_TEAM_SIZE = sum(
+    count for role, count in ROLE_DISTRIBUTION.items()
+    if ROLE_TEAM[role] is Team.WOLF
+)
+VILLAGE_TEAM_SIZE = MAX_PLAYERS - WOLF_TEAM_SIZE
+
 # Discordの1メッセージあたりの文字数上限。超えると送信自体が
 # HTTPException (50035 Invalid Form Body) で失敗するため、
 # 名前などを前置して中継する箇所では本文をこの範囲へ収める
@@ -116,7 +123,12 @@ SLOW_INTERACTION_SECONDS = 2.0
 SE_ENABLED = True
 VOTE_TIMEOUT = 60              # 投票制限時間 (秒)
 CHANNEL_DELETE_DELAY = 300     # 結果発表後の削除待ち (秒)
-# 終了後推薦: 霊媒師・初日処刑者・初夜襲撃死者がDMで1票ずつ送る受付時間。
+# 3狼提出の受付時間 (秒)。死亡した瞬間から数え、この間だけ #霊界 を開けない。
+# 霊界へ入れてしまうと先に死んだ人から答えを聞けるので、提出は必ずこの窓の中で
+# 締める。提出するか時間切れになった時点で解放する
+WOLF_GUESS_TIMEOUT = 120
+
+# 終了後投票の受付時間。#昼 のパネル1枚で受ける (DMは送らない)。
 # #昼の削除待ち (300秒) より短くし、集計結果を同じチャンネルへ出せるようにする。
 POSTGAME_RECOMMENDATION_TIMEOUT = 180
 
@@ -236,10 +248,53 @@ INITIAL_RATING = 1500
 WIN_PARTICIPATION_BONUS = 1
 
 # 6:4 の環境を基準にした固定プール。
-# 狼勝ち: 狼4人で +60 / 村9人で -60
-# 村勝ち: 村9人で +90 / 狼4人で -90
-WOLF_WIN_FIXED_POOL = 60
-VILLAGE_WIN_FIXED_POOL = 90
+# 狼勝ち: 狼4人で +120 / 村9人で -120
+# 村勝ち: 村9人で +180 / 狼4人で -180
+# 比 120:180 は「狼勝率60%で全体EV=0」を意味する。勝率の実測が溜まったら
+# W/V = (1-p)/p に合わせ直す。倍率だけを変えても均衡勝率は動かない。
+WOLF_WIN_FIXED_POOL = 120
+VILLAGE_WIN_FIXED_POOL = 180
+
+# 卓帯 (初心者/中級者/上級者) のインデックス。制限卓の参加条件をそのまま流用し、
+# 卓の定義とランク帯の対応がずれないようにする。
+RANK_BAND_ROOM_IDS = ("beginner", "intermediate", "advanced")
+RANK_BAND = {
+    rank_name: band_index
+    for band_index, _room_id in enumerate(RANK_BAND_ROOM_IDS)
+    for rank_name in (ROOM_DEFINITION_MAP[_room_id].allowed_ranks or frozenset())
+}
+
+# 陣営の代表帯の差1につき ±10%。差は最大2帯なので係数は 0.8〜1.2 に収まる。
+# 制限卓は参加条件で帯が揃うため、構造的に常に等倍 (100) になる。
+RANK_BAND_COEFFICIENT_STEP_PERCENT = 10
+
+# ------------------------------------------------------------
+# プレイボーナス (勝敗とは別に、試合中の働きへ加点する)
+#
+# 本体プールと違い、これらは**非ゼロサム**でレートを注入する。
+# 意図的にそうしている (プレイするインセンティブを作るため) が、
+# 「試合数の多い人ほど積み上がる」性質があるので、増やすときは
+# 本体プールとの比率が崩れていないかを確認すること。
+# ------------------------------------------------------------
+# 処刑された人狼へ投票していた村陣営 (狂人は対象外)。処刑を確定させた
+# 最終ラウンドの投票だけを見る。0票やランダム処刑では誰にも入らない
+BONUS_WOLF_EXECUTION_VOTE = 2
+# 6回目の議論に到達したときの人狼 (狂人は対象外)
+BONUS_FINAL_DAY_WOLF = 2
+BONUS_FINAL_DAY_THRESHOLD = 6
+# 3狼提出の的中1人につき。初日・2日目に死亡した人は倍率をかける
+BONUS_WOLF_GUESS_HIT = 1
+BONUS_WOLF_GUESS_SLOTS = 3
+BONUS_WOLF_GUESS_EARLY_MULTIPLIER = 2
+BONUS_WOLF_GUESS_EARLY_MAX_DAY = 2
+# 3狼提出の対象となる死因。除外 (途中離脱) は対象外
+BONUS_WOLF_GUESS_DEATH_CAUSES = frozenset({"処刑", "襲撃"})
+# 狩人の護衛成功1回につき
+BONUS_GUARD_SUCCESS = 1
+# 初夜に占い師を襲撃して殺しきったときの人狼 (狂人は対象外)
+BONUS_NIGHT1_SEER_KILL = 1
+# 終了後の投票 (勝利陣営→敗北陣営の1票 / 推薦の1票) 1票あたり
+BONUS_POSTGAME_VOTE = 1
 
 # レート下限 (これ以上は下がらない。底にいる人の継続意欲を守る)
 RATING_FLOOR = 1000
