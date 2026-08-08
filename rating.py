@@ -5,8 +5,20 @@ import math
 from dataclasses import dataclass
 
 from config import (
+    BONUS_FINAL_DAY_THRESHOLD,
+    BONUS_FINAL_DAY_WOLF,
+    BONUS_GUARD_SUCCESS,
+    BONUS_NIGHT1_SEER_KILL,
+    BONUS_WOLF_EXECUTION_VOTE,
+    BONUS_WOLF_GUESS_DEATH_CAUSES,
+    BONUS_WOLF_GUESS_EARLY_MAX_DAY,
+    BONUS_WOLF_GUESS_EARLY_MULTIPLIER,
+    BONUS_WOLF_GUESS_HIT,
+    BONUS_WOLF_GUESS_SLOTS,
     GRANDMASTER_PERCENTAGE,
     GRANDMASTER_SLOTS,
+    RANK_BAND,
+    RANK_BAND_COEFFICIENT_STEP_PERCENT,
     RANK_ROLE_PREFIX,
     RANK_SPECS,
     RATING_FLOOR,
@@ -15,6 +27,7 @@ from config import (
     VILLAGE_WIN_FIXED_POOL,
     WIN_PARTICIPATION_BONUS,
     WOLF_WIN_FIXED_POOL,
+    Role,
     Team,
 )
 
@@ -75,6 +88,49 @@ def _split_pool_evenly(
     return allocations
 
 
+def _band_median(players: list[dict]) -> int | None:
+    """
+    陣営の代表となる卓帯を返す。偶数人数は下位側を採用する
+    (room_runner.build_rank_bucket と同じ規則に揃える)。
+
+    1人でもランクが取れなければ None を返し、呼び出し側は補正を諦める。
+    ランク取得失敗時に片側だけ歪んだ係数が掛かるのを防ぐため。
+    """
+    bands: list[int] = []
+    for player in players:
+        band = RANK_BAND.get(player.get("rank_name") or "")
+        if band is None:
+            return None
+        bands.append(band)
+    if not bands:
+        return None
+    bands.sort()
+    return bands[(len(bands) - 1) // 2]
+
+
+def band_coefficient_percent(
+    wolf_players: list[dict],
+    village_players: list[dict],
+    *,
+    wolf_won: bool,
+) -> int:
+    """
+    プールへ掛ける係数を百分率で返す (100 = 等倍)。
+
+    格上の陣営が勝つと減り (最小80)、格下の陣営が勝つと増える (最大120)。
+    プール全体へ掛けるので、勝者と敗者が同じプールから出るゼロサム性は保たれる。
+    """
+    wolf_band = _band_median(wolf_players)
+    village_band = _band_median(village_players)
+    if wolf_band is None or village_band is None:
+        return 100
+
+    delta = wolf_band - village_band
+    step = -delta if wolf_won else delta
+    step = max(-2, min(2, step))
+    return 100 + step * RANK_BAND_COEFFICIENT_STEP_PERCENT
+
+
 def calculate_game_results(
     player_data: list[dict],
     *,
@@ -84,9 +140,12 @@ def calculate_game_results(
     6:4 環境を前提にした固定プール方式。
 
     狼勝ち:
-      本体 +60 / -60 を勝敗人数で配分し、勝者へ参加ボーナス
+      本体 +120 / -120 を勝敗人数で配分し、勝者へ参加ボーナス
     村勝ち:
-      本体 +90 / -90 を勝敗人数で配分し、勝者へ参加ボーナス
+      本体 +180 / -180 を勝敗人数で配分し、勝者へ参加ボーナス
+
+    player_data に "rank_name" (試合時表示ランク) があれば、陣営ごとの
+    卓帯の中央値差から係数 (0.8〜1.2) をプールへ掛ける。無ければ等倍。
     """
     winners = [p for p in player_data if p["won"]]
     losers = [p for p in player_data if not p["won"]]
@@ -105,11 +164,23 @@ def calculate_game_results(
     loser_ids = [p["player_id"] for p in losers]
     winner_value = winner_team.value if isinstance(winner_team, Team) else str(winner_team)
     if winner_value == Team.WOLF.value or winner_value == Team.WOLF.name:
+        wolf_won = True
         pool = WOLF_WIN_FIXED_POOL
     elif winner_value == Team.VILLAGE.value or winner_value == Team.VILLAGE.name:
+        wolf_won = False
         pool = VILLAGE_WIN_FIXED_POOL
     else:
         raise ValueError(f"unknown winner_team: {winner_team}")
+
+    # 勝敗と勝利陣営が決まれば各人の陣営は一意に決まる。
+    # 係数はプールへ掛ける (勝者側だけに掛けるとゼロサムが崩れる)
+    coefficient = band_coefficient_percent(
+        winners if wolf_won else losers,
+        losers if wolf_won else winners,
+        wolf_won=wolf_won,
+    )
+    pool = pool * coefficient // 100
+
     winner_elo_map = _split_pool_evenly(winner_ids, pool)
     loser_elo_map = _split_pool_evenly(loser_ids, pool, negative=True)
 
@@ -140,6 +211,118 @@ def calculate_game_results(
         })
 
     return results
+
+
+# ============================================================
+# プレイボーナス (勝敗とは別枠の非ゼロサム加点)
+# ============================================================
+
+def _as_int(value: object) -> int | None:
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def calculate_play_bonuses(
+    player_records: list[dict],
+    facts: dict | None,
+) -> dict[int, int]:
+    """
+    1試合ぶんのプレイボーナスを player_id -> 合計点 で返す。
+
+    player_records:
+      精算キューへ積んだ参加者情報
+      ({"player_id", "role", "team", "won", "died_on_day", "death_cause"})
+    facts:
+      同じく精算キューへ積んだ試合中の事実。項目が欠けていればその加点が
+      入らないだけで、精算そのものは止めない (付加統計の保存失敗で
+      勝敗とレートの精算を止めないのと同じ方針)。
+
+    本体プールと違い**非ゼロサム**なので、必ず別枠で加算し履歴にも分けて残す。
+    """
+    bonuses: dict[int, int] = {}
+    by_id: dict[int, dict] = {}
+    for record in player_records or []:
+        if not isinstance(record, dict):
+            continue
+        player_id = _as_int(record.get("player_id"))
+        if player_id is not None:
+            by_id[player_id] = record
+    if not by_id:
+        return bonuses
+
+    def add(player_id: int | None, points: int) -> None:
+        if not points or player_id is None or player_id not in by_id:
+            return
+        bonuses[player_id] = bonuses.get(player_id, 0) + points
+
+    facts = facts or {}
+    wolf_ids = {
+        player_id for player_id, record in by_id.items()
+        if record.get("role") == Role.WEREWOLF.value
+    }
+
+    # 処刑された人狼へ投票していた村陣営 (狂人は狼陣営なので入らない)
+    for execution in facts.get("executions") or []:
+        if not isinstance(execution, dict):
+            continue
+        if _as_int(execution.get("target")) not in wolf_ids:
+            continue
+        for raw_voter in execution.get("voters") or []:
+            voter_id = _as_int(raw_voter)
+            record = by_id.get(voter_id) if voter_id is not None else None
+            if record is None or record.get("team") != Team.VILLAGE.value:
+                continue
+            add(voter_id, BONUS_WOLF_EXECUTION_VOTE)
+
+    # 6回目の議論へ到達した試合の人狼
+    if (_as_int(facts.get("days")) or 0) >= BONUS_FINAL_DAY_THRESHOLD:
+        for wolf_id in wolf_ids:
+            add(wolf_id, BONUS_FINAL_DAY_WOLF)
+
+    # 3狼提出 (村陣営限定)。情報が少ない初日・2日目の死亡ほど倍率が高い
+    for raw_id, raw_guess in (facts.get("wolf_guesses") or {}).items():
+        guesser_id = _as_int(raw_id)
+        record = by_id.get(guesser_id) if guesser_id is not None else None
+        if record is None or record.get("team") != Team.VILLAGE.value:
+            continue
+        if record.get("death_cause") not in BONUS_WOLF_GUESS_DEATH_CAUSES:
+            continue
+        died_on_day = _as_int(record.get("died_on_day"))
+        if died_on_day is None:
+            continue
+        guessed = {
+            value for value in (_as_int(v) for v in (raw_guess or []))
+            if value is not None
+        }
+        hits = min(len(guessed & wolf_ids), BONUS_WOLF_GUESS_SLOTS)
+        if not hits:
+            continue
+        points = hits * BONUS_WOLF_GUESS_HIT
+        if died_on_day <= BONUS_WOLF_GUESS_EARLY_MAX_DAY:
+            points *= BONUS_WOLF_GUESS_EARLY_MULTIPLIER
+        add(guesser_id, points)
+
+    # 狩人の護衛成功
+    guard_successes = _as_int(facts.get("guard_successes")) or 0
+    if guard_successes > 0:
+        for player_id, record in by_id.items():
+            if record.get("role") == Role.GUARD.value:
+                add(player_id, guard_successes * BONUS_GUARD_SUCCESS)
+
+    # 初夜に占い師を襲撃して殺しきった (護衛成功・噛みなしでは入らない)
+    night1_target = _as_int(facts.get("night1_kill_target"))
+    target_record = by_id.get(night1_target) if night1_target is not None else None
+    if (
+        target_record is not None
+        and target_record.get("role") == Role.SEER.value
+        and _as_int(target_record.get("died_on_day")) == 1
+    ):
+        for wolf_id in wolf_ids:
+            add(wolf_id, BONUS_NIGHT1_SEER_KILL)
+
+    return bonuses
 
 
 # ============================================================

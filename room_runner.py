@@ -22,6 +22,7 @@ from config import (
     RUNOFF_SPEECH_TIME, LAST_WILL_TIME, DISCUSSION_GRACE_TIME,
     MUTE_GRACE_TIME, MUTE_RETRY_DELAY,
     POSTGAME_RECOMMENDATION_TIMEOUT,
+    WOLF_GUESS_TIMEOUT, BONUS_WOLF_GUESS_DEATH_CAUSES,
     SE_ENABLED,
     ADOPT_EXISTING_LAYOUT,
     PRIVATE_ROOM_CREATOR_ROLE_NAME,
@@ -31,7 +32,8 @@ from models import Player, GameState, by_number
 from views import (
     LobbyView, GMPanelEntryView, VoteView, RunoffVoteView,
     WolfVoteView, SeerView, GuardView, SpeechDoneView,
-    MorningReadyView, PrepReadyView, PostgameRecommendationView,
+    MorningReadyView, PrepReadyView, PostgameVotePanelView,
+    WolfGuessView,
     build_vote_result_embed,
 )
 import database
@@ -327,6 +329,8 @@ class RoomRunner:
         # 再起動復元後のGM「再開」はDiscord側で二重配送・連打され得る。
         # resume_game内部でも直列化し、復元ゲームタスクを二本起動しない。
         self.resume_lock = asyncio.Lock()
+        # 3狼提出の受付が終わったら霊界を開けるタイマー。GCで消えないよう保持する
+        self._spirit_release_tasks: set[asyncio.Task] = set()
         self.state = GameState()
         self.state.room_id = self.room_def.room_id
         self.state.room_name = self.room_def.name
@@ -857,6 +861,12 @@ class RoomRunner:
                 for voter_id, target_id in state.votes.items()
             ],
             "runoff_candidates": list(state.runoff_candidates),
+            "decisive_executions": list(state.decisive_executions),
+            "wolf_guesses": [
+                {"player_id": player_id, "targets": list(targets)}
+                for player_id, targets in state.wolf_guesses.items()
+            ],
+            "spirit_hold_ids": list(state.spirit_hold_ids),
             "wolf_target": state.wolf_target,
             "wolf_voters": [
                 {"user_id": user_id, "target_id": target_id}
@@ -1034,6 +1044,17 @@ class RoomRunner:
             if row.get("voter_id") is not None and row.get("target_id") is not None
         }
         state.runoff_candidates = [int(pid) for pid in payload.get("runoff_candidates", [])]
+        state.decisive_executions = [
+            row for row in payload.get("decisive_executions", []) if isinstance(row, dict)
+        ]
+        state.wolf_guesses = {
+            int(row["player_id"]): [int(t) for t in row.get("targets", [])]
+            for row in payload.get("wolf_guesses", [])
+            if row.get("player_id") is not None
+        }
+        # 保留中に落ちた場合は復元時に解放する (`_release_spirit_holds`)。
+        # 再起動を挟んでまで提出を待つと、その間に霊界の話を聞けてしまう
+        state.spirit_hold_ids = {int(pid) for pid in payload.get("spirit_hold_ids", [])}
         state.wolf_target = payload.get("wolf_target")
         state.wolf_voters = {
             int(row["user_id"]): int(row["target_id"])
@@ -1123,6 +1144,10 @@ class RoomRunner:
         await self._assign_alive_role()
         await self._restrict_vc_for_game()
         await self._grant_alive_vc_access()
+        # _apply_spirit_blocks は死亡者の霊界を開けるので、保留も同時に解ける。
+        # 再起動をまたいでまで提出を待つと、その間に霊界の話を聞けてしまうため、
+        # 未提出のぶんは0点で確定させる
+        state.spirit_hold_ids.clear()
         await self._apply_spirit_blocks()
 
         await self._post_lobby_ui()
@@ -2213,6 +2238,7 @@ class RoomRunner:
         top = [pid for pid, cnt in tally.items() if cnt == max_votes]
 
         if len(top) == 1:
+            self._record_decisive_execution(top[0])
             return top[0]
         else:
             # 決戦投票
@@ -2225,6 +2251,25 @@ class RoomRunner:
                 await self._stop_for_durability_error("決戦投票候補の保存", e)
                 raise StateDurabilityError("決戦投票候補を保存できませんでした") from e
             return await self._runoff(top)
+
+    def _record_decisive_execution(self, target_id: int) -> None:
+        """投票で決まった処刑と、その対象へ入れた人を控える (プレイボーナス用)。
+
+        ランダム処刑 (0票・再同票) では呼ばない。処刑を確定させた最終ラウンドの
+        票だけを見るので、決戦があった場合は決戦の票だけが残る。
+        """
+        state = self.state
+        voters = sorted(
+            voter_id for voter_id, voted_for in state.votes.items()
+            if voted_for == target_id
+        )
+        if not voters:
+            return
+        state.decisive_executions.append({
+            "day": state.day_number,
+            "target": int(target_id),
+            "voters": voters,
+        })
 
     def _tally_votes(self, votes: dict) -> dict[int, int]:
         tally: dict[int, int] = {}
@@ -2371,6 +2416,7 @@ class RoomRunner:
         top = [pid for pid, cnt in tally.items() if cnt == max_votes]
 
         if len(top) == 1:
+            self._record_decisive_execution(top[0])
             return top[0]
         else:
             # 再同票 → ランダム処刑
@@ -2740,14 +2786,29 @@ class RoomRunner:
                 "死亡者の発言権を安全に剥奪できませんでした",
                 state_committed=True,
             )
-        await self._open_spirit_for(player.member)
-        await self._safe_spirit_send(
-            f"👻 **{player.display_name}** が霊界へやってきました。"
-        )
+        # 村側の死亡だけは、3狼提出を締めるまで霊界を開けない。
+        # 先に入っている死者から答えを聞けてしまうと提出の意味が無くなる
+        held_for_guess = self._should_hold_spirit(player, method)
+        if held_for_guess:
+            self._hold_spirit_for_guess(player.user_id)
+        else:
+            await self._open_spirit_for(player.member)
+            await self._safe_spirit_send(
+                f"👻 **{player.display_name}** が霊界へやってきました。"
+            )
 
         if method == "処刑":
             self._play_se("execution")
-            await self._safe_village_send(f"⚰️ **{player.display_name}** が処刑されました。")
+            # 提出ボタンは処刑告知へ相乗りさせる (メッセージを増やさない)
+            await self._safe_village_send(
+                f"⚰️ **{player.display_name}** が処刑されました。"
+                + (
+                    f"\n🐺 亡くなった方は **{WOLF_GUESS_TIMEOUT // 60}分以内**に"
+                    "3狼予想を提出できます（提出すると霊界へ入れます）。"
+                    if held_for_guess else ""
+                ),
+                view=WolfGuessView(self) if held_for_guess else None,
+            )
 
             # 霊媒師にDM
             medium = next(
@@ -3661,12 +3722,22 @@ class RoomRunner:
 
         lines.append(f"\n現在の生存者: **{len(state.alive_players())}人**")
 
+        # 襲撃死の3狼提出ボタンは朝の結果へ相乗りさせる (メッセージを増やさない)
+        holding = bool(state.spirit_hold_ids)
+        if holding:
+            lines.append(
+                f"\n🐺 亡くなった方は **{WOLF_GUESS_TIMEOUT // 60}分以内**に"
+                "3狼予想を提出できます（提出すると霊界へ入れます）。"
+            )
+
         embed = discord.Embed(
             title=f"🌅 {state.day_number}日目の朝",
             description="\n".join(lines),
             color=discord.Color.yellow(),
         )
-        await self._safe_village_send(embed=embed)
+        await self._safe_village_send(
+            embed=embed, view=WolfGuessView(self) if holding else None,
+        )
 
         # ログクリア
         state._last_executed = None
@@ -3676,6 +3747,26 @@ class RoomRunner:
     # ============================================================
     # ゲーム終了
     # ============================================================
+
+    def _build_bonus_facts(self, game_stats: Optional[dict]) -> dict:
+        """プレイボーナスの材料を精算キューへ載せる形にまとめる。
+
+        日数と護衛成功数は集計済みの統計から、投票と3狼提出はゲーム中に
+        控えたものから取る。Discord APIは呼ばない。
+        """
+        state = self.state
+        stats = game_stats or {}
+        return {
+            "days": int(stats.get("days") or state.day_number or 0),
+            "guard_successes": int(stats.get("guard_successes") or 0),
+            "executions": list(state.decisive_executions),
+            # JSONのキーは文字列になるので、読み出し側で int へ戻している
+            "wolf_guesses": {
+                str(player_id): list(targets)
+                for player_id, targets in state.wolf_guesses.items()
+            },
+            "night1_kill_target": state.night1_killed_id,
+        }
 
     async def _end_game(self, winner: Team) -> None:
         state = self.state
@@ -3687,6 +3778,9 @@ class RoomRunner:
             # 最初のawaitより前に立つため、同一イベントループ上で原子的。
             return
         state.ending = True
+        # 受付を閉じてから材料を集める。解放すると spirit_hold_ids が空になり、
+        # submit_wolf_guess も通らなくなるので、提出の締めを兼ねる
+        await self._release_all_spirit_holds()
 
         player_meta = [
             {
@@ -3705,6 +3799,8 @@ class RoomRunner:
         except Exception as e:
             # 集計の不具合で勝敗のstage自体を失わない。
             log.exception(f"ゲーム統計の組み立てに失敗 (精算は継続): {e}")
+
+        bonus_facts = self._build_bonus_facts(game_stats)
 
         player_records = []
         for p in state.players.values():
@@ -3785,6 +3881,7 @@ class RoomRunner:
                         winner_team=winner.value,
                         player_records=staged_records,
                         game_stats=staged_stats,
+                        bonus_facts=bonus_facts,
                         gm_id=state.gm_id,
                         base_room_id=state.room_id,
                         recruitment_id=state.recruitment_id,
@@ -3799,6 +3896,7 @@ class RoomRunner:
                     winner_team=winner.value,
                     player_records=staged_records,
                     game_stats=staged_stats,
+                    bonus_facts=bonus_facts,
                     gm_id=state.gm_id,
                     base_room_id=state.room_id,
                     recruitment_id=state.recruitment_id,
@@ -3920,6 +4018,7 @@ class RoomRunner:
                                     winner_team=winner.value,
                                     player_records=staged_records,
                                     game_stats=staged_stats,
+                                    bonus_facts=bonus_facts,
                                     gm_id=state.gm_id,
                                     base_room_id=state.room_id,
                                     recruitment_id=state.recruitment_id,
@@ -3964,24 +4063,49 @@ class RoomRunner:
         # バックグラウンドにすることで、ニックネーム/VC復元と次村受付を3分止めない。
         if settled and self.is_rated_room() and game_id is not None:
             recommendation_voters = self._postgame_recommendation_voters(state)
-            if recommendation_voters:
+            postgame_voters: set[int] = set()
+            loser_ids: set[int] = set()
+            if winner is not None:
+                postgame_voters = self._postgame_vote_voters(state, winner)
+                loser_ids = {
+                    player.user_id
+                    for player in state.players.values()
+                    if player.role is not None and ROLE_TEAM[player.role] is not winner
+                }
+                if not loser_ids:
+                    postgame_voters = set()
+            ballot_keys = (
+                {(voter_id, "recommend") for voter_id in recommendation_voters}
+                | {(voter_id, "postgame") for voter_id in postgame_voters}
+            )
+            if ballot_keys:
                 try:
                     # タスク起動前に行を作り、直後のシーズンリセットとの隙間を塞ぐ。
-                    await database.create_game_recommendation_ballots(
-                        int(game_id),
-                        state.guild.id,
-                        recommendation_voters,
-                        timeout_seconds=POSTGAME_RECOMMENDATION_TIMEOUT,
-                    )
+                    if recommendation_voters:
+                        await database.create_game_recommendation_ballots(
+                            int(game_id),
+                            state.guild.id,
+                            recommendation_voters,
+                            timeout_seconds=POSTGAME_RECOMMENDATION_TIMEOUT,
+                            kind="recommend",
+                        )
+                    if postgame_voters:
+                        await database.create_game_recommendation_ballots(
+                            int(game_id),
+                            state.guild.id,
+                            postgame_voters,
+                            timeout_seconds=POSTGAME_RECOMMENDATION_TIMEOUT,
+                            kind="postgame",
+                        )
                 except Exception as e:
-                    log.exception(f"終了後推薦の受付作成に失敗: {e}")
+                    log.exception(f"終了後投票の受付作成に失敗: {e}")
                     await self._safe_village_send(
-                        "⚠️ 終了後推薦の受付を開始できませんでした。ログを確認してください。"
+                        "⚠️ 終了後投票の受付を開始できませんでした。ログを確認してください。"
                     )
                 else:
                     self.manager.spawn_bg_task(
                         self._run_postgame_recommendations(
-                            state, int(game_id), recommendation_voters
+                            state, int(game_id), ballot_keys, loser_ids,
                         )
                     )
 
@@ -4083,59 +4207,67 @@ class RoomRunner:
             voters.add(int(state.night1_killed_id))
         return voters
 
+    @staticmethod
+    def _postgame_vote_voters(state: GameState, winner: Team) -> set[int]:
+        """勝利陣営の全員を返す (敗北陣営の1人へ+1を贈る票)。"""
+        return {
+            player.user_id
+            for player in state.players.values()
+            if player.role is not None and ROLE_TEAM[player.role] is winner
+        }
+
     async def _run_postgame_recommendations(
         self,
         finished_state: GameState,
         game_id: int,
-        voter_ids: set[int],
+        ballot_keys: set[tuple[int, str]],
+        loser_ids: set[int],
     ) -> None:
-        """推薦DMを送り、全員確定または3分経過後に匿名で集計する。"""
+        """終了後の投票パネルを `#昼` に1枚だけ出し、締切後に匿名で集計する。
+
+        **DMは送らない。** 投票権者は最大13人になるので、DMだと1試合で13通に
+        なる。パネルなら送信APIは1回で済む (押下は interaction 専用ルート)。
+        """
         guild = finished_state.guild
         if guild is None:
             return
-        pending = set(voter_ids)
+        pending = set(ballot_keys)
         all_done = asyncio.Event()
 
-        def on_confirmed(voter_id: int) -> None:
-            pending.discard(voter_id)
+        def on_confirmed(voter_id: int, kind: str) -> None:
+            pending.discard((voter_id, kind))
             if not pending:
                 all_done.set()
 
-        candidates = list(finished_state.players.values())
-        for voter_id in sorted(voter_ids):
-            voter = finished_state.players.get(voter_id)
-            if voter is None:
-                pending.discard(voter_id)
+        ballots: dict[int, list[str]] = {}
+        for voter_id, kind in sorted(ballot_keys):
+            if voter_id in finished_state.players:
+                ballots.setdefault(voter_id, []).append(kind)
+            else:
+                # 参加者として復元できない票は閉じる (集計を待たせない)
+                pending.discard((voter_id, kind))
                 await database.cancel_game_recommendation_ballot(
-                    game_id, guild.id, voter_id
+                    game_id, guild.id, voter_id, kind=kind,
                 )
-                continue
-            view = PostgameRecommendationView(
+
+        if ballots:
+            view = PostgameVotePanelView(
                 game_id=game_id,
                 guild_id=guild.id,
-                voter_id=voter_id,
-                candidates=candidates,
+                ballots=ballots,
+                players=list(finished_state.players.values()),
+                loser_ids=loser_ids,
                 timeout=POSTGAME_RECOMMENDATION_TIMEOUT,
                 on_confirmed=on_confirmed,
             )
-            try:
-                message = await self._discord_api_call(
-                    voter.member.send,
-                    "👏 **終了後推薦（+1レート）**\n"
-                    "霊媒師・初日の処刑者・初夜の襲撃死者には、"
-                    "この試合の参加者1人へ+1を贈る推薦票があります。\n"
-                    "自分自身は選べません。条件が重なっても1人1票です。\n"
-                    f"受付は **{POSTGAME_RECOMMENDATION_TIMEOUT // 60}分間**。"
-                    "推薦者名は公開されません。",
-                    view=view,
-                )
-                view.message = message
-            except (discord.Forbidden, discord.HTTPException) as e:
-                log.warning(f"終了後推薦DM送信失敗 (ID:{voter_id}): {e}")
-                pending.discard(voter_id)
-                await database.cancel_game_recommendation_ballot(
-                    game_id, guild.id, voter_id
-                )
+            view.message = await self._safe_village_send(
+                "🗳️ **終了後の投票**（受付 "
+                f"**{POSTGAME_RECOMMENDATION_TIMEOUT // 60}分**・1票につきレート+1）\n"
+                "・**勝利陣営**は、手強かった敗北陣営の1人へ\n"
+                "・**霊媒師 / 初日の処刑者 / 初夜の襲撃死者**は、参加者の1人へ\n"
+                "投票権のある人だけが操作できます。投票者名は公開されません。",
+                view=view,
+            )
 
         if not pending:
             all_done.set()
@@ -4227,17 +4359,18 @@ class RoomRunner:
             delta = r["delta"]
             elo_delta = r["elo_delta"]
             bonus = r["bonus"]
+            play_bonus = r.get("play_bonus", 0)
             recommendation_bonus = r.get("recommendation_bonus", 0)
             sign = "+" if delta >= 0 else ""
             elo_sign = "+" if elo_delta >= 0 else ""
-            detail_txt = ""
+            parts = [f"本体{elo_sign}{elo_delta}"]
             if bonus > 0:
-                detail_txt = f" (本体{elo_sign}{elo_delta} / +{bonus}🎁)"
+                parts.append(f"勝利+{bonus}")
+            if play_bonus > 0:
+                parts.append(f"活躍+{play_bonus}")
             if recommendation_bonus > 0:
-                detail_txt = (
-                    f" (本体{elo_sign}{elo_delta} / 勝利+{bonus} / "
-                    f"推薦+{recommendation_bonus})"
-                )
+                parts.append(f"投票+{recommendation_bonus}")
+            detail_txt = f" ({' / '.join(parts)})" if len(parts) > 1 else ""
             after_rank = after_rank_map.get(pid)
             new_rank_name = after_rank.rank_name if after_rank else "ブロンズ"
             new_emoji = after_rank.emoji if after_rank else "🥉"
@@ -5768,6 +5901,91 @@ class RoomRunner:
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
             log.warning(f"#昼 への送信失敗: {e}")
             return None
+
+    # ============================================================
+    # 3狼提出 (霊界を開ける前の数分だけ受け付ける)
+    # ============================================================
+
+    def _should_hold_spirit(self, player: Player, method: str) -> bool:
+        """3狼提出のために #霊界 の解放を待つべき死亡かどうか。
+
+        村陣営の処刑死・襲撃死だけが対象。狼陣営・除外・勝敗確定後は待たない
+        (勝敗が決まった瞬間の死亡は、待たせても提出前に終了処理が走るため)。
+        """
+        state = self.state
+        if state.ending or state.pending_winner is not None:
+            return False
+        if method not in BONUS_WOLF_GUESS_DEATH_CAUSES:
+            return False
+        if player.role is None or ROLE_TEAM[player.role] is not Team.VILLAGE:
+            return False
+        return state.spirit_channel is not None
+
+    def _hold_spirit_for_guess(self, player_id: int) -> None:
+        """霊界の解放を保留し、時間切れで自動解放するタイマーを仕掛ける"""
+        state = self.state
+        if player_id in state.spirit_hold_ids:
+            return
+        state.spirit_hold_ids.add(player_id)
+
+        async def release_later() -> None:
+            try:
+                await asyncio.sleep(WOLF_GUESS_TIMEOUT)
+                await self._release_spirit_hold(player_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning(f"霊界保留の自動解除に失敗 (ID:{player_id}): {e}")
+
+        task = asyncio.create_task(release_later())
+        self._spirit_release_tasks.add(task)
+        task.add_done_callback(self._spirit_release_tasks.discard)
+
+    async def submit_wolf_guess(self, player_id: int, targets: list[int]) -> bool:
+        """3狼提出を凍結して霊界を開ける。受付外なら False を返す。"""
+        state = self.state
+        if player_id not in state.spirit_hold_ids or player_id in state.wolf_guesses:
+            return False
+        state.wolf_guesses[player_id] = sorted({int(t) for t in targets})
+        try:
+            await self._persist_room_state()
+        except Exception as e:
+            state.wolf_guesses.pop(player_id, None)
+            log.warning(f"3狼提出の保存に失敗 (ID:{player_id}): {e}")
+            return False
+        await self._release_spirit_hold(player_id)
+        return True
+
+    async def _release_spirit_hold(self, player_id: int) -> None:
+        state = self.state
+        if player_id not in state.spirit_hold_ids:
+            return
+        state.spirit_hold_ids.discard(player_id)
+        player = state.get_player(player_id)
+        if player is not None and player.member is not None:
+            await self._open_spirit_for(player.member)
+            await self._safe_spirit_send(
+                f"👻 **{player.display_name}** が霊界へやってきました。"
+            )
+        try:
+            await self._persist_room_state()
+        except Exception as e:
+            log.warning(f"霊界保留の解除保存に失敗 (ID:{player_id}): {e}")
+
+    async def _release_all_spirit_holds(self) -> None:
+        """保留を全部解放する。ゲーム終了時と復元時に呼ぶ。
+
+        再起動をまたいでまで提出を待たない。待つと、その間に霊界の話を
+        聞けてしまい提出の意味がなくなる (未提出のぶんは0点で確定)。
+
+        自動解除タイマーもここで畳む。残しておくと、2分以内に次の村が
+        始まった場合に前の村のタイマーが新しい保留を解いてしまう。
+        """
+        for task in list(self._spirit_release_tasks):
+            task.cancel()
+        self._spirit_release_tasks.clear()
+        for player_id in list(self.state.spirit_hold_ids):
+            await self._release_spirit_hold(player_id)
 
     async def _open_spirit_for(self, member: discord.Member) -> None:
         """死亡/除外したメンバーの #霊界 閲覧ブロック (メンバー個別上書き) を解除する"""

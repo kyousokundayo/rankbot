@@ -18,14 +18,18 @@ from config import (
     GRANDMASTER_PERCENTAGE,
     GRANDMASTER_SLOTS,
     INITIAL_RATING,
+    RANK_BAND,
     RANK_SPECS,
     RATING_FLOOR,
+    ROLE_TEAM,
+    Role,
     ROOM_DEFINITION_MAP,
     SEASON_RANK_MIN_GAMES,
     SEASON_RANK_PERCENTAGES,
     VILLAGE_WIN_FIXED_POOL,
     WIN_PARTICIPATION_BONUS,
     WOLF_WIN_FIXED_POOL,
+    Team,
 )
 
 
@@ -42,11 +46,37 @@ def make_players(
     return players
 
 
+def make_ranked_players(
+    winner_count: int,
+    loser_count: int,
+    *,
+    winner_rank: str,
+    loser_rank: str,
+    rating: int = INITIAL_RATING,
+) -> list[dict]:
+    players = make_players(winner_count, loser_count, rating)
+    for player in players:
+        player["rank_name"] = winner_rank if player["won"] else loser_rank
+    return players
+
+
 class TestCalculateGameResults(unittest.TestCase):
     def test_adopted_rating_constants(self):
         self.assertEqual(INITIAL_RATING, 1500)
         self.assertEqual(RATING_FLOOR, 1000)
         self.assertEqual(WIN_PARTICIPATION_BONUS, 1)
+        self.assertEqual(WOLF_WIN_FIXED_POOL, 120)
+        self.assertEqual(VILLAGE_WIN_FIXED_POOL, 180)
+
+    def test_pool_ratio_implies_sixty_percent_wolf_winrate(self):
+        """W/V = (1-p)/p。120:180 は「狼勝率60%で全体EV=0」を意味する。
+
+        倍率だけを変えても均衡勝率は動かない。実測が溜まったら比率のほうを直す。
+        """
+        break_even = VILLAGE_WIN_FIXED_POOL / (
+            VILLAGE_WIN_FIXED_POOL + WOLF_WIN_FIXED_POOL
+        )
+        self.assertAlmostEqual(break_even, 0.60)
 
     def test_wolf_win_pool_is_zero_sum_except_bonus(self):
         """狼勝ち (勝者4/敗者9): elo_deltaはゼロサム、deltaはボーナス分だけ正"""
@@ -69,7 +99,7 @@ class TestCalculateGameResults(unittest.TestCase):
         self.assertEqual(delta_sum, 9 * WIN_PARTICIPATION_BONUS)
 
     def test_pool_selection_by_winner_count(self):
-        """勝者が少数側 (狼勝ち) なら60プール、多数側 (村勝ち) なら90プール"""
+        """勝者が少数側 (狼勝ち) なら120プール、多数側 (村勝ち) なら180プール"""
         wolf_win = rating_lib.calculate_game_results(
             make_players(4, 9), winner_team="狼陣営"
         )
@@ -174,6 +204,324 @@ class TestCalculateGameResults(unittest.TestCase):
             for r in results:
                 self.assertEqual(r["delta"], 0)
                 self.assertEqual(r["rating_after"], r["rating_before"])
+
+
+class TestBandCoefficient(unittest.TestCase):
+    """卓帯 (初心者/中級者/上級者) の中央値差によるプール補正"""
+
+    def test_rank_band_covers_every_rank(self):
+        """9段階すべてが3帯のどれかに入る (制限卓の参加条件から導出している)"""
+        for rank_name, _emoji, _color in RANK_SPECS:
+            self.assertIn(rank_name, RANK_BAND)
+        self.assertEqual(set(RANK_BAND.values()), {0, 1, 2})
+
+    def test_same_band_is_neutral(self):
+        """同じ帯どうしなら等倍。制限卓は参加条件で帯が揃うのでここに入る"""
+        for winner_team, winners, losers, pool in (
+            ("狼陣営", 4, 9, WOLF_WIN_FIXED_POOL),
+            ("村陣営", 9, 4, VILLAGE_WIN_FIXED_POOL),
+        ):
+            with self.subTest(winner_team=winner_team):
+                results = rating_lib.calculate_game_results(
+                    make_ranked_players(
+                        winners, losers,
+                        winner_rank="ゴールド", loser_rank="エメラルド",
+                    ),
+                    winner_team=winner_team,
+                )
+                gain = sum(r["elo_delta"] for r in results if r["elo_delta"] > 0)
+                self.assertEqual(gain, pool)
+
+    def test_stronger_side_winning_shrinks_pool(self):
+        """上級者の狼が初心者の村に勝つ: 2帯差の格上勝ち → 0.8倍"""
+        results = rating_lib.calculate_game_results(
+            make_ranked_players(4, 9, winner_rank="マスター", loser_rank="ブロンズ"),
+            winner_team="狼陣営",
+        )
+        gain = sum(r["elo_delta"] for r in results if r["elo_delta"] > 0)
+        self.assertEqual(gain, WOLF_WIN_FIXED_POOL * 80 // 100)
+
+    def test_weaker_side_winning_grows_pool(self):
+        """初心者の狼が上級者の村に勝つ: 2帯差の格下勝ち → 1.2倍"""
+        results = rating_lib.calculate_game_results(
+            make_ranked_players(4, 9, winner_rank="ブロンズ", loser_rank="マスター"),
+            winner_team="狼陣営",
+        )
+        gain = sum(r["elo_delta"] for r in results if r["elo_delta"] > 0)
+        self.assertEqual(gain, WOLF_WIN_FIXED_POOL * 120 // 100)
+
+    def test_one_band_difference_is_ten_percent(self):
+        """中級者の村が初心者の狼に勝つ: 1帯差の格上勝ち → 0.9倍"""
+        results = rating_lib.calculate_game_results(
+            make_ranked_players(9, 4, winner_rank="プラチナ", loser_rank="シルバー"),
+            winner_team="村陣営",
+        )
+        gain = sum(r["elo_delta"] for r in results if r["elo_delta"] > 0)
+        self.assertEqual(gain, VILLAGE_WIN_FIXED_POOL * 90 // 100)
+
+    def test_coefficient_keeps_zero_sum(self):
+        """係数を掛けてもプール本体のゼロサムは崩れない"""
+        for winner_rank, loser_rank in (
+            ("マスター", "ブロンズ"),
+            ("ブロンズ", "マスター"),
+            ("ゴールド", "シルバー"),
+        ):
+            with self.subTest(winner_rank=winner_rank, loser_rank=loser_rank):
+                results = rating_lib.calculate_game_results(
+                    make_ranked_players(
+                        4, 9, winner_rank=winner_rank, loser_rank=loser_rank,
+                    ),
+                    winner_team="狼陣営",
+                )
+                self.assertEqual(sum(r["elo_delta"] for r in results), 0)
+
+    def test_missing_rank_falls_back_to_neutral(self):
+        """1人でもランクが取れなければ補正しない (片側だけ歪むのを防ぐ)"""
+        players = make_ranked_players(
+            4, 9, winner_rank="マスター", loser_rank="ブロンズ",
+        )
+        players[0]["rank_name"] = None
+        results = rating_lib.calculate_game_results(players, winner_team="狼陣営")
+        gain = sum(r["elo_delta"] for r in results if r["elo_delta"] > 0)
+        self.assertEqual(gain, WOLF_WIN_FIXED_POOL)
+
+    def test_no_rank_key_at_all_is_neutral(self):
+        """rank_name を渡さない既存の呼び出しはそのまま等倍で通る"""
+        results = rating_lib.calculate_game_results(
+            make_players(4, 9), winner_team="狼陣営"
+        )
+        gain = sum(r["elo_delta"] for r in results if r["elo_delta"] > 0)
+        self.assertEqual(gain, WOLF_WIN_FIXED_POOL)
+
+    def test_median_uses_lower_side_on_even_count(self):
+        """狼4人の帯が割れたら下位側を代表にする (build_rank_bucket と同じ規則)"""
+        players = [
+            {"player_id": 100, "rating": INITIAL_RATING, "won": True, "rank_name": "マスター"},
+            {"player_id": 101, "rating": INITIAL_RATING, "won": True, "rank_name": "ダイヤ"},
+            {"player_id": 102, "rating": INITIAL_RATING, "won": True, "rank_name": "ブロンズ"},
+            {"player_id": 103, "rating": INITIAL_RATING, "won": True, "rank_name": "シルバー"},
+        ]
+        players += [
+            {
+                "player_id": 200 + i, "rating": INITIAL_RATING,
+                "won": False, "rank_name": "シルバー",
+            }
+            for i in range(9)
+        ]
+        results = rating_lib.calculate_game_results(players, winner_team="狼陣営")
+        gain = sum(r["elo_delta"] for r in results if r["elo_delta"] > 0)
+        # 狼の帯は上位側なら2だが下位側を採る規則で0。村も0なので等倍
+        self.assertEqual(gain, WOLF_WIN_FIXED_POOL)
+
+
+WOLF_IDS = (1, 2, 3)
+MADMAN_ID = 4
+SEER_ID = 5
+MEDIUM_ID = 6
+GUARD_ID = 7
+VILLAGER_IDS = (8, 9, 10, 11, 12, 13)
+
+
+def make_records(deaths: dict[int, dict] | None = None) -> list[dict]:
+    """13人固定構成の参加者レコード。deaths で死亡日と死因を差し込む"""
+    layout = (
+        [(pid, Role.WEREWOLF) for pid in WOLF_IDS]
+        + [(MADMAN_ID, Role.MADMAN), (SEER_ID, Role.SEER)]
+        + [(MEDIUM_ID, Role.MEDIUM), (GUARD_ID, Role.GUARD)]
+        + [(pid, Role.VILLAGER) for pid in VILLAGER_IDS]
+    )
+    records = []
+    for player_id, role in layout:
+        team = ROLE_TEAM[role]
+        record = {
+            "player_id": player_id,
+            "role": role.value,
+            "team": team.value,
+            "won": team is Team.VILLAGE,
+            "died_on_day": None,
+            "death_cause": None,
+        }
+        record.update((deaths or {}).get(player_id, {}))
+        records.append(record)
+    return records
+
+
+class TestCalculatePlayBonuses(unittest.TestCase):
+    """勝敗とは別枠の非ゼロサム加点"""
+
+    def test_no_facts_gives_nothing(self):
+        for facts in (None, {}):
+            with self.subTest(facts=facts):
+                self.assertEqual(
+                    rating_lib.calculate_play_bonuses(make_records(), facts), {}
+                )
+
+    def test_empty_records_is_safe(self):
+        self.assertEqual(rating_lib.calculate_play_bonuses([], {"days": 9}), {})
+
+    def test_wolf_execution_vote_only_pays_village(self):
+        """処刑された人狼へ投票した村陣営だけが+2。狂人と人狼は入らない"""
+        bonuses = rating_lib.calculate_play_bonuses(
+            make_records(),
+            {"executions": [{"day": 2, "target": WOLF_IDS[0],
+                             "voters": [8, 9, MADMAN_ID, WOLF_IDS[1]]}]},
+        )
+        self.assertEqual(bonuses.get(8), 2)
+        self.assertEqual(bonuses.get(9), 2)
+        self.assertNotIn(MADMAN_ID, bonuses)
+        self.assertNotIn(WOLF_IDS[1], bonuses)
+
+    def test_executing_the_madman_pays_nobody(self):
+        bonuses = rating_lib.calculate_play_bonuses(
+            make_records(),
+            {"executions": [{"day": 1, "target": MADMAN_ID, "voters": [8, 9, 10]}]},
+        )
+        self.assertEqual(bonuses, {})
+
+    def test_random_execution_without_voters_pays_nobody(self):
+        bonuses = rating_lib.calculate_play_bonuses(
+            make_records(),
+            {"executions": [{"day": 3, "target": WOLF_IDS[0], "voters": []}]},
+        )
+        self.assertEqual(bonuses, {})
+
+    def test_multiple_wolf_executions_stack(self):
+        bonuses = rating_lib.calculate_play_bonuses(
+            make_records(),
+            {"executions": [
+                {"day": 1, "target": WOLF_IDS[0], "voters": [8]},
+                {"day": 2, "target": WOLF_IDS[1], "voters": [8]},
+            ]},
+        )
+        self.assertEqual(bonuses.get(8), 4)
+
+    def test_final_day_pays_wolves_only(self):
+        bonuses = rating_lib.calculate_play_bonuses(make_records(), {"days": 6})
+        for wolf_id in WOLF_IDS:
+            self.assertEqual(bonuses.get(wolf_id), 2)
+        self.assertNotIn(MADMAN_ID, bonuses)
+        self.assertNotIn(SEER_ID, bonuses)
+
+    def test_final_day_threshold_is_exclusive_below_six(self):
+        self.assertEqual(rating_lib.calculate_play_bonuses(make_records(), {"days": 5}), {})
+
+    def test_wolf_guess_scores_one_per_hit(self):
+        """3日目以降の死亡は等倍。的中2人なら+2"""
+        records = make_records({8: {"died_on_day": 3, "death_cause": "襲撃"}})
+        bonuses = rating_lib.calculate_play_bonuses(
+            records, {"wolf_guesses": {"8": [WOLF_IDS[0], WOLF_IDS[1], MADMAN_ID]}},
+        )
+        self.assertEqual(bonuses.get(8), 2)
+
+    def test_wolf_guess_doubles_for_early_deaths(self):
+        """初日・2日目の死亡は2倍。全的中なら+6"""
+        for day in (1, 2):
+            with self.subTest(day=day):
+                records = make_records({8: {"died_on_day": day, "death_cause": "処刑"}})
+                bonuses = rating_lib.calculate_play_bonuses(
+                    records, {"wolf_guesses": {8: list(WOLF_IDS)}},
+                )
+                self.assertEqual(bonuses.get(8), 6)
+
+    def test_wolf_guess_ignores_wolf_team(self):
+        """狼陣営は3狼提出の対象外 (狂人も含む)"""
+        records = make_records({MADMAN_ID: {"died_on_day": 1, "death_cause": "処刑"}})
+        bonuses = rating_lib.calculate_play_bonuses(
+            records, {"wolf_guesses": {MADMAN_ID: list(WOLF_IDS)}},
+        )
+        self.assertEqual(bonuses, {})
+
+    def test_wolf_guess_ignores_removed_players(self):
+        """除外 (途中離脱) は対象外"""
+        records = make_records({8: {"died_on_day": 1, "death_cause": "除外"}})
+        bonuses = rating_lib.calculate_play_bonuses(
+            records, {"wolf_guesses": {8: list(WOLF_IDS)}},
+        )
+        self.assertEqual(bonuses, {})
+
+    def test_wolf_guess_ignores_survivors(self):
+        """死亡日がない (終了時まで生存) 人は対象外"""
+        bonuses = rating_lib.calculate_play_bonuses(
+            make_records(), {"wolf_guesses": {8: list(WOLF_IDS)}},
+        )
+        self.assertEqual(bonuses, {})
+
+    def test_wolf_guess_caps_at_three_hits(self):
+        """4人以上を提出しても的中は3人ぶんまで"""
+        records = make_records({8: {"died_on_day": 4, "death_cause": "襲撃"}})
+        bonuses = rating_lib.calculate_play_bonuses(
+            records, {"wolf_guesses": {8: list(WOLF_IDS) + [MADMAN_ID, SEER_ID]}},
+        )
+        self.assertEqual(bonuses.get(8), 3)
+
+    def test_guard_success_pays_the_guard(self):
+        bonuses = rating_lib.calculate_play_bonuses(
+            make_records(), {"guard_successes": 2},
+        )
+        self.assertEqual(bonuses.get(GUARD_ID), 2)
+        self.assertEqual(len(bonuses), 1)
+
+    def test_no_guard_success_pays_nothing(self):
+        self.assertEqual(
+            rating_lib.calculate_play_bonuses(make_records(), {"guard_successes": 0}), {}
+        )
+
+    def test_night1_seer_kill_pays_wolves(self):
+        records = make_records({SEER_ID: {"died_on_day": 1, "death_cause": "襲撃"}})
+        bonuses = rating_lib.calculate_play_bonuses(
+            records, {"night1_kill_target": SEER_ID},
+        )
+        for wolf_id in WOLF_IDS:
+            self.assertEqual(bonuses.get(wolf_id), 1)
+        self.assertNotIn(MADMAN_ID, bonuses)
+
+    def test_night1_kill_of_other_role_pays_nothing(self):
+        records = make_records({MEDIUM_ID: {"died_on_day": 1, "death_cause": "襲撃"}})
+        bonuses = rating_lib.calculate_play_bonuses(
+            records, {"night1_kill_target": MEDIUM_ID},
+        )
+        self.assertEqual(bonuses, {})
+
+    def test_seer_dying_later_is_not_a_night1_kill(self):
+        """初夜が護衛成功で、占い師が後日死んだ場合は入らない"""
+        records = make_records({SEER_ID: {"died_on_day": 3, "death_cause": "襲撃"}})
+        bonuses = rating_lib.calculate_play_bonuses(
+            records, {"night1_kill_target": SEER_ID},
+        )
+        self.assertEqual(bonuses, {})
+
+    def test_bonuses_from_different_rules_stack(self):
+        records = make_records({
+            SEER_ID: {"died_on_day": 1, "death_cause": "襲撃"},
+            8: {"died_on_day": 1, "death_cause": "処刑"},
+        })
+        bonuses = rating_lib.calculate_play_bonuses(records, {
+            "days": 6,
+            "guard_successes": 1,
+            "night1_kill_target": SEER_ID,
+            "executions": [{"day": 2, "target": WOLF_IDS[0], "voters": [9, 10]}],
+            "wolf_guesses": {8: [WOLF_IDS[0], SEER_ID, MADMAN_ID]},
+        })
+        # 人狼: 最終日+2、初夜占い噛み+1
+        for wolf_id in WOLF_IDS:
+            self.assertEqual(bonuses.get(wolf_id), 3)
+        self.assertEqual(bonuses.get(GUARD_ID), 1)      # GJ 1回
+        self.assertEqual(bonuses.get(8), 2)             # 的中1人 × 初日2倍
+        self.assertEqual(bonuses.get(9), 2)             # 人狼処刑への投票
+        self.assertEqual(bonuses.get(10), 2)
+        self.assertNotIn(MADMAN_ID, bonuses)
+
+    def test_unknown_player_ids_are_ignored(self):
+        """参加者にいないIDが混ざっても落ちない"""
+        bonuses = rating_lib.calculate_play_bonuses(
+            make_records(),
+            {
+                "executions": [{"day": 1, "target": WOLF_IDS[0], "voters": [999, None, "x"]}],
+                "wolf_guesses": {"999": [1, 2, 3]},
+                "night1_kill_target": "not-an-id",
+            },
+        )
+        self.assertEqual(bonuses, {})
 
 
 def make_rows(count: int, games: int = SEASON_RANK_MIN_GAMES) -> list[dict]:
