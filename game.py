@@ -28,9 +28,8 @@ from config import (
     USER_VISIBLE_VARIANT_IDS,
 )
 from permissions import RoomPermissionMixin, RoomVisibilityError
-from room_runner import (  # noqa: F401  (互換のため再エクスポート)
+from room_runner import (
     MUTE_MARKER_ROLE_PREFIX,
-    ROLE_EMOJI,
     RoomRunner,
     member_roles_for_edit,
 )
@@ -276,7 +275,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         """無効固定卓に復旧が必要な状態が残っていないか判定する。
 
         無効卓はRunnerを作らないため、空のLOBBY/GAME_OVER以外を見落とすと
-        復元・ミュート回収・募集移行を失う。隔離snapshotも手掛かりを失わない
+        復元・ミュート回収・募集の開催反映を失う。隔離snapshotも手掛かりを失わない
         よう常に停止理由にする。
         """
         disabled_room_ids = {
@@ -353,112 +352,8 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             f"{detail}"
         )
 
-    async def _retire_removed_fixed_rooms(
-        self,
-        guild: discord.Guild,
-        snapshots: dict[str, dict],
-        quarantined_room_ids: set[str],
-    ) -> None:
-        """明示廃止された旧5卓を、保存IDだけで一回限り回収する。
-
-        名前一致だけでは削除しない。空ロビー、非隔離snapshot、保存カテゴリID、
-        Botが記録した子チャンネルだけ、という全条件が揃った卓に限定する。
-        手動チャンネルが1つでも混在すれば通常のfail-closed検査へ残す。
-        """
-        retired_ids = {
-            "beginner", "intermediate", "advanced", "open_9_cross", "open_9_turn",
-        }
-        definitions = {room.room_id: room for room in ROOM_DEFINITIONS}
-        active_recruitments = await database.list_active_recruitments_for_room_ids(
-            guild.id, retired_ids
-        )
-        recruitments_by_room: dict[str, list[dict]] = {}
-        for row in active_recruitments:
-            recruitments_by_room.setdefault(str(row["room_id"]), []).append(row)
-
-        for room_id in sorted(retired_ids):
-            payload = snapshots.get(room_id)
-            if payload is None or room_id in quarantined_room_ids:
-                continue
-            phase = str(payload.get("phase") or "")
-            if phase not in {Phase.LOBBY.name, Phase.GAME_OVER.name}:
-                continue
-            if payload.get("players") or payload.get("gm_id") is not None:
-                continue
-            linked = payload.get("recruitment_id")
-            if linked is not None and not any(
-                int(item["id"]) == int(linked)
-                for item in recruitments_by_room.get(room_id, [])
-            ):
-                continue
-
-            channel_ids = payload.get("channel_ids") or {}
-            category_id = channel_ids.get("category")
-            # statsは全卓共通の#統計で、旧卓カテゴリの子ではない。ここへ含めると
-            # 「保存済み子がカテゴリ外」の安全判定に必ず当たり、空の旧卓でも
-            # 回収できず起動停止になる。
-            owned_child_keys = {"lobby", "voice", "village", "spirit"}
-            recorded_child_ids = {
-                int(channel_id)
-                for name, channel_id in channel_ids.items()
-                if name in owned_child_keys and isinstance(channel_id, int)
-            }
-            category = guild.get_channel(category_id) if isinstance(category_id, int) else None
-            existing_children = [
-                guild.get_channel(channel_id) for channel_id in recorded_child_ids
-            ]
-            existing_children = [item for item in existing_children if item is not None]
-            if category is None:
-                if existing_children:
-                    continue
-            else:
-                definition = definitions.get(room_id)
-                if not isinstance(category, discord.CategoryChannel):
-                    continue
-                if definition is None or category.name != definition.name:
-                    continue
-                actual_child_ids = {
-                    int(child.id) for child in getattr(category, "channels", ())
-                }
-                if not actual_child_ids.issubset(recorded_child_ids):
-                    log.warning(
-                        "旧固定卓に手動チャンネルがあるため自動削除しません: %s",
-                        definition.name,
-                    )
-                    continue
-                if any(
-                    getattr(getattr(child, "category", None), "id", None) != category.id
-                    for child in existing_children
-                ):
-                    continue
-
-            try:
-                for child in existing_children:
-                    await self.paced_discord_api_call(
-                        child.delete,
-                        reason="常設卓廃止に伴うBot所有チャンネル回収",
-                    )
-                if category is not None:
-                    await self.paced_discord_api_call(
-                        category.delete,
-                        reason="常設卓廃止に伴うBot所有カテゴリ回収",
-                    )
-            except (discord.Forbidden, discord.HTTPException) as exc:
-                raise RuntimeError(
-                    f"旧固定卓 {room_id} のDiscord資産を安全に回収できません: {exc}"
-                ) from exc
-
-            for recruitment in recruitments_by_room.get(room_id, []):
-                await database.set_recruitment_status(
-                    int(recruitment["id"]), database.RECRUITMENT_ARCHIVED
-                )
-                await database.clear_recruitment_message_id(int(recruitment["id"]))
-            await database.delete_room_state(guild.id, room_id)
-            snapshots.pop(room_id, None)
-            log.info("旧常設卓を安全に削除しました: %s", room_id)
-
     # ============================================================
-    # 定期DBバックアップ (起動時バックアップとは別に24時間ごと)
+    # 定期DBバックアップ (24時間ごと)
     # ============================================================
 
     @tasks.loop(hours=24)
@@ -786,8 +681,6 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 category_overwrites[staff_role] = discord.PermissionOverwrite(
                     view_channel=True, read_messages=True, send_messages=False, connect=True
                 )
-        legacy_category_name = "GMロール説明"
-        legacy_channel_name = "専用村作成"
         category = None
         stored_category_id = await database.get_meta(guild.id, "gm_hub_category_id")
         if stored_category_id and str(stored_category_id).isdigit():
@@ -796,23 +689,6 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 category = candidate
         if category is None:
             category = discord.utils.get(guild.categories, name=GM_INFO_CATEGORY_NAME)
-        if category is None:
-            legacy_category = discord.utils.get(
-                guild.categories, name=legacy_category_name
-            )
-            legacy_channel = (
-                discord.utils.get(
-                    guild.text_channels,
-                    name=legacy_channel_name,
-                    category=legacy_category,
-                )
-                if legacy_category is not None else None
-            )
-            if legacy_category is not None and legacy_channel is not None:
-                category = await legacy_category.edit(
-                    name=GM_INFO_CATEGORY_NAME,
-                    reason="募集とGM村作成を統合",
-                )
         if category is None:
             category = await guild.create_category(
                 GM_INFO_CATEGORY_NAME, overwrites=category_overwrites
@@ -828,15 +704,6 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             channel = discord.utils.get(
                 guild.text_channels, name=CH_GM_INFO, category=category
             )
-        if channel is None:
-            legacy_channel = discord.utils.get(
-                guild.text_channels, name=legacy_channel_name, category=category
-            )
-            if legacy_channel is not None:
-                channel = await legacy_channel.edit(
-                    name=CH_GM_INFO,
-                    reason="募集とGM村作成を統合",
-                )
         channel_overwrites = dict(category_overwrites)
         channel_overwrites[guild.default_role] = discord.PermissionOverwrite(
             view_channel=False, read_messages=False, send_messages=False
@@ -890,48 +757,10 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         embed = discord.Embed(
             title="GM村と募集の作成",
             description=(
-                f"**{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロールを持っている人は、"
-                "自分の名前村と募集を一度に作成できます。\n"
-                "募集カードは作成した村の #参加受付 に置かれ、参加・取消・同村拒否の確認をそこで完結します。"
+                "GMは自分の村を作成し、参加者を募集できます。\n"
+                "村は1人1つまで作成できます。"
             ),
             color=discord.Color.dark_gold(),
-        )
-        embed.add_field(
-            name="できること",
-            value=(
-                "GM村と募集を同時作成\n"
-                "村名を変更\n"
-                "GM村を削除\n"
-                "ゲーム開始前に公開中の3形式へ変更\n"
-                "参加者への連絡・募集終了"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="制限",
-            value=(
-                "GM村は1人1つまでです。\n"
-                "村主本人だけがその村のゲームマスターになれます。\n"
-                f"**{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** の両方を外れると、GM村は自動削除されます。"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="ランク対象",
-            value=(
-                "正常終了したすべての村で、レート、ランク、ランクロール、"
-                "今季戦績、統計、ランキングが更新されます。\n"
-                "13人村と9人村は、それぞれ対応するラダーへ反映します。"
-            ),
-            inline=False,
-        )
-        embed.add_field(
-            name="注意",
-            value=(
-                "削除するとGM村カテゴリ、募集、参加記録が消えます。\n"
-                "ゲーム中のGM村は、先にゲームを終了してから削除してください。"
-            ),
-            inline=False,
         )
         for attempt in range(3):
             try:
@@ -950,39 +779,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             name=row["room_name"],
             allowed_gm_user_ids=frozenset({row["owner_id"]}),
             private_owner_id=row["owner_id"],
-            # GM名前村は公開観戦型。動的村の判定はowner/room_idが正本で、
-            # role_nameは旧閲覧ロールの掃除中だけDBに残る互換値。
-            private_role_name=None,
             variant_id=str(row.get("variant_id") or "v13_cross"),
-        )
-
-    @staticmethod
-    def _is_protected_from_legacy_access_role_cleanup(
-        guild: discord.Guild,
-        role: discord.Role,
-    ) -> bool:
-        """旧閲覧ロールの保存IDが壊れても運営ロールを削除しない。"""
-        role_name = str(getattr(role, "name", ""))
-        permissions = getattr(role, "permissions", None)
-        return (
-            role_name in {GM_ROLE_NAME, TEMP_GM_ROLE_NAME}
-            or role_name.startswith(MUTE_MARKER_ROLE_PREFIX)
-            or role_name.startswith("人狼進行中:")
-            or bool(getattr(role, "managed", False))
-            # 旧閲覧ロールはサーバー権限を持たない。運用中に別用途へ
-            # 転用されたロールは、保存IDと名前が一致しても削除しない。
-            or int(getattr(permissions, "value", 0)) != 0
-            or role == getattr(guild, "default_role", None)
-        )
-
-    @staticmethod
-    def _legacy_access_role_name_matches(row: dict, role: discord.Role) -> bool:
-        """stable IDに加え、保存時の名前も一致する旧ロールだけを認める。"""
-        stored_role_name = row.get("role_name")
-        return (
-            isinstance(stored_role_name, str)
-            and bool(stored_role_name)
-            and getattr(role, "name", None) == stored_role_name
         )
 
     def _resolve_private_room_assets(
@@ -990,22 +787,21 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         guild: discord.Guild,
         row: dict,
         *,
-        legacy_category_id: Optional[int] = None,
+        fallback_category_id: Optional[int] = None,
         require_existing: bool = False,
-    ) -> tuple[Optional[discord.CategoryChannel], Optional[discord.Role], list[str]]:
-        """削除・改名対象をstable IDだけで解決する。
+    ) -> tuple[Optional[discord.CategoryChannel], list[str]]:
+        """削除・改名対象のカテゴリをstable IDだけで解決する。
 
-        名前一致は所有証明にならない。保存IDが無い旧資産には触れず、
-        snapshot/runnerが持つcategory IDだけを互換用に使う。
+        名前一致は所有証明にならない。保存IDが無い場合だけ、snapshot/runnerが
+        保持するカテゴリIDを耐障害フォールバックとして使う。
         """
         errors: list[str] = []
         stored_category_id = row.get("category_id")
-        stored_role_id = row.get("role_id")
 
         trusted_category_id = (
             stored_category_id
             if stored_category_id is not None
-            else legacy_category_id
+            else fallback_category_id
         )
         category = next(
             (
@@ -1014,14 +810,6 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             ),
             None,
         )
-        role = next(
-            (
-                item for item in getattr(guild, "roles", [])
-                if getattr(item, "id", None) == stored_role_id
-            ),
-            None,
-        )
-
         # 保存IDの不在は削除時には「既に削除済み」。改名はカテゴリが必要。
         if require_existing and category is None and trusted_category_id is not None:
             errors.append(f"保存カテゴリID {trusted_category_id} が見つかりません")
@@ -1030,104 +818,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             "カテゴリ" in error for error in errors
         ):
             errors.append("カテゴリが見つかりません")
-        return category, role, errors
-
-    async def _cleanup_legacy_private_room_access_roles(
-        self,
-        guild: discord.Guild,
-        room_id: str,
-    ) -> None:
-        """公開overwrite適用後に、指定GM村の旧閲覧ロールを回収する。"""
-        rows = [
-            row for row in await database.load_private_rooms(guild.id)
-            if row["room_id"] == room_id
-        ]
-        for row in rows:
-            stored_role_id = row.get("role_id")
-            if stored_role_id is None:
-                if row.get("role_name") is None:
-                    continue
-                # stable IDの無い旧ロールは名前だけでは特定・削除しない。
-                # 今後使わないDB上の名前と再付与journalだけを捨てる。
-                await database.clear_private_room_access_role(
-                    guild.id,
-                    row["room_id"],
-                    expected_role_id=None,
-                )
-                continue
-            if not isinstance(stored_role_id, int) or isinstance(stored_role_id, bool):
-                log.warning(
-                    "GM名前村の旧閲覧ロールIDが不正なため触れません: "
-                    "room=%s role_id=%r",
-                    row["room_id"],
-                    stored_role_id,
-                )
-                continue
-            get_role = getattr(guild, "get_role", None)
-            role = get_role(stored_role_id) if callable(get_role) else None
-            if role is not None and self._is_protected_from_legacy_access_role_cleanup(
-                guild, role,
-            ):
-                log.error(
-                    "GM名前村の旧閲覧ロールIDが保護対象を指すため"
-                    "Discord側には触れず参照だけ解除します: room=%s role=%s(%s)",
-                    row["room_id"],
-                    getattr(role, "name", "?"),
-                    stored_role_id,
-                )
-                cleared = await database.clear_private_room_access_role(
-                    guild.id,
-                    row["room_id"],
-                    expected_role_id=stored_role_id,
-                )
-                if not cleared:
-                    log.warning(
-                        "GM名前村の旧閲覧ロール参照が同時更新されました: %s",
-                        row["room_id"],
-                    )
-                continue
-            if role is not None and not self._legacy_access_role_name_matches(row, role):
-                log.warning(
-                    "GM名前村の旧閲覧ロールIDは存在しますが保存名と"
-                    "一致しないため、Discord側には触れず参照だけ解除します: "
-                    "room=%s stored_name=%r actual_name=%r role=%s",
-                    row["room_id"],
-                    row.get("role_name"),
-                    getattr(role, "name", None),
-                    stored_role_id,
-                )
-                await database.clear_private_room_access_role(
-                    guild.id,
-                    row["room_id"],
-                    expected_role_id=stored_role_id,
-                )
-                continue
-            if role is not None:
-                try:
-                    await self.paced_discord_api_call(
-                        role.delete,
-                        reason="GM名前村を公開観戦型へ移行",
-                    )
-                except (discord.Forbidden, discord.HTTPException) as exc:
-                    # DB参照を残すことで、次回起動時に同じstable IDを再試行する。
-                    log.warning(
-                        "GM名前村の旧閲覧ロール削除失敗"
-                        " (room=%s role=%s): %s",
-                        row["room_id"],
-                        stored_role_id,
-                        exc,
-                    )
-                    continue
-            cleared = await database.clear_private_room_access_role(
-                guild.id,
-                row["room_id"],
-                expected_role_id=stored_role_id,
-            )
-            if not cleared:
-                log.warning(
-                    "GM名前村の旧閲覧ロール参照が同時更新されました: %s",
-                    row["room_id"],
-                )
+        return category, errors
 
     async def _load_private_room_runners(
         self,
@@ -1141,7 +832,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 guild,
                 row,
                 reason="中断された専用村削除を再試行",
-                legacy_category_id=(
+                fallback_category_id=(
                     snapshots.get(row["room_id"], {}).get("channel_ids", {}).get("category")
                 ),
             )
@@ -1150,7 +841,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             await self._reconcile_private_room_rename(
                 guild,
                 row,
-                legacy_category_id=(
+                fallback_category_id=(
                     snapshots.get(row["room_id"], {}).get("channel_ids", {}).get("category")
                 ),
             )
@@ -1188,13 +879,13 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         guild: discord.Guild,
         row: dict,
         *,
-        legacy_category_id: Optional[int] = None,
+        fallback_category_id: Optional[int] = None,
     ) -> bool:
         """DBへ記録済みの改名intentをDiscordへ反映する。"""
-        category, role, errors = self._resolve_private_room_assets(
+        category, errors = self._resolve_private_room_assets(
             guild,
             row,
-            legacy_category_id=legacy_category_id,
+            fallback_category_id=fallback_category_id,
             require_existing=True,
         )
         if not errors:
@@ -1202,7 +893,6 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 guild.id,
                 row["room_id"],
                 category_id=category.id if category is not None else None,
-                role_id=row.get("role_id"),
             )
             if not checkpointed:
                 errors.append("Discord資産IDの保存状態が競合しました")
@@ -1227,7 +917,6 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             guild.id,
             row["room_id"],
             category_id=category.id if category is not None else row.get("category_id"),
-            role_id=row.get("role_id"),
         )
         return True
 
@@ -1237,7 +926,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         row: dict,
         *,
         reason: str,
-        legacy_category_id: Optional[int] = None,
+        fallback_category_id: Optional[int] = None,
     ) -> bool:
         active_recruitments = await database.list_active_recruitments_for_room_ids(
             guild.id, {row["room_id"]},
@@ -1258,10 +947,10 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         room = self.rooms.pop(row["room_id"], None)
         runtime_category = getattr(getattr(room, "state", None), "category", None)
         runtime_category_id = getattr(runtime_category, "id", None)
-        category, role, asset_errors = self._resolve_private_room_assets(
+        category, asset_errors = self._resolve_private_room_assets(
             guild,
             row,
-            legacy_category_id=legacy_category_id or runtime_category_id,
+            fallback_category_id=fallback_category_id or runtime_category_id,
             require_existing=False,
         )
         if (
@@ -1280,7 +969,6 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 category_id=(
                     category.id if category is not None else row.get("category_id")
                 ),
-                role_id=role.id if role is not None else row.get("role_id"),
             )
             if not checkpointed:
                 asset_errors.append("Discord資産IDの保存状態が競合しました")
@@ -1333,37 +1021,12 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             guild.roles,
             name=f"{MUTE_MARKER_ROLE_PREFIX}{row['room_id']}",
         )
-        if role is not None and self._is_protected_from_legacy_access_role_cleanup(
-            guild, role,
-        ):
-            # 壊れたDB参照でGM/仮GM/ゲーム中の生存者ロールを
-            # 専用村アクセスロールと誤認しても、Discord側には触れない。
-            log.error(
-                "専用村削除の保存ロールIDが保護対象のため削除から除外: "
-                "room=%s role=%s(%s)",
-                row["room_id"],
-                getattr(role, "name", "?"),
-                getattr(role, "id", "?"),
-            )
-            role = None
-        elif role is not None and not self._legacy_access_role_name_matches(row, role):
-            log.warning(
-                "専用村削除の保存ロールIDは保存名と一致しないため"
-                "Discord側の削除から除外: room=%s role=%s",
-                row["room_id"],
-                getattr(role, "id", "?"),
-            )
-            role = None
-        roles_to_delete = [
-            target for target in (role, marker_role)
-            if not asset_errors and target is not None
-        ]
-        for target_role in roles_to_delete:
+        if not asset_errors and marker_role is not None:
             try:
-                await self.paced_discord_api_call(target_role.delete, reason=reason)
+                await self.paced_discord_api_call(marker_role.delete, reason=reason)
             except (discord.Forbidden, discord.HTTPException) as e:
-                log.warning(f"GM村関連ロール削除失敗 ({target_role.name}): {e}")
-                errors.append(f"ロール {target_role.id}: {e}")
+                log.warning(f"GM村muteマーカー削除失敗 ({marker_role.name}): {e}")
+                errors.append(f"ロール {marker_role.id}: {e}")
 
         if errors:
             await database.mark_private_room_status(
@@ -1648,9 +1311,6 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         quarantined_room_ids = await database.load_unresolved_room_state_quarantine_ids(
             guild.id
         )
-        await self._retire_removed_fixed_rooms(
-            guild, snapshots, quarantined_room_ids
-        )
         await self._assert_disabled_fixed_rooms_safe_to_skip(
             guild.id,
             snapshots,
@@ -1729,29 +1389,15 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                         )
                         if snapshot_was_active:
                             # 復元で霊界の生存者denyとVC発言禁止を確定した後、
-                            # 子チャンネルから最後にカテゴリを公開する。
-                            await room._sync_active_gm_named_game_channel_visibility(
+                            # 子チャンネルからカテゴリへ公開観戦権限を復元する。
+                            await room._restore_active_private_room_visibility(
                                 guild,
                                 snapshot.get("channel_ids", {}),
                             )
-                        # setup/restoreでカテゴリ・VC・#昼・#霊界の公開権限を
-                        # 適用できた後に旧閲覧ロールを消す。先に消すと、
-                        # 進行中snapshotが旧@everyone denyのまま閉じる。
-                        private_row = await database.get_private_room_by_owner(
-                            guild.id,
-                            int(room.room_def.private_owner_id),
-                        )
                         await database.mark_private_room_active(
                             guild.id,
                             room.state.room_id,
                             category_id=room.state.category.id if room.state.category else None,
-                            # 旧ロール削除のDiscord APIが失敗した場合に、次回起動の
-                            # stable-ID再試行を失わない。成功時だけcleanup側がNULL化する。
-                            role_id=(private_row or {}).get("role_id"),
-                        )
-                        await self._cleanup_legacy_private_room_access_roles(
-                            guild,
-                            room.state.room_id,
                         )
                     log.debug(f"卓セットアップ完了: {room.state.room_name}")
                     completed_rooms += 1
@@ -1865,26 +1511,6 @@ class GameCog(RoomPermissionMixin, commands.Cog):
     async def _ensure_rank_roles(self, guild: discord.Guild) -> dict[str, discord.Role]:
         existing = {r.name: r for r in guild.roles}
         result: dict[str, discord.Role] = {}
-        # v0.38までの共有9人ラダー用GMロールが既にあれば、位置・権限を
-        # 保ったままクロストーク側へ改名して再利用する。メンバー構成は、
-        # 直後のラダー別ランクロール同期で新しい2ラダーの実績へ揃える。
-        legacy_name = rating_lib.LEGACY_NINE_GRANDMASTER_ROLE_NAME
-        cross_role_name = rating_lib.special_grandmaster_role_name("l9_cross")
-        legacy_role = existing.get(legacy_name)
-        if cross_role_name not in existing and legacy_role is not None:
-            edit_role = getattr(legacy_role, "edit", None)
-            if callable(edit_role):
-                try:
-                    migrated = await self.paced_discord_api_call(
-                        edit_role,
-                        name=cross_role_name,
-                        hoist=True,
-                        reason="9人GMロールを進行別ラダーへ移行",
-                    )
-                    existing.pop(legacy_name, None)
-                    existing[cross_role_name] = migrated or legacy_role
-                except (discord.Forbidden, discord.HTTPException) as e:
-                    log.warning("旧9人GMロールの改名失敗 (%s): %s", legacy_name, e)
         gm_role_names = {
             rating_lib.special_grandmaster_role_name(ladder_id)
             for ladder_id in LADDER_DEFINITIONS
@@ -2079,20 +1705,11 @@ class GameCog(RoomPermissionMixin, commands.Cog):
 
     async def load_pending_unmutes(self, guild: discord.Guild) -> None:
         try:
-            normalized = await database.load_pending_unmute_ids(guild.id)
-            # 旧CSV形式から一度だけ移行する
-            raw = await database.get_meta(guild.id, "pending_unmutes")
+            pending = await database.load_pending_unmute_ids(guild.id)
         except Exception as e:
             log.warning(f"ミュート解除待ちの読込失敗: {e}")
             return
-        legacy = {
-            int(x) for x in raw.split(",") if x.strip().isdigit()
-        } if raw else set()
-        merged = normalized | legacy
-        self.pending_unmutes[guild.id] = merged
-        if legacy:
-            await database.add_pending_unmutes(guild.id, legacy)
-            await database.set_meta(guild.id, "pending_unmutes", "")
+        self.pending_unmutes[guild.id] = pending
 
     async def _resolve_pending_unmute(self, member: discord.Member) -> None:
         pending = self.pending_unmutes.get(member.guild.id)
@@ -2299,7 +1916,6 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 name=normalized_name,
                 allowed_gm_user_ids=frozenset({owner.id}),
                 private_owner_id=owner.id,
-                private_role_name=None,
                 variant_id=variant_id,
             )
             try:
@@ -2308,7 +1924,6 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                     room_id=room_id,
                     owner_id=owner.id,
                     room_name=normalized_name,
-                    role_name=None,
                     variant_id=variant_id,
                 )
                 room = await self._setup_private_room_from_definition(guild, room_def)
@@ -2420,10 +2035,10 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             "id",
             None,
         )
-        category, _legacy_role, asset_errors = self._resolve_private_room_assets(
+        category, asset_errors = self._resolve_private_room_assets(
             guild,
             row,
-            legacy_category_id=runtime_category_id,
+            fallback_category_id=runtime_category_id,
             require_existing=True,
         )
         if asset_errors or category is None:
@@ -2438,7 +2053,6 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             guild.id,
             row["room_id"],
             category_id=category.id,
-            role_id=row.get("role_id"),
         )
         if not checkpointed:
             await interaction.followup.send(
@@ -2459,9 +2073,6 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 guild.id,
                 row["room_id"],
                 normalized_name,
-                # 旧ロール削除がDiscord API失敗で再試行待ちなら、
-                # role_idと照合する旧名を失わない。削除済み行は既にNULL。
-                row.get("role_name"),
             )
         except sqlite3.IntegrityError:
             await interaction.followup.send(
@@ -2480,10 +2091,8 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         desired_row = {
             **row,
             "room_name": normalized_name,
-            "role_name": row.get("role_name"),
             "status": "renaming",
             "category_id": category.id if category is not None else row.get("category_id"),
-            "role_id": row.get("role_id"),
         }
         renamed = await self._reconcile_private_room_rename(guild, desired_row)
         if not renamed:
@@ -2507,7 +2116,6 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             name=normalized_name,
             allowed_gm_user_ids=frozenset({interaction.user.id}),
             private_owner_id=interaction.user.id,
-            private_role_name=None,
             variant_id=str(row.get("variant_id") or "v13_cross"),
         )
         if room is None:
@@ -2639,19 +2247,10 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         self.rooms[room_def.room_id] = room
         await room.setup_channels(guild, stats_channel=self.stats_channel)
         await room.restore_from_snapshot(None)
-        private_row = await database.get_private_room_by_owner(
-            guild.id,
-            int(room_def.private_owner_id),
-        )
         await database.mark_private_room_active(
             guild.id,
             room_def.room_id,
             category_id=room.state.category.id if room.state.category else None,
-            role_id=(private_row or {}).get("role_id"),
-        )
-        await self._cleanup_legacy_private_room_access_roles(
-            guild,
-            room_def.room_id,
         )
         return room
 
@@ -2667,7 +2266,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
 
     @app_commands.command(
         name="private_room_delete",
-        description="自分のGM村と受付中の募集を削除します（GM／仮GM専用）",
+        description="自分のGM村と受付中の募集を削除（GM／仮GM・管理権限の救済対応）",
     )
     async def private_room_delete(self, interaction: discord.Interaction) -> None:
         await self.delete_private_room_for_member(interaction)

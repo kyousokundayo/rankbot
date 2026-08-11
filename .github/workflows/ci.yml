@@ -1,5 +1,5 @@
 # GitHubへリポジトリをpushすると自動で走るチェック
-# (ローカルでは scripts/run_checks.sh が同等)
+# (ローカルでは scripts/run_checks.sh で同種の検証を実行。OS固有検査と対象範囲は異なる)
 name: CI
 
 permissions:

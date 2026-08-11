@@ -58,7 +58,6 @@ class PrivateRoomCleanupTest(unittest.IsolatedAsyncioTestCase):
         row = {
             **_private_room_row(),
             "status": "active",
-            "role_name": "テスト専用村",
             "variant_id": "v13_turn",
         }
         guild = SimpleNamespace(id=1)

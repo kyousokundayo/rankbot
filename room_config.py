@@ -41,8 +41,6 @@ class RoomDefinition:
     # GM取得を許可するユーザーID (Noneなら制限なし)
     allowed_gm_user_ids: frozenset[int] | None = None
     private_owner_id: int | None = None
-    # v0.39以前のGM名前村閲覧ロールとのDB互換用。v0.40以降は常にNone。
-    private_role_name: str | None = None
     # 指定ロール・サーバー管理者だけにカテゴリ全体を表示する固定卓。
     access_role_names: frozenset[str] | None = None
     # 既存の位置引数を壊さないよう末尾へ追加。省略時は従来どおり13人

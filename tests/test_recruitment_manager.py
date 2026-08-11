@@ -1,4 +1,4 @@
-"""募集から既存ロビーへの移行と通知をDiscord APIなしで検証する。"""
+"""募集の開催反映と通知をDiscord APIなしで検証する。"""
 from __future__ import annotations
 
 import asyncio
@@ -29,15 +29,19 @@ from recruitment import (
     RecruitmentScheduleView,
 )
 import recruitment as recruitment_lib
-from views import LobbyView
-
-
 class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="werewolf-recruitment-manager-")
         self._old_path = database.DB_PATH
         database.DB_PATH = str(Path(self._tmp.name) / "manager.db")
         await database.init_db()
+        self.room_id = "private_1"
+        await database.save_private_room(
+            1, self.room_id, 1, "GM村", "v13_cross",
+        )
+        await database.mark_private_room_active(
+            1, self.room_id, category_id=101,
+        )
 
         self.members = {
             user_id: SimpleNamespace(
@@ -51,21 +55,26 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         )
         self.state = SimpleNamespace(
             phase=Phase.LOBBY, players={}, gm_id=None, recruitment_id=None,
-            room_name="総合", lobby_channel=None,
+            room_id=self.room_id, room_name="GM村", lobby_channel=None,
         )
         self.room = SimpleNamespace(
             state=self.state,
             room_def=SimpleNamespace(
+                room_id=self.room_id,
+                name="GM村",
+                variant_id="v13_cross",
+                private_owner_id=1,
                 allowed_ranks=None, allowed_gm_user_ids=None, owner_only_gm=False,
+                access_role_names=None, strict_access_role_names=None,
             ),
-            is_private_room=lambda: False,
+            is_private_room=lambda: True,
             action_lock=asyncio.Lock(),
             _is_game_in_progress=lambda: False,
             validate_gm_claim=AsyncMock(return_value=None),
             _persist_room_state=AsyncMock(),
             _post_lobby_ui=AsyncMock(),
         )
-        self.cog = SimpleNamespace(rooms={"open": self.room})
+        self.cog = SimpleNamespace(rooms={self.room_id: self.room})
         self.manager = RecruitmentManager(SimpleNamespace(), self.cog)
         self.manager.channel = SimpleNamespace(guild=self.guild)
         self.manager.refresh_message = AsyncMock()
@@ -77,9 +86,10 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
 
     async def _full_recruitment(self, *, gm_id=None) -> int:
         recruitment_id = await database.create_recruitment(
-            1, 1, title="移行テスト",
+            1, 1, title="開催テスト",
             scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
-            room_id="open", streaming=False, allowed_ranks=None,
+            room_id=self.room_id, variant_id="v13_cross",
+            streaming=False, allowed_ranks=None,
         )
         for user_id in range(100, 113):
             await database.add_recruitment_entry(recruitment_id, user_id)
@@ -133,14 +143,14 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             visible_blocked_ids.update(int(option.value) for option in select.options)
         self.assertEqual(visible_blocked_ids, set(blocked_ids))
 
-    async def _insert_legacy_recruitment(
+    async def _insert_disabled_recruitment(
         self,
         *,
         status: str = database.RECRUITMENT_OPEN,
         room_id: str = "open_9_cross",
         variant_id: str = "v9_cross",
     ) -> int:
-        """現行APIが拒否する廃止固定卓の既存DB行を移行テスト用に再現する。"""
+        """現行APIが拒否する無効固定卓の異常DB行を安全性テスト用に再現する。"""
         variant = recruitment_lib.VARIANT_DEFINITIONS[variant_id]
         async with database.connect_db() as db:
             cursor = await db.execute(
@@ -204,26 +214,13 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             user=self.members[1], guild=self.guild,
         )
 
-    @staticmethod
-    def _hide_nine_recruitment():
-        """段階導入へ戻した場合の既存カード保護を個別に検証する。"""
-        return patch.object(
-            recruitment_lib,
-            "RECRUITMENT_DISABLED_ROOM_IDS",
-            frozenset({"open_9_cross"}),
-        )
-
-    async def test_transfer_registers_thirteen_and_auto_host_gm(self) -> None:
+    async def test_start_registers_thirteen_and_auto_host_gm(self) -> None:
         recruitment_id = await self._full_recruitment()
         result = await self.manager.transfer(self._interaction(), recruitment_id)
         self.assertIn("13人とGM", result)
         self.assertEqual(len(self.state.players), 13)
         self.assertEqual(self.state.gm_id, 1)
         self.assertEqual(self.state.recruitment_id, recruitment_id)
-        start_button = next(
-            item for item in LobbyView(self.room).children if item.custom_id == "start_game"
-        )
-        self.assertFalse(start_button.disabled)
         self.room._persist_room_state.assert_awaited_once()
         self.room._post_lobby_ui.assert_awaited_once()
         row = await database.get_recruitment(recruitment_id)
@@ -284,7 +281,7 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         row = await database.get_recruitment(recruitment_id)
         self.assertEqual(row["status"], database.RECRUITMENT_OPEN)
 
-    async def test_transfer_can_retry_after_lobby_checkpoint_failure(self) -> None:
+    async def test_start_can_retry_after_lobby_checkpoint_failure(self) -> None:
         recruitment_id = await self._full_recruitment()
         self.room._persist_room_state.side_effect = RuntimeError("DB down")
 
@@ -305,7 +302,8 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         recruitment_id = await database.create_recruitment(
             1, 1, title="通知テスト",
             scheduled_at=datetime.now(timezone.utc) + timedelta(minutes=10),
-            room_id="open", streaming=False, allowed_ranks=None,
+            room_id=self.room_id, variant_id="v13_cross",
+            streaming=False, allowed_ranks=None,
         )
         await database.add_recruitment_entry(recruitment_id, 100)
         await self.manager.process_notifications(self.guild)
@@ -322,7 +320,8 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             1,
             title="今すぐ通知",
             scheduled_at=now - timedelta(seconds=1),
-            room_id="open",
+            room_id=self.room_id,
+            variant_id="v13_cross",
             streaming=False,
             allowed_ranks=None,
         )
@@ -341,7 +340,8 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             1,
             title="後参加通知",
             scheduled_at=now + timedelta(minutes=10),
-            room_id="open",
+            room_id=self.room_id,
+            variant_id="v13_cross",
             streaming=False,
             allowed_ranks=None,
         )
@@ -365,7 +365,8 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             1,
             title="通知競合",
             scheduled_at=now + timedelta(minutes=10),
-            room_id="open",
+            room_id=self.room_id,
+            variant_id="v13_cross",
             streaming=False,
             allowed_ranks=None,
         )
@@ -387,7 +388,8 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             1,
             title="取消競合",
             scheduled_at=now + timedelta(minutes=10),
-            room_id="open",
+            room_id=self.room_id,
+            variant_id="v13_cross",
             streaming=False,
             allowed_ranks=None,
         )
@@ -413,7 +415,8 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             1,
             title="DM拒否",
             scheduled_at=now + timedelta(minutes=10),
-            room_id="open",
+            room_id=self.room_id,
+            variant_id="v13_cross",
             streaming=False,
             allowed_ranks=None,
         )
@@ -432,16 +435,17 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             [],
         )
 
-    async def test_temporary_failure_is_retried_after_transfer_while_slot_is_active(
+    async def test_temporary_failure_is_retried_after_start_while_slot_is_active(
         self,
     ) -> None:
         now = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
         recruitment_id = await database.create_recruitment(
             1,
             1,
-            title="移行直前の一時失敗",
+            title="開催直前の一時失敗",
             scheduled_at=now + timedelta(minutes=10),
-            room_id="open",
+            room_id=self.room_id,
+            variant_id="v13_cross",
             streaming=False,
             allowed_ranks=None,
         )
@@ -478,7 +482,8 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             1,
             title="参加成功優先",
             scheduled_at=datetime.now(timezone.utc) + timedelta(minutes=10),
-            room_id="open",
+            room_id=self.room_id,
+            variant_id="v13_cross",
             streaming=False,
             allowed_ranks=None,
         )
@@ -512,7 +517,8 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             1,
             title="変更後は参加不可",
             scheduled_at=datetime.now(timezone.utc) + timedelta(minutes=10),
-            room_id="open",
+            room_id=self.room_id,
+            variant_id="v13_cross",
             streaming=False,
             allowed_ranks=None,
         )
@@ -569,13 +575,12 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             1,
             title="公開村の参加取消",
             scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
-            room_id="open",
+            room_id=self.room_id,
+            variant_id="v13_cross",
             streaming=False,
             allowed_ranks=None,
         )
         await database.add_recruitment_entry(recruitment_id, 100)
-        self.room.is_private_room = lambda: True
-        self.room.room_def.private_owner_id = 1
         card = RecruitmentCardView(self.manager, recruitment_id)
         interaction = SimpleNamespace(
             user=self.members[100],
@@ -697,20 +702,19 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["status"], database.RECRUITMENT_ARCHIVED)
 
     async def test_disabled_recruitment_is_never_published(self) -> None:
-        recruitment_id = await self._insert_legacy_recruitment()
+        recruitment_id = await self._insert_disabled_recruitment()
         channel = SimpleNamespace(guild=self.guild, send=AsyncMock())
         self.manager.channel = channel
 
-        with self._hide_nine_recruitment():
-            with self.assertRaisesRegex(RuntimeError, "作成を取り消しました"):
-                await self.manager.publish_new_recruitment(self.guild, recruitment_id)
+        with self.assertRaisesRegex(RuntimeError, "作成を取り消しました"):
+            await self.manager.publish_new_recruitment(self.guild, recruitment_id)
 
         channel.send.assert_not_awaited()
         row = await database.get_recruitment(recruitment_id)
         self.assertEqual(row["status"], database.RECRUITMENT_ARCHIVED)
 
     async def test_existing_disabled_card_is_deleted(self) -> None:
-        recruitment_id = await self._insert_legacy_recruitment()
+        recruitment_id = await self._insert_disabled_recruitment()
         await database.set_recruitment_message_id(recruitment_id, 999)
         message = SimpleNamespace(delete=AsyncMock())
         self.manager.channel = SimpleNamespace(
@@ -724,14 +728,13 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         )
         row = await database.get_recruitment(recruitment_id)
 
-        with self._hide_nine_recruitment():
-            await self.manager.ensure_recruitment_message(self.guild, row)
+        await self.manager.ensure_recruitment_message(self.guild, row)
 
         message.delete.assert_awaited_once()
         self.assertIsNone((await database.get_recruitment(recruitment_id))["message_id"])
 
     async def test_setup_removes_held_rollout_card_after_room_is_hidden_again(self) -> None:
-        recruitment_id = await self._insert_legacy_recruitment(
+        recruitment_id = await self._insert_disabled_recruitment(
             status=database.RECRUITMENT_HELD,
         )
         await database.set_recruitment_message_id(recruitment_id, 1001)
@@ -746,8 +749,7 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         self.manager._ensure_operations_channel = AsyncMock(return_value=None)
         self.manager._upsert_panel = AsyncMock()
 
-        with self._hide_nine_recruitment():
-            await self.manager.setup(self.guild)
+        await self.manager.setup(self.guild)
 
         message.delete.assert_awaited_once()
         row = await database.get_recruitment(recruitment_id)
@@ -755,7 +757,7 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(row["message_id"])
 
     async def test_notification_loop_retries_hidden_card_after_discord_error(self) -> None:
-        recruitment_id = await self._insert_legacy_recruitment(
+        recruitment_id = await self._insert_disabled_recruitment(
             status=database.RECRUITMENT_HELD,
         )
         await database.set_recruitment_message_id(recruitment_id, 1002)
@@ -777,13 +779,12 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             variant_id="v9_cross",
             lobby_channel=self.manager.channel,
         )
-        with self._hide_nine_recruitment():
-            await self.manager.process_notifications(self.guild)
-            self.assertEqual(
-                (await database.get_recruitment(recruitment_id))["message_id"], 1002,
-            )
+        await self.manager.process_notifications(self.guild)
+        self.assertEqual(
+            (await database.get_recruitment(recruitment_id))["message_id"], 1002,
+        )
 
-            await self.manager.process_notifications(self.guild)
+        await self.manager.process_notifications(self.guild)
         self.assertEqual(message.delete.await_count, 2)
         self.assertIsNone(
             (await database.get_recruitment(recruitment_id))["message_id"]
@@ -792,7 +793,7 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
     async def test_stale_hidden_card_rejects_host_menu(self) -> None:
         """削除失敗で残ったカードからも、段階導入中卓を操作できない。"""
         room_id = "private_hidden"
-        recruitment_id = await self._insert_legacy_recruitment(
+        recruitment_id = await self._insert_disabled_recruitment(
             room_id=room_id, variant_id="v13_turn",
         )
         self._install_private_room(room_id, variant_id="v13_turn")
@@ -851,7 +852,7 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             (await database.get_recruitment(recruitment_id))["message_id"], 900,
         )
 
-    async def test_config_drift_blocks_transfer_without_touching_lobby(self) -> None:
+    async def test_config_drift_blocks_start_without_touching_lobby(self) -> None:
         recruitment_id = await self._full_recruitment()
         current = recruitment_lib.VARIANT_DEFINITIONS["v13_cross"]
         with patch.dict(
@@ -867,7 +868,7 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_hidden_variant_ready_dm_is_suppressed(self) -> None:
         room_id = "private_hidden"
-        recruitment_id = await self._insert_legacy_recruitment(
+        recruitment_id = await self._insert_disabled_recruitment(
             room_id=room_id, variant_id="v13_turn",
         )
         self._install_private_room(room_id, variant_id="v13_turn")
@@ -1160,13 +1161,13 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
 
         channel.send.assert_awaited_once()
 
-    async def test_open_room_uses_selected_rank_names_and_keeps_unranked_distinct(self) -> None:
+    async def test_gm_room_uses_selected_rank_names_and_keeps_unranked_distinct(self) -> None:
         permissions = SimpleNamespace(administrator=False, manage_guild=False)
         member = SimpleNamespace(id=200, guild_permissions=permissions, roles=[])
         guild = SimpleNamespace(id=1, owner_id=999)
         row = {
             "id": 1,
-            "room_id": "open",
+            "room_id": self.room_id,
             "variant_id": "v13_cross",
             "capacity": 13,
             "backup_capacity": 3,
@@ -1201,82 +1202,6 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
                     self.manager, guild, unranked_row, member,
                 )
             )
-
-    async def test_strict_role_rejects_manage_guild_candidate_without_role(self) -> None:
-        strict_room = SimpleNamespace(
-            room_id="strict",
-            name="ねいと限定卓",
-            variant_id="v13_cross",
-            allowed_ranks=None,
-            access_role_names=None,
-            strict_access_role_names=frozenset({"ねいと"}),
-        )
-        row = {
-            "id": 1,
-            "room_id": "strict",
-            "variant_id": "v13_cross",
-            "capacity": 13,
-            "backup_capacity": 3,
-            "occupancy_minutes": 90,
-            "allowed_ranks": None,
-        }
-        naito_role = SimpleNamespace(id=10, name="ねいと")
-        guild = SimpleNamespace(id=1, owner_id=999, roles=[naito_role])
-        permissions = SimpleNamespace(administrator=False, manage_guild=True)
-        manager_without_role = SimpleNamespace(
-            id=200, guild_permissions=permissions, roles=[],
-        )
-        member_with_role = SimpleNamespace(
-            id=201, guild_permissions=permissions, roles=[naito_role],
-        )
-
-        with patch.dict(
-            recruitment_lib.ROOM_DEFINITION_MAP,
-            {"strict": strict_room},
-        ), patch(
-            "database.get_player_current_rank_info", AsyncMock(return_value=None),
-        ):
-            error = await RecruitmentManager.validate_candidate(
-                self.manager, guild, row, manager_without_role,
-            )
-            self.assertIn("ねいと", error)
-            self.assertIsNone(
-                await RecruitmentManager.validate_candidate(
-                    self.manager, guild, row, member_with_role,
-                )
-            )
-
-    async def test_strict_role_blocks_existing_card_transfer(self) -> None:
-        strict_room = SimpleNamespace(
-            room_id="open",
-            name="ねいと限定卓",
-            variant_id="v13_cross",
-            allowed_ranks=None,
-            allowed_gm_user_ids=None,
-            access_role_names=None,
-            strict_access_role_names=frozenset({"ねいと"}),
-        )
-        variant = recruitment_lib.VARIANT_DEFINITIONS["v13_cross"]
-        snapshot = (strict_room, variant, 13, 3, 90)
-        self.guild.owner_id = 999
-        self.guild.roles = [SimpleNamespace(id=10, name="ねいと")]
-        self.members[1].roles = []
-        self.members[1].guild_permissions = SimpleNamespace(
-            administrator=False, manage_guild=True,
-        )
-        recruitment_id = await self._full_recruitment()
-        # 公開済みカードが旧設定から残っていても、管理権限だけでは
-        # 厳格ロール卓のゲームを開始できない。
-        with patch.object(
-            recruitment_lib, "_recruitment_snapshot", return_value=snapshot,
-        ):
-            result = await self.manager.transfer(self._interaction(), recruitment_id)
-
-        self.assertIn("ゲーム開始", result)
-        self.assertIn("ねいと", result)
-        self.room.validate_gm_claim.assert_not_awaited()
-        self.assertEqual(self.state.players, {})
-
 
 class ScheduleRangeTest(unittest.TestCase):
     """日付セレクトが提示する候補と、上限判定の範囲を一致させる。"""

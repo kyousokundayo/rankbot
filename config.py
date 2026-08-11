@@ -180,13 +180,6 @@ VARIANT_TO_LADDER = {
     variant_id: definition.ladder_id
     for variant_id, definition in VARIANT_DEFINITIONS.items()
 }
-# v0.38まで9人2変種が共有していたラダー。v0.40初回起動時に、
-# 現在の変種定義へ安全に分割するためだけに残す互換情報。
-LEGACY_NINE_LADDER_ID = "l9"
-LEGACY_NINE_LADDER_SPLIT = MappingProxyType({
-    variant_id: VARIANT_TO_LADDER[variant_id]
-    for variant_id in ("v9_cross", "v9_turn")
-})
 LADDER_DEFINITIONS = {
     "l13": LadderDefinition(
         "l13", "13人村", 13, "グランドマスター", 0xE74C3C,
@@ -330,8 +323,6 @@ CH_VILLAGE = "昼"
 CH_SPIRIT = "霊界"
 CH_LOBBY = "参加受付"
 CH_STATS = "統計"
-# 旧 #募集 を識別して移行・撤去するための名前。新規作成には使わない。
-CH_RECRUITMENT = "募集"
 CH_OPERATIONS = "運営"
 VC_GAME = "人狼ゲーム"
 CH_GM_INFO = "村作成"
@@ -372,9 +363,8 @@ OPERATIONS_STAFF_ROLE_NAMES = frozenset(
     if name.strip()
 )
 
-# 募集システム。占有区間は [開催時刻, 開催時刻+90分) とし、
-# 終端と次の開始が同時刻なら重複扱いにしない。
-RECRUITMENT_OCCUPANCY_MINUTES = 90
+# 募集システム。占有時間は各変種の定義に保持し、終端と次の開始が
+# 同時刻なら重複扱いにしない。
 RECRUITMENT_MAX_DAYS_AHEAD = 7
 # 「今すぐ」募集の開始までの猶予 (分)。
 # _schedule_out_of_range が「現在より後」を要求するので0にはできない。
@@ -382,8 +372,6 @@ RECRUITMENT_MAX_DAYS_AHEAD = 7
 # 開催枠内で補完する。通知後に参加・補欠繰上げとなった人は処理直後に
 # 個別台帳を確認し、補完失敗時だけ次回巡回で再試行する。
 RECRUITMENT_IMMEDIATE_LEAD_MINUTES = 10
-RECRUITMENT_MAX_PER_HOST = 3
-RECRUITMENT_CAPACITY = MAX_PLAYERS
 RECRUITMENT_BACKUP_CAPACITY = 3
 RECRUITMENT_NOTIFICATION_WINDOW_MINUTES = 15
 # 「参加者へ一括連絡」の再送までの間隔 (秒)。1回で最大17人へDMが飛ぶため、
@@ -396,14 +384,6 @@ PLAYER_BLOCK_LIMIT = 50
 # 誰でも押せるフォームなので、連投でDBとバックアップが膨らむのを防ぐ。
 # 正当な報告を妨げない程度に余裕を持たせる。
 FEEDBACK_MAX_PER_DAY = 10
-
-# 実装だけを保持し、一般ユーザーへ出さない固定卓。
-# 一般公開するときは対象IDをこの集合から外す。
-VARIANT_ROLLOUT_ROOM_IDS = frozenset({
-    "open_13_turn",
-})
-# 13人ターン制だけは実装のみで完全未公開とし、募集も停止する。
-RECRUITMENT_DISABLED_ROOM_IDS = VARIANT_ROLLOUT_ROOM_IDS
 
 # GM／仮GMがGM/#村作成へ到達できるよう、両ロールへ閲覧を許可する。
 # 作成ボタン側でも同じロール名を再検証する。
@@ -623,19 +603,6 @@ SEASON_RANK_PERCENTAGES = {
     "ダイヤ": 0.10,
     "マスター": 0.10,
 }
-
-# 旧シミュレーション/補助用途向けの固定閾値（本番ランク表示では使わない）
-RANK_TIERS = [
-    (0,    "アイアン",         "🔩", "#4f4f4f"),
-    (1500, "ブロンズ",         "🥉", "#cd7f32"),
-    (1700, "シルバー",         "🥈", "#c0c0c0"),
-    (1900, "ゴールド",         "🥇", "#f1c40f"),
-    (2100, "プラチナ",         "💠", "#1abc9c"),
-    (2300, "エメラルド",       "🍀", "#2ecc71"),
-    (2500, "ダイヤ",           "💎", "#3498db"),
-    (2700, "マスター",         "👑", "#9b59b6"),
-    (2900, "グランドマスター", "🌟", "#e74c3c"),
-]
 
 # Discordに付与するランクロール名のプレフィックス
 RANK_ROLE_PREFIX = ""

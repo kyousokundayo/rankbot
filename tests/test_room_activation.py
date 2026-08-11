@@ -90,6 +90,12 @@ class DisabledRoomStartupGuardTest(unittest.IsolatedAsyncioTestCase):
             "open_13_turn",
             Phase.NIGHT.name,
             {
+                "public_log_archive_allowed": True,
+                "vc_default_permissions_captured": False,
+                "vc_gm_speak_captured": False,
+                "morning_confirmed": False,
+                "prep_confirmed": False,
+                "mute_marker_enabled": True,
                 "players": [
                     {
                         "user_id": 10,
@@ -110,7 +116,7 @@ class DisabledRoomStartupGuardTest(unittest.IsolatedAsyncioTestCase):
         manager._cleanup_private_rooms_without_creator_role.assert_not_awaited()
 
     async def test_unarchived_recruitment_blocks_before_discord_work(self) -> None:
-        # enabled=False に変更する前の募集が残った移行状態をDBへ再現する。
+        # enabled=False に変更する前の募集が再混入した異常状態をDBへ再現する。
         async with database.connect_db() as db:
             await db.execute(
                 "INSERT INTO recruitments "

@@ -558,7 +558,7 @@ class GameStatsDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sum(item["count"] for item in ranked["roles"].values()), 13)
         self.assertEqual(ranked["seer"]["checks"], 0)
 
-    async def test_init_db_migrates_legacy_game_tables_without_backfill(self) -> None:
+    async def test_init_db_rejects_legacy_game_tables_without_changing_them(self) -> None:
         legacy_path = str(Path(self._tmp.name) / "legacy.db")
         async with database.aiosqlite.connect(legacy_path) as db:
             await db.execute(
@@ -577,29 +577,72 @@ class GameStatsDatabaseTest(unittest.IsolatedAsyncioTestCase):
                 "VALUES (1, 1, 10, '村人', '村陣営', 1)"
             )
             await db.commit()
+            schema_version_before = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+            journal_mode_before = (await db.execute_fetchall(
+                "PRAGMA journal_mode"
+            ))[0][0]
 
         database.DB_PATH = legacy_path
-        await database.init_db()
+        with self.assertRaisesRegex(RuntimeError, "未移行のDBスキーマ"):
+            await database.init_db()
         async with database.connect_db() as db:
-            game_columns = {
-                row[1] for row in await db.execute_fetchall("PRAGMA table_info(games)")
-            }
-            player_columns = {
-                row[1] for row in await db.execute_fetchall("PRAGMA table_info(game_players)")
-            }
-            old_player = (await db.execute_fetchall(
-                "SELECT died_on_day, death_cause, rank_at_game, rank_provisional "
-                "FROM game_players WHERE id = 1"
-            ))[0]
-            old_stats = (await db.execute_fetchall(
-                "SELECT COUNT(*) FROM game_stats WHERE game_id = 1"
+            tables = await db.execute_fetchall(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            )
+            old_player = await db.execute_fetchall(
+                "SELECT id, game_id, player_id, role, team, won FROM game_players"
+            )
+            schema_version_after = (await db.execute_fetchall(
+                "PRAGMA schema_version"
             ))[0][0]
-        self.assertIn("gm_id", game_columns)
-        self.assertIn("base_room_id", game_columns)
-        self.assertIn("recruitment_id", game_columns)
-        self.assertTrue({"died_on_day", "death_cause", "rank_at_game", "rank_provisional"} <= player_columns)
-        self.assertEqual(old_player, (None, None, None, None))
-        self.assertEqual(old_stats, 0)
+            journal_mode_after = (await db.execute_fetchall(
+                "PRAGMA journal_mode"
+            ))[0][0]
+        self.assertEqual(tables, [("game_players",), ("games",)])
+        self.assertEqual(old_player, [(1, 1, 10, "村人", "村陣営", 1)])
+        self.assertEqual(schema_version_after, schema_version_before)
+        self.assertEqual(journal_mode_after, journal_mode_before)
+
+    async def test_init_db_rejects_unmigrated_settlement_parameters_without_backfill(self) -> None:
+        async with database.connect_db() as db:
+            await db.execute(
+                "INSERT INTO game_settlements "
+                "(guild_id, room_id, game_run_id, variant_id, ladder_id, room_name, "
+                "rated, winner_team, player_records) "
+                "VALUES (1, 'legacy', 'run-legacy', 'v9_cross', 'l9_cross', "
+                "'旧9人村', 1, '村陣営', '[]')"
+            )
+            await db.commit()
+
+        with self.assertRaisesRegex(RuntimeError, "レート用スナップショット"):
+            await database.init_db()
+        async with database.connect_db() as db:
+            parameters = (await db.execute_fetchall(
+                "SELECT village_win_pool, wolf_win_pool, wolf_guess_slots, "
+                "final_day_threshold FROM game_settlements "
+                "WHERE guild_id=1 AND room_id='legacy' AND game_run_id='run-legacy'"
+            ))[0]
+        self.assertEqual(parameters, (None, None, None, None))
+
+    async def test_init_db_rejects_reintroduced_legacy_l9_without_rewriting_it(self) -> None:
+        async with database.connect_db() as db:
+            await db.execute(
+                "INSERT INTO games "
+                "(guild_id, variant_id, ladder_id, room_id, winner_team) "
+                "VALUES (1, 'v9_cross', 'l9', 'legacy-l9', '村陣営')"
+            )
+            await db.commit()
+
+        with self.assertRaisesRegex(RuntimeError, "旧l9"):
+            await database.init_db()
+
+        async with database.connect_db() as db:
+            ladder_id = (await db.execute_fetchall(
+                "SELECT ladder_id FROM games WHERE room_id='legacy-l9'"
+            ))[0][0]
+        self.assertEqual(ladder_id, "l9")
 
 
 class VariantBalanceStatsTest(unittest.IsolatedAsyncioTestCase):
