@@ -1371,7 +1371,7 @@ class _GameLoopLogCapture(logging.Handler):
 async def _wait_for_game_task(
     game_task: asyncio.Task,
     *,
-    timeout: float = 10.0,
+    timeout: float = 30.0,
 ) -> None:
     """CIの速度差を許容しつつ、タイムアウトを通常終了へ化けさせない。"""
     try:
