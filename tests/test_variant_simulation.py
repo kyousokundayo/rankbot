@@ -137,10 +137,7 @@ class VariantDefinitionTest(unittest.TestCase):
             self.assertNotIn(room.room_id, config.ACTIVE_ROOM_IDS)
             self.assertIsNone(room.strict_access_role_names)
             self.assertNotIn(room.room_id, config.PUBLIC_ROOM_IDS)
-            self.assertNotIn(room.room_id, config.RECRUITMENT_DISABLED_ROOM_IDS)
 
-        self.assertEqual(config.VARIANT_ROLLOUT_ROOM_IDS, frozenset({"open_13_turn"}))
-        self.assertEqual(config.RECRUITMENT_DISABLED_ROOM_IDS, frozenset({"open_13_turn"}))
         self.assertEqual(config.ROOM_DEFINITION_MAP["open"].variant_id, "v13_cross")
         self.assertEqual(disabled.variant_id, "v13_turn")
         self.assertEqual(config.ROOM_DEFINITION_MAP["open_9_cross"].variant_id, "v9_cross")

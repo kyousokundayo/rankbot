@@ -138,7 +138,7 @@ def _voice_dependency_error() -> Optional[str]:
         )
 
     try:
-        import nacl  # noqa: F401
+        __import__("nacl")
     except ImportError as e:
         return f"PyNaClが見つかりません: {e}"
     if not voice_client.has_nacl:

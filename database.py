@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import aiosqlite
 from collections.abc import Collection
 from contextlib import asynccontextmanager
@@ -14,19 +15,13 @@ from config import (
     BONUS_POSTGAME_VOTE,
     FEEDBACK_MAX_PER_DAY,
     INITIAL_RATING,
-    LEGACY_NINE_LADDER_ID,
-    LEGACY_NINE_LADDER_SPLIT,
+    LADDER_DEFINITIONS,
     LEADERBOARD_LIMIT,
     LEADERBOARD_MIN_SAMPLES,
     PLAYER_BLOCK_LIMIT,
     RECRUITMENT_BACKUP_CAPACITY,
-    RECRUITMENT_CAPACITY,
-    RECRUITMENT_MAX_PER_HOST,
     RECRUITMENT_NOTIFICATION_WINDOW_MINUTES,
-    RECRUITMENT_OCCUPANCY_MINUTES,
     RECRUITMENT_RANK_OPTIONS,
-    RECRUITMENT_UNRANKED_LABEL,
-    ROOM_DEFINITION_MAP,
     VARIANT_DEFINITIONS,
     Phase,
     Role,
@@ -44,10 +39,6 @@ DB_PATH = str(DATA_DIR / "werewolf_stats.db")
 DB_TIMEOUT_SECONDS = 10
 DB_BUSY_TIMEOUT_MS = 10_000
 ROOM_STATE_SCHEMA_VERSION = 1
-RECRUITMENT_NOTIFICATION_DELIVERY_MIGRATION_KEY = (
-    "recruitment_notification_deliveries_v1"
-)
-NINE_LADDER_SPLIT_MIGRATION_KEY = "legacy_l9_split_v1"
 DEFAULT_VARIANT_ID = rating_lib.DEFAULT_VARIANT_ID
 DEFAULT_LADDER_ID = rating_lib.DEFAULT_LADDER_ID
 
@@ -121,12 +112,28 @@ def _validate_room_snapshot(phase: str, payload: dict) -> None:
     game_run_id = payload.get("game_run_id")
     if game_run_id is not None and not isinstance(game_run_id, str):
         raise ValueError("game_run_id is not a string")
+    required_boolean_keys = (
+        "public_log_archive_allowed",
+        "vc_default_permissions_captured",
+        "vc_gm_speak_captured",
+        "morning_confirmed",
+        "prep_confirmed",
+        "mute_marker_enabled",
+    )
+    for key in required_boolean_keys:
+        if key not in payload:
+            raise ValueError(f"current snapshot is missing {key}")
     for key in (
         "day_execution_resolved", "night_resolved", "initial_seer_result_sent",
-        "morning_confirmed", "prep_confirmed", "mute_marker_enabled",
+        *required_boolean_keys,
     ):
         if key in payload and not isinstance(payload[key], bool):
             raise ValueError(f"{key} is not boolean")
+    if (
+        phase not in {Phase.LOBBY.name, Phase.GAME_OVER.name}
+        and payload.get("mute_marker_enabled") is not True
+    ):
+        raise ValueError("active snapshot requires mute ownership markers")
 
     players = payload.get("players", [])
     if not isinstance(players, list):
@@ -156,6 +163,13 @@ def _validate_room_snapshot(phase: str, payload: dict) -> None:
                 raise ValueError(f"players[{index}].role is required in active phase")
             if not isinstance(row.get("number"), int) or row.get("number", 0) <= 0:
                 raise ValueError(f"players[{index}].number must be positive in active phase")
+
+    if (
+        phase not in {Phase.LOBBY.name, Phase.GAME_OVER.name}
+        and any(row.get("role") == Role.SEER.name for row in players)
+        and not _is_snapshot_id(payload.get("initial_seer_target"))
+    ):
+        raise ValueError("active snapshot with seer requires initial_seer_target")
 
     for key in (
         "preparation_dm_sent_ids", "morning_ready_ids", "morning_warned_ids",
@@ -279,643 +293,653 @@ def _remove_orphan_backup_sidecars(stem: str) -> None:
             break
 
 
-async def _ensure_column(
+def _normalized_schema_sql(sql: str) -> str:
+    """SQLiteが保存したDDLを、空白と大文字小文字に依存せず比較する。"""
+    return " ".join(sql.split()).casefold()
+
+
+async def _ensure_index_definition(
     db: aiosqlite.Connection,
-    table_name: str,
-    column_name: str,
-    definition: str,
+    index_name: str,
+    create_sql: str,
 ) -> None:
-    rows = await db.execute_fetchall(f"PRAGMA table_info({table_name})")
-    existing = {row[1] for row in rows}
-    if column_name not in existing:
-        await db.execute(f"ALTER TABLE {table_name} ADD COLUMN {definition}")
+    """索引は定義が違う時だけ再作成し、通常起動ではDBを書き換えない。"""
+    rows = await db.execute_fetchall(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name=?",
+        (index_name,),
+    )
+    if rows and rows[0][0] is not None:
+        if _normalized_schema_sql(str(rows[0][0])) == _normalized_schema_sql(create_sql):
+            return
+        await db.execute(f"DROP INDEX {index_name}")
+    await db.execute(create_sql)
 
 
-_PLAYER_RATING_COLUMNS = {
-    "player_id", "guild_id", "ladder_id", "rating", "peak_rating",
-    "games", "wins", "season_games", "season_wins", "last_updated",
+_RETIRED_NINE_LADDER_ID = "l9"
+_CURRENT_SCHEMA_REQUIRED_COLUMNS = {
+    "games": {
+        "game_id", "guild_id", "variant_id", "ladder_id", "room_id",
+        "room_name", "game_run_id", "gm_id", "base_room_id",
+        "recruitment_id", "winner_team", "played_at",
+    },
+    "game_players": {
+        "id", "game_id", "player_id", "role", "team", "won",
+        "died_on_day", "death_cause", "rank_at_game", "wolf_guess_hits",
+        "rank_provisional",
+    },
+    "game_stats": {
+        "game_id", "days", "peaceful_mornings", "guard_successes",
+        "guard_checks", "seer_checks", "seer_wolf_hits",
+        "day1_execution_was_wolf", "executions_total", "executions_wolf",
+        "night1_kill_had_role", "wolf_alive_by_day", "rank_bucket",
+    },
+    "player_ratings": {
+        "player_id", "guild_id", "ladder_id", "rating", "peak_rating",
+        "games", "wins", "season_games", "season_wins", "last_updated",
+    },
+    "rating_history": {
+        "id", "player_id", "guild_id", "game_id", "variant_id", "ladder_id",
+        "rating_before", "rating_after", "elo_delta", "bonus", "play_bonus",
+        "recommendation_bonus", "created_at",
+    },
+    "season_resets": {
+        "id", "guild_id", "executed_by", "reset_at", "affected_players", "note",
+    },
+    "rating_snapshots": {
+        "id", "season_reset_id", "player_id", "guild_id", "ladder_id",
+        "rating_before", "rating_after", "season_rank", "rank_position",
+        "top_percent", "season_games", "season_wins",
+    },
+    "bot_meta": {"guild_id", "key", "value", "updated_at"},
+    "pending_unmutes": {"guild_id", "member_id", "created_at"},
+    "room_states": {"guild_id", "room_id", "phase", "payload", "updated_at"},
+    "room_state_quarantine": {
+        "guild_id", "room_id", "phase", "payload", "error", "quarantined_at",
+    },
+    "game_settlements": {
+        "guild_id", "room_id", "game_run_id", "variant_id", "ladder_id",
+        "room_name", "rated", "winner_team", "player_records", "stats_payload",
+        "bonus_payload", "gm_id", "base_room_id", "recruitment_id",
+        "village_win_pool", "wolf_win_pool", "wolf_guess_slots",
+        "final_day_threshold", "status", "game_id", "last_error", "created_at",
+        "updated_at",
+    },
+    "game_recommendations": {
+        "game_id", "guild_id", "voter_id", "kind", "recipient_id", "status",
+        "expires_at", "confirmed_at", "awarded_at", "created_at",
+    },
+    "private_rooms": {
+        "guild_id", "room_id", "owner_id", "room_name", "variant_id", "status",
+        "category_id", "last_error", "created_at",
+    },
+    "recruitments": {
+        "id", "guild_id", "host_id", "title", "scheduled_at", "room_id", "gm_id",
+        "streaming", "allowed_ranks", "note", "status", "notified_at",
+        "ready_notified_at", "closed_at", "message_id", "variant_id", "capacity",
+        "backup_capacity", "occupancy_minutes", "created_at",
+    },
+    "recruitment_entries": {"recruitment_id", "user_id", "kind", "joined_at"},
+    "recruitment_notification_deliveries": {
+        "recruitment_id", "user_id", "notified_at", "delivery_status",
+    },
+    "player_blocks": {"guild_id", "blocker_id", "blocked_id", "created_at"},
+    "feedback_reports": {
+        "report_id", "guild_id", "user_id", "category", "summary", "details",
+        "bot_version", "room_id", "room_name", "phase", "source_channel_id", "created_at",
+    },
 }
-_PLAYER_RATING_PK = ["player_id", "guild_id", "ladder_id"]
-_PLAYER_RATING_MIGRATION_TABLE = "player_ratings_ladder_migrated"
-_PLAYER_RATING_MIGRATION_SAVEPOINT = "migrate_player_ratings_ladder_pk"
-_PRIVATE_ROOMS_MIGRATION_TABLE = "private_rooms_public_migrated"
-_PRIVATE_ROOM_MEMBERS_MIGRATION_TABLE = "private_room_members_public_migrated"
-_PRIVATE_ROOMS_MIGRATION_SAVEPOINT = "migrate_private_rooms_public"
-_NINE_LADDER_SPLIT_SAVEPOINT = "split_legacy_l9"
+
+# 既存DBは列名だけでなく、現行DDLが依存する宣言型・NULL可否・DEFAULTも
+# 起動前に照合する。旧版で残った余分なnullable列は許容するため、必須列だけを
+# 対象にする。ここにない必須列の宣言型はINTEGERとして扱う。
+_CURRENT_SCHEMA_TEXT_COLUMNS = frozenset("""
+bot_meta.key bot_meta.value feedback_reports.bot_version feedback_reports.category
+feedback_reports.details feedback_reports.phase feedback_reports.room_id
+feedback_reports.room_name feedback_reports.summary game_players.death_cause
+game_players.rank_at_game game_players.role game_players.team
+game_recommendations.expires_at game_recommendations.kind game_recommendations.status
+game_settlements.base_room_id game_settlements.bonus_payload
+game_settlements.game_run_id game_settlements.ladder_id game_settlements.last_error
+game_settlements.player_records game_settlements.room_id game_settlements.room_name
+game_settlements.stats_payload game_settlements.status game_settlements.variant_id
+game_settlements.winner_team game_stats.rank_bucket game_stats.wolf_alive_by_day
+games.base_room_id games.game_run_id games.ladder_id games.room_id games.room_name
+games.variant_id games.winner_team player_ratings.ladder_id private_rooms.last_error
+private_rooms.room_id private_rooms.room_name private_rooms.status
+private_rooms.variant_id rating_history.ladder_id rating_history.variant_id
+rating_snapshots.ladder_id rating_snapshots.season_rank recruitment_entries.kind
+recruitment_notification_deliveries.delivery_status
+recruitment_notification_deliveries.notified_at recruitments.allowed_ranks
+recruitments.closed_at recruitments.note recruitments.notified_at
+recruitments.ready_notified_at recruitments.room_id recruitments.scheduled_at
+recruitments.status recruitments.title recruitments.variant_id
+room_state_quarantine.error room_state_quarantine.payload room_state_quarantine.phase
+room_state_quarantine.room_id room_states.payload room_states.phase room_states.room_id
+season_resets.note
+""".split())
+_CURRENT_SCHEMA_TIMESTAMP_COLUMNS = frozenset("""
+bot_meta.updated_at feedback_reports.created_at game_recommendations.awarded_at
+game_recommendations.confirmed_at game_recommendations.created_at
+game_settlements.created_at game_settlements.updated_at games.played_at
+pending_unmutes.created_at player_blocks.created_at player_ratings.last_updated
+private_rooms.created_at rating_history.created_at recruitment_entries.joined_at
+recruitments.created_at room_state_quarantine.quarantined_at room_states.updated_at
+season_resets.reset_at
+""".split())
+_CURRENT_SCHEMA_REAL_COLUMNS = frozenset({"rating_snapshots.top_percent"})
+_CURRENT_SCHEMA_NULLABLE_COLUMNS = frozenset("""
+bot_meta.updated_at feedback_reports.created_at feedback_reports.details
+feedback_reports.phase feedback_reports.report_id feedback_reports.room_id
+feedback_reports.room_name feedback_reports.source_channel_id game_players.death_cause
+game_players.died_on_day game_players.id game_players.rank_at_game
+game_players.rank_provisional game_players.wolf_guess_hits
+game_recommendations.awarded_at game_recommendations.confirmed_at
+game_recommendations.created_at game_recommendations.recipient_id
+game_settlements.base_room_id game_settlements.bonus_payload game_settlements.created_at
+game_settlements.final_day_threshold game_settlements.game_id game_settlements.gm_id
+game_settlements.last_error game_settlements.recruitment_id
+game_settlements.stats_payload game_settlements.updated_at
+game_settlements.village_win_pool game_settlements.wolf_guess_slots
+game_settlements.wolf_win_pool game_stats.day1_execution_was_wolf game_stats.game_id
+game_stats.night1_kill_had_role game_stats.rank_bucket games.base_room_id games.game_id
+games.game_run_id games.gm_id games.played_at games.recruitment_id
+pending_unmutes.created_at player_blocks.created_at player_ratings.last_updated
+private_rooms.category_id private_rooms.created_at private_rooms.last_error
+rating_history.created_at rating_history.id rating_snapshots.id
+rating_snapshots.rank_position rating_snapshots.season_rank rating_snapshots.top_percent
+recruitment_entries.joined_at recruitments.allowed_ranks recruitments.closed_at
+recruitments.created_at recruitments.gm_id recruitments.id recruitments.message_id
+recruitments.note recruitments.notified_at recruitments.ready_notified_at
+room_state_quarantine.payload room_state_quarantine.phase
+room_state_quarantine.quarantined_at room_states.updated_at season_resets.id
+season_resets.note season_resets.reset_at
+""".split())
+_CURRENT_SCHEMA_DEFAULTS = {
+    "bot_meta.updated_at": "CURRENT_TIMESTAMP",
+    "feedback_reports.created_at": "CURRENT_TIMESTAMP",
+    "game_recommendations.created_at": "CURRENT_TIMESTAMP",
+    "game_recommendations.kind": "'recommend'",
+    "game_recommendations.status": "'pending'",
+    "game_settlements.created_at": "CURRENT_TIMESTAMP",
+    "game_settlements.ladder_id": "'l13'",
+    "game_settlements.room_name": "''",
+    "game_settlements.status": "'pending'",
+    "game_settlements.updated_at": "CURRENT_TIMESTAMP",
+    "game_settlements.variant_id": "'v13_cross'",
+    "games.ladder_id": "'l13'",
+    "games.played_at": "CURRENT_TIMESTAMP",
+    "games.room_id": "''",
+    "games.room_name": "''",
+    "games.variant_id": "'v13_cross'",
+    "pending_unmutes.created_at": "CURRENT_TIMESTAMP",
+    "player_blocks.created_at": "CURRENT_TIMESTAMP",
+    "player_ratings.games": "0",
+    "player_ratings.ladder_id": "'l13'",
+    "player_ratings.last_updated": "CURRENT_TIMESTAMP",
+    "player_ratings.season_games": "0",
+    "player_ratings.season_wins": "0",
+    "player_ratings.wins": "0",
+    "private_rooms.created_at": "CURRENT_TIMESTAMP",
+    "private_rooms.status": "'active'",
+    "private_rooms.variant_id": "'v13_cross'",
+    "rating_history.bonus": "0",
+    "rating_history.created_at": "CURRENT_TIMESTAMP",
+    "rating_history.ladder_id": "'l13'",
+    "rating_history.play_bonus": "0",
+    "rating_history.recommendation_bonus": "0",
+    "rating_history.variant_id": "'v13_cross'",
+    "rating_snapshots.ladder_id": "'l13'",
+    "rating_snapshots.season_games": "0",
+    "rating_snapshots.season_wins": "0",
+    "recruitment_entries.joined_at": "CURRENT_TIMESTAMP",
+    "recruitment_notification_deliveries.delivery_status": "'sent'",
+    "recruitments.backup_capacity": "3",
+    "recruitments.capacity": "13",
+    "recruitments.created_at": "CURRENT_TIMESTAMP",
+    "recruitments.occupancy_minutes": "90",
+    "recruitments.status": "'募集中'",
+    "recruitments.streaming": "0",
+    "recruitments.variant_id": "'v13_cross'",
+    "room_state_quarantine.quarantined_at": "CURRENT_TIMESTAMP",
+    "room_states.updated_at": "CURRENT_TIMESTAMP",
+    "season_resets.affected_players": "0",
+    "season_resets.reset_at": "CURRENT_TIMESTAMP",
+}
+_CURRENT_SCHEMA_PRIMARY_KEYS = {
+    "games": ["game_id"],
+    "game_players": ["id"],
+    "game_stats": ["game_id"],
+    "player_ratings": ["player_id", "guild_id", "ladder_id"],
+    "rating_history": ["id"],
+    "season_resets": ["id"],
+    "rating_snapshots": ["id"],
+    "bot_meta": ["guild_id", "key"],
+    "pending_unmutes": ["guild_id", "member_id"],
+    "room_states": ["guild_id", "room_id"],
+    "room_state_quarantine": ["guild_id", "room_id"],
+    "game_settlements": ["guild_id", "room_id", "game_run_id"],
+    "game_recommendations": ["game_id", "voter_id", "kind"],
+    "private_rooms": ["guild_id", "room_id"],
+    "recruitments": ["id"],
+    "recruitment_entries": ["recruitment_id", "user_id"],
+    "recruitment_notification_deliveries": ["recruitment_id", "user_id"],
+    "player_blocks": ["guild_id", "blocker_id", "blocked_id"],
+    "feedback_reports": ["report_id"],
+}
+_CURRENT_SCHEMA_UNIQUE_KEYS = {
+    "private_rooms": {
+        ("guild_id", "owner_id"),
+        ("guild_id", "room_name"),
+    },
+}
+_CURRENT_SCHEMA_FOREIGN_KEYS = {
+    "game_players": {("game_id", "games", "game_id")},
+    "game_stats": {("game_id", "games", "game_id")},
+    "rating_history": {("game_id", "games", "game_id")},
+    "rating_snapshots": {("season_reset_id", "season_resets", "id")},
+    "game_settlements": {("game_id", "games", "game_id")},
+    "game_recommendations": {("game_id", "games", "game_id")},
+    "recruitment_entries": {("recruitment_id", "recruitments", "id")},
+    "recruitment_notification_deliveries": {
+        ("recruitment_id", "recruitments", "id")
+    },
+}
+_CURRENT_SCHEMA_CHECK_PATTERNS = {
+    "recruitment_entries": (
+        "kind IN ('参加','補欠')",
+        re.compile(
+            r"check\s*\(\s*kind\s+in\s*\(\s*'参加'\s*,\s*'補欠'\s*\)\s*\)",
+            re.IGNORECASE,
+        ),
+    ),
+    "player_blocks": (
+        "blocker_id <> blocked_id",
+        re.compile(
+            r"check\s*\(\s*(?:blocker_id\s*(?:<>|!=)\s*blocked_id|"
+            r"blocked_id\s*(?:<>|!=)\s*blocker_id)\s*\)",
+            re.IGNORECASE,
+        ),
+    ),
+}
 
 
-def _player_rating_table_metadata(rows: list[tuple], *, table_name: str) -> tuple[set[str], list[str]]:
-    columns = {str(row[1]) for row in rows}
-    unknown_columns = columns - _PLAYER_RATING_COLUMNS
-    if unknown_columns:
+def _normalized_schema_default(value) -> Optional[str]:
+    """DEFAULT式を大文字小文字・空白・外側の括弧に依存せず比較する。"""
+    if value is None:
+        return None
+    normalized = _normalized_schema_sql(str(value))
+    while normalized.startswith("(") and normalized.endswith(")"):
+        normalized = normalized[1:-1].strip()
+    return normalized
+
+
+def _expected_current_column_type(column_key: str) -> str:
+    if column_key in _CURRENT_SCHEMA_TEXT_COLUMNS:
+        return "TEXT"
+    if column_key in _CURRENT_SCHEMA_TIMESTAMP_COLUMNS:
+        return "TIMESTAMP"
+    if column_key in _CURRENT_SCHEMA_REAL_COLUMNS:
+        return "REAL"
+    return "INTEGER"
+
+
+async def _validate_current_schema(db: aiosqlite.Connection) -> None:
+    """v0.40移行済みDBだけを、DDL実行前に読み取り検査する。"""
+    errors: list[str] = []
+    table_info: dict[str, list[tuple]] = {}
+    for table_name, required_columns in _CURRENT_SCHEMA_REQUIRED_COLUMNS.items():
+        rows = await db.execute_fetchall(f"PRAGMA table_info({table_name})")
+        table_info[table_name] = rows
+        existing = {str(row[1]) for row in rows}
+        missing = sorted(required_columns - existing)
+        if missing:
+            errors.append(f"{table_name}の不足列={','.join(missing)}")
+
+        rows_by_name = {str(row[1]): row for row in rows}
+        for column_name in sorted(required_columns):
+            row = rows_by_name.get(column_name)
+            if row is None:
+                continue
+            column_key = f"{table_name}.{column_name}"
+            actual_type = str(row[2] or "").strip().upper()
+            expected_type = _expected_current_column_type(column_key)
+            if actual_type != expected_type:
+                errors.append(
+                    f"{column_key}の型={actual_type or 'なし'}"
+                    f"(期待={expected_type})"
+                )
+
+            actual_not_null = bool(row[3])
+            expected_not_null = column_key not in _CURRENT_SCHEMA_NULLABLE_COLUMNS
+            if actual_not_null != expected_not_null:
+                errors.append(
+                    f"{column_key}のNOT NULL="
+                    f"{'あり' if actual_not_null else 'なし'}"
+                )
+
+            actual_default = _normalized_schema_default(row[4])
+            expected_default = _normalized_schema_default(
+                _CURRENT_SCHEMA_DEFAULTS.get(column_key)
+            )
+            if actual_default != expected_default:
+                errors.append(
+                    f"{column_key}のDEFAULT={actual_default or 'なし'}"
+                    f"(期待={expected_default or 'なし'})"
+                )
+
+    for table_name, expected_primary_key in _CURRENT_SCHEMA_PRIMARY_KEYS.items():
+        rows = table_info[table_name]
+        actual_primary_key = [
+            str(row[1])
+            for row in sorted(rows, key=lambda item: int(item[5] or 0))
+            if int(row[5] or 0) > 0
+        ]
+        if actual_primary_key != expected_primary_key:
+            errors.append(
+                f"{table_name}の主キー={','.join(actual_primary_key) or 'なし'}"
+            )
+
+    for table_name, expected_unique_keys in _CURRENT_SCHEMA_UNIQUE_KEYS.items():
+        actual_unique_keys: set[tuple[str, ...]] = set()
+        for index_row in await db.execute_fetchall(f"PRAGMA index_list({table_name})"):
+            # 条件付きUNIQUEは全行の一意性を保証しないため、現行の
+            # テーブル制約の代用としては認めない。
+            if not int(index_row[2] or 0) or int(index_row[4] or 0):
+                continue
+            index_columns = await db.execute_fetchall(
+                "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+                (str(index_row[1]),),
+            )
+            actual_unique_keys.add(tuple(str(row[0]) for row in index_columns))
+        for unique_key in sorted(expected_unique_keys - actual_unique_keys):
+            errors.append(
+                f"{table_name}の一意制約不足=({','.join(unique_key)})"
+            )
+
+    for table_name in _CURRENT_SCHEMA_REQUIRED_COLUMNS:
+        expected_foreign_keys = _CURRENT_SCHEMA_FOREIGN_KEYS.get(table_name, set())
+        actual_foreign_keys = {
+            (str(row[3]), str(row[2]), str(row[4]))
+            for row in await db.execute_fetchall(
+                f"PRAGMA foreign_key_list({table_name})"
+            )
+        }
+        for child_column, parent_table, parent_column in sorted(
+            expected_foreign_keys - actual_foreign_keys
+        ):
+            errors.append(
+                f"{table_name}の外部キー不足="
+                f"{child_column}->{parent_table}.{parent_column}"
+            )
+        for child_column, parent_table, parent_column in sorted(
+            actual_foreign_keys - expected_foreign_keys
+        ):
+            errors.append(
+                f"{table_name}の未定義外部キー="
+                f"{child_column}->{parent_table}.{parent_column}"
+            )
+
+    for table_name, (description, pattern) in _CURRENT_SCHEMA_CHECK_PATTERNS.items():
+        table_sql_rows = await db.execute_fetchall(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
+            (table_name,),
+        )
+        table_sql = str(table_sql_rows[0][0]) if table_sql_rows else ""
+        if not pattern.search(table_sql):
+            errors.append(f"{table_name}のCHECK制約不足={description}")
+
+    # 旧private roomのアクセスロール列がNOT NULLだと、現行の保存処理は
+    # その列を更新しないため、新規の個室保存が失敗する。DDLを変える前に拒否する。
+    for row in table_info["private_rooms"]:
+        if str(row[1]) == "role_name" and int(row[3] or 0):
+            errors.append("private_rooms.role_nameがNOT NULL")
+
+    if errors:
         raise RuntimeError(
-            f"{table_name}に未対応の列があります: "
-            + ", ".join(sorted(unknown_columns))
+            "未移行のDBスキーマはサポートしていません。"
+            "v0.40移行済みDBまたは新規DBを使用してください: "
+            + "; ".join(errors)
         )
-    required_columns = _PLAYER_RATING_COLUMNS - {"ladder_id"}
-    missing_columns = required_columns - columns
-    if missing_columns:
+
+
+async def _validate_foreign_key_integrity(db: aiosqlite.Connection) -> None:
+    """現行テーブルの外部キーに反する孤児行だけを起動前に拒否する。"""
+    for table_name in _CURRENT_SCHEMA_FOREIGN_KEYS:
+        violations = await db.execute_fetchall(
+            f"PRAGMA foreign_key_check({table_name})"
+        )
+        if violations:
+            _, row_id, parent_table, _ = violations[0]
+            raise RuntimeError(
+                "DBの外部キー整合性が壊れています: "
+                f"{table_name} rowid={row_id} -> {parent_table}"
+            )
+
+
+async def _validate_check_integrity(db: aiosqlite.Connection) -> None:
+    """現行CHECK制約の追加前や無効化中に入った不正行を拒否する。"""
+    invalid_entries = await db.execute_fetchall(
+        "SELECT recruitment_id, user_id FROM recruitment_entries "
+        "WHERE kind NOT IN (?, ?) LIMIT 1",
+        ("参加", "補欠"),
+    )
+    if invalid_entries:
+        recruitment_id, user_id = invalid_entries[0]
         raise RuntimeError(
-            f"{table_name}に必要な列がありません: "
-            + ", ".join(sorted(missing_columns))
+            "recruitment_entries.kindが現行制約に違反しています: "
+            f"募集#{recruitment_id}/user={user_id}"
         )
-    primary_key = [
-        str(row[1])
-        for row in sorted(rows, key=lambda item: int(item[5] or 0))
-        if int(row[5] or 0) > 0
-    ]
-    return columns, primary_key
 
-
-async def _normalized_player_rating_rows(
-    db: aiosqlite.Connection,
-    table_name: str,
-    *,
-    has_ladder_id: bool,
-) -> list[tuple]:
-    if table_name not in {"player_ratings", _PLAYER_RATING_MIGRATION_TABLE}:
-        raise ValueError("unknown player rating migration table")
-    ladder_expr = (
-        f"COALESCE(ladder_id, '{DEFAULT_LADDER_ID}')"
-        if has_ladder_id else f"'{DEFAULT_LADDER_ID}'"
+    invalid_blocks = await db.execute_fetchall(
+        "SELECT guild_id, blocker_id FROM player_blocks "
+        "WHERE blocker_id = blocked_id LIMIT 1"
     )
-    return await db.execute_fetchall(
-        "SELECT player_id, guild_id, "
-        f"{ladder_expr} AS normalized_ladder_id, "
-        "rating, peak_rating, games, wins, season_games, season_wins, last_updated "
-        f"FROM {table_name} "
-        "ORDER BY player_id, guild_id, normalized_ladder_id"
-    )
-
-
-async def _migrate_player_ratings_ladder_pk(db: aiosqlite.Connection) -> None:
-    """player_ratingsを3列主キーへ、既存値を失わず原子的・冪等移行する。"""
-    main_info = await db.execute_fetchall("PRAGMA table_info(player_ratings)")
-    if not main_info:
-        return
-    main_columns, main_primary_key = _player_rating_table_metadata(
-        main_info, table_name="player_ratings",
-    )
-    main_is_current = (
-        "ladder_id" in main_columns and main_primary_key == _PLAYER_RATING_PK
-    )
-    migrated_info = await db.execute_fetchall(
-        f"PRAGMA table_info({_PLAYER_RATING_MIGRATION_TABLE})"
-    )
-
-    await db.execute(f"SAVEPOINT {_PLAYER_RATING_MIGRATION_SAVEPOINT}")
-    try:
-        if migrated_info:
-            migrated_columns, migrated_primary_key = _player_rating_table_metadata(
-                migrated_info, table_name=_PLAYER_RATING_MIGRATION_TABLE,
-            )
-            if (
-                "ladder_id" not in migrated_columns
-                or migrated_primary_key != _PLAYER_RATING_PK
-            ):
-                raise RuntimeError(
-                    "player_ratingsの中断移行テーブル構造が不正です。"
-                )
-            main_rows = await _normalized_player_rating_rows(
-                db, "player_ratings", has_ladder_id="ladder_id" in main_columns,
-            )
-            migrated_rows = await _normalized_player_rating_rows(
-                db, _PLAYER_RATING_MIGRATION_TABLE, has_ladder_id=True,
-            )
-
-            # 旧実装がDROP後・RENAME前で止まり、次回initのCREATEによって
-            # 空の新player_ratingsが作られた場合は、検証済み一時表を正本へ戻す。
-            if main_is_current and not main_rows and migrated_rows:
-                await db.execute("DROP TABLE player_ratings")
-                await db.execute(
-                    f"ALTER TABLE {_PLAYER_RATING_MIGRATION_TABLE} "
-                    "RENAME TO player_ratings"
-                )
-                await db.execute(f"RELEASE {_PLAYER_RATING_MIGRATION_SAVEPOINT}")
-                return
-
-            if main_rows != migrated_rows:
-                raise RuntimeError(
-                    "player_ratingsの中断移行テーブルと正本が一致しません。"
-                    "どちらも変更せず停止します。"
-                )
-            if main_is_current:
-                # 正本が既に新構造かつ内容一致なら、一時表だけ安全に回収する。
-                await db.execute(f"DROP TABLE {_PLAYER_RATING_MIGRATION_TABLE}")
-            else:
-                # COPY検証後に止まった旧構造を、完成済み一時表へ切り替える。
-                await db.execute("DROP TABLE player_ratings")
-                await db.execute(
-                    f"ALTER TABLE {_PLAYER_RATING_MIGRATION_TABLE} "
-                    "RENAME TO player_ratings"
-                )
-            await db.execute(f"RELEASE {_PLAYER_RATING_MIGRATION_SAVEPOINT}")
-            return
-
-        if main_is_current:
-            await db.execute(f"RELEASE {_PLAYER_RATING_MIGRATION_SAVEPOINT}")
-            return
-
-        await db.execute(f"""
-            CREATE TABLE {_PLAYER_RATING_MIGRATION_TABLE} (
-                player_id INTEGER NOT NULL,
-                guild_id INTEGER NOT NULL,
-                ladder_id TEXT NOT NULL DEFAULT '{DEFAULT_LADDER_ID}',
-                rating INTEGER NOT NULL,
-                peak_rating INTEGER NOT NULL,
-                games INTEGER NOT NULL DEFAULT 0,
-                wins INTEGER NOT NULL DEFAULT 0,
-                season_games INTEGER NOT NULL DEFAULT 0,
-                season_wins INTEGER NOT NULL DEFAULT 0,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (player_id, guild_id, ladder_id)
-            )
-        """)
-        ladder_expr = (
-            f"COALESCE(ladder_id, '{DEFAULT_LADDER_ID}')"
-            if "ladder_id" in main_columns else f"'{DEFAULT_LADDER_ID}'"
-        )
-        await db.execute(
-            f"INSERT INTO {_PLAYER_RATING_MIGRATION_TABLE} "
-            "(player_id, guild_id, ladder_id, rating, peak_rating, games, wins, "
-            "season_games, season_wins, last_updated) "
-            f"SELECT player_id, guild_id, {ladder_expr}, rating, peak_rating, games, wins, "
-            "season_games, season_wins, last_updated FROM player_ratings"
-        )
-        before_rows = await _normalized_player_rating_rows(
-            db, "player_ratings", has_ladder_id="ladder_id" in main_columns,
-        )
-        after_rows = await _normalized_player_rating_rows(
-            db, _PLAYER_RATING_MIGRATION_TABLE, has_ladder_id=True,
-        )
-        if after_rows != before_rows:
-            raise RuntimeError("player_ratings移行で内容が変化しました。")
-        await db.execute("DROP TABLE player_ratings")
-        await db.execute(
-            f"ALTER TABLE {_PLAYER_RATING_MIGRATION_TABLE} RENAME TO player_ratings"
-        )
-        await db.execute(f"RELEASE {_PLAYER_RATING_MIGRATION_SAVEPOINT}")
-    except BaseException:
-        await db.execute(f"ROLLBACK TO {_PLAYER_RATING_MIGRATION_SAVEPOINT}")
-        await db.execute(f"RELEASE {_PLAYER_RATING_MIGRATION_SAVEPOINT}")
-        raise
-
-
-async def _migrate_private_rooms_role_name_nullable(
-    db: aiosqlite.Connection,
-) -> None:
-    """GM名前村の旧閲覧ロール名をNULLにできる構造へ移行する。
-
-    SQLiteは列のNOT NULLだけを外せないため、参照子表も含めて
-    SAVEPOINT内で作り直す。既存値はそのまま保持し、Discordロールの
-    削除と参照解除はstable role_idを確認できる起動後に行う。
-    """
-    room_info = await db.execute_fetchall("PRAGMA table_info(private_rooms)")
-    if not room_info:
-        return
-    role_name_info = next(
-        (row for row in room_info if str(row[1]) == "role_name"),
-        None,
-    )
-    if role_name_info is None:
-        raise RuntimeError("private_rooms.role_nameが見つかりません。")
-    if int(role_name_info[3] or 0) == 0:
-        return
-
-    await db.execute(f"SAVEPOINT {_PRIVATE_ROOMS_MIGRATION_SAVEPOINT}")
-    try:
-        await db.execute(f"""
-            CREATE TABLE {_PRIVATE_ROOMS_MIGRATION_TABLE} (
-                guild_id INTEGER NOT NULL,
-                room_id TEXT NOT NULL,
-                owner_id INTEGER NOT NULL,
-                room_name TEXT NOT NULL,
-                role_name TEXT,
-                variant_id TEXT NOT NULL DEFAULT 'v13_cross',
-                status TEXT NOT NULL DEFAULT 'active',
-                category_id INTEGER,
-                role_id INTEGER,
-                last_error TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (guild_id, room_id),
-                UNIQUE (guild_id, owner_id),
-                UNIQUE (guild_id, room_name),
-                UNIQUE (guild_id, role_name)
-            )
-        """)
-        await db.execute(
-            f"INSERT INTO {_PRIVATE_ROOMS_MIGRATION_TABLE} "
-            "(guild_id, room_id, owner_id, room_name, role_name, variant_id, "
-            "status, category_id, role_id, last_error, created_at) "
-            "SELECT guild_id, room_id, owner_id, room_name, role_name, variant_id, "
-            "status, category_id, role_id, last_error, created_at FROM private_rooms"
-        )
-        await db.execute(f"""
-            CREATE TABLE {_PRIVATE_ROOM_MEMBERS_MIGRATION_TABLE} (
-                guild_id INTEGER NOT NULL,
-                room_id TEXT NOT NULL,
-                member_id INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'active',
-                last_error TEXT,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (guild_id, room_id, member_id),
-                FOREIGN KEY (guild_id, room_id)
-                    REFERENCES {_PRIVATE_ROOMS_MIGRATION_TABLE}(guild_id, room_id)
-            )
-        """)
-        await db.execute(
-            f"INSERT INTO {_PRIVATE_ROOM_MEMBERS_MIGRATION_TABLE} "
-            "(guild_id, room_id, member_id, status, last_error, added_at) "
-            "SELECT guild_id, room_id, member_id, status, last_error, added_at "
-            "FROM private_room_members"
+    if invalid_blocks:
+        guild_id, blocker_id = invalid_blocks[0]
+        raise RuntimeError(
+            "player_blocksに自己ブロックが残っています: "
+            f"guild={guild_id}/user={blocker_id}"
         )
 
-        old_rooms = await db.execute_fetchall(
-            "SELECT guild_id, room_id, owner_id, room_name, role_name, variant_id, "
-            "status, category_id, role_id, last_error, created_at "
-            "FROM private_rooms ORDER BY guild_id, room_id"
-        )
-        new_rooms = await db.execute_fetchall(
-            "SELECT guild_id, room_id, owner_id, room_name, role_name, variant_id, "
-            "status, category_id, role_id, last_error, created_at "
-            f"FROM {_PRIVATE_ROOMS_MIGRATION_TABLE} ORDER BY guild_id, room_id"
-        )
-        old_members = await db.execute_fetchall(
-            "SELECT guild_id, room_id, member_id, status, last_error, added_at "
-            "FROM private_room_members ORDER BY guild_id, room_id, member_id"
-        )
-        new_members = await db.execute_fetchall(
-            "SELECT guild_id, room_id, member_id, status, last_error, added_at "
-            f"FROM {_PRIVATE_ROOM_MEMBERS_MIGRATION_TABLE} "
-            "ORDER BY guild_id, room_id, member_id"
-        )
-        if old_rooms != new_rooms or old_members != new_members:
-            raise RuntimeError("GM名前村DB移行で内容が変化しました。")
 
-        await db.execute("DROP TABLE private_room_members")
-        await db.execute("DROP TABLE private_rooms")
-        await db.execute(
-            f"ALTER TABLE {_PRIVATE_ROOMS_MIGRATION_TABLE} RENAME TO private_rooms"
-        )
-        await db.execute(
-            f"ALTER TABLE {_PRIVATE_ROOM_MEMBERS_MIGRATION_TABLE} "
-            "RENAME TO private_room_members"
-        )
-        foreign_key_errors = await db.execute_fetchall(
-            "PRAGMA foreign_key_check(private_room_members)"
-        )
-        if foreign_key_errors:
-            raise RuntimeError("GM名前村DB移行後の外部キー検査に失敗しました。")
-        await db.execute(f"RELEASE {_PRIVATE_ROOMS_MIGRATION_SAVEPOINT}")
-    except BaseException:
-        await db.execute(f"ROLLBACK TO {_PRIVATE_ROOMS_MIGRATION_SAVEPOINT}")
-        await db.execute(f"RELEASE {_PRIVATE_ROOMS_MIGRATION_SAVEPOINT}")
-        raise
-
-
-async def _validate_nine_ladder_split_state(
-    db: aiosqlite.Connection,
-) -> None:
-    """marker後も旧l9の再混入と9人変種の誤ラダーを見逃さない。"""
-    remaining = await db.execute_fetchall(
+async def _validate_ladder_integrity(db: aiosqlite.Connection) -> None:
+    """旧l9の再混入と、保存済み変種・ラダー不一致を拒否する。"""
+    legacy_counts = await db.execute_fetchall(
         "SELECT 'games', COUNT(*) FROM games WHERE ladder_id=? UNION ALL "
         "SELECT 'player_ratings', COUNT(*) FROM player_ratings WHERE ladder_id=? "
         "UNION ALL SELECT 'rating_history', COUNT(*) FROM rating_history "
         "WHERE ladder_id=? UNION ALL SELECT 'rating_snapshots', COUNT(*) "
         "FROM rating_snapshots WHERE ladder_id=? UNION ALL "
         "SELECT 'game_settlements', COUNT(*) FROM game_settlements WHERE ladder_id=?",
-        (LEGACY_NINE_LADDER_ID,) * 5,
+        (_RETIRED_NINE_LADDER_ID,) * 5,
     )
-    legacy_tables = [name for name, count in remaining if int(count) != 0]
+    legacy_tables = [name for name, count in legacy_counts if int(count)]
     if legacy_tables:
-        raise RuntimeError(
-            "9人ラダー分割後に旧l9が残っています: "
-            + ", ".join(legacy_tables)
-        )
+        raise RuntimeError("旧l9が残っています: " + ", ".join(legacy_tables))
 
-    split_items = tuple(LEGACY_NINE_LADDER_SPLIT.items())
+    variant_ladders = tuple(
+        (variant_id, definition.ladder_id)
+        for variant_id, definition in VARIANT_DEFINITIONS.items()
+    )
+    valid_variant_ids = tuple(variant_id for variant_id, _ in variant_ladders)
     mismatch_conditions = " OR ".join(
-        "(variant_id=? AND ladder_id<>?)" for _ in split_items
+        "(variant_id=? AND ladder_id<>?)" for _ in variant_ladders
     )
-    mismatch_params = tuple(
-        item for pair in split_items for item in pair
-    )
-    mismatches = await db.execute_fetchall(
-        "SELECT 'games', COUNT(*) FROM games WHERE "
-        f"{mismatch_conditions} UNION ALL "
-        "SELECT 'rating_history', COUNT(*) FROM rating_history WHERE "
-        f"{mismatch_conditions} UNION ALL "
-        "SELECT 'game_settlements', COUNT(*) FROM game_settlements WHERE "
-        f"{mismatch_conditions}",
-        mismatch_params * 3,
-    )
-    invalid_tables = [name for name, count in mismatches if int(count) != 0]
+    mismatch_params = tuple(item for pair in variant_ladders for item in pair)
+    placeholders = ", ".join("?" for _ in valid_variant_ids)
+    invalid_tables: list[str] = []
+    for table_name in ("games", "rating_history", "game_settlements"):
+        invalid = await db.execute_fetchall(
+            f"SELECT 1 FROM {table_name} WHERE variant_id NOT IN ({placeholders}) "
+            f"OR {mismatch_conditions} LIMIT 1",
+            valid_variant_ids + mismatch_params,
+        )
+        if invalid:
+            invalid_tables.append(table_name)
     if invalid_tables:
         raise RuntimeError(
-            "9人変種とラダーが一致しません: " + ", ".join(invalid_tables)
+            "変種とラダーが一致しません: " + ", ".join(invalid_tables)
         )
+
+    known_ladders = tuple(LADDER_DEFINITIONS)
+    ladder_placeholders = ", ".join("?" for _ in known_ladders)
+    invalid_rating_tables: list[str] = []
+    for table_name in ("player_ratings", "rating_snapshots"):
+        invalid = await db.execute_fetchall(
+            f"SELECT 1 FROM {table_name} WHERE ladder_id NOT IN ({ladder_placeholders}) "
+            "LIMIT 1",
+            known_ladders,
+        )
+        if invalid:
+            invalid_rating_tables.append(table_name)
+    if invalid_rating_tables:
+        raise RuntimeError(
+            "未対応ラダーが残っています: " + ", ".join(invalid_rating_tables)
+        )
+
     history_game_mismatches = await db.execute_fetchall(
         "SELECT rh.id FROM rating_history rh LEFT JOIN games g "
-        "ON g.game_id=rh.game_id WHERE rh.variant_id IN (?, ?) AND "
-        "(g.game_id IS NULL OR g.guild_id<>rh.guild_id "
-        "OR g.variant_id<>rh.variant_id) LIMIT 1",
-        (split_items[0][0], split_items[1][0]),
+        "ON g.game_id=rh.game_id WHERE g.game_id IS NULL "
+        "OR g.guild_id<>rh.guild_id OR g.variant_id<>rh.variant_id "
+        "OR g.ladder_id<>rh.ladder_id LIMIT 1"
     )
     if history_game_mismatches:
-        raise RuntimeError(
-            "9人rating_historyとgamesの変種またはguildが一致しません。"
-        )
+        raise RuntimeError("rating_historyとgamesの変種・ラダー・guildが一致しません。")
 
-
-async def _migrate_legacy_nine_ladder_split(
-    db: aiosqlite.Connection,
-) -> None:
-    """v0.38までの共有 ``l9`` を9人2変種の個別ラダーへ分割する。
-
-    現在値のrating/peakは情報上分離不能なので両ラダーへ同値でseedする。
-    試合数・勝数はrating_historyとgame_playersから変種別に復元し、
-    season_*は旧season_gamesを正本として最新の同件数を振り分ける。
-    過去スナップショットも変種が無いため両方へ複製する。競合・件数不一致時は
-    上書きや推測をせず全変更を戻し、markerは全検証後だけ記録する。
-    """
-    split_items = tuple(LEGACY_NINE_LADDER_SPLIT.items())
-    target_ladders = tuple(ladder_id for _, ladder_id in split_items)
-    if len(split_items) != 2 or len(set(target_ladders)) != 2:
-        raise RuntimeError("9人ラダー分割設定が不正です。")
-
-    marker = await db.execute_fetchall(
-        "SELECT value FROM bot_meta WHERE guild_id=0 AND key=?",
-        (NINE_LADDER_SPLIT_MIGRATION_KEY,),
+    incomplete_settlements = await db.execute_fetchall(
+        "SELECT 1 FROM game_settlements WHERE village_win_pool IS NULL "
+        "OR wolf_win_pool IS NULL OR wolf_guess_slots IS NULL "
+        "OR final_day_threshold IS NULL LIMIT 1"
     )
-    if marker:
-        if marker[0][0] != "done":
-            raise RuntimeError("9人ラダー分割markerの値が不正です。")
-        await _validate_nine_ladder_split_state(db)
-        return
+    if incomplete_settlements:
+        raise RuntimeError(
+            "game_settlementsのレート用スナップショットが未移行です。"
+        )
 
-    await db.execute(f"SAVEPOINT {_NINE_LADDER_SPLIT_SAVEPOINT}")
+
+async def _validate_recruitment_integrity(db: aiosqlite.Connection) -> None:
+    """未終了募集が同じ村主のGM名前村へ結び付いていることを確認する。"""
+    invalid_rows = await db.execute_fetchall(
+        "SELECT r.id, r.room_id FROM recruitments r "
+        "LEFT JOIN private_rooms p "
+        "ON p.guild_id = r.guild_id AND p.room_id = r.room_id "
+        "WHERE r.status IN (?, ?) "
+        "AND (p.room_id IS NULL OR p.owner_id <> r.host_id) LIMIT 1",
+        (RECRUITMENT_OPEN, RECRUITMENT_HELD),
+    )
+    if invalid_rows:
+        recruitment_id, room_id = invalid_rows[0]
+        raise RuntimeError(
+            "未終了募集が村主のGM名前村と一致しません: "
+            f"募集#{recruitment_id}/{room_id}"
+        )
+
+
+_CURRENT_INDEX_DEFINITIONS = {
+    "idx_game_players_player_id": (
+        "CREATE INDEX idx_game_players_player_id ON game_players(player_id)"
+    ),
+    "idx_player_ratings_guild_rating": (
+        "CREATE INDEX idx_player_ratings_guild_rating "
+        "ON player_ratings(guild_id, ladder_id, rating DESC)"
+    ),
+    "idx_rating_history_player_guild": (
+        "CREATE INDEX idx_rating_history_player_guild "
+        "ON rating_history(player_id, guild_id, ladder_id, variant_id)"
+    ),
+    "idx_game_players_game_player": (
+        "CREATE INDEX idx_game_players_game_player "
+        "ON game_players(game_id, player_id)"
+    ),
+    "idx_rating_history_game_player": (
+        "CREATE INDEX idx_rating_history_game_player "
+        "ON rating_history(game_id, player_id)"
+    ),
+    "idx_games_guild_played_at": (
+        "CREATE INDEX idx_games_guild_played_at "
+        "ON games(guild_id, played_at DESC)"
+    ),
+    "idx_games_guild_variant_played_at": (
+        "CREATE INDEX idx_games_guild_variant_played_at "
+        "ON games(guild_id, variant_id, played_at DESC)"
+    ),
+    "idx_games_run_unique": (
+        "CREATE UNIQUE INDEX idx_games_run_unique "
+        "ON games(guild_id, room_id, game_run_id) "
+        "WHERE game_run_id IS NOT NULL AND game_run_id <> ''"
+    ),
+    "idx_feedback_reports_guild_created": (
+        "CREATE INDEX idx_feedback_reports_guild_created "
+        "ON feedback_reports(guild_id, report_id DESC)"
+    ),
+    "idx_game_recommendations_guild_status": (
+        "CREATE INDEX idx_game_recommendations_guild_status "
+        "ON game_recommendations(guild_id, status, expires_at)"
+    ),
+    "idx_recruitments_guild_scheduled": (
+        "CREATE INDEX idx_recruitments_guild_scheduled "
+        "ON recruitments(guild_id, scheduled_at)"
+    ),
+    "idx_recruitment_entries_recruitment": (
+        "CREATE INDEX idx_recruitment_entries_recruitment "
+        "ON recruitment_entries(recruitment_id)"
+    ),
+    "idx_player_blocks_guild_blocked": (
+        "CREATE INDEX idx_player_blocks_guild_blocked "
+        "ON player_blocks(guild_id, blocked_id)"
+    ),
+    "idx_rating_snapshots_player_guild": (
+        "CREATE INDEX idx_rating_snapshots_player_guild "
+        "ON rating_snapshots(player_id, guild_id, ladder_id, season_reset_id DESC)"
+    ),
+    "idx_rating_snapshots_reset_guild": (
+        "CREATE INDEX idx_rating_snapshots_reset_guild "
+        "ON rating_snapshots(season_reset_id, guild_id, ladder_id)"
+    ),
+    "idx_rating_snapshots_reset_player_ladder": (
+        "CREATE UNIQUE INDEX idx_rating_snapshots_reset_player_ladder "
+        "ON rating_snapshots(season_reset_id, player_id, guild_id, ladder_id)"
+    ),
+}
+
+
+async def _ensure_current_indexes(db: aiosqlite.Connection) -> None:
+    """現行索引を一括で定義修復し、途中失敗なら全変更を戻す。"""
+    savepoint = "ensure_current_indexes"
+    current_index = ""
+    await db.execute(f"SAVEPOINT {savepoint}")
     try:
-        for table_name in ("games", "rating_history", "game_settlements"):
-            invalid = await db.execute_fetchall(
-                f"SELECT variant_id, COUNT(*) FROM {table_name} "
-                "WHERE ladder_id=? AND variant_id NOT IN (?, ?) "
-                "GROUP BY variant_id",
-                (
-                    LEGACY_NINE_LADDER_ID,
-                    split_items[0][0], split_items[1][0],
-                ),
-            )
-            if invalid:
-                variants = ", ".join(
-                    f"{variant_id}={count}" for variant_id, count in invalid
-                )
-                raise RuntimeError(
-                    f"{table_name}の旧l9に振り分け不能な変種があります: "
-                    f"{variants}"
-                )
-
-        history_game_mismatches = await db.execute_fetchall(
-            "SELECT rh.id FROM rating_history rh LEFT JOIN games g "
-            "ON g.game_id=rh.game_id WHERE rh.variant_id IN (?, ?) AND "
-            "(g.game_id IS NULL OR g.guild_id<>rh.guild_id "
-            "OR g.variant_id<>rh.variant_id) LIMIT 1",
-            (split_items[0][0], split_items[1][0]),
-        )
-        if history_game_mismatches:
-            raise RuntimeError(
-                "9人rating_historyとgamesの変種またはguildが一致しません。"
-            )
-
-        legacy_players = await db.execute_fetchall(
-            "SELECT player_id, guild_id, rating, peak_rating, games, wins, "
-            "season_games, season_wins, last_updated FROM player_ratings "
-            "WHERE ladder_id=? ORDER BY guild_id, player_id",
-            (LEGACY_NINE_LADDER_ID,),
-        )
-        aggregated = await db.execute_fetchall(
-            "WITH unique_history AS ("
-            " SELECT rh.player_id, rh.guild_id, rh.game_id, rh.variant_id, "
-            " MAX(rh.id) AS history_id "
-            " FROM rating_history rh JOIN player_ratings legacy "
-            " ON legacy.player_id=rh.player_id AND legacy.guild_id=rh.guild_id "
-            " AND legacy.ladder_id=? WHERE rh.ladder_id=? "
-            " AND rh.variant_id IN (?, ?) "
-            " GROUP BY rh.player_id, rh.guild_id, rh.game_id, rh.variant_id"
-            "), ranked_history AS ("
-            " SELECT unique_history.*, ROW_NUMBER() OVER ("
-            " PARTITION BY player_id, guild_id ORDER BY history_id DESC"
-            " ) AS recent_position FROM unique_history"
-            "), player_game AS ("
-            " SELECT game_id, player_id, MIN(won) AS min_won, "
-            " MAX(won) AS max_won FROM game_players GROUP BY game_id, player_id"
-            ") SELECT uh.player_id, uh.guild_id, uh.variant_id, COUNT(*), "
-            " COALESCE(SUM(pg.max_won), 0), "
-            " COALESCE(SUM(CASE WHEN uh.recent_position<=legacy.season_games "
-            " THEN 1 ELSE 0 END), 0), "
-            " COALESCE(SUM(CASE WHEN uh.recent_position<=legacy.season_games "
-            " THEN pg.max_won ELSE 0 END), 0), "
-            " COALESCE(SUM(CASE WHEN pg.game_id IS NULL "
-            " OR pg.min_won<>pg.max_won THEN 1 ELSE 0 END), 0) "
-            " FROM ranked_history uh JOIN player_ratings legacy "
-            " ON legacy.player_id=uh.player_id AND legacy.guild_id=uh.guild_id "
-            " AND legacy.ladder_id=? LEFT JOIN player_game pg "
-            " ON pg.game_id=uh.game_id AND pg.player_id=uh.player_id "
-            " GROUP BY uh.player_id, uh.guild_id, uh.variant_id",
-            (
-                LEGACY_NINE_LADDER_ID,
-                LEGACY_NINE_LADDER_ID,
-                split_items[0][0], split_items[1][0],
-                LEGACY_NINE_LADDER_ID,
-            ),
-        )
-        stats_by_variant = {
-            (int(player_id), int(guild_id), str(variant_id)): (
-                int(games), int(wins), int(season_games), int(season_wins),
-            )
-            for (
-                player_id, guild_id, variant_id, games, wins,
-                season_games, season_wins, invalid_player_game,
-            ) in aggregated
-            if not int(invalid_player_game)
-        }
-        if any(int(row[7]) for row in aggregated):
-            raise RuntimeError(
-                "9人rating_historyに対応するgame_players.wonを確定できません。"
-            )
-
-        expected_player_rows: dict[tuple[int, int, str], tuple] = {}
-        for (
-            player_id, guild_id, current_rating, peak_rating,
-            old_games, old_wins, old_season_games, old_season_wins,
-            last_updated,
-        ) in legacy_players:
-            split_stats = [
-                stats_by_variant.get(
-                    (int(player_id), int(guild_id), variant_id),
-                    (0, 0, 0, 0),
-                )
-                for variant_id, _ in split_items
-            ]
-            restored_totals = tuple(sum(values) for values in zip(*split_stats))
-            legacy_totals = (
-                int(old_games), int(old_wins),
-                int(old_season_games), int(old_season_wins),
-            )
-            if restored_totals != legacy_totals:
-                raise RuntimeError(
-                    "旧l9のplayer_ratings件数を履歴から復元できません: "
-                    f"guild={guild_id}, player={player_id}, "
-                    f"legacy={legacy_totals}, restored={restored_totals}"
-                )
-            for (variant_id, ladder_id), stats in zip(split_items, split_stats):
-                expected_player_rows[
-                    (int(player_id), int(guild_id), ladder_id)
-                ] = (
-                    int(current_rating), int(peak_rating), *stats, last_updated,
-                )
-
-        existing_targets = await db.execute_fetchall(
-            "SELECT player_id, guild_id, ladder_id, rating, peak_rating, games, "
-            "wins, season_games, season_wins, last_updated FROM player_ratings "
-            "WHERE ladder_id IN (?, ?)",
-            target_ladders,
-        )
-        existing_target_map = {
-            (int(row[0]), int(row[1]), str(row[2])): tuple(row[3:])
-            for row in existing_targets
-        }
-        for key, expected in expected_player_rows.items():
-            existing = existing_target_map.get(key)
-            if existing is not None and existing != expected:
-                raise RuntimeError(
-                    "旧l9と移行先player_ratingsが一致しません。"
-                    "どちらも変更せず停止します。"
-                )
-
-        snapshot_duplicates = await db.execute_fetchall(
-            "SELECT season_reset_id, player_id, guild_id, COUNT(*) "
-            "FROM rating_snapshots WHERE ladder_id=? "
-            "GROUP BY season_reset_id, player_id, guild_id HAVING COUNT(*)<>1",
-            (LEGACY_NINE_LADDER_ID,),
-        )
-        if snapshot_duplicates:
-            raise RuntimeError("旧l9のrating_snapshotsに重複があります。")
-        snapshot_conflicts = await db.execute_fetchall(
-            "SELECT legacy.id, target.ladder_id "
-            "FROM rating_snapshots legacy JOIN rating_snapshots target "
-            "ON target.season_reset_id=legacy.season_reset_id "
-            "AND target.player_id=legacy.player_id "
-            "AND target.guild_id=legacy.guild_id "
-            "AND target.ladder_id IN (?, ?) "
-            "WHERE legacy.ladder_id=? AND NOT ("
-            "target.rating_before IS legacy.rating_before "
-            "AND target.rating_after IS legacy.rating_after "
-            "AND target.season_rank IS legacy.season_rank "
-            "AND target.rank_position IS legacy.rank_position "
-            "AND target.top_percent IS legacy.top_percent "
-            "AND target.season_games IS legacy.season_games "
-            "AND target.season_wins IS legacy.season_wins)",
-            (*target_ladders, LEGACY_NINE_LADDER_ID),
-        )
-        if snapshot_conflicts:
-            raise RuntimeError(
-                "旧l9と移行先rating_snapshotsが一致しません。"
-                "どちらも変更せず停止します。"
-            )
-
-        for variant_id, ladder_id in split_items:
-            for table_name in ("games", "rating_history", "game_settlements"):
-                await db.execute(
-                    f"UPDATE {table_name} SET ladder_id=? "
-                    "WHERE ladder_id=? AND variant_id=?",
-                    (ladder_id, LEGACY_NINE_LADDER_ID, variant_id),
-                )
-            await db.execute(
-                "INSERT INTO rating_snapshots "
-                "(season_reset_id, player_id, guild_id, ladder_id, "
-                "rating_before, rating_after, season_rank, rank_position, "
-                "top_percent, season_games, season_wins) "
-                "SELECT legacy.season_reset_id, legacy.player_id, "
-                "legacy.guild_id, ?, legacy.rating_before, "
-                "legacy.rating_after, legacy.season_rank, "
-                "legacy.rank_position, legacy.top_percent, "
-                "legacy.season_games, legacy.season_wins "
-                "FROM rating_snapshots legacy WHERE legacy.ladder_id=? "
-                "AND NOT EXISTS (SELECT 1 FROM rating_snapshots target "
-                "WHERE target.season_reset_id=legacy.season_reset_id "
-                "AND target.player_id=legacy.player_id "
-                "AND target.guild_id=legacy.guild_id "
-                "AND target.ladder_id=?)",
-                (ladder_id, LEGACY_NINE_LADDER_ID, ladder_id),
-            )
-
-        missing_targets = [
-            (player_id, guild_id, ladder_id, *expected)
-            for (player_id, guild_id, ladder_id), expected
-            in expected_player_rows.items()
-            if (player_id, guild_id, ladder_id) not in existing_target_map
-        ]
-        if missing_targets:
-            await db.executemany(
-                "INSERT INTO player_ratings "
-                "(player_id, guild_id, ladder_id, rating, peak_rating, games, "
-                "wins, season_games, season_wins, last_updated) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                missing_targets,
-            )
-
-        migrated_targets = await db.execute_fetchall(
-            "SELECT player_id, guild_id, ladder_id, rating, peak_rating, games, "
-            "wins, season_games, season_wins, last_updated FROM player_ratings "
-            "WHERE ladder_id IN (?, ?)",
-            target_ladders,
-        )
-        migrated_target_map = {
-            (int(row[0]), int(row[1]), str(row[2])): tuple(row[3:])
-            for row in migrated_targets
-        }
-        if any(
-            migrated_target_map.get(key) != expected
-            for key, expected in expected_player_rows.items()
-        ):
-            raise RuntimeError("旧l9のplayer_ratings移行後検証に失敗しました。")
-
-        incomplete_snapshots = await db.execute_fetchall(
-            "SELECT legacy.id, COUNT(target.id) "
-            "FROM rating_snapshots legacy LEFT JOIN rating_snapshots target "
-            "ON target.season_reset_id=legacy.season_reset_id "
-            "AND target.player_id=legacy.player_id "
-            "AND target.guild_id=legacy.guild_id "
-            "AND target.ladder_id IN (?, ?) "
-            "WHERE legacy.ladder_id=? GROUP BY legacy.id "
-            "HAVING COUNT(target.id)<>2",
-            (*target_ladders, LEGACY_NINE_LADDER_ID),
-        )
-        if incomplete_snapshots:
-            raise RuntimeError("旧l9のrating_snapshots複製件数が一致しません。")
-
-        await db.execute(
-            "DELETE FROM player_ratings WHERE ladder_id=?",
-            (LEGACY_NINE_LADDER_ID,),
-        )
-        await db.execute(
-            "DELETE FROM rating_snapshots WHERE ladder_id=?",
-            (LEGACY_NINE_LADDER_ID,),
-        )
-        await _validate_nine_ladder_split_state(db)
-        await db.execute(
-            "INSERT INTO bot_meta (guild_id, key, value) VALUES (0, ?, 'done')",
-            (NINE_LADDER_SPLIT_MIGRATION_KEY,),
-        )
-        await db.execute(f"RELEASE {_NINE_LADDER_SPLIT_SAVEPOINT}")
-    except BaseException:
-        await db.execute(f"ROLLBACK TO {_NINE_LADDER_SPLIT_SAVEPOINT}")
-        await db.execute(f"RELEASE {_NINE_LADDER_SPLIT_SAVEPOINT}")
-        raise
+        for current_index, create_sql in _CURRENT_INDEX_DEFINITIONS.items():
+            await _ensure_index_definition(db, current_index, create_sql)
+    except Exception as exc:
+        try:
+            await db.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            await db.execute(f"RELEASE SAVEPOINT {savepoint}")
+        except Exception:
+            log.exception("検索索引修復のロールバックに失敗しました")
+        raise RuntimeError(
+            f"現行検索索引を修復できません: {current_index or '開始前'}"
+        ) from exc
+    await db.execute(f"RELEASE SAVEPOINT {savepoint}")
 
 
 async def init_db() -> None:
     async with connect_db() as db:
+        user_table_count = int((await db.execute_fetchall(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%'"
+        ))[0][0])
+        if user_table_count:
+            await _validate_current_schema(db)
+            await _validate_foreign_key_integrity(db)
+            await _validate_check_integrity(db)
+            await _validate_ladder_integrity(db)
+            await _validate_recruitment_integrity(db)
+            await _ensure_current_indexes(db)
+            await db.execute("PRAGMA journal_mode = WAL")
+            await db.commit()
+            return
+
         await db.execute("PRAGMA journal_mode = WAL")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS games (
@@ -944,6 +968,7 @@ async def init_db() -> None:
                 died_on_day INTEGER,
                 death_cause TEXT,
                 rank_at_game TEXT,
+                wolf_guess_hits INTEGER,
                 rank_provisional INTEGER,
                 FOREIGN KEY (game_id) REFERENCES games(game_id)
             )
@@ -1130,29 +1155,14 @@ async def init_db() -> None:
                 room_id TEXT NOT NULL,
                 owner_id INTEGER NOT NULL,
                 room_name TEXT NOT NULL,
-                role_name TEXT,
                 variant_id TEXT NOT NULL DEFAULT 'v13_cross',
                 status TEXT NOT NULL DEFAULT 'active',
                 category_id INTEGER,
-                role_id INTEGER,
                 last_error TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (guild_id, room_id),
                 UNIQUE (guild_id, owner_id),
-                UNIQUE (guild_id, room_name),
-                UNIQUE (guild_id, role_name)
-            )
-        """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS private_room_members (
-                guild_id INTEGER NOT NULL,
-                room_id TEXT NOT NULL,
-                member_id INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'active',
-                last_error TEXT,
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (guild_id, room_id, member_id),
-                FOREIGN KEY (guild_id, room_id) REFERENCES private_rooms(guild_id, room_id)
+                UNIQUE (guild_id, room_name)
             )
         """)
         await db.execute("""
@@ -1225,306 +1235,12 @@ async def init_db() -> None:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        await _ensure_column(db, "games", "room_id", "room_id TEXT NOT NULL DEFAULT ''")
-        await _ensure_column(
-            db, "games", "variant_id",
-            f"variant_id TEXT NOT NULL DEFAULT '{DEFAULT_VARIANT_ID}'",
-        )
-        await _ensure_column(
-            db, "games", "ladder_id",
-            f"ladder_id TEXT NOT NULL DEFAULT '{DEFAULT_LADDER_ID}'",
-        )
-        await _ensure_column(db, "games", "room_name", "room_name TEXT NOT NULL DEFAULT ''")
-        await _ensure_column(db, "games", "game_run_id", "game_run_id TEXT")
-        await _ensure_column(db, "games", "gm_id", "gm_id INTEGER")
-        await _ensure_column(db, "games", "base_room_id", "base_room_id TEXT")
-        await _ensure_column(db, "games", "recruitment_id", "recruitment_id INTEGER")
-        await _ensure_column(db, "game_players", "died_on_day", "died_on_day INTEGER")
-        await _ensure_column(db, "game_players", "death_cause", "death_cause TEXT")
-        await _ensure_column(db, "game_players", "rank_at_game", "rank_at_game TEXT")
-        # 3狼提出の的中数。NULLは「提出していない/対象外」で、統計の分母にも入らない
-        await _ensure_column(
-            db, "game_players", "wolf_guess_hits", "wolf_guess_hits INTEGER",
-        )
-        await _ensure_column(
-            db, "game_players", "rank_provisional", "rank_provisional INTEGER",
-        )
-        await _ensure_column(
-            db, "game_stats", "guard_checks",
-            "guard_checks INTEGER NOT NULL DEFAULT 0",
-        )
-        await _ensure_column(db, "player_ratings", "season_games", "season_games INTEGER NOT NULL DEFAULT 0")
-        await _ensure_column(db, "player_ratings", "season_wins", "season_wins INTEGER NOT NULL DEFAULT 0")
-        await _migrate_player_ratings_ladder_pk(db)
-        await _ensure_column(
-            db, "rating_history", "variant_id",
-            f"variant_id TEXT NOT NULL DEFAULT '{DEFAULT_VARIANT_ID}'",
-        )
-        await _ensure_column(
-            db, "rating_history", "ladder_id",
-            f"ladder_id TEXT NOT NULL DEFAULT '{DEFAULT_LADDER_ID}'",
-        )
-        await _ensure_column(
-            db, "rating_snapshots", "ladder_id",
-            f"ladder_id TEXT NOT NULL DEFAULT '{DEFAULT_LADDER_ID}'",
-        )
-        await _ensure_column(db, "rating_snapshots", "season_rank", "season_rank TEXT")
-        await _ensure_column(db, "rating_snapshots", "rank_position", "rank_position INTEGER")
-        await _ensure_column(db, "rating_snapshots", "top_percent", "top_percent REAL")
-        await _ensure_column(db, "rating_snapshots", "season_games", "season_games INTEGER NOT NULL DEFAULT 0")
-        await _ensure_column(db, "rating_snapshots", "season_wins", "season_wins INTEGER NOT NULL DEFAULT 0")
-        await _ensure_column(db, "private_rooms", "status", "status TEXT NOT NULL DEFAULT 'active'")
-        await _ensure_column(db, "private_rooms", "category_id", "category_id INTEGER")
-        await _ensure_column(db, "private_rooms", "role_id", "role_id INTEGER")
-        await _ensure_column(db, "private_rooms", "last_error", "last_error TEXT")
-        await _ensure_column(
-            db, "private_rooms", "variant_id",
-            f"variant_id TEXT NOT NULL DEFAULT '{DEFAULT_VARIANT_ID}'",
-        )
-        await _ensure_column(db, "private_room_members", "status", "status TEXT NOT NULL DEFAULT 'active'")
-        await _ensure_column(db, "private_room_members", "last_error", "last_error TEXT")
-        await _migrate_private_rooms_role_name_nullable(db)
-        await _ensure_column(db, "game_settlements", "room_name", "room_name TEXT NOT NULL DEFAULT ''")
-        await _ensure_column(
-            db, "game_settlements", "variant_id",
-            f"variant_id TEXT NOT NULL DEFAULT '{DEFAULT_VARIANT_ID}'",
-        )
-        await _ensure_column(
-            db, "game_settlements", "ladder_id",
-            f"ladder_id TEXT NOT NULL DEFAULT '{DEFAULT_LADDER_ID}'",
-        )
-        await _migrate_legacy_nine_ladder_split(db)
-        await _ensure_column(db, "game_settlements", "stats_payload", "stats_payload TEXT")
-        await _ensure_column(db, "game_settlements", "bonus_payload", "bonus_payload TEXT")
-        await _ensure_column(
-            db, "game_settlements", "village_win_pool", "village_win_pool INTEGER",
-        )
-        await _ensure_column(
-            db, "game_settlements", "wolf_win_pool", "wolf_win_pool INTEGER",
-        )
-        await _ensure_column(
-            db, "game_settlements", "wolf_guess_slots", "wolf_guess_slots INTEGER",
-        )
-        await _ensure_column(
-            db, "game_settlements", "final_day_threshold", "final_day_threshold INTEGER",
-        )
-        for variant_id, definition in VARIANT_DEFINITIONS.items():
-            await db.execute(
-                "UPDATE game_settlements SET "
-                "village_win_pool = COALESCE(village_win_pool, ?), "
-                "wolf_win_pool = COALESCE(wolf_win_pool, ?), "
-                "wolf_guess_slots = COALESCE(wolf_guess_slots, ?), "
-                "final_day_threshold = COALESCE(final_day_threshold, ?) "
-                "WHERE variant_id = ? AND ("
-                "village_win_pool IS NULL OR wolf_win_pool IS NULL OR "
-                "wolf_guess_slots IS NULL OR final_day_threshold IS NULL)",
-                (
-                    definition.village_win_pool,
-                    definition.wolf_win_pool,
-                    definition.wolf_guess_slots,
-                    definition.final_day_threshold,
-                    variant_id,
-                ),
-            )
-        await _ensure_column(
-            db, "recruitments", "variant_id",
-            f"variant_id TEXT NOT NULL DEFAULT '{DEFAULT_VARIANT_ID}'",
-        )
-        await _ensure_column(
-            db, "recruitments", "capacity",
-            f"capacity INTEGER NOT NULL DEFAULT {RECRUITMENT_CAPACITY}",
-        )
-        await _ensure_column(
-            db, "recruitments", "backup_capacity",
-            f"backup_capacity INTEGER NOT NULL DEFAULT {RECRUITMENT_BACKUP_CAPACITY}",
-        )
-        await _ensure_column(
-            db, "recruitments", "occupancy_minutes",
-            f"occupancy_minutes INTEGER NOT NULL DEFAULT {RECRUITMENT_OCCUPANCY_MINUTES}",
-        )
-        # 終了後の票を「推薦」と「勝利陣営→敗北陣営」の2種類へ広げる。
-        # 勝利陣営の霊媒師などは1人で両方を持つので、主キーに kind が要る。
-        # 列追加では主キーを変えられないため、ここだけ作り直しになる。
-        recommendation_columns = {
-            row[1] for row in await db.execute_fetchall(
-                "PRAGMA table_info(game_recommendations)"
-            )
-        }
-        if recommendation_columns and "kind" not in recommendation_columns:
-            await db.execute("""
-                CREATE TABLE game_recommendations_migrated (
-                    game_id INTEGER NOT NULL,
-                    guild_id INTEGER NOT NULL,
-                    voter_id INTEGER NOT NULL,
-                    kind TEXT NOT NULL DEFAULT 'recommend',
-                    recipient_id INTEGER,
-                    status TEXT NOT NULL DEFAULT 'pending',
-                    expires_at TEXT NOT NULL,
-                    confirmed_at TIMESTAMP,
-                    awarded_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (game_id, voter_id, kind),
-                    FOREIGN KEY (game_id) REFERENCES games(game_id)
-                )
-            """)
-            await db.execute(
-                "INSERT INTO game_recommendations_migrated "
-                "(game_id, guild_id, voter_id, kind, recipient_id, status, "
-                "expires_at, confirmed_at, awarded_at, created_at) "
-                "SELECT game_id, guild_id, voter_id, 'recommend', recipient_id, status, "
-                "expires_at, confirmed_at, awarded_at, created_at "
-                "FROM game_recommendations"
-            )
-            await db.execute("DROP TABLE game_recommendations")
-            await db.execute(
-                "ALTER TABLE game_recommendations_migrated "
-                "RENAME TO game_recommendations"
-            )
-        await _ensure_column(
-            db, "rating_history", "play_bonus",
-            "play_bonus INTEGER NOT NULL DEFAULT 0",
-        )
-        await _ensure_column(db, "game_settlements", "gm_id", "gm_id INTEGER")
-        await _ensure_column(
-            db, "game_settlements", "base_room_id", "base_room_id TEXT",
-        )
-        await _ensure_column(
-            db, "game_settlements", "recruitment_id", "recruitment_id INTEGER",
-        )
-        await _ensure_column(
-            db, "recruitments", "ready_notified_at", "ready_notified_at TEXT",
-        )
-        await _ensure_column(db, "recruitments", "closed_at", "closed_at TEXT")
-        await _ensure_column(db, "recruitments", "allowed_ranks", "allowed_ranks TEXT")
-        await _ensure_column(
-            db,
-            "recruitment_notification_deliveries",
-            "delivery_status",
-            "delivery_status TEXT NOT NULL DEFAULT 'sent'",
-        )
-        # 旧版で募集単位の通知済み時刻だけがある場合、当時すでに参加していた
-        # 人を台帳へ一度だけ移す。毎起動繰り返すと、新版で一時的にDM送信へ
-        # 失敗した人まで notified_at を根拠に通知済みへ変えてしまう。
-        delivery_migration = await db.execute_fetchall(
-            "SELECT 1 FROM bot_meta WHERE guild_id=0 AND key=?",
-            (RECRUITMENT_NOTIFICATION_DELIVERY_MIGRATION_KEY,),
-        )
-        if not delivery_migration:
-            await db.execute(
-                "INSERT OR IGNORE INTO recruitment_notification_deliveries "
-                "(recruitment_id, user_id, notified_at) "
-                "SELECT e.recruitment_id, e.user_id, r.notified_at "
-                "FROM recruitment_entries e JOIN recruitments r ON r.id=e.recruitment_id "
-                "WHERE e.kind='参加' AND r.notified_at IS NOT NULL "
-                "AND datetime(e.joined_at)<=datetime(r.notified_at)"
-            )
-            await db.execute(
-                "INSERT INTO bot_meta (guild_id, key, value) VALUES (0, ?, 'done')",
-                (RECRUITMENT_NOTIFICATION_DELIVERY_MIGRATION_KEY,),
-            )
-        recruitment_columns = {
-            row[1] for row in await db.execute_fetchall("PRAGMA table_info(recruitments)")
-        }
-        if "allow_beginner" in recruitment_columns:
-            # 旧「初心者参加不可」は、意味を変えずゴールド以上の選択へ移す。
-            # 旧「参加可」およびNULLは、新方式の「制限なし」(NULL) のまま扱う。
-            beginner_ranks = ROOM_DEFINITION_MAP["beginner"].allowed_ranks or frozenset()
-            legacy_allowed = [
-                rank_name for rank_name in RECRUITMENT_RANK_OPTIONS
-                if rank_name != RECRUITMENT_UNRANKED_LABEL
-                and rank_name not in beginner_ranks
-            ]
-            await db.execute(
-                "UPDATE recruitments SET allowed_ranks = ? "
-                "WHERE room_id = 'open' AND allow_beginner = 0 AND allowed_ranks IS NULL",
-                (json.dumps(legacy_allowed, ensure_ascii=False),),
-            )
-        await _ensure_column(
-            db, "rating_history", "recommendation_bonus",
-            "recommendation_bonus INTEGER NOT NULL DEFAULT 0",
-        )
-        # ============================================================
-        # インデックス: 統計クエリ高速化
-        # ============================================================
-        # get_player_stats: WHERE player_id = ?
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_game_players_player_id "
-            "ON game_players(player_id)"
-        )
-        # get_all_player_ratings / ランキング集計: WHERE guild_id = ? の絞り込み用
-        await db.execute("DROP INDEX IF EXISTS idx_player_ratings_guild_rating")
-        await db.execute(
-            "CREATE INDEX idx_player_ratings_guild_rating "
-            "ON player_ratings(guild_id, ladder_id, rating DESC)"
-        )
-        # rating_history 検索 (将来の履歴表示用)
-        await db.execute("DROP INDEX IF EXISTS idx_rating_history_player_guild")
-        await db.execute(
-            "CREATE INDEX idx_rating_history_player_guild "
-            "ON rating_history(player_id, guild_id, ladder_id, variant_id)"
-        )
-        # 旧DBに重複履歴があっても起動不能にしない。ゲームrun自体の冪等性は
-        # idx_games_run_uniqueで保証し、履歴側は検索用の非unique indexに留める。
-        await db.execute("DROP INDEX IF EXISTS idx_game_players_game_player")
-        await db.execute("DROP INDEX IF EXISTS idx_rating_history_game_player")
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_game_players_game_player "
-            "ON game_players(game_id, player_id)"
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_rating_history_game_player "
-            "ON rating_history(game_id, player_id)"
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_games_guild_played_at "
-            "ON games(guild_id, played_at DESC)"
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_games_guild_variant_played_at "
-            "ON games(guild_id, variant_id, played_at DESC)"
-        )
-        await db.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_games_run_unique "
-            "ON games(guild_id, room_id, game_run_id) "
-            "WHERE game_run_id IS NOT NULL AND game_run_id <> ''"
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_feedback_reports_guild_created "
-            "ON feedback_reports(guild_id, report_id DESC)"
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_game_recommendations_guild_status "
-            "ON game_recommendations(guild_id, status, expires_at)"
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_recruitments_guild_scheduled "
-            "ON recruitments(guild_id, scheduled_at)"
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_recruitment_entries_recruitment "
-            "ON recruitment_entries(recruitment_id)"
-        )
-        await db.execute(
-            "CREATE INDEX IF NOT EXISTS idx_player_blocks_guild_blocked "
-            "ON player_blocks(guild_id, blocked_id)"
-        )
-        # rating_snapshots はシーズンリセットのたびに全プレイヤー分が積み増され、
-        # 削除されない。統計表示の主要導線 (自分の統計 / ユーザー選択) が毎回
-        # 引くので、行数が増える前に索引を張っておく。
-        await db.execute("DROP INDEX IF EXISTS idx_rating_snapshots_player_guild")
-        await db.execute("DROP INDEX IF EXISTS idx_rating_snapshots_reset_guild")
-        await db.execute(
-            "CREATE INDEX idx_rating_snapshots_player_guild "
-            "ON rating_snapshots(player_id, guild_id, ladder_id, season_reset_id DESC)"
-        )
-        await db.execute(
-            "CREATE INDEX idx_rating_snapshots_reset_guild "
-            "ON rating_snapshots(season_reset_id, guild_id, ladder_id)"
-        )
-        await db.execute(
-            "CREATE UNIQUE INDEX IF NOT EXISTS idx_rating_snapshots_reset_player_ladder "
-            "ON rating_snapshots(season_reset_id, player_id, guild_id, ladder_id)"
-        )
+        await _validate_current_schema(db)
+        await _validate_foreign_key_integrity(db)
+        await _validate_check_integrity(db)
+        await _validate_ladder_integrity(db)
+        await _validate_recruitment_integrity(db)
+        await _ensure_current_indexes(db)
         await db.commit()
 
 
@@ -2721,33 +2437,10 @@ async def remove_pending_unmute(guild_id: int, member_id: int) -> None:
 
 async def load_pending_unmute_ids(guild_id: int) -> set[int]:
     async with connect_db() as db:
-        await db.execute("BEGIN IMMEDIATE")
-        legacy_rows = await db.execute_fetchall(
-            "SELECT value FROM bot_meta WHERE guild_id = ? AND key = 'pending_unmutes'",
-            (guild_id,),
-        )
-        if legacy_rows and legacy_rows[0][0]:
-            legacy_ids = {
-                int(value)
-                for value in str(legacy_rows[0][0]).split(",")
-                if value.strip().isdigit()
-            }
-            if legacy_ids:
-                await db.executemany(
-                    "INSERT OR IGNORE INTO pending_unmutes (guild_id, member_id) VALUES (?, ?)",
-                    [(guild_id, member_id) for member_id in legacy_ids],
-                )
-            # 正規化insertと同一transactionでのみ旧値を空にする。
-            await db.execute(
-                "UPDATE bot_meta SET value = '', updated_at = CURRENT_TIMESTAMP "
-                "WHERE guild_id = ? AND key = 'pending_unmutes'",
-                (guild_id,),
-            )
         rows = await db.execute_fetchall(
             "SELECT member_id FROM pending_unmutes WHERE guild_id = ?",
             (guild_id,),
         )
-        await db.commit()
     return {int(row[0]) for row in rows}
 
 
@@ -2765,16 +2458,6 @@ async def save_room_state(guild_id: int, room_id: str, phase: str, payload: dict
         await db.commit()
 
 
-async def delete_room_state(guild_id: int, room_id: str) -> None:
-    """廃止済み固定卓の空snapshotを、一回限りのDiscord回収後に削除する。"""
-    async with connect_db() as db:
-        await db.execute(
-            "DELETE FROM room_states WHERE guild_id = ? AND room_id = ?",
-            (guild_id, room_id),
-        )
-        await db.commit()
-
-
 async def load_room_states(guild_id: int) -> dict[str, dict]:
     async with connect_db() as db:
         rows = await db.execute_fetchall(
@@ -2788,8 +2471,8 @@ async def load_room_states(guild_id: int) -> dict[str, dict]:
                 payload = json.loads(payload_text)
                 if not isinstance(payload, dict):
                     raise ValueError("payload is not an object")
-                version = payload.get("_schema_version", 0)
-                if version not in (0, ROOM_STATE_SCHEMA_VERSION):
+                version = payload.get("_schema_version")
+                if version != ROOM_STATE_SCHEMA_VERSION:
                     raise ValueError(f"unsupported schema version: {version}")
                 _validate_room_snapshot(phase, payload)
             except (json.JSONDecodeError, TypeError, ValueError) as e:
@@ -2837,10 +2520,10 @@ async def list_active_recruitments_for_room_ids(
     guild_id: int,
     room_ids: Collection[str],
 ) -> list[dict[str, int | str]]:
-    """未アーカイブの募集を固定卓IDで返す。
+    """未アーカイブの募集を指定した卓IDで返す。
 
-    無効化した固定卓に、移行前の募集や開催済み記録が残ったまま起動すると、
-    Runnerが存在しない卓へ通知・移行を試みるおそれがある。起動前のfail-closed
+    無効固定卓に、未終了の募集や開催済み記録が再混入したまま起動すると、
+    Runnerが存在しない卓へ通知・開催反映を試みるおそれがある。起動前のfail-closed
     検査だけに使い、アーカイブ済みの履歴は対象外とする。
     """
     normalized_room_ids = tuple(sorted({str(room_id) for room_id in room_ids}))
@@ -2871,54 +2554,23 @@ async def save_private_room(
     room_id: str,
     owner_id: int,
     room_name: str,
-    role_name: Optional[str] = None,
     variant_id: str = DEFAULT_VARIANT_ID,
 ) -> None:
     async with connect_db() as db:
         await db.execute(
             "INSERT INTO private_rooms "
-            "(guild_id, room_id, owner_id, room_name, role_name, variant_id, status) "
-            "VALUES (?, ?, ?, ?, ?, ?, 'creating')",
-            (guild_id, room_id, owner_id, room_name, role_name, variant_id),
+            "(guild_id, room_id, owner_id, room_name, variant_id, status) "
+            "VALUES (?, ?, ?, ?, ?, 'creating')",
+            (guild_id, room_id, owner_id, room_name, variant_id),
         )
         await db.commit()
-
-
-async def clear_private_room_access_role(
-    guild_id: int,
-    room_id: str,
-    *,
-    expected_role_id: Optional[int],
-) -> bool:
-    """旧閲覧ロール参照をrole_idの比較付きで解除する。
-
-    ``None`` は「現在もNULLの旧行」にだけ一致する。role_idが
-    同時に別値へ更新された場合は何も変えない。
-    """
-    async with connect_db() as db:
-        await db.execute("BEGIN IMMEDIATE")
-        cursor = await db.execute(
-            "UPDATE private_rooms SET role_id = NULL, role_name = NULL "
-            "WHERE guild_id = ? AND room_id = ? "
-            "AND ((? IS NULL AND role_id IS NULL) OR role_id = ?)",
-            (guild_id, room_id, expected_role_id, expected_role_id),
-        )
-        if cursor.rowcount == 1:
-            # 参加者は募集・ルーム状態が正本。この表は旧閲覧ロール
-            # の再付与journalだったので、参照解除と同じtransactionで捨てる。
-            await db.execute(
-                "DELETE FROM private_room_members WHERE guild_id = ? AND room_id = ?",
-                (guild_id, room_id),
-            )
-        await db.commit()
-        return cursor.rowcount == 1
 
 
 async def load_private_rooms(guild_id: int) -> list[dict]:
     async with connect_db() as db:
         rows = await db.execute_fetchall(
-            "SELECT room_id, owner_id, room_name, role_name, variant_id, "
-            "status, category_id, role_id, last_error "
+            "SELECT room_id, owner_id, room_name, variant_id, status, category_id, "
+            "last_error "
             "FROM private_rooms WHERE guild_id = ?",
             (guild_id,),
         )
@@ -2927,12 +2579,10 @@ async def load_private_rooms(guild_id: int) -> list[dict]:
             "room_id": row[0],
             "owner_id": row[1],
             "room_name": row[2],
-            "role_name": row[3],
-            "variant_id": row[4],
-            "status": row[5],
-            "category_id": row[6],
-            "role_id": row[7],
-            "last_error": row[8],
+            "variant_id": row[3],
+            "status": row[4],
+            "category_id": row[5],
+            "last_error": row[6],
         }
         for row in rows
     ]
@@ -2941,8 +2591,8 @@ async def load_private_rooms(guild_id: int) -> list[dict]:
 async def get_private_room_by_owner(guild_id: int, owner_id: int) -> Optional[dict]:
     async with connect_db() as db:
         rows = await db.execute_fetchall(
-            "SELECT room_id, owner_id, room_name, role_name, variant_id, "
-            "status, category_id, role_id, last_error "
+            "SELECT room_id, owner_id, room_name, variant_id, status, category_id, "
+            "last_error "
             "FROM private_rooms WHERE guild_id = ? AND owner_id = ?",
             (guild_id, owner_id),
         )
@@ -2953,20 +2603,18 @@ async def get_private_room_by_owner(guild_id: int, owner_id: int) -> Optional[di
         "room_id": row[0],
         "owner_id": row[1],
         "room_name": row[2],
-        "role_name": row[3],
-        "variant_id": row[4],
-        "status": row[5],
-        "category_id": row[6],
-        "role_id": row[7],
-        "last_error": row[8],
+        "variant_id": row[3],
+        "status": row[4],
+        "category_id": row[5],
+        "last_error": row[6],
     }
 
 
 async def get_private_room_by_name(guild_id: int, room_name: str) -> Optional[dict]:
     async with connect_db() as db:
         rows = await db.execute_fetchall(
-            "SELECT room_id, owner_id, room_name, role_name, variant_id, "
-            "status, category_id, role_id, last_error "
+            "SELECT room_id, owner_id, room_name, variant_id, status, category_id, "
+            "last_error "
             "FROM private_rooms WHERE guild_id = ? AND room_name = ?",
             (guild_id, room_name),
         )
@@ -2977,12 +2625,10 @@ async def get_private_room_by_name(guild_id: int, room_name: str) -> Optional[di
         "room_id": row[0],
         "owner_id": row[1],
         "room_name": row[2],
-        "role_name": row[3],
-        "variant_id": row[4],
-        "status": row[5],
-        "category_id": row[6],
-        "role_id": row[7],
-        "last_error": row[8],
+        "variant_id": row[3],
+        "status": row[4],
+        "category_id": row[5],
+        "last_error": row[6],
     }
 
 
@@ -3004,7 +2650,6 @@ async def update_private_room_names(
     guild_id: int,
     room_id: str,
     room_name: str,
-    role_name: Optional[str] = None,
 ) -> None:
     """改名intentをDBへ先行記録する。
 
@@ -3013,10 +2658,10 @@ async def update_private_room_names(
     """
     async with connect_db() as db:
         await db.execute(
-            "UPDATE private_rooms SET room_name = ?, role_name = ?, status = 'renaming', "
+            "UPDATE private_rooms SET room_name = ?, status = 'renaming', "
             "last_error = NULL "
             "WHERE guild_id = ? AND room_id = ?",
-            (room_name, role_name, guild_id, room_id),
+            (room_name, guild_id, room_id),
         )
         await db.commit()
 
@@ -3026,19 +2671,15 @@ async def mark_private_room_active(
     room_id: str,
     *,
     category_id: Optional[int],
-    role_id: Optional[int],
 ) -> None:
     """GM名前村を利用可能にする。
 
-    ``role_id=None`` は旧閲覧ロールの削除再試行用IDを保持する。
-    削除完了後のNULL化は ``clear_private_room_access_role`` だけが行う。
     """
     async with connect_db() as db:
         await db.execute(
-            "UPDATE private_rooms SET status = 'active', category_id = ?, "
-            "role_id = COALESCE(?, role_id), last_error = NULL "
+            "UPDATE private_rooms SET status = 'active', category_id = ?, last_error = NULL "
             "WHERE guild_id = ? AND room_id = ?",
-            (category_id, role_id, guild_id, room_id),
+            (category_id, guild_id, room_id),
         )
         await db.commit()
 
@@ -3048,9 +2689,8 @@ async def checkpoint_private_room_asset_ids(
     room_id: str,
     *,
     category_id: Optional[int],
-    role_id: Optional[int],
 ) -> bool:
-    """旧NULL行で確認できたDiscord資産IDを、削除・改名前に固定する。
+    """未保存行で確認できたカテゴリIDを、削除・改名前に固定する。
 
     既に別IDが保存されていた場合は上書きしない。呼出側はFalseならDiscordへ
     副作用を出さず、最新行を読み直す。
@@ -3058,18 +2698,14 @@ async def checkpoint_private_room_asset_ids(
     async with connect_db() as db:
         cursor = await db.execute(
             "UPDATE private_rooms SET "
-            "category_id = COALESCE(category_id, ?), "
-            "role_id = COALESCE(role_id, ?) "
+            "category_id = COALESCE(category_id, ?) "
             "WHERE guild_id = ? AND room_id = ? "
-            "AND (category_id IS NULL OR category_id = ?) "
-            "AND (role_id IS NULL OR role_id = ?)",
+            "AND (category_id IS NULL OR category_id = ?)",
             (
                 category_id,
-                role_id,
                 guild_id,
                 room_id,
                 category_id,
-                role_id,
             ),
         )
         await db.commit()
@@ -3095,10 +2731,6 @@ async def mark_private_room_status(
 
 async def delete_private_room(guild_id: int, room_id: str) -> None:
     async with connect_db() as db:
-        await db.execute(
-            "DELETE FROM private_room_members WHERE guild_id = ? AND room_id = ?",
-            (guild_id, room_id),
-        )
         await db.execute(
             "DELETE FROM private_rooms WHERE guild_id = ? AND room_id = ?",
             (guild_id, room_id),
@@ -3850,21 +3482,10 @@ async def create_recruitment(
     guild_id: int, host_id: int, *, title: str,
     scheduled_at: datetime | str, room_id: str, streaming: bool,
     allowed_ranks: Optional[Collection[str]], note: str = "",
-    variant_id: Optional[str] = None,
+    variant_id: str,
 ) -> int:
-    """卓予約と主催者上限を同じBEGIN IMMEDIATE内で確定して作成する。"""
-    room_definition = ROOM_DEFINITION_MAP.get(room_id)
-    if room_definition is None:
-        if variant_id is None:
-            raise RecruitmentConflict("募集可能な卓を確認できません。")
-        resolved_variant_id = variant_id
-    else:
-        if not room_definition.enabled:
-            raise RecruitmentConflict("この卓は未公開のため募集を作成できません。")
-        resolved_variant_id = (
-            variant_id if variant_id is not None else room_definition.variant_id
-        )
-    variant = get_variant_definition(resolved_variant_id)
+    """名前村の所有権・受付中1件制限・予約を同じtransactionで確定する。"""
+    variant = get_variant_definition(variant_id)
     capacity = int(variant.player_count)
     backup_capacity = int(RECRUITMENT_BACKUP_CAPACITY)
     occupancy_minutes = int(variant.recruitment_occupancy_minutes)
@@ -3877,24 +3498,29 @@ async def create_recruitment(
     )
     async with connect_db() as db:
         await db.execute("BEGIN IMMEDIATE")
-        host_rows = await db.execute_fetchall(
-            "SELECT COUNT(*) FROM recruitments WHERE guild_id = ? AND host_id = ? AND status = ?",
-            (guild_id, host_id, RECRUITMENT_OPEN),
+        private_room_rows = await db.execute_fetchall(
+            "SELECT owner_id, status FROM private_rooms "
+            "WHERE guild_id = ? AND room_id = ?",
+            (guild_id, room_id),
         )
-        if int(host_rows[0][0]) >= RECRUITMENT_MAX_PER_HOST:
+        if not private_room_rows:
             await db.rollback()
-            raise RecruitmentConflict(f"開催前の募集は1人{RECRUITMENT_MAX_PER_HOST}件までです。")
-        # 募集カードとGM村が1対1なのは動的な名前村だけ。固定卓用の旧APIまで
-        # 一律に制限すると、日時の異なる総合卓予約との後方互換を壊す。
-        if room_definition is None:
-            existing_open = await db.execute_fetchall(
-                "SELECT id FROM recruitments WHERE guild_id = ? AND room_id = ? "
-                "AND status = ? LIMIT 1",
-                (guild_id, room_id, RECRUITMENT_OPEN),
-            )
-            if existing_open:
-                await db.rollback()
-                raise RecruitmentConflict("この村には募集中の募集が既にあります。")
+            raise RecruitmentConflict("募集は有効なGM村でのみ作成できます。")
+        owner_id, room_status = private_room_rows[0]
+        if int(owner_id) != host_id:
+            await db.rollback()
+            raise RecruitmentConflict("村主だけがこのGM村の募集を作成できます。")
+        if str(room_status) != "active":
+            await db.rollback()
+            raise RecruitmentConflict("このGM村は利用可能な状態ではありません。")
+        existing_open = await db.execute_fetchall(
+            "SELECT id FROM recruitments WHERE guild_id = ? AND room_id = ? "
+            "AND status = ? LIMIT 1",
+            (guild_id, room_id, RECRUITMENT_OPEN),
+        )
+        if existing_open:
+            await db.rollback()
+            raise RecruitmentConflict("この村には募集中の募集が既にあります。")
         overlaps = await db.execute_fetchall(
             "SELECT id FROM recruitments WHERE guild_id = ? AND room_id = ? "
             "AND status IN (?, ?) "

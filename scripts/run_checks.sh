@@ -21,7 +21,7 @@ echo "== dependency consistency =="
 echo "== unit tests =="
 "$PY" -m unittest discover -s tests
 
-echo "== simulate_games (10 runs) =="
+echo "== simulate_games (10 additional runs / 15 total) =="
 "$PY" simulate_games.py --runs 10
 
 echo "== all checks passed =="

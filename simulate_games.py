@@ -1866,7 +1866,7 @@ async def _run_population_simulation_with_private_temp(
             print(f"winner_counts: {dict(winner_counts)}")
             print(f"average_rating: {avg_rating:.2f}")
             print("rank_distribution:")
-            for _, rank_name, _, _ in config.RANK_TIERS:
+            for rank_name, _emoji, _color in config.RANK_SPECS:
                 count = rank_counts.get(rank_name, 0)
                 pct = count / population_size * 100
                 print(f"  {rank_name}: {count} ({pct:.1f}%)")

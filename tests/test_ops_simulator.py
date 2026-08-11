@@ -145,7 +145,7 @@ class TestFakeDiscordFidelity(unittest.IsolatedAsyncioTestCase):
         self.assertIs(runner.state.lobby_channel, lobby)
         self.assertIs(runner.state.voice_channel, voice)
 
-    async def test_legacy_restricted_active_snapshot_keeps_existing_visibility(self):
+    async def test_missing_public_marker_keeps_existing_restricted_visibility(self):
         """限定中に始まったゲームは、公開設定への更新後もVCを公開しない。"""
         controller = SimpleNamespace(on_channel_message=lambda _message: None)
         guild = FakeGuild(1, "guild", controller)
@@ -166,7 +166,7 @@ class TestFakeDiscordFidelity(unittest.IsolatedAsyncioTestCase):
         lobby = await guild.create_text_channel("参加受付", category=category)
         voice = await guild.create_voice_channel("人狼ゲーム", category=category)
         runner._post_lobby_ui = AsyncMock()
-        # public_log_archive_allowed がない旧snapshotも安全側（限定）として扱う。
+        # public_log_archive_allowed がなくても安全側（限定）として扱う。
         snapshot = {
             "phase": Phase.NIGHT.name,
             "channel_ids": {
@@ -182,8 +182,8 @@ class TestFakeDiscordFidelity(unittest.IsolatedAsyncioTestCase):
         self.assertIs(category.overwrites[guild.default_role.id], restricted)
         self.assertIs(runner.state.voice_channel, voice)
 
-    async def test_legacy_restricted_active_snapshot_without_category_fails_closed(self):
-        """旧限定ゲームの所有カテゴリがないとき、公開カテゴリを作成しない。"""
+    async def test_missing_public_marker_and_category_fails_closed(self):
+        """限定ゲームの所有カテゴリがないとき、公開カテゴリを作成しない。"""
         controller = SimpleNamespace(on_channel_message=lambda _message: None)
         guild = FakeGuild(1, "guild", controller)
         manager = GameCog(SimpleNamespace(managed_guild_id=1))

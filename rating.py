@@ -33,7 +33,6 @@ from config import (
 
 DEFAULT_VARIANT_ID = config_lib.DEFAULT_VARIANT_ID
 DEFAULT_LADDER_ID = config_lib.DEFAULT_LADDER_ID
-LEGACY_NINE_GRANDMASTER_ROLE_NAME = "グランドマスター（9人村）"
 
 
 def ladder_id_for_variant(variant_id: str) -> str:
@@ -87,8 +86,8 @@ def resolve_variant_rating_parameters(
 ) -> dict[str, int]:
     """変種ごとの精算値を検証し、未指定値を確定する。
 
-    呼び出し側が卓定義の値を渡せばそれを優先する。省略時は既存の
-    13人クロストークと同じ値になり、旧APIの挙動を維持する。
+    呼び出し側が卓定義の値を渡せばそれを優先する。省略時は指定変種の
+    現行定義から補う。
     """
     definition = config_lib.get_variant_definition(variant_id)
     defaults = {
@@ -630,10 +629,6 @@ def all_rank_role_names() -> list[str]:
         role_name = special_grandmaster_role_name(str(ladder_id))
         if role_name not in names:
             names.append(role_name)
-    # v0.40以前に自動作成された旧9人GMロールは、新ロールへの移行時だけ
-    # Bot管理ロールとして扱う。新規作成対象には含めない。
-    if LEGACY_NINE_GRANDMASTER_ROLE_NAME not in names:
-        names.append(LEGACY_NINE_GRANDMASTER_ROLE_NAME)
     return names
 
 

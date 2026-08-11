@@ -280,22 +280,11 @@ async def on_ready():
 
             # DB初期化
             from database import (
-                backup_db,
                 get_meta,
                 init_db,
                 set_meta,
             )
 
-            # init_db自身がスキーマmigrationを含む。既存DBは変更前の復旧点を
-            # 必ず作り、バックアップ不能ならmigrationへ入らない。
-            try:
-                pre_migration_backup = await backup_db(label="pre_migration")
-                if pre_migration_backup:
-                    log.info(f"DB変更前バックアップ作成: {pre_migration_backup}")
-            except Exception as e:
-                raise RuntimeError(
-                    "DB変更前のバックアップを作成できないため起動を中止します"
-                ) from e
             await init_db()
             log.info("データベース初期化完了")
 

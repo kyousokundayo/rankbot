@@ -140,18 +140,12 @@ def death_nick(display_name: str, method: str) -> str:
     return f"{display_name[:NICK_MAX_LEN - len(marker)]}{marker}"
 
 
-def _action_subject_id(
-    entry: dict,
-    key: str,
-    label_to_ids: dict[str, list[int]],
-) -> Optional[int]:
-    """新形式のIDを優先し、旧スナップショットは一意な表示名だけ補完する。"""
+def _action_subject_id(entry: dict, key: str) -> Optional[int]:
+    """現行action logの安定IDだけを統計集計に使う。"""
     value = entry.get(f"{key}_id")
     if isinstance(value, int) and not isinstance(value, bool) and value > 0:
         return value
-    label = entry.get(key)
-    candidates = label_to_ids.get(str(label), []) if label else []
-    return candidates[0] if len(candidates) == 1 else None
+    return None
 
 
 def build_game_stats(
@@ -162,22 +156,14 @@ def build_game_stats(
 ) -> tuple[dict, dict[int, dict]]:
     """進行ログから試合統計とプレイヤーごとの死亡記録を組み立てる。
 
-    Discord表示名は重複し得るため、新規ログのactor_id/target_idを正本にする。
-    v0.31から継続中の試合は、表示名が一意な場合だけ旧ログを補完する。
+    Discord表示名は重複・改名し得るため、actor_id/target_idだけを正本にする。
     """
     safe_days = max(0, int(days))
     role_by_id = {int(row["player_id"]): str(row["role"]) for row in players}
-    label_to_ids: dict[str, list[int]] = {}
-    for row in players:
-        label = str(row.get("display_name") or "")
-        if label:
-            label_to_ids.setdefault(label, []).append(int(row["player_id"]))
-
     seer_actions: set[tuple] = set()
     guard_success_days: set[int] = set()
     peaceful_days: set[int] = set()
     night_days: set[int] = set()
-    attack_death_days: set[int] = set()
     death_events: set[tuple] = set()
     death_records: dict[int, dict] = {}
     executions_total = 0
@@ -203,8 +189,8 @@ def build_game_stats(
         if str(entry.get("phase") or "") == Phase.NIGHT.name and day > 0:
             night_days.add(day)
 
-        actor_id = _action_subject_id(entry, "actor", label_to_ids)
-        target_id = _action_subject_id(entry, "target", label_to_ids)
+        actor_id = _action_subject_id(entry, "actor")
+        target_id = _action_subject_id(entry, "target")
         if kind == "占い":
             seer_actions.add((day, actor_id, target_id, detail))
             continue
@@ -251,14 +237,9 @@ def build_game_stats(
             if day == 1 and day1_execution_was_wolf is None:
                 day1_execution_was_wolf = int(is_wolf)
         elif cause == "襲撃":
-            if day > 0:
-                attack_death_days.add(day)
             if day == 1 and night1_kill_had_role is None and role is not None:
                 night1_kill_had_role = int(role != Role.VILLAGER.value)
 
-    # 明示的な「平和」は新規ゲームの正本。v0.31から継続中の旧ログは、
-    # 夜行動が残る日から襲撃死の日を引いて補完する。
-    peaceful_days.update(night_days - attack_death_days)
     seer_wolf_hits = sum(
         1 for _day, _actor, _target, detail in seer_actions
         if "結果=人狼" in detail
@@ -371,7 +352,7 @@ class RoomRunner:
         self._game_views: list[discord.ui.View] = []
 
     def is_private_room(self) -> bool:
-        """GMが作成した名前村か。旧参加ロール列の有無には依存しない。"""
+        """GMが作成した名前村か。保存済みの村主IDで判定する。"""
         return self.room_def.private_owner_id is not None
 
     def uses_manual_static_permissions(self) -> bool:
@@ -412,7 +393,7 @@ class RoomRunner:
         if variant_id not in USER_VISIBLE_VARIANT_IDS:
             return "公開されていないゲーム形式には変更できません。"
         # 募集の参加・取消・開催と同じ manager→room の順で固定し、
-        # 旧定員のrosterを新形式へ移す競合を作らない。
+        # 変更前の定員で確定したrosterを新形式へ持ち込む競合を作らない。
         async with self.manager.recruitment_manager.lock, self.action_lock:
             state = self.state
             if state.phase != Phase.LOBBY or self._is_game_in_progress():
@@ -652,18 +633,18 @@ class RoomRunner:
     # セットアップ
     # ============================================================
 
-    async def _sync_active_gm_named_game_channel_visibility(
+    async def _restore_active_private_room_visibility(
         self,
         guild: discord.Guild,
         channel_ids: dict,
     ) -> None:
-        """進行中の旧GM名前村を、個人制御を残したまま公開基準へ移行する。
+        """進行中GM村の公開観戦権限を、個人制御を残したまま復元する。
 
         復元処理が完了した後、保存済みIDでBot所有を確認できる進行中の
         #昼/#霊界と、現在のカテゴリ・受付・VCを公開基準へ収束させる。
-        生存者の霊界denyや生存ロールの書込許可は保持し、呼出元が戻った後に
-        旧閲覧ロールを削除できる状態にする。復元中にゲームが終了した場合は、
-        まだ元カテゴリにある終了チャンネルも退避まで読み取り専用で公開する。
+        生存者の霊界denyや生存ロールの書込許可は保持する。復元中にゲームが
+        終了した場合は、まだ元カテゴリにある終了チャンネルも退避まで
+        読み取り専用で公開する。
         """
         if not self.is_private_room():
             return
@@ -677,17 +658,16 @@ class RoomRunner:
                         channel,
                         target,
                         desired[target],
-                        reason="GM名前村を公開観戦型へ移行",
+                        reason="GM村の公開観戦権限を復元",
                     )
                 except (discord.Forbidden, discord.HTTPException) as error:
                     raise RuntimeError(
                         f"{self.room_def.name}/{getattr(channel, 'name', 'カテゴリ')} "
-                        "を公開観戦型へ移行できません"
+                        "の公開観戦権限を復元できません"
                     ) from error
 
-        # カテゴリを先に公開すると、子チャンネルが旧カテゴリ権限を継承していた
-        # 場合に霊界denyやVC発言禁止より先に見える。子を安全な完成形へ収束させ、
-        # 最後にカテゴリを公開する。
+        # カテゴリを先に公開すると、子チャンネルの個別制御より先に見える。
+        # 子を安全な完成形へ収束させ、最後にカテゴリの公開観戦権限を復元する。
         lobby = self.state.lobby_channel
         if lobby is not None:
             await sync_targets(
@@ -761,11 +741,11 @@ class RoomRunner:
             snapshot is not None
             and snapshot.get("phase") not in (Phase.LOBBY.name, Phase.GAME_OVER.name)
         )
-        # 互換キー名はpublic_log_archive_allowedだが、ここでは進行中カテゴリ・VCの
-        # アクセス境界を守るためだけに使う。終了ログはこの値にかかわらず全村で
-        # 公開ログへ退避する。値を持たない旧snapshotは限定卓だった可能性を否定
-        # できないため、固定卓は保存済みカテゴリのアクセス境界を維持する。
-        # GM名前村は公開観戦型へ統一したため、旧snapshotでも現在の公開基準へ移す。
+        # public_log_archive_allowedは、ここでは進行中カテゴリ・VCのアクセス境界を
+        # 守るためだけに使う。終了ログはこの値にかかわらず全村で公開ログへ退避する。
+        # DB境界では現行snapshotの必須キーだが、直接呼出しで欠損しても公開側へ
+        # 倒さない。固定卓は保存済みカテゴリのアクセス境界を維持する。
+        # GM名前村は公開観戦型なので、復元完了後に現在の公開基準へ収束させる。
         preserve_snapshot_access_boundary = (
             active_snapshot
             and not self.is_private_room()
@@ -819,10 +799,10 @@ class RoomRunner:
                 self.room_def.name,
             )
         elif active_snapshot and self.is_private_room():
-            # 旧GM村はrestore側で霊界の生存者denyとVC発言禁止を確定してから、
-            # 子チャンネル→カテゴリの順で公開する。ここで先に公開しない。
+            # 進行中GM村はrestore側で霊界の生存者denyとVC発言禁止を確定してから、
+            # 子チャンネル→カテゴリの順で公開観戦権限を復元する。ここでは先に戻さない。
             log.info(
-                "進行中GM名前村の公開移行を復元完了まで保留します (%s)",
+                "進行中GM村の公開観戦権限復元を復元完了まで保留します (%s)",
                 self.room_def.name,
             )
         else:
@@ -930,8 +910,8 @@ class RoomRunner:
         # 前回クラッシュ等で残ったVCの一時権限を掃除する。
         if not active_snapshot:
             if self.uses_manual_static_permissions():
-                # 手動値の所有記録がある項目だけを三値へ戻す。旧snapshotで
-                # 記録がない個別overwriteは、Bot所有と断定できないため触らない。
+                # 手動値の所有記録がある項目だけを三値へ戻す。記録がない
+                # 個別overwriteは、Bot所有と断定できないため触らない。
                 raw_snapshot = snapshot or {}
                 if raw_snapshot.get("vc_default_permissions_captured") is True:
                     default_ow = vc.overwrites_for(guild.default_role)
@@ -1056,8 +1036,11 @@ class RoomRunner:
         marker_role_name: Optional[str] = None,
     ) -> set[int]:
         """非active復元で解除してよいBot所有muteだけを返す。"""
+        if snapshot.get("mute_marker_enabled") is not True:
+            # 現行方式の所有証拠がなければ、手動muteを誤解除しない。
+            return set()
         owned = set(snapshot.get("bot_muted_ids", []))
-        if snapshot.get("mute_marker_enabled") and marker_role_name:
+        if marker_role_name:
             member_by_id = {member.id: member for member in members}
             marker_holders = {
                 member.id for member in members
@@ -1074,28 +1057,14 @@ class RoomRunner:
             }
             owned.update(marker_holders)
         intent_ids = set(snapshot.get("bot_mute_intent_ids", []))
-        expected_nicks = {
-            int(row["user_id"]): f"{int(row.get('number', 0)):02d}.{row.get('base_name') or row.get('original_nickname') or ''}"[:32]
-            for row in snapshot.get("players", [])
-            if row.get("user_id") is not None and row.get("number")
-        }
         for member in members:
             voice = getattr(member, "voice", None)
             if member.id not in intent_ids or voice is None or not voice.mute:
                 continue
-            if snapshot.get("mute_marker_enabled"):
-                if marker_role_name and any(
-                    getattr(role, "name", None) == marker_role_name
-                    for role in getattr(member, "roles", [])
-                ):
-                    owned.add(member.id)
-                else:
-                    log.warning(f"非active復元時の手動mute候補を保護: {member.display_name}")
-                continue
-            expected = expected_nicks.get(member.id, "観戦者")
-            if member.nick == expected:
-                # nick+mute同一PATCHの成功が確認できる場合だけ
-                # Bot所有として残留muteを解除する。
+            if marker_role_name and any(
+                getattr(role, "name", None) == marker_role_name
+                for role in getattr(member, "roles", [])
+            ):
                 owned.add(member.id)
             else:
                 log.warning(f"非active復元時の手動mute候補を保護: {member.display_name}")
@@ -1621,9 +1590,8 @@ class RoomRunner:
         state.gm_id = payload.get("gm_id")
         state.game_run_id = payload.get("game_run_id") or secrets.token_hex(16)
         state.recruitment_id = payload.get("recruitment_id")
-        # 互換キー名はpublic_log_archive_allowedだが、現在は進行中カテゴリ・VCの
-        # 開始時アクセス境界を復元するためだけに保持する。終了ログはこの値に
-        # かかわらず全村で公開ログへ退避する。
+        # 進行中カテゴリ・VCの開始時アクセス境界を復元するために保持する。
+        # 終了ログはこの値にかかわらず全村で公開ログへ退避する。
         state.public_log_archive_allowed = (
             payload.get("public_log_archive_allowed") is True
             and self._configured_public_access_boundary()
@@ -1910,9 +1878,9 @@ class RoomRunner:
             self.is_private_room()
             and (state.village_channel is None or state.spirit_channel is None)
         ):
-            # 旧限定GM村の復元中に新しい公開チャンネルを作ると、生存者の
+            # 進行中GM村の復元中に新しい公開チャンネルを作ると、生存者の
             # 霊界denyを付け終えるまで閲覧できる隙間が生じる。欠損時は
-            # 勝手に作り直さず、状態と旧閲覧ロールを保持したまま停止する。
+            # 勝手に作り直さず、保存状態を保ったまま停止する。
             raise StateDurabilityError(
                 "進行中GM名前村の #昼 / #霊界 が見つかりません"
             )
@@ -2321,8 +2289,8 @@ class RoomRunner:
             return
         state.guild = guild
         state.game_run_id = secrets.token_hex(16)
-        # 互換キー名はpublic_log_archive_allowedだが、進行中カテゴリ・VCの
-        # 開始時アクセス境界を再起動後も守るために保存する。終了ログは全村で
+        # 進行中カテゴリ・VCの開始時アクセス境界を再起動後も守るために保存する。
+        # 終了ログは全村で
         # 共通の公開ログへ退避するため、この値では制限しない。
         state.public_log_archive_allowed = (
             self._configured_public_access_boundary()
@@ -2861,14 +2829,9 @@ class RoomRunner:
         if seer and not state.initial_seer_result_sent:
             random_white = state.get_player(state.initial_seer_target)
             if random_white is None:
-                # 旧スナップショット互換。選ぶ場合も送信前に保存する。
-                non_wolves = self._initial_seer_white_candidates(seer)
-                if not non_wolves:
-                    failed.append(seer.member)
-                    return failed
-                random_white = secrets.choice(non_wolves)
-                state.initial_seer_target = random_white.user_id
-                await self._persist_room_state()
+                raise StateDurabilityError(
+                    "初日占い対象が開始checkpointにありません"
+                )
             try:
                 await self._discord_api_call(
                     seer.member.send,
@@ -3050,7 +3013,7 @@ class RoomRunner:
                 await self._night_phase()
 
                 # 襲撃処理
-                killed = await self._process_night()
+                await self._process_night()
                 winner = state.check_win()
                 if winner:
                     await self._end_game(winner)
@@ -4474,11 +4437,8 @@ class RoomRunner:
             if (
                 vs_after is not None
                 and vs_after.mute
-                and (
-                    self._has_own_mute_marker(player.member)
-                    if state.mute_marker_enabled
-                    else player.member.nick == edit_kwargs["nick"]
-                )
+                and state.mute_marker_enabled
+                and self._has_own_mute_marker(player.member)
             ):
                 state.bot_muted_ids.add(player.user_id)
 
@@ -4633,8 +4593,8 @@ class RoomRunner:
             state.morning_ready_event.clear()
             state.night_resolved = False
         elif self._pending_guard_player() is not None:
-            # 旧スナップショットで朝が確定済みでも、未護衛なら解決せず
-            # 同じ夜のDM/朝パネルを再掲示する。無効な護衛先もここで外す。
+            # 朝が確定済みでも、護衛先が無効なら解決せず同じ夜の
+            # DM/朝パネルを再掲示する。
             await self._reopen_night_for_required_guard()
         elif state.morning_confirmed:
             state.morning_ready_event.set()
@@ -4837,8 +4797,8 @@ class RoomRunner:
 
         狩人だけは護衛放棄不可で、朝宣言やGMの強制夜明けでも
         有効な ``guard_target`` が無いまま夜を解決してはならない。
-        旧スナップショットの ``-1`` や、GM除外後に死亡した対象なども
-        未確定として扱う。占い・襲撃の既存の未行動スキップとは意図的に分ける。
+        GM除外後に死亡した対象なども未確定として扱う。
+        占い・襲撃の既存の未行動スキップとは意図的に分ける。
         """
         state = self.state
         guard = next(
@@ -4852,8 +4812,7 @@ class RoomRunner:
     async def _reopen_night_for_required_guard(self) -> Optional[Player]:
         """未護衛の夜明け確定を取り消し、狩人の再選択を可能にする。
 
-        再起動前の旧版で ``morning_confirmed=True`` のまま保存された場合や、
-        GM除外で護衛先が無効になった場合にも、夜を解決せず同じ夜のUIを
+        GM除外などで護衛先が無効になった場合にも、夜を解決せず同じ夜のUIを
         再掲示するために使う。ほかの役職の未行動スキップには影響しない。
         """
         state = self.state
@@ -5545,8 +5504,8 @@ class RoomRunner:
         if state.night_resolved:
             return None
 
-        # 通常のUI経路だけでなく、旧スナップショットや直接のEvent操作からも
-        # 未護衛のまま夜を解決させない。状態をdurableに戻してから同じ夜を
+        # 通常のUI経路だけでなく、直接のEvent操作からも未護衛のまま
+        # 夜を解決させない。状態をdurableに戻してから同じ夜を
         # 再掲示するので、再起動復元経路でも護衛放棄は発生しない。
         if self._pending_guard_player() is not None:
             await self._reopen_night_for_required_guard()
@@ -6685,8 +6644,8 @@ class RoomRunner:
             async def finish_night(*, resume_existing: bool) -> bool:
                 """夜を解決して朝へ進む。勝敗確定ならTrue。"""
                 if not state.night_resolved:
-                    # 旧版のスナップショットで夜明けが確定済みでも、狩人の
-                    # 護衛が未確定/無効なら必ず確定を解除してUIを再掲示する。
+                    # 夜明けが確定済みでも、狩人の護衛が未確定/無効なら
+                    # 必ず確定を解除してUIを再掲示する。
                     # これを先に行わないと ``morning_confirmed=True`` の経路が
                     # _night_phase を飛ばして未護衛のまま解決してしまう。
                     if self._pending_guard_player() is not None:
@@ -7246,13 +7205,12 @@ class RoomRunner:
         )
 
     async def _enable_mute_markers(self) -> discord.Role:
-        """旧snapshotの所有記録をマーカー方式へ一度だけ移行する。
-
-        旧bot_muted_idsはすでにdurableな所有記録なので、この移行では
-        rolesだけを付与しても手動muteを新たに奪うことはない。
-        enabledのcheckpointは全員への付与後に行う。
-        """
+        """現行ゲームで有効化済みのmute所有マーカーを取得・復旧する。"""
         state = self.state
+        if not state.mute_marker_enabled:
+            raise StateDurabilityError(
+                "現行ゲームのsnapshotにmute所有マーカー情報がありません"
+            )
         guild = state.guild
         existing_marker = (
             discord.utils.get(guild.roles, name=self._mute_marker_role_name())
@@ -7261,34 +7219,39 @@ class RoomRunner:
         marker = await self._ensure_mute_marker_role()
         if marker is None:
             raise StateDurabilityError("mute所有マーカーを確保できません")
-        if state.mute_marker_enabled and existing_marker is not None:
+        if existing_marker is not None or guild is None:
             return marker
 
-        if guild is not None:
-            for member_id in list(state.bot_muted_ids):
-                member = guild.get_member(member_id)
-                if member is None or self._has_own_mute_marker(member):
-                    continue
-                try:
-                    await self._paced_discord_api_call(
-                        member.edit,
-                        roles=self._roles_with_mute_marker(member, marker, present=True),
-                        reason="人狼: 旧mute所有記録のマーカー移行",
-                    )
-                except (discord.Forbidden, discord.HTTPException) as e:
-                    await self._stop_for_durability_error("mute所有マーカー移行", e)
-                    raise StateDurabilityError(
-                        f"mute所有マーカーを付与できません: {member_id}"
-                    ) from e
-
-        old_enabled = state.mute_marker_enabled
-        state.mute_marker_enabled = True
-        try:
-            await self._persist_room_state()
-        except Exception as e:
-            state.mute_marker_enabled = old_enabled
-            await self._stop_for_durability_error("muteマーカー方式のcheckpoint", e)
-            raise StateDurabilityError("muteマーカー方式を保存できません") from e
+        # 現行snapshotのままDiscord側のマーカーロールだけが削除された場合、
+        # DBに残るBot所有記録を手動muteと誤認して捨てない。接続中なら実際に
+        # muteの人だけ、切断中なら状態を確認できないため所有記録を保つ形で、
+        # 再作成したロールを付け直す。
+        for member_id in list(state.bot_muted_ids):
+            member = guild.get_member(member_id)
+            if member is None or self._has_own_mute_marker(member):
+                continue
+            voice = getattr(member, "voice", None)
+            if voice is not None and not voice.mute:
+                continue
+            edit_kwargs: dict = {
+                "roles": self._roles_with_mute_marker(
+                    member, marker, present=True,
+                ),
+            }
+            if voice is not None:
+                # muteと所有マーカーを同じPATCHで確定し、途中状態を作らない。
+                edit_kwargs["mute"] = True
+            try:
+                await self._paced_discord_api_call(
+                    member.edit,
+                    **edit_kwargs,
+                    reason="人狼: 消失したmute所有マーカーの復旧",
+                )
+            except (discord.Forbidden, discord.HTTPException) as e:
+                await self._stop_for_durability_error("mute所有マーカー復旧", e)
+                raise StateDurabilityError(
+                    f"mute所有マーカーを復旧できません: {member_id}"
+                ) from e
         return marker
 
     async def _reconcile_mute_marker_ownership(self) -> None:
@@ -7513,8 +7476,7 @@ class RoomRunner:
 
         marker: Optional[discord.Role] = None
         if state.guild is not None:
-            # 新規ゲームは開始時に有効化済み。旧snapshotだけ
-            # ここで移行し、その後のmute/unmuteは全て同一PATCHで
+            # ゲーム開始時に有効化済み。mute/unmuteは全て同一PATCHで
             # マーカーを付け外しする。
             marker = await self._enable_mute_markers()
 
@@ -7612,15 +7574,9 @@ class RoomRunner:
             if vs is None or not vs.mute:
                 # 未実行。意図は残し、次の_sync_server_mutesで実行する。
                 continue
-            player = state.get_player(user_id)
-            expected_nick = player.display_name[:32] if player else "観戦者"
             if state.mute_marker_enabled and self._has_own_mute_marker(member):
                 # mute+専用ロールを同一PATCHで送っているため、
                 # ニックネームより強い一意な成功証拠になる。
-                state.bot_muted_ids.add(user_id)
-            elif not state.mute_marker_enabled and member.nick == expected_nick:
-                # nick+muteを1PATCHで送ったため、期待nickも反映済みなら
-                # BotのPATCH成功と判定できる。
                 state.bot_muted_ids.add(user_id)
             else:
                 # muteだけが付いている場合は手動muteの可能性がある。
@@ -7956,7 +7912,7 @@ class RoomRunner:
             try:
                 await self._persist_room_state()
             except Exception as e:
-                # Discord側は既に開始前へ戻っている。旧snapshotの復元処理は
+                # Discord側は既に開始前へ戻っている。次回の復元処理は
                 # 同じ値を再適用するだけなので、終了処理全体は止めない。
                 log.exception("VC手動権限の復元済み状態を保存できません: %s", e)
 
@@ -8630,7 +8586,7 @@ class RoomRunner:
     async def on_member_remove(self, member: discord.Member) -> None:
         # ロビー中の退出: GM枠/参加枠を解放してUIを更新する
         # (これがないと、退出した人が GM/参加者のままロックされ
-        #  ボット再起動以外で復旧できなくなる)。募集transferと同じlockで
+        #  ボット再起動以外で復旧できなくなる)。募集の開催反映と同じlockで
         # 再判定し、確定rosterを並行して欠員状態へ書き換えない。
         async with self.action_lock:
             state = self.state

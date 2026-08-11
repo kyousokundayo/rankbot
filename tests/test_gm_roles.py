@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import database
@@ -182,35 +182,50 @@ class GmStaffRoleTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertLess(gm_role.position, guild.role_named(TEMP_GM_ROLE_NAME).position)
 
-    async def test_legacy_access_role_cleanup_requires_stable_id_and_name(self) -> None:
-        guild = _Guild([("@everyone", 0), ("旧GM村", 1)])
-        guild.default_role = guild.role_named("@everyone")
-        legacy_role = guild.role_named("旧GM村")
-        assert legacy_role is not None
-        legacy_role.delete = AsyncMock()
-        guild.get_role = lambda role_id: legacy_role if role_id == legacy_role.id else None
-        manager = self._manager()
-        row = {
-            "room_id": "private_10",
-            "role_id": legacy_role.id,
-            "role_name": "旧GM村",
-        }
+    async def test_gm_hub_does_not_adopt_legacy_names_without_stored_ids(self) -> None:
+        """同名の手動カテゴリを、所有証明なしに改名・再利用しない。"""
+        legacy_category = MagicMock(spec=discord.CategoryChannel)
+        legacy_category.name = "GMロール説明"
+        legacy_category.edit = AsyncMock()
+        legacy_channel = MagicMock(spec=discord.TextChannel)
+        legacy_channel.name = "専用村作成"
+        legacy_channel.category = legacy_category
+        legacy_channel.edit = AsyncMock()
 
-        with patch.object(
-            database, "load_private_rooms", AsyncMock(return_value=[row]),
-        ), patch.object(
-            database,
-            "clear_private_room_access_role",
-            AsyncMock(return_value=True),
-        ) as clear_role:
-            await manager._cleanup_legacy_private_room_access_roles(
-                guild, "private_10",
-            )
-
-        legacy_role.delete.assert_awaited_once()
-        clear_role.assert_awaited_once_with(
-            guild.id, "private_10", expected_role_id=legacy_role.id,
+        new_category = MagicMock(spec=discord.CategoryChannel)
+        new_category.id = 100
+        new_category.name = "GM"
+        new_channel = MagicMock(spec=discord.TextChannel)
+        new_channel.id = 101
+        new_channel.name = "村作成"
+        new_channel.category = new_category
+        new_channel.send = AsyncMock()
+        default_role = object()
+        guild = SimpleNamespace(
+            id=1,
+            roles=[],
+            categories=[legacy_category],
+            text_channels=[legacy_channel],
+            default_role=default_role,
+            me=object(),
+            get_channel=lambda _channel_id: None,
+            create_category=AsyncMock(return_value=new_category),
+            create_text_channel=AsyncMock(return_value=new_channel),
         )
+        manager = self._manager()
+        manager._set_permission_if_changed = AsyncMock()
+        manager._purge_bot_messages = AsyncMock()
+
+        with patch.object(database, "get_meta", AsyncMock(return_value=None)), patch.object(
+            database, "set_meta", AsyncMock()
+        ):
+            result = await manager._ensure_gm_info_channel(guild)
+
+        self.assertIs(result, new_channel)
+        guild.create_category.assert_awaited_once()
+        guild.create_text_channel.assert_awaited_once()
+        legacy_category.edit.assert_not_awaited()
+        legacy_channel.edit.assert_not_awaited()
 
     def test_gm_and_temp_gm_are_both_private_room_creator_roles(self) -> None:
         manager = self._manager()

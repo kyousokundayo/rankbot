@@ -502,8 +502,8 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(runner.state.morning_confirmed)
                 self.assertFalse(runner.state.morning_ready_event.is_set())
 
-    async def test_v9_legacy_morning_confirmation_reopens_before_unprotected_night_resolves(self) -> None:
-        """旧snapshotのmorning_confirmedでも、未護衛のまま解決しない。"""
+    async def test_v9_confirmed_morning_reopens_if_required_guard_is_missing(self) -> None:
+        """不整合なmorning_confirmedでも、未護衛のまま解決しない。"""
         for variant_id in ("v9_cross", "v9_turn"):
             with self.subTest(variant_id=variant_id):
                 runner = make_runner(variant_id)
@@ -936,7 +936,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         """
         runner = make_runner()
         wolf = add_player(runner, 1, Role.WEREWOLF)
-        other_wolf = add_player(runner, 2, Role.WEREWOLF)
+        add_player(runner, 2, Role.WEREWOLF)
         victim = add_player(runner, 3)
         runner.refresh_wolf_dm_displays = AsyncMock()
         runner._relay_to_wolves = AsyncMock()
@@ -1640,8 +1640,8 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(restored.state.public_log_archive_allowed)
         self.assertTrue(restored._can_archive_to_public_log())
 
-    async def test_legacy_snapshot_keeps_access_marker_but_archives_log(self) -> None:
-        """旧snapshotの閲覧境界は安全側へ倒しつつ、終了ログは公開する。"""
+    async def test_missing_access_marker_stays_safe_but_archives_log(self) -> None:
+        """欠損した閲覧境界は安全側へ倒しつつ、終了ログは公開する。"""
         runner = make_runner()
         runner.state.public_log_archive_allowed = True
         runner._delete_alive_role = AsyncMock()
@@ -1898,6 +1898,38 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         await recovered._reconcile_mute_marker_ownership()
         self.assertIn(member.id, recovered.state.bot_muted_ids)
 
+    async def test_deleted_mute_marker_role_is_recreated_for_current_owned_mute(self) -> None:
+        runner = make_runner()
+        channel = SimpleNamespace(id=10)
+        member = FakeMember(1)
+        everyone = FakeRole(1, "@everyone", default=True)
+        marker = FakeRole(2, runner._mute_marker_role_name())
+        member.roles = [everyone]
+        member.voice = FakeVoiceState(mute=True, channel=channel)
+        guild = FakeGuild([member], [everyone])
+        guild.create_role = AsyncMock(side_effect=lambda **_kwargs: marker)
+        member.guild = guild
+        runner.state.guild = guild
+        runner.state.voice_channel = SimpleNamespace(id=10, members=[member])
+        runner.state.mute_marker_enabled = True
+        runner.state.bot_muted_ids = {member.id}
+
+        async def apply_patch(**kwargs) -> None:
+            member.voice.mute = kwargs["mute"]
+            member.roles = [everyone, *kwargs["roles"]]
+
+        member.edit = AsyncMock(side_effect=apply_patch)
+
+        restored = await runner._enable_mute_markers()
+        await runner._reconcile_mute_marker_ownership()
+
+        self.assertIs(restored, marker)
+        guild.create_role.assert_awaited_once()
+        member.edit.assert_awaited_once()
+        self.assertTrue(member.edit.await_args.kwargs["mute"])
+        self.assertIn(marker, member.roles)
+        self.assertIn(member.id, runner.state.bot_muted_ids)
+
     async def test_unmute_marker_removal_wins_over_stale_checkpoint(self) -> None:
         runner = make_runner()
         channel = SimpleNamespace(id=10)
@@ -1993,6 +2025,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         player.member.guild = guild
         runner.state.guild = guild
         runner.state.voice_channel = SimpleNamespace(id=channel.id, members=[player.member])
+        runner.state.mute_marker_enabled = True
         denied = discord.Forbidden(
             SimpleNamespace(status=403, reason="Forbidden", headers={}), "denied"
         )
@@ -2443,7 +2476,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner._teardown_game_roles_and_perms.assert_awaited_once()
         self.assertGreaterEqual(calls, 4)
 
-    async def test_nonactive_mute_intent_only_promotes_same_patch_evidence(self) -> None:
+    async def test_nonactive_snapshot_without_marker_never_claims_mute_ownership(self) -> None:
         confirmed = FakeMember(1)
         confirmed.nick = "01.confirmed"
         confirmed.voice = FakeVoiceState(mute=True, channel=SimpleNamespace(id=1))
@@ -2463,8 +2496,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
             snapshot, [confirmed, manual]
         )
 
-        self.assertEqual(owned, {1, 9})
-        self.assertNotIn(2, owned)
+        self.assertEqual(owned, set())
 
     async def test_nonactive_mutes_cover_guild_and_protect_other_active_vc(self) -> None:
         runner = make_runner()

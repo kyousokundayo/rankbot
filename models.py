@@ -108,9 +108,8 @@ class GameState:
         self.game_run_id: str = ""
         # 募集経由で組まれたゲームだけ設定。直接ロビー参加はNone。
         self.recruitment_id: Optional[int] = None
-        # 互換キー名はpublic_log_archive_allowedだが、現在は開始時にカテゴリ/VCの
-        # 閲覧境界が一般公開だったかを表す。設定変更後の再起動中もゲーム中の
-        # アクセス境界を保つためsnapshotへ保存し、旧snapshotはFalseとして扱う。
+        # 開始時にカテゴリ/VCの閲覧境界が一般公開だったかを表す。
+        # 設定変更後の再起動中もゲーム中のアクセス境界を保つためsnapshotへ保存する。
         # 終了ログはこの値に関係なく、全村で共通の公開ログへ退避する。
         self.public_log_archive_allowed: bool = False
         # 静的権限を手動管理する卓では、ゲーム中だけVCの発言/内蔵チャットを
@@ -219,7 +218,7 @@ class GameState:
         self.guard_previous: Optional[int] = None
 
         # 進行ログ: 役職の行動・投票・死亡を発生順に積む。
-        # 終了時に #参加受付 へ貼って、二重実行などの不具合を追えるようにする。
+        # 終了時に #昼 へ貼って、二重実行などの不具合を追えるようにする。
         # 拒否された操作もここへ残す (弾けていることの証跡になる)。
         self.action_log: list[dict] = []
 

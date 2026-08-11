@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -185,6 +186,16 @@ class HelpAndRuleEmbedTest(unittest.TestCase):
         self.assertIn("役職確認を締切", fields["GMの操作"])
         self.assertIn("全村", fields["終わった試合を読み返す"])
         self.assertIn("書き込みはできません", fields["終わった試合を読み返す"])
+
+    def test_release_version_is_consistent_across_current_documents(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        spec = (root / "SPEC.md").read_text(encoding="utf-8")
+        changelog = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+
+        self.assertIn(f"現在のバージョン: **{BOT_VERSION}**", readme)
+        self.assertIn(f"対応Bot: **{BOT_VERSION}**", spec)
+        self.assertIn(f"## {BOT_VERSION}", changelog)
 
     def test_vote_help_explains_timeout_instead_of_claiming_no_abstention(self) -> None:
         rule_embed = build_rule_embeds()[0]

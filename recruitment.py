@@ -1,4 +1,4 @@
-"""数日先の募集を既存の即時ロビーへ安全に移す予約層。"""
+"""GM名前村の募集・予約・開催反映を安全に管理する。"""
 from __future__ import annotations
 
 import asyncio
@@ -17,7 +17,6 @@ import rating as rating_lib
 from config import (
     CH_LOBBY,
     CH_OPERATIONS,
-    CH_RECRUITMENT,
     OPERATIONS_CATEGORY_NAME,
     OPERATIONS_STAFF_ROLE_NAMES,
     PLAYER_BLOCK_LIMIT,
@@ -25,7 +24,6 @@ from config import (
     PRIVATE_ROOM_CREATOR_ROLE_NAMES,
     RECRUITMENT_CONTACT_COOLDOWN_SECONDS,
     RECRUITMENT_IMMEDIATE_LEAD_MINUTES,
-    RECRUITMENT_DISABLED_ROOM_IDS,
     RECRUITMENT_MAX_DAYS_AHEAD,
     RECRUITMENT_NOTIFICATION_WINDOW_MINUTES,
     RECRUITMENT_RANK_OPTIONS,
@@ -151,12 +149,11 @@ class RecruitmentSnapshotMismatch(RuntimeError):
 
 
 def _recruitment_is_disabled(row: dict) -> bool:
-    """廃止固定卓または非公開変種の古い募集導線をfail-closedにする。"""
+    """無効固定卓または非公開変種の募集をfail-closedにする。"""
     room_id = str(row.get("room_id") or "")
     static_room = ROOM_DEFINITION_MAP.get(room_id)
     return (
-        room_id in RECRUITMENT_DISABLED_ROOM_IDS
-        or (static_room is not None and not getattr(static_room, "enabled", True))
+        (static_room is not None and not getattr(static_room, "enabled", True))
         or str(row.get("variant_id") or "") not in USER_VISIBLE_VARIANT_IDS
     )
 
@@ -527,34 +524,6 @@ class RecruitmentManager:
             return
         self._role_pinged_recruitment_ids.add(recruitment_id)
 
-    async def _retire_legacy_public_channel(self, guild: discord.Guild) -> None:
-        """旧 #募集 を、保存済みIDが一致する場合だけ回収する。
-
-        名前だけで同名の手動チャンネルを削除しない。旧実装は作成時にIDを
-        ``bot_meta`` へ保存していたため、そのIDと旧名の両方が一致するものだけを
-        Bot所有資産として扱う。
-        """
-        stored = await database.get_meta(guild.id, "recruitment_channel_id")
-        if not stored or not str(stored).isdigit():
-            return
-        channel = guild.get_channel(int(stored))
-        if channel is None:
-            await database.set_meta(guild.id, "recruitment_channel_id", "")
-            return
-        if not isinstance(channel, discord.TextChannel) or channel.name != CH_RECRUITMENT:
-            log.warning(
-                "旧#募集の保存IDが別チャンネルを指すため削除しません: %s", stored
-            )
-            return
-        try:
-            await channel.delete(reason="募集カードを各GM村の参加受付へ統合")
-        except (discord.Forbidden, discord.HTTPException) as exc:
-            log.error("旧#募集を削除できません: %s", exc)
-            return
-        await database.set_meta(guild.id, "recruitment_channel_id", "")
-        await database.set_meta(guild.id, "recruitment_home_message_id", "")
-        log.info("旧#募集を削除し、GM村の#参加受付へ募集導線を統合しました")
-
     async def _ensure_operations_channel(
         self, guild: discord.Guild,
     ) -> Optional[discord.TextChannel]:
@@ -674,22 +643,15 @@ class RecruitmentManager:
 
         for row in await database.list_open_recruitments(guild.id):
             room = self._room_for_row(row)
-            if (
-                _recruitment_is_disabled(row)
-                or room is None
-                or not room.is_private_room()
-            ):
-                log.warning(
-                    "旧固定卓の公開募集をアーカイブします: %s/%s",
-                    row["id"], row["room_id"],
-                )
-                await database.set_recruitment_status(
-                    row["id"], database.RECRUITMENT_ARCHIVED,
-                )
-                await database.clear_recruitment_message_id(row["id"])
+            if _recruitment_is_disabled(row):
+                await self._remove_hidden_recruitment_message(row)
                 continue
+            if room is None or not room.is_private_room():
+                raise RuntimeError(
+                    "未終了募集のGM名前村を復元できません: "
+                    f"募集#{row['id']}/{row['room_id']}"
+                )
             await self.ensure_recruitment_message(guild, row)
-        await self._retire_legacy_public_channel(guild)
 
     async def _recover_held_recruitment(
         self, guild: discord.Guild, row: dict,
@@ -925,7 +887,7 @@ class RecruitmentManager:
     async def _cleanup_archived_recruitment_locked(
         self, guild: discord.Guild, row: dict,
     ) -> None:
-        """manager lock保持中に、旧募集だけを安全に回収する。"""
+        """manager lock保持中に、終了済み募集だけを安全に回収する。"""
         room = self._room_for_row(row)
         if room is None or not room.is_private_room():
             await database.clear_recruitment_message_id(int(row["id"]))
@@ -1008,7 +970,7 @@ class RecruitmentManager:
             value="\n".join(_display_name(guild, uid) for uid in backups) or "なし",
             inline=False,
         )
-        gm_text = _display_name(guild, row["gm_id"]) if row["gm_id"] else "未登録（移行時は主催者がGM）"
+        gm_text = _display_name(guild, row["gm_id"]) if row["gm_id"] else "未登録（開催時は主催者がGM）"
         embed.add_field(name="GM", value=gm_text, inline=False)
         embed.add_field(
             name="参加条件",
@@ -1084,7 +1046,7 @@ class RecruitmentManager:
 
         段階導入中へ戻した直後は、Discord APIの一時失敗で古いカード/Viewが
         数分残ることがある。表示を隠すだけでは古いボタンを押せるため、参加・
-        GM・主催者操作・移行のすべてで同じ境界を通す。
+        GM・主催者操作・開催反映のすべてで同じ境界を通す。
         """
         if _recruitment_is_disabled(row):
             return f"この卓は段階導入中のため{action}できません。"
@@ -1146,7 +1108,7 @@ class RecruitmentManager:
                 _recruitment_snapshot(row, self.game_cog)
             )
         except RecruitmentSnapshotMismatch as exc:
-            log.error("募集移行をsnapshot不整合で抑止 (%s): %s", row["id"], exc)
+            log.error("募集の開催反映をsnapshot不整合で抑止 (%s): %s", row["id"], exc)
             return str(exc)
         room = self.game_cog.rooms.get(row["room_id"])
         if room is None:
@@ -1154,7 +1116,7 @@ class RecruitmentManager:
         if getattr(room, "_postgame_vote_pending", False):
             return "終了後投票を集計中です。受付終了後にもう一度開始してください。"
         if room.state.phase != Phase.LOBBY or room._is_game_in_progress():
-            return "対象卓はゲーム進行中のため移行できません。"
+            return "対象卓はゲーム進行中のため開催できません。"
         entries = await database.list_recruitment_entries(recruitment_id)
         participant_ids = [e["user_id"] for e in entries if e["kind"] == "参加"]
         if len(participant_ids) != capacity:
@@ -1186,20 +1148,20 @@ class RecruitmentManager:
                 if gm_error:
                     invalid.append(f"GM {gm.display_name}: {gm_error}")
         if invalid:
-            return "開催時の条件確認で移行を中止しました。\n" + "\n".join(f"・{x}" for x in invalid)
+            return "開催時の条件確認で開始を中止しました。\n" + "\n".join(f"・{x}" for x in invalid)
         async with room.action_lock:
             state = room.state
             if getattr(room, "_postgame_vote_pending", False):
                 return "終了後投票を集計中です。受付終了後にもう一度開始してください。"
             if state.phase != Phase.LOBBY or room._is_game_in_progress():
-                return "対象卓の状態が変わったため移行を中止しました。"
+                return "対象卓の状態が変わったため開始を中止しました。"
             desired_ids = {member.id for member in members}
-            already_transferred = (
+            already_applied = (
                 state.recruitment_id == recruitment_id
                 and set(state.players) == desired_ids
                 and state.gm_id == gm_id
             )
-            if not already_transferred:
+            if not already_applied:
                 # 空判定は長い候補検証の後、通常ロビー操作と同じlock内で
                 # 直前に行う。飛び込み参加者を無言clearしない。
                 linked_empty_lobby = (
@@ -1211,9 +1173,9 @@ class RecruitmentManager:
                     state.players or state.gm_id is not None
                 ) and not reset_lobby:
                     return "LOBBY_NOT_EMPTY"
-                # 募集を先に開催済みへCASし、参加/取消/別移行を止める。
+                # 募集を先に開催済みへCASし、参加/取消/別の開催反映を止める。
                 # その後のロビー保存が失敗しても、開催済みの同じ募集だけは
-                # transferを再試行できるため、DBとDiscordの分断を回収できる。
+                # 開催反映を再試行できるため、DBとDiscordの分断を回収できる。
                 if row["status"] == database.RECRUITMENT_OPEN:
                     changed = await database.set_recruitment_status(
                         recruitment_id, database.RECRUITMENT_HELD
@@ -1222,7 +1184,7 @@ class RecruitmentManager:
                         latest = await database.get_recruitment(recruitment_id)
                         if latest is None or latest["status"] != database.RECRUITMENT_HELD:
                             raise database.RecruitmentConflict(
-                                "募集状態が変わったため、卓への移行を中止しました。"
+                                "募集状態が変わったため、卓への開催反映を中止しました。"
                             )
                 old_players = dict(state.players)
                 old_gm_id = state.gm_id
@@ -1248,7 +1210,7 @@ class RecruitmentManager:
                 try:
                     await state.lobby_channel.send("募集の開催のため受付をリセットしました。")
                 except (discord.Forbidden, discord.HTTPException) as exc:
-                    log.warning("募集移行の受付リセット告知失敗: %s", exc)
+                    log.warning("募集開催時の受付リセット告知失敗: %s", exc)
         return f"✅ **{room.state.room_name}** の参加受付へ{capacity}人とGMを登録しました。"
 
     @staticmethod
@@ -1392,7 +1354,7 @@ class RecruitmentManager:
                 await database.list_pending_recruitment_notification_user_ids(row["id"])
             )
             for user_id in participant_ids:
-                # 取消/繰上げ/移行と同じmanager→notification順で1人ずつ処理。
+                # 取消/繰上げ/開催反映と同じmanager→notification順で1人ずつ処理。
                 # 取消済みへの誤送信を防ぎつつ、全募集のDM中ずっと操作を
                 # 止めるlock convoyは避ける。
                 async with self.lock:
@@ -1532,14 +1494,10 @@ class RecruitmentScheduleView(discord.ui.View):
         self,
         manager: RecruitmentManager,
         host_id: int,
-        *,
-        allow_admin_rooms: bool = False,
     ) -> None:
         super().__init__(timeout=300)
         self.manager = manager
         self.host_id = host_id
-        # 引数は旧呼び出し互換のため残すが、段階導入中卓は管理者にも公開しない。
-        self.allow_admin_rooms = False
         self.values: dict[str, str] = {}
         self.rebuild()
 
@@ -1947,7 +1905,7 @@ class RecruitmentCardView(discord.ui.View):
                 "DMを受け取れないため参加できません。DMを開放してください。", ephemeral=True,
             )
         try:
-            # 卓への移行も同じlockを使う。登録から開催前通知までの間に
+            # 卓への開催反映も同じlockを使う。登録から開催前通知までの間に
             # 開催済みへ変わり、後参加者だけ通知されない隙間を作らない。
             async with self.manager.lock:
                 # DM確認中に形式・ランク条件が変更されていることがあるため、
@@ -2008,7 +1966,7 @@ class RecruitmentCardView(discord.ui.View):
         if access_error:
             return await interaction.followup.send(access_error, ephemeral=True)
         try:
-            # 補欠繰り上げと開催前通知を、卓移行と同じlock内で完了する。
+            # 補欠繰り上げと開催前通知を、卓への開催反映と同じlock内で完了する。
             # 次回巡回を待たず、繰り上げ直後に開催済みとなる場合も漏らさない。
             async with self.manager.lock:
                 entries = await database.list_recruitment_entries(
@@ -2105,7 +2063,7 @@ class RecruitmentLobbyResetConfirmView(discord.ui.View):
         super().__init__(timeout=120)
         self.manager, self.recruitment_id, self.host_id = manager, recruitment_id, host_id
 
-    @discord.ui.button(label="受付をリセットして移行", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="受付をリセットして開催", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if interaction.user.id != self.host_id:
             return await interaction.response.send_message("主催者だけ操作できます。", ephemeral=True)
@@ -2116,7 +2074,7 @@ class RecruitmentLobbyResetConfirmView(discord.ui.View):
 
     @discord.ui.button(label="中止", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.edit_message(content="移行を中止しました。", view=None)
+        await interaction.response.edit_message(content="開催を中止しました。", view=None)
 
 
 class RecruitmentHostView(discord.ui.View):

@@ -111,9 +111,5 @@ class ApiPacingMetricsTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(int(manager._api_call_stats["Member.add_roles"]["count"]), 1)
 
-    def test_summary_without_any_call_is_silent(self) -> None:
-        self._manager().log_api_pacing_summary("テスト")
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -93,81 +93,403 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
             rows = await db.execute_fetchall("PRAGMA foreign_keys")
         self.assertEqual(rows[0][0], 1)
 
-    async def test_legacy_private_room_role_schema_migrates_without_data_loss(self) -> None:
-        """v0.39のNOT NULL列を、旧閲覧ロール行ごと安全にNULL許可へ移す。"""
-        current_path = database.DB_PATH
-        database.DB_PATH = str(Path(self._tmp.name) / "legacy-private-room.db")
-        try:
-            async with database.connect_db() as db:
-                await db.execute("""
-                    CREATE TABLE private_rooms (
-                        guild_id INTEGER NOT NULL,
-                        room_id TEXT NOT NULL,
-                        owner_id INTEGER NOT NULL,
-                        room_name TEXT NOT NULL,
-                        role_name TEXT NOT NULL,
-                        variant_id TEXT NOT NULL DEFAULT 'v13_cross',
-                        status TEXT NOT NULL DEFAULT 'active',
-                        category_id INTEGER,
-                        role_id INTEGER,
-                        last_error TEXT,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        PRIMARY KEY (guild_id, room_id),
-                        UNIQUE (guild_id, owner_id),
-                        UNIQUE (guild_id, room_name),
-                        UNIQUE (guild_id, role_name)
-                    )
-                """)
-                await db.execute("""
-                    CREATE TABLE private_room_members (
-                        guild_id INTEGER NOT NULL,
-                        room_id TEXT NOT NULL,
-                        member_id INTEGER NOT NULL,
-                        status TEXT NOT NULL DEFAULT 'active',
-                        last_error TEXT,
-                        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        PRIMARY KEY (guild_id, room_id, member_id),
-                        FOREIGN KEY (guild_id, room_id)
-                            REFERENCES private_rooms(guild_id, room_id)
-                    )
-                """)
-                await db.execute(
-                    "INSERT INTO private_rooms "
-                    "(guild_id, room_id, owner_id, room_name, role_name, "
-                    "variant_id, status, category_id, role_id) "
-                    "VALUES (1, 'private_10', 10, '旧村', '旧村', "
-                    "'v13_cross', 'active', 100, 200)"
-                )
-                await db.execute(
-                    "INSERT INTO private_room_members "
-                    "(guild_id, room_id, member_id) VALUES (1, 'private_10', 20)"
-                )
-                await db.commit()
+    async def test_new_private_room_schema_and_api_do_not_expose_legacy_access_roles(self) -> None:
+        async with database.connect_db() as db:
+            columns = await db.execute_fetchall("PRAGMA table_info(private_rooms)")
+        self.assertNotIn("role_name", {row[1] for row in columns})
+        self.assertNotIn("role_id", {row[1] for row in columns})
 
+        await database.save_private_room(1, "private_10", 10, "十村")
+        row = await database.get_private_room_by_owner(1, 10)
+        assert row is not None
+        self.assertNotIn("role_name", row)
+        self.assertNotIn("role_id", row)
+
+    async def test_existing_private_room_legacy_columns_are_retained_but_ignored(self) -> None:
+        async with database.connect_db() as db:
+            await db.execute("ALTER TABLE private_rooms ADD COLUMN role_name TEXT")
+            await db.execute("ALTER TABLE private_rooms ADD COLUMN role_id INTEGER")
+            await db.commit()
+
+        await database.init_db()
+        async with database.connect_db() as db:
+            columns = await db.execute_fetchall("PRAGMA table_info(private_rooms)")
+        self.assertTrue({"role_name", "role_id"}.issubset({row[1] for row in columns}))
+
+        await database.save_private_room(1, "private_10", 10, "十村")
+        row = await database.get_private_room_by_owner(1, 10)
+        assert row is not None
+        self.assertNotIn("role_name", row)
+        self.assertNotIn("role_id", row)
+
+    async def test_orphan_in_unused_legacy_table_is_ignored(self) -> None:
+        async with database.connect_db() as db:
+            await db.execute("PRAGMA foreign_keys = OFF")
+            await db.execute("""
+                CREATE TABLE private_room_members (
+                    guild_id INTEGER NOT NULL,
+                    room_id TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, room_id, user_id),
+                    FOREIGN KEY (guild_id, room_id)
+                        REFERENCES private_rooms(guild_id, room_id)
+                )
+            """)
+            await db.execute(
+                "INSERT INTO private_room_members "
+                "(guild_id, room_id, user_id) VALUES (1, 'removed', 10)"
+            )
+            await db.commit()
+
+        await database.init_db()
+        async with database.connect_db() as db:
+            count = (await db.execute_fetchall(
+                "SELECT COUNT(*) FROM private_room_members"
+            ))[0][0]
+        self.assertEqual(count, 1)
+
+    async def test_init_db_rejects_not_null_legacy_private_room_role_without_changes(self) -> None:
+        async with database.connect_db() as db:
+            await db.execute(
+                "ALTER TABLE private_rooms ADD COLUMN role_name TEXT NOT NULL"
+            )
+            await db.commit()
+            schema_version_before = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+            journal_mode_before = (await db.execute_fetchall(
+                "PRAGMA journal_mode"
+            ))[0][0]
+            table_sql_before = (await db.execute_fetchall(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='private_rooms'"
+            ))[0][0]
+
+        with self.assertRaisesRegex(RuntimeError, "private_rooms.role_nameがNOT NULL"):
             await database.init_db()
 
-            async with database.connect_db() as db:
-                columns = await db.execute_fetchall(
-                    "PRAGMA table_info(private_rooms)"
-                )
-                members = await db.execute_fetchall(
-                    "SELECT member_id FROM private_room_members"
-                )
-            role_name = next(row for row in columns if row[1] == "role_name")
-            self.assertEqual(role_name[3], 0)
-            self.assertEqual(members, [(20,)])
-            legacy = await database.get_private_room_by_owner(1, 10)
-            self.assertEqual(legacy["role_id"], 200)
-            self.assertEqual(legacy["role_name"], "旧村")
+        async with database.connect_db() as db:
+            schema_version_after = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+            journal_mode_after = (await db.execute_fetchall(
+                "PRAGMA journal_mode"
+            ))[0][0]
+            table_sql_after = (await db.execute_fetchall(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='private_rooms'"
+            ))[0][0]
+        self.assertEqual(schema_version_after, schema_version_before)
+        self.assertEqual(journal_mode_after, journal_mode_before)
+        self.assertEqual(table_sql_after, table_sql_before)
 
-            await database.save_private_room(
-                1, "private_11", 11, "新村", None,
+    async def test_init_db_rejects_partial_private_room_unique_keys(self) -> None:
+        async with database.connect_db() as db:
+            await db.execute("PRAGMA foreign_keys = OFF")
+            await db.execute("ALTER TABLE private_rooms RENAME TO private_rooms_old")
+            await db.execute("""
+                CREATE TABLE private_rooms (
+                    guild_id INTEGER NOT NULL,
+                    room_id TEXT NOT NULL,
+                    owner_id INTEGER NOT NULL,
+                    room_name TEXT NOT NULL,
+                    variant_id TEXT NOT NULL DEFAULT 'v13_cross',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    category_id INTEGER,
+                    last_error TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (guild_id, room_id)
+                )
+            """)
+            await db.execute(
+                "CREATE UNIQUE INDEX private_rooms_owner_partial "
+                "ON private_rooms(guild_id, owner_id) WHERE owner_id > 0"
             )
-            self.assertIsNone(
-                (await database.get_private_room_by_owner(1, 11))["role_name"]
+            await db.execute(
+                "CREATE UNIQUE INDEX private_rooms_name_partial "
+                "ON private_rooms(guild_id, room_name) WHERE room_name <> ''"
             )
+            await db.execute("DROP TABLE private_rooms_old")
+            await db.commit()
+            schema_version_before = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+
+        with self.assertRaisesRegex(RuntimeError, "private_roomsの一意制約不足"):
+            await database.init_db()
+
+        async with database.connect_db() as db:
+            schema_version_after = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+        self.assertEqual(schema_version_after, schema_version_before)
+
+    async def test_init_db_rejects_schema_without_required_foreign_key(self) -> None:
+        async with database.connect_db() as db:
+            await db.execute("PRAGMA foreign_keys = OFF")
+            await db.execute(
+                "ALTER TABLE recruitment_notification_deliveries "
+                "RENAME TO recruitment_notification_deliveries_old"
+            )
+            await db.execute("""
+                CREATE TABLE recruitment_notification_deliveries (
+                    recruitment_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    notified_at TEXT NOT NULL,
+                    delivery_status TEXT NOT NULL DEFAULT 'sent',
+                    PRIMARY KEY (recruitment_id, user_id)
+                )
+            """)
+            await db.execute("DROP TABLE recruitment_notification_deliveries_old")
+            await db.commit()
+
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "recruitment_notification_deliveriesの外部キー不足",
+        ):
+            await database.init_db()
+
+    async def test_init_db_rejects_foreign_key_orphan(self) -> None:
+        async with database.connect_db() as db:
+            await db.execute("PRAGMA foreign_keys = OFF")
+            await db.execute(
+                "INSERT INTO game_players "
+                "(game_id, player_id, role, team, won) VALUES (?, ?, ?, ?, ?)",
+                (999_999, 1, "villager", "village", 0),
+            )
+            await db.commit()
+
+        with self.assertRaisesRegex(RuntimeError, "DBの外部キー整合性"):
+            await database.init_db()
+
+    async def test_init_db_rejects_column_and_check_contract_drift_unchanged(self) -> None:
+        recruitment_template = """
+            CREATE TABLE recruitment_entries (
+                recruitment_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                kind {kind_definition},
+                joined_at {joined_definition},
+                PRIMARY KEY (recruitment_id, user_id),
+                FOREIGN KEY (recruitment_id) REFERENCES recruitments(id)
+            )
+        """
+        scenarios = (
+            (
+                "column_type",
+                "recruitment_entries",
+                recruitment_template.format(
+                    kind_definition="INTEGER NOT NULL CHECK(kind IN ('参加', '補欠'))",
+                    joined_definition="TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+                ),
+                r"recruitment_entries\.kindの型",
+            ),
+            (
+                "not_null",
+                "recruitment_entries",
+                recruitment_template.format(
+                    kind_definition="TEXT CHECK(kind IN ('参加', '補欠'))",
+                    joined_definition="TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+                ),
+                r"recruitment_entries\.kindのNOT NULL",
+            ),
+            (
+                "default",
+                "recruitment_entries",
+                recruitment_template.format(
+                    kind_definition="TEXT NOT NULL CHECK(kind IN ('参加', '補欠'))",
+                    joined_definition="TIMESTAMP",
+                ),
+                r"recruitment_entries\.joined_atのDEFAULT",
+            ),
+            (
+                "entry_check",
+                "recruitment_entries",
+                recruitment_template.format(
+                    kind_definition="TEXT NOT NULL",
+                    joined_definition="TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+                ),
+                r"recruitment_entriesのCHECK制約不足",
+            ),
+            (
+                "self_block_check",
+                "player_blocks",
+                """
+                    CREATE TABLE player_blocks (
+                        guild_id INTEGER NOT NULL,
+                        blocker_id INTEGER NOT NULL,
+                        blocked_id INTEGER NOT NULL,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (guild_id, blocker_id, blocked_id)
+                    )
+                """,
+                r"player_blocksのCHECK制約不足",
+            ),
+        )
+        original_test_db_path = database.DB_PATH
+        try:
+            for scenario_name, table_name, create_sql, error_pattern in scenarios:
+                with self.subTest(scenario=scenario_name):
+                    database.DB_PATH = str(
+                        Path(self._tmp.name) / f"contract-{scenario_name}.db"
+                    )
+                    await database.init_db()
+                    async with database.connect_db() as db:
+                        await db.execute("PRAGMA foreign_keys = OFF")
+                        await db.execute(
+                            f"ALTER TABLE {table_name} RENAME TO {table_name}_old"
+                        )
+                        await db.execute(create_sql)
+                        await db.execute(f"DROP TABLE {table_name}_old")
+                        await db.commit()
+                        schema_version_before = (await db.execute_fetchall(
+                            "PRAGMA schema_version"
+                        ))[0][0]
+                        journal_mode_before = (await db.execute_fetchall(
+                            "PRAGMA journal_mode"
+                        ))[0][0]
+                        table_sql_before = (await db.execute_fetchall(
+                            "SELECT sql FROM sqlite_master "
+                            "WHERE type='table' AND name=?",
+                            (table_name,),
+                        ))[0][0]
+
+                    with self.assertRaisesRegex(RuntimeError, error_pattern):
+                        await database.init_db()
+
+                    async with database.connect_db() as db:
+                        schema_version_after = (await db.execute_fetchall(
+                            "PRAGMA schema_version"
+                        ))[0][0]
+                        journal_mode_after = (await db.execute_fetchall(
+                            "PRAGMA journal_mode"
+                        ))[0][0]
+                        table_sql_after = (await db.execute_fetchall(
+                            "SELECT sql FROM sqlite_master "
+                            "WHERE type='table' AND name=?",
+                            (table_name,),
+                        ))[0][0]
+                    self.assertEqual(schema_version_after, schema_version_before)
+                    self.assertEqual(journal_mode_after, journal_mode_before)
+                    self.assertEqual(table_sql_after, table_sql_before)
         finally:
-            database.DB_PATH = current_path
+            database.DB_PATH = original_test_db_path
+
+    async def test_init_db_rejects_rows_violating_current_checks(self) -> None:
+        original_test_db_path = database.DB_PATH
+        scenarios = (
+            (
+                "invalid_entry_kind",
+                (
+                    "INSERT INTO recruitments "
+                    "(id, guild_id, host_id, title, scheduled_at, room_id, status) "
+                    "VALUES (1, 1, 10, '終了済み', '2099-01-01T00:00:00', "
+                    "'private_10', '終了済み')",
+                    "INSERT INTO recruitment_entries "
+                    "(recruitment_id, user_id, kind) VALUES (1, 20, '不正')",
+                ),
+                r"recruitment_entries\.kindが現行制約に違反",
+            ),
+            (
+                "self_block",
+                (
+                    "INSERT INTO player_blocks "
+                    "(guild_id, blocker_id, blocked_id) VALUES (1, 20, 20)",
+                ),
+                r"player_blocksに自己ブロック",
+            ),
+        )
+        try:
+            for scenario_name, statements, error_pattern in scenarios:
+                with self.subTest(scenario=scenario_name):
+                    database.DB_PATH = str(
+                        Path(self._tmp.name) / f"invalid-row-{scenario_name}.db"
+                    )
+                    await database.init_db()
+                    async with database.connect_db() as db:
+                        await db.execute("PRAGMA ignore_check_constraints = ON")
+                        for statement in statements:
+                            await db.execute(statement)
+                        await db.commit()
+                    with self.assertRaisesRegex(RuntimeError, error_pattern):
+                        await database.init_db()
+        finally:
+            database.DB_PATH = original_test_db_path
+
+    async def test_init_db_repairs_indexes_once_without_rebuilding_current_schema(self) -> None:
+        index_names = tuple(database._CURRENT_INDEX_DEFINITIONS)
+        async with database.connect_db() as db:
+            for index_name in index_names:
+                await db.execute(f"DROP INDEX {index_name}")
+                await db.execute(
+                    f"CREATE INDEX {index_name} ON games(game_id)"
+                )
+            await db.commit()
+
+        await database.init_db()
+        async with database.connect_db() as db:
+            index_rows = await db.execute_fetchall(
+                "SELECT name, sql FROM sqlite_master WHERE type='index' "
+                f"AND name IN ({', '.join('?' for _ in index_names)})",
+                index_names,
+            )
+            index_sql = {str(row[0]): str(row[1]) for row in index_rows}
+            schema_version = (await db.execute_fetchall("PRAGMA schema_version"))[0][0]
+        expected_index_sql = database._CURRENT_INDEX_DEFINITIONS
+        self.assertEqual(set(index_sql), set(expected_index_sql))
+        for index_name, expected_sql in expected_index_sql.items():
+            self.assertEqual(
+                database._normalized_schema_sql(index_sql[index_name]),
+                database._normalized_schema_sql(expected_sql),
+            )
+
+        await database.init_db()
+        async with database.connect_db() as db:
+            second_schema_version = (
+                await db.execute_fetchall("PRAGMA schema_version")
+            )[0][0]
+        self.assertEqual(second_schema_version, schema_version)
+
+    async def test_failed_unique_index_repair_rolls_back_all_index_changes(self) -> None:
+        async with database.connect_db() as db:
+            await db.execute("DROP INDEX idx_games_run_unique")
+            await db.execute(
+                "CREATE INDEX idx_games_run_unique "
+                "ON games(guild_id, room_id, game_run_id)"
+            )
+            for winner_team in ("village", "wolf"):
+                await db.execute(
+                    "INSERT INTO games "
+                    "(guild_id, room_id, game_run_id, winner_team) "
+                    "VALUES (1, 'open', 'duplicate-run', ?)",
+                    (winner_team,),
+                )
+            await db.commit()
+            schema_version_before = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+            journal_mode_before = (await db.execute_fetchall(
+                "PRAGMA journal_mode"
+            ))[0][0]
+            index_sql_before = (await db.execute_fetchall(
+                "SELECT sql FROM sqlite_master WHERE type='index' "
+                "AND name='idx_games_run_unique'"
+            ))[0][0]
+
+        with self.assertRaisesRegex(RuntimeError, "idx_games_run_unique"):
+            await database.init_db()
+
+        async with database.connect_db() as db:
+            schema_version_after = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+            journal_mode_after = (await db.execute_fetchall(
+                "PRAGMA journal_mode"
+            ))[0][0]
+            index_sql_after = (await db.execute_fetchall(
+                "SELECT sql FROM sqlite_master WHERE type='index' "
+                "AND name='idx_games_run_unique'"
+            ))[0][0]
+        self.assertEqual(schema_version_after, schema_version_before)
+        self.assertEqual(journal_mode_after, journal_mode_before)
+        self.assertEqual(index_sql_after, index_sql_before)
 
     async def test_backup_names_are_unique_and_retention_is_per_label(self) -> None:
         original_backup_dir = database.BACKUP_DIR
@@ -244,7 +566,6 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
             room_id="private_1",
             name="専用村",
             private_owner_id=1,
-            private_role_name=private_role.name,
             allowed_ranks=frozenset(),
         )
         await _PermissionManager()._apply_room_visibility(guild, category, room_def)
@@ -333,7 +654,6 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
             room_id="beginner",
             name="初心者",
             private_owner_id=None,
-            private_role_name=None,
             allowed_ranks=frozenset({"ブロンズ"}),
         )
 
@@ -365,7 +685,6 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
             room_id="community",
             name="コミュニティ村",
             private_owner_id=None,
-            private_role_name=None,
             allowed_ranks=None,
             access_role_names=frozenset({"コミュニティ参加者", "招待者"}),
         )
@@ -394,7 +713,6 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
             room_id="open_9_turn",
             name="総合-9ターン",
             private_owner_id=None,
-            private_role_name=None,
             allowed_ranks=None,
             access_role_names=None,
             strict_access_role_names=frozenset({"ねいと"}),
@@ -415,7 +733,6 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
             room_id="open_9_cross",
             name="総合-9クロストーク",
             private_owner_id=None,
-            private_role_name=None,
             allowed_ranks=None,
             access_role_names=None,
             strict_access_role_names=frozenset({"ねいと"}),
@@ -472,7 +789,6 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
             room_id="open_9_cross",
             name="総合-9クロストーク",
             private_owner_id=None,
-            private_role_name=None,
             allowed_ranks=None,
             access_role_names=None,
             strict_access_role_names=frozenset({"ねいと"}),
@@ -550,13 +866,12 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await runner.validate_gm_claim(allowed))
 
     async def test_private_room_owner_and_name_queries(self) -> None:
-        await database.save_private_room(1, "private_10", 10, "十村", None)
+        await database.save_private_room(1, "private_10", 10, "十村")
         by_owner = await database.get_private_room_by_owner(1, 10)
         by_name = await database.get_private_room_by_name(1, "十村")
         self.assertEqual(by_owner["room_id"], "private_10")
         self.assertEqual(by_name["owner_id"], 10)
         self.assertEqual(by_owner["status"], "creating")
-        self.assertIsNone(by_owner["role_name"])
 
     async def test_feedback_report_keeps_game_context(self) -> None:
         report_id = await database.save_feedback_report(
@@ -582,15 +897,27 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reports[0]["source_channel_id"], 123)
 
     async def test_corrupt_room_state_is_quarantined_per_row(self) -> None:
-        await database.save_room_state(1, "good", "LOBBY", {"players": []})
+        current_flags = {
+            "public_log_archive_allowed": True,
+            "vc_default_permissions_captured": False,
+            "vc_gm_speak_captured": False,
+            "morning_confirmed": False,
+            "prep_confirmed": False,
+            "mute_marker_enabled": False,
+        }
+        await database.save_room_state(
+            1, "good", "LOBBY", {**current_flags, "players": []},
+        )
         await database.save_room_state(
             1,
             "no_bite",
             "NIGHT",
             {
+                **current_flags,
                 "players": [
                     {"user_id": 101, "role": "WEREWOLF", "number": 1, "alive": True}
                 ],
+                "mute_marker_enabled": True,
                 "wolf_target": -1,
                 "wolf_voters": [{"user_id": 101, "target_id": -1}],
             },
@@ -620,6 +947,33 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
                 "VALUES (1, 'bad_active_player', 'NIGHT', "
                 "'{\"players\":[{\"user_id\":2,\"role\":null,\"number\":0}]}')"
             )
+            await db.execute(
+                "INSERT INTO room_states (guild_id, room_id, phase, payload) "
+                "VALUES (1, 'bad_version', 'LOBBY', "
+                "'{\"_schema_version\":0,\"players\":[]}')"
+            )
+            await db.execute(
+                "INSERT INTO room_states (guild_id, room_id, phase, payload) "
+                "VALUES (1, 'bad_marker', 'NIGHT', "
+                "'{\"_schema_version\":1,"
+                "\"public_log_archive_allowed\":true,"
+                "\"vc_default_permissions_captured\":false,"
+                "\"vc_gm_speak_captured\":false,"
+                "\"morning_confirmed\":false,"
+                "\"prep_confirmed\":false,\"players\":[]}')"
+            )
+            await db.execute(
+                "INSERT INTO room_states (guild_id, room_id, phase, payload) "
+                "VALUES (1, 'bad_seer_target', 'PREPARATION', "
+                "'{\"_schema_version\":1,"
+                "\"public_log_archive_allowed\":true,"
+                "\"vc_default_permissions_captured\":false,"
+                "\"vc_gm_speak_captured\":false,"
+                "\"morning_confirmed\":false,\"prep_confirmed\":false,"
+                "\"mute_marker_enabled\":true,"
+                "\"players\":[{\"user_id\":1,\"role\":\"SEER\","
+                "\"number\":1,\"alive\":true}]}')"
+            )
             await db.commit()
         loaded = await database.load_room_states(1)
         self.assertIn("good", loaded)
@@ -632,22 +986,36 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(
             {row[0] for row in rows},
-            {"bad", "bad_role", "bad_channel", "bad_winner", "bad_active_player"},
+            {
+                "bad", "bad_role", "bad_channel", "bad_winner",
+                "bad_active_player", "bad_version", "bad_marker", "bad_seer_target",
+            },
         )
         unresolved = await database.load_unresolved_room_state_quarantine_ids(1)
         self.assertEqual(
             unresolved,
-            {"bad", "bad_role", "bad_channel", "bad_winner", "bad_active_player"},
+            {
+                "bad", "bad_role", "bad_channel", "bad_winner",
+                "bad_active_player", "bad_version", "bad_marker", "bad_seer_target",
+            },
         )
 
         # 運用者が有効なsnapshotを復旧した卓は、隔離履歴が残っていても
         # 起動時の未解決エラーとして扱わない。
-        await database.save_room_state(1, "bad", "LOBBY", {"players": []})
+        await database.save_room_state(
+            1, "bad", "LOBBY", {**current_flags, "players": []},
+        )
         unresolved = await database.load_unresolved_room_state_quarantine_ids(1)
         self.assertNotIn("bad", unresolved)
 
     def test_snapshot_validator_covers_recovered_vote_fields(self) -> None:
         base = {
+            "public_log_archive_allowed": True,
+            "vc_default_permissions_captured": False,
+            "vc_gm_speak_captured": False,
+            "morning_confirmed": False,
+            "prep_confirmed": False,
+            "mute_marker_enabled": True,
             "players": [
                 {"user_id": 101, "role": "VILLAGER", "number": 1, "alive": True}
             ],
@@ -676,6 +1044,26 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         ):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 database._validate_room_snapshot("DAY_VOTE", {**base, field: value})
+
+    def test_active_seer_snapshot_requires_initial_target(self) -> None:
+        active_seer = {
+            "public_log_archive_allowed": True,
+            "vc_default_permissions_captured": False,
+            "vc_gm_speak_captured": False,
+            "morning_confirmed": False,
+            "prep_confirmed": False,
+            "mute_marker_enabled": True,
+            "players": [
+                {"user_id": 101, "role": "SEER", "number": 1, "alive": True}
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "initial_seer_target"):
+            database._validate_room_snapshot("PREPARATION", active_seer)
+        database._validate_room_snapshot(
+            "PREPARATION", {**active_seer, "initial_seer_target": 102},
+        )
+        database._validate_room_snapshot("LOBBY", active_seer)
+        database._validate_room_snapshot("GAME_OVER", active_seer)
 
     @staticmethod
     def _records() -> list[dict]:
@@ -826,25 +1214,21 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await database.load_pending_unmute_ids(1), {2})
 
-    async def test_legacy_pending_unmutes_are_migrated_atomically(self) -> None:
-        await database.set_meta(1, "pending_unmutes", "11,22,11,bad")
-        await database.add_pending_unmutes(1, {33})
-        self.assertEqual(await database.load_pending_unmute_ids(1), {11, 22, 33})
-        self.assertEqual(await database.get_meta(1, "pending_unmutes"), "")
-        # 再読込しても重複せず、移行済みの値を失わない。
-        self.assertEqual(await database.load_pending_unmute_ids(1), {11, 22, 33})
-
     async def test_private_room_rename_journal(self) -> None:
-        await database.save_private_room(1, "private_10", 10, "旧村", None)
+        await database.save_private_room(1, "private_10", 10, "旧村")
+        self.assertTrue(await database.checkpoint_private_room_asset_ids(
+            1, "private_10", category_id=100,
+        ))
+        self.assertFalse(await database.checkpoint_private_room_asset_ids(
+            1, "private_10", category_id=101,
+        ))
         await database.mark_private_room_active(
-            1, "private_10", category_id=100, role_id=None
+            1, "private_10", category_id=100
         )
-        await database.update_private_room_names(1, "private_10", "新村", None)
+        await database.update_private_room_names(1, "private_10", "新村")
         renamed = await database.get_private_room_by_name(1, "新村")
         self.assertEqual(renamed["status"], "renaming")
         self.assertEqual(renamed["category_id"], 100)
-        self.assertIsNone(renamed["role_id"])
-        self.assertIsNone(renamed["role_name"])
 
     async def test_public_log_category_names_are_reserved_for_private_rooms(self) -> None:
         manager = GameCog(SimpleNamespace(managed_guild_id=1))
@@ -938,52 +1322,6 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
             member.roles[1:], [target_l13_rank, target_l9_gm, target_l9t_gm],
         )
 
-    async def test_legacy_nine_grandmaster_role_is_renamed_to_exact_cross_name(self) -> None:
-        class EditableRole(_PermissionTarget):
-            def __init__(self, target_id: int, name: str, position: int) -> None:
-                super().__init__(target_id, name)
-                self.hoist = False
-                self.position = position
-                self.edit_calls: list[dict] = []
-
-            async def edit(self, **kwargs):
-                self.edit_calls.append(dict(kwargs))
-                if "name" in kwargs:
-                    self.name = str(kwargs["name"])
-                if "hoist" in kwargs:
-                    self.hoist = bool(kwargs["hoist"])
-                if "position" in kwargs:
-                    self.position = int(kwargs["position"])
-                return self
-
-        cross_name = rating_lib.special_grandmaster_role_name("l9_cross")
-        roles = [
-            EditableRole(300 + index, name, index)
-            for index, (name, _color) in enumerate(
-                rating_lib.all_rank_role_specs(), 1,
-            )
-            if name != cross_name
-        ]
-        legacy = EditableRole(
-            999, rating_lib.LEGACY_NINE_GRANDMASTER_ROLE_NAME, 20,
-        )
-        roles.append(legacy)
-
-        async def unexpected_create_role(**_kwargs):
-            self.fail("旧9人GMロールを再利用できるためcreate_roleは不要です")
-
-        guild = SimpleNamespace(id=1, roles=roles, create_role=unexpected_create_role)
-        manager = GameCog(SimpleNamespace(managed_guild_id=1))
-        manager.bulk_api_interval = 0
-
-        result = await manager._ensure_rank_roles(guild)
-
-        self.assertIs(result[cross_name], legacy)
-        self.assertEqual(legacy.name, "グランドマスター9")
-        self.assertTrue(legacy.hoist)
-        self.assertTrue(
-            any(call.get("name") == "グランドマスター9" for call in legacy.edit_calls)
-        )
 
     async def test_only_grandmaster_roles_are_forced_to_hoist(self) -> None:
         class EditableRole(_PermissionTarget):
@@ -1054,7 +1392,7 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(call.get("hoist") is True for call in l9t_gm.edit_calls))
         self.assertTrue(any("position" in call for call in l13_gm.edit_calls))
 
-    async def test_legacy_duplicate_history_does_not_block_migration(self) -> None:
+    async def test_duplicate_history_keeps_nonunique_lookup_indexes(self) -> None:
         async with database.connect_db() as db:
             cursor = await db.execute(
                 "INSERT INTO games (guild_id, winner_team) VALUES (1, '人狼陣営')"
@@ -1072,7 +1410,7 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
                 [(game_id,), (game_id,)],
             )
             await db.commit()
-        # 重複を破壊せずinitが完了し、子履歴indexは非uniqueになる。
+        # 重複履歴を破壊せずinitが完了し、検索用indexは非uniqueになる。
         await database.init_db()
         async with database.connect_db() as db:
             gp_count = (await db.execute_fetchall(
