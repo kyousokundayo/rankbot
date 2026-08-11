@@ -94,6 +94,13 @@ class FakeCategory:
             else:
                 self.overwrites[key] = overwrite
 
+    def overwrites_for(self, target: Any) -> discord.PermissionOverwrite:
+        overwrite = self.overwrites.get(getattr(target, "id", target))
+        if overwrite is None:
+            return discord.PermissionOverwrite()
+        allow, deny = overwrite.pair()
+        return discord.PermissionOverwrite.from_pair(allow, deny)
+
     async def edit(self, *, name: Optional[str] = None, reason: Optional[str] = None) -> None:
         if name is not None:
             self.name = name
@@ -268,6 +275,7 @@ class FakeTextChannel:
         name: Optional[str] = None,
         category: Optional[FakeCategory] = None,
         position: Optional[int] = None,
+        overwrites: Optional[dict[Any, discord.PermissionOverwrite]] = None,
         sync_permissions: bool = False,
         reason: Optional[str] = None,
     ) -> None:
@@ -283,6 +291,11 @@ class FakeTextChannel:
                 self.overwrites = dict(getattr(category, "overwrites", {}) or {})
         if position is not None:
             self.position = position
+        if overwrites is not None:
+            self.overwrites = {
+                getattr(target, "id", target): overwrite
+                for target, overwrite in overwrites.items()
+            }
 
     async def set_permissions(self, target: Any, **permissions: Any) -> None:
         key = getattr(target, "id", target)
@@ -293,6 +306,13 @@ class FakeTextChannel:
                 self.overwrites.pop(key, None)
             else:
                 self.overwrites[key] = overwrite
+
+    def overwrites_for(self, target: Any) -> discord.PermissionOverwrite:
+        overwrite = self.overwrites.get(getattr(target, "id", target))
+        if overwrite is None:
+            return discord.PermissionOverwrite()
+        allow, deny = overwrite.pair()
+        return discord.PermissionOverwrite.from_pair(allow, deny)
 
 
 class FakeVoiceChannel:

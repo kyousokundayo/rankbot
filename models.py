@@ -108,10 +108,24 @@ class GameState:
         self.game_run_id: str = ""
         # 募集経由で組まれたゲームだけ設定。直接ロビー参加はNone。
         self.recruitment_id: Optional[int] = None
-        # 開始時に公開卓だったか。終了ログの公開可否と、設定変更後の再起動中に
-        # カテゴリ/VCのアクセス境界を保つためsnapshotへ保存する。旧snapshotは
-        # 復元時にFalseとして扱う。
+        # 互換キー名はpublic_log_archive_allowedだが、現在は開始時にカテゴリ/VCの
+        # 閲覧境界が一般公開だったかを表す。設定変更後の再起動中もゲーム中の
+        # アクセス境界を保つためsnapshotへ保存し、旧snapshotはFalseとして扱う。
+        # 終了ログはこの値に関係なく、全村で共通の公開ログへ退避する。
         self.public_log_archive_allowed: bool = False
+        # 静的権限を手動管理する卓では、ゲーム中だけVCの発言/内蔵チャットを
+        # 閉じ、終了時に開始前の三値(True/False/未設定)へ正確に戻す。
+        self.vc_default_permissions_captured: bool = False
+        self.vc_default_speak_before_game: Optional[bool] = None
+        self.vc_default_send_before_game: Optional[bool] = None
+        # 専任GMへゲーム中だけ付けるVC発言許可も、手動overwriteの他項目を
+        # 壊さず、終了時に開始前の三値へ戻す。再起動をまたぐためIDも保存する。
+        self.vc_gm_speak_captured: bool = False
+        self.vc_gm_speak_user_id: Optional[int] = None
+        self.vc_gm_speak_before_game: Optional[bool] = None
+        # Botが作成した #昼/#霊界 の所有ID。手動管理カテゴリでは名前だけを
+        # 根拠に既存チャンネルを削除しないため、ロビーへ戻った後も保持する。
+        self.managed_game_channel_ids: set[int] = set()
         self.day_generation: int = 0
         self.night_generation: int = 0
 

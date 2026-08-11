@@ -85,6 +85,31 @@ class FakeRole:
         return self._default
 
 
+class FakeLogCategory:
+    def __init__(self, name: str, *, channels=None, overwrites=None) -> None:
+        self.name = name
+        self.channels = list(channels or [])
+        self.overwrites = dict(overwrites or {})
+        self.edit = AsyncMock(side_effect=self._edit)
+
+    async def _edit(self, *, overwrites, reason=None):
+        self.overwrites = dict(overwrites)
+        return self
+
+
+class FakeLogChannel:
+    def __init__(self, name: str, channel_id: int, *, overwrites=None) -> None:
+        self.name = name
+        self.id = channel_id
+        self.overwrites = dict(overwrites or {})
+        self.edit = AsyncMock(side_effect=self._edit)
+        self.delete = AsyncMock()
+
+    async def _edit(self, *, overwrites, reason=None):
+        self.overwrites = dict(overwrites)
+        return self
+
+
 class FakeGuild:
     def __init__(self, members: list[FakeMember], roles: list[FakeRole]) -> None:
         self.id = 123
@@ -93,6 +118,38 @@ class FakeGuild:
 
     def get_member(self, user_id: int):
         return next((member for member in self.members if member.id == user_id), None)
+
+
+class FakeVoiceChannel:
+    def __init__(self, overwrites=None) -> None:
+        self.id = 500
+        self.overwrites = dict(overwrites or {})
+
+    def overwrites_for(self, target):
+        overwrite = self.overwrites.get(target, discord.PermissionOverwrite())
+        return discord.PermissionOverwrite.from_pair(*overwrite.pair())
+
+    async def set_permissions(
+        self, target, *, overwrite=None, reason=None, **permissions
+    ) -> None:
+        if permissions:
+            overwrite = discord.PermissionOverwrite(**permissions)
+        if overwrite is None:
+            self.overwrites.pop(target, None)
+        else:
+            self.overwrites[target] = discord.PermissionOverwrite.from_pair(
+                *overwrite.pair()
+            )
+
+
+def permission_text_channel(
+    *, set_permissions: AsyncMock | None = None,
+) -> SimpleNamespace:
+    """discord.TextChannelの個別overwrite APIを再現する最小テストダブル。"""
+    return SimpleNamespace(
+        set_permissions=set_permissions or AsyncMock(),
+        overwrites_for=lambda _target: discord.PermissionOverwrite(),
+    )
 
 
 def make_runner(variant_id: str = "v13_cross") -> RoomRunner:
@@ -126,6 +183,141 @@ def add_player(runner: RoomRunner, user_id: int, role: Role = Role.VILLAGER) -> 
 
 
 class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
+    async def test_private_restore_requires_spirit_channel_for_access_control(self) -> None:
+        runner = RoomRunner(
+            None,
+            FakeManager(),
+            RoomDefinition("private_1", "GM名前村", private_owner_id=1),
+        )
+        runner.state.spirit_channel = None
+
+        with self.assertRaisesRegex(RuntimeError, "#霊界を確認できない"):
+            await runner._apply_spirit_blocks(required=True)
+
+    async def test_vc_spectator_restriction_failure_stops_game_safely(self) -> None:
+        runner = make_runner()
+        default = FakeRole(1, "@everyone", default=True)
+        guild = FakeGuild([], [default])
+        guild.default_role = default
+        guild.me = FakeMember(99, "bot")
+        denied = discord.Forbidden(
+            SimpleNamespace(status=403, reason="Forbidden", headers={}),
+            "denied",
+        )
+        runner.state.guild = guild
+        runner.state.voice_channel = SimpleNamespace(
+            overwrites_for=lambda _target: discord.PermissionOverwrite(),
+            set_permissions=AsyncMock(side_effect=denied),
+        )
+        runner._stop_for_durability_error = AsyncMock()
+
+        with self.assertRaises(StateDurabilityError):
+            await runner._prepare_game_vc_permissions("ゲーム開始時のVC権限設定")
+
+        runner._stop_for_durability_error.assert_awaited_once()
+
+    async def test_manual_room_restores_static_channel_and_vc_permissions(self) -> None:
+        manager = FakeManager()
+        runner = RoomRunner(
+            None,
+            manager,
+            RoomDefinition(
+                "nate",
+                "ねいとくん村",
+                access_role_names=frozenset({"ねいと"}),
+                sync_permissions=False,
+            ),
+        )
+        default = FakeRole(1, "@everyone", default=True)
+        bot_member = FakeMember(99, "bot")
+        gm = FakeMember(2, "GM")
+        manual_role = FakeRole(3, "手動閲覧ロール")
+        guild = FakeGuild([gm, bot_member], [default, manual_role])
+        guild.default_role = default
+        guild.me = bot_member
+        category_overwrites = {
+            default: discord.PermissionOverwrite(view_channel=False),
+            manual_role: discord.PermissionOverwrite(
+                view_channel=True, send_messages=True,
+            ),
+        }
+        category = SimpleNamespace(overwrites=category_overwrites)
+        category.overwrites_for = lambda target: discord.PermissionOverwrite.from_pair(
+            *category_overwrites.get(target, discord.PermissionOverwrite()).pair()
+        )
+        runner.state.category = category
+        runner.state.guild = guild
+        runner.state.gm_id = gm.id
+        runner._persist_room_state = AsyncMock()
+
+        village_overwrites = runner._build_game_channel_overwrites(
+            guild, village=True,
+        )
+        self.assertFalse(village_overwrites[default].view_channel)
+        self.assertTrue(village_overwrites[manual_role].view_channel)
+        self.assertFalse(village_overwrites[manual_role].send_messages)
+        self.assertTrue(category_overwrites[manual_role].send_messages)
+
+        vc = FakeVoiceChannel(
+            {
+                default: discord.PermissionOverwrite(
+                    view_channel=False, speak=True,
+                ),
+                gm: discord.PermissionOverwrite(connect=True, speak=False),
+            }
+        )
+        runner.state.voice_channel = vc
+
+        await runner._restrict_vc_for_game()
+        self.assertFalse(vc.overwrites_for(default).speak)
+        self.assertFalse(vc.overwrites_for(default).send_messages)
+        self.assertFalse(vc.overwrites_for(default).view_channel)
+        self.assertTrue(vc.overwrites_for(gm).speak)
+        self.assertTrue(vc.overwrites_for(gm).connect)
+
+        await runner._release_vc_after_game()
+        self.assertTrue(vc.overwrites_for(default).speak)
+        self.assertIsNone(vc.overwrites_for(default).send_messages)
+        self.assertFalse(vc.overwrites_for(default).view_channel)
+        self.assertFalse(vc.overwrites_for(gm).speak)
+        self.assertTrue(vc.overwrites_for(gm).connect)
+        self.assertFalse(runner.state.vc_default_permissions_captured)
+        self.assertFalse(runner.state.vc_gm_speak_captured)
+        self.assertEqual(runner._persist_room_state.await_count, 2)
+
+    async def test_active_fixed_and_gm_rooms_are_rated_and_wait_for_postgame(self) -> None:
+        fixed = RoomRunner(
+            None, FakeManager(), RoomDefinition("open", "総合")
+        )
+        gm_room = RoomRunner(
+            None,
+            FakeManager(),
+            RoomDefinition(
+                "private_1",
+                "テストGM村",
+                private_owner_id=1,
+                variant_id="v9_turn",
+            ),
+        )
+        inactive = RoomRunner(
+            None, FakeManager(), RoomDefinition("retired", "廃止卓", enabled=False)
+        )
+
+        self.assertTrue(fixed.is_rated_room())
+        self.assertTrue(gm_room.is_rated_room())
+        self.assertFalse(inactive.is_rated_room())
+
+        fixed._postgame_vote_pending = True
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        await fixed._start_game_locked(interaction)
+        self.assertIn(
+            "終了後投票を集計中",
+            interaction.followup.send.await_args.args[0],
+        )
+
     async def test_bulk_api_pacer_serializes_calls_and_respects_semaphore(self) -> None:
         manager = GameCog(SimpleNamespace(managed_guild_id=1))
         manager.bulk_api_interval = 0.02
@@ -1157,15 +1349,20 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
     async def test_finished_channel_moves_to_the_log_category(self) -> None:
         """終了した卓は削除せず、試合番号を付けてログカテゴリへ移す。"""
         runner = make_runner()
-        category = SimpleNamespace(name="ログ-昼", channels=[])
+        default = FakeRole(1, "@everyone", default=True)
+        category = FakeLogCategory(
+            "ログ-昼",
+            overwrites={default: runner._public_log_overwrite()},
+        )
         guild = SimpleNamespace(
-            id=1, categories=[category], create_category=AsyncMock()
+            id=1, default_role=default,
+            categories=[category], create_category=AsyncMock(),
         )
         runner.state.guild = guild
         channel = SimpleNamespace(name="昼", id=500, edit=AsyncMock())
 
         moved = await runner._archive_game_channel(
-            channel, "ログ-昼", 4, public_log_archive_allowed=True,
+            channel, "ログ-昼", 4,
         )
 
         self.assertTrue(moved)
@@ -1174,44 +1371,199 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         # 番号を先頭に置く (Discordはカテゴリ内を名前順に並べる)
         self.assertEqual(kwargs["name"], "04-昼")
         self.assertIs(kwargs["category"], category)
-        self.assertTrue(kwargs["sync_permissions"])
+        self.assertNotIn("sync_permissions", kwargs)
+        self.assertEqual(kwargs["overwrites"], category.overwrites)
+        category.edit.assert_not_awaited()
 
-    async def test_strict_access_room_never_archives_to_public_log(self) -> None:
-        """ねいと限定卓の終了ログを共通ログカテゴリへ漏らさない。"""
-        runner = RoomRunner(
-            None,
-            FakeManager(),
-            RoomDefinition(
-                "strict", "限定卓",
-                strict_access_role_names=frozenset({"ねいと"}),
-            ),
+    async def test_existing_log_category_permissions_are_normalized(self) -> None:
+        """既存の個別allow/denyも公開・書込不可へ補正してから使用する。"""
+        runner = make_runner()
+        default = FakeRole(1, "@everyone", default=True)
+        stale_role = FakeRole(2, "過去の許可ロール")
+        stale_member = FakeMember(3)
+        bot_member = FakeMember(99, "bot")
+        bot_member.bot = True
+        category = FakeLogCategory(
+            "ログ-昼",
+            overwrites={
+                stale_role: discord.PermissionOverwrite(
+                    view_channel=False, send_messages=True, manage_messages=True,
+                ),
+                stale_member: discord.PermissionOverwrite(
+                    create_public_threads=True, send_messages_in_threads=True,
+                ),
+            },
         )
         runner.state.guild = SimpleNamespace(
-            id=1, categories=[], create_category=AsyncMock()
+            id=1, default_role=default, me=bot_member,
+            categories=[category], create_category=AsyncMock(),
+        )
+
+        result = await runner._ensure_log_category("ログ-昼")
+
+        self.assertIs(result, category)
+        category.edit.assert_awaited_once()
+        for target in (default, stale_role, stale_member):
+            overwrite = category.overwrites[target]
+            self.assertTrue(overwrite.view_channel)
+            self.assertTrue(overwrite.read_message_history)
+            self.assertFalse(overwrite.send_messages)
+            self.assertFalse(overwrite.add_reactions)
+            self.assertFalse(overwrite.create_public_threads)
+            self.assertFalse(overwrite.create_private_threads)
+            self.assertFalse(overwrite.send_messages_in_threads)
+            self.assertFalse(overwrite.send_voice_messages)
+            self.assertFalse(overwrite.send_polls)
+            self.assertFalse(overwrite.use_application_commands)
+            self.assertFalse(overwrite.use_external_apps)
+            self.assertFalse(overwrite.manage_channels)
+            self.assertFalse(overwrite.manage_roles)
+            self.assertFalse(overwrite.manage_messages)
+            self.assertFalse(overwrite.manage_threads)
+            self.assertFalse(overwrite.manage_webhooks)
+        self.assertTrue(category.overwrites[bot_member].view_channel)
+        self.assertTrue(category.overwrites[bot_member].manage_channels)
+        self.assertTrue(category.overwrites[bot_member].manage_roles)
+        self.assertFalse(category.overwrites[bot_member].send_messages)
+
+    async def test_log_category_permission_failure_falls_back_to_delete(self) -> None:
+        """既存カテゴリの権限を保証できなければ、そのカテゴリを使用しない。"""
+        runner = make_runner()
+        default = FakeRole(1, "@everyone", default=True)
+        category = FakeLogCategory("ログ-昼")
+        category.edit = AsyncMock(
+            side_effect=discord.Forbidden(Mock(status=403), "denied")
+        )
+        runner.state.guild = SimpleNamespace(
+            id=1, default_role=default,
+            categories=[category], create_category=AsyncMock(),
+        )
+
+        result = await runner._ensure_log_category("ログ-昼")
+
+        self.assertIsNone(result)
+
+    async def test_unresolved_log_overwrite_target_is_normalized_atomically(self) -> None:
+        """キャッシュ外の対象も型付きObjectのまま一括上書きへ含める。"""
+        runner = make_runner()
+        default = FakeRole(1, "@everyone", default=True)
+        unresolved = discord.Object(id=999, type=discord.Role)
+        category = FakeLogCategory(
+            "ログ-昼",
+            overwrites={unresolved: discord.PermissionOverwrite(send_messages=True)},
+        )
+        runner.state.guild = SimpleNamespace(
+            id=1, default_role=default,
+            categories=[category], create_category=AsyncMock(),
+        )
+
+        result = await runner._ensure_log_category("ログ-昼")
+
+        self.assertIs(result, category)
+        category.edit.assert_awaited_once()
+        self.assertFalse(category.overwrites[unresolved].send_messages)
+
+    async def test_existing_unsynced_log_channel_is_normalized(self) -> None:
+        """カテゴリと非同期の既存ログも同じ読み取り専用上書きへ戻す。"""
+        runner = make_runner()
+        default = FakeRole(1, "@everyone", default=True)
+        desired = {default: runner._public_log_overwrite()}
+        child = FakeLogChannel(
+            "01-昼", 100,
+            overwrites={default: discord.PermissionOverwrite(send_messages=True)},
+        )
+        category = FakeLogCategory(
+            "ログ-昼", channels=[child], overwrites=desired,
+        )
+        runner.state.guild = SimpleNamespace(
+            id=1, default_role=default,
+            categories=[category], create_category=AsyncMock(),
+        )
+
+        result = await runner._ensure_log_category("ログ-昼")
+
+        self.assertIs(result, category)
+        child.edit.assert_awaited_once()
+        self.assertEqual(child.overwrites, desired)
+
+    async def test_unmanaged_same_name_category_is_not_adopted(self) -> None:
+        """同名でも管理外の子を含むカテゴリは公開化・整理しない。"""
+        runner = make_runner()
+        default = FakeRole(1, "@everyone", default=True)
+        manual = FakeLogChannel("手動メモ", 100)
+        category = FakeLogCategory("ログ-昼", channels=[manual])
+        runner.state.guild = SimpleNamespace(
+            id=1, default_role=default,
+            categories=[category], create_category=AsyncMock(),
+        )
+
+        result = await runner._ensure_log_category("ログ-昼")
+
+        self.assertIsNone(result)
+        category.edit.assert_not_awaited()
+        manual.edit.assert_not_awaited()
+
+    async def test_archive_uses_safe_overwrites_without_waiting_for_gateway_cache(self) -> None:
+        """カテゴリPATCH後も旧キャッシュからunsafe権限をコピーしない。"""
+        runner = make_runner()
+        default = FakeRole(1, "@everyone", default=True)
+        category = FakeLogCategory(
+            "ログ-昼",
+            overwrites={default: discord.PermissionOverwrite(send_messages=True)},
+        )
+        # 実discord.pyのedit同様、REST成功だけを返して元オブジェクトは更新しない。
+        category.edit = AsyncMock(return_value=category)
+        runner.state.guild = SimpleNamespace(
+            id=1, default_role=default,
+            categories=[category], create_category=AsyncMock(),
         )
         channel = SimpleNamespace(name="昼", id=500, edit=AsyncMock())
 
         moved = await runner._archive_game_channel(
-            channel, "ログ-昼", 4, public_log_archive_allowed=False,
+            channel, "ログ-昼", 4,
         )
 
-        self.assertFalse(moved)
-        runner.state.guild.create_category.assert_not_awaited()
-        channel.edit.assert_not_awaited()
+        self.assertTrue(moved)
+        overwrite = channel.edit.await_args.kwargs["overwrites"][default]
+        self.assertTrue(overwrite.view_channel)
+        self.assertFalse(overwrite.send_messages)
+
+    async def test_all_room_types_archive_to_public_log(self) -> None:
+        """総合・手動権限の固定卓・GM名前村を同じ公開ログへ退避する。"""
+        rooms = (
+            RoomDefinition("general", "総合"),
+            RoomDefinition("local", "ねいとくん村", sync_permissions=False),
+            RoomDefinition(
+                "private", "GM名前村",
+                private_owner_id=10,
+            ),
+        )
+        for room in rooms:
+            with self.subTest(room=room.room_id):
+                runner = RoomRunner(None, FakeManager(), room)
+                self.assertTrue(runner._can_archive_to_public_log())
 
     async def test_log_category_is_trimmed_when_it_hits_the_limit(self) -> None:
         """上限50に達したら古い順に40まで減らす (IDの昇順 = 作成順)。"""
         runner = make_runner()
-        old = [SimpleNamespace(name=f"{i:02d}-昼", id=100 + i, delete=AsyncMock())
-               for i in range(LOG_CATEGORY_LIMIT)]
-        category = SimpleNamespace(name="ログ-昼", channels=list(reversed(old)))
+        default = FakeRole(1, "@everyone", default=True)
+        desired = {default: runner._public_log_overwrite()}
+        old = [
+            FakeLogChannel(f"{i:02d}-昼", 100 + i, overwrites=desired)
+            for i in range(LOG_CATEGORY_LIMIT)
+        ]
+        category = FakeLogCategory(
+            "ログ-昼", channels=list(reversed(old)),
+            overwrites=desired,
+        )
         runner.state.guild = SimpleNamespace(
-            id=1, categories=[category], create_category=AsyncMock()
+            id=1, default_role=default,
+            categories=[category], create_category=AsyncMock(),
         )
         channel = SimpleNamespace(name="昼", id=9999, edit=AsyncMock())
 
         await runner._archive_game_channel(
-            channel, "ログ-昼", 51, public_log_archive_allowed=True,
+            channel, "ログ-昼", 51,
         )
 
         deleted = [ch for ch in old if ch.delete.await_count]
@@ -1230,14 +1582,14 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         channel = SimpleNamespace(name="昼", id=500, edit=AsyncMock())
 
         moved = await runner._archive_game_channel(
-            channel, "ログ-昼", 4, public_log_archive_allowed=True,
+            channel, "ログ-昼", 4,
         )
 
         self.assertFalse(moved)
         channel.edit.assert_not_awaited()
 
-    async def test_game_start_snapshots_public_log_archive_permission(self) -> None:
-        """公開可否は、開始時のアクセス境界から保存する。"""
+    async def test_game_start_snapshots_original_access_boundary(self) -> None:
+        """ゲーム中の閲覧境界は、終了ログの公開とは別に開始時点で保存する。"""
         for strict, expected in ((False, True), (True, False)):
             with self.subTest(strict=strict):
                 room = RoomDefinition(
@@ -1246,6 +1598,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
                     strict_access_role_names=(frozenset({"ねいと"}) if strict else None),
                 )
                 runner = RoomRunner(None, FakeManager(), room)
+                runner.manager.rooms[room.room_id] = runner
                 for user_id in range(1, 14):
                     add_player(runner, user_id)
                 runner._create_game_channels = AsyncMock(
@@ -1265,8 +1618,8 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
                     expected,
                 )
 
-    async def test_restricted_snapshot_stays_private_after_room_is_published(self) -> None:
-        """限定中に開始した卓は、公開後の復元でもログを公開しない。"""
+    async def test_restricted_snapshot_keeps_access_marker_but_archives_log(self) -> None:
+        """限定中の閲覧境界は維持しつつ、終了ログは公開する。"""
         source = RoomRunner(
             None,
             FakeManager(),
@@ -1285,10 +1638,10 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         await restored.restore_from_snapshot(snapshot)
 
         self.assertFalse(restored.state.public_log_archive_allowed)
-        self.assertFalse(restored._can_archive_to_public_log())
+        self.assertTrue(restored._can_archive_to_public_log())
 
-    async def test_legacy_snapshot_never_enables_public_log_archive(self) -> None:
-        """公開可否を持たない旧snapshotは、ログ漏洩を避けて削除へ倒す。"""
+    async def test_legacy_snapshot_keeps_access_marker_but_archives_log(self) -> None:
+        """旧snapshotの閲覧境界は安全側へ倒しつつ、終了ログは公開する。"""
         runner = make_runner()
         runner.state.public_log_archive_allowed = True
         runner._delete_alive_role = AsyncMock()
@@ -1300,7 +1653,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         })
 
         self.assertFalse(runner.state.public_log_archive_allowed)
-        self.assertFalse(runner._can_archive_to_public_log())
+        self.assertTrue(runner._can_archive_to_public_log())
 
     async def test_provisional_vote_can_be_changed_but_the_final_one_cannot(self) -> None:
         """議論中の仮投票は入れ替え自由、投票フェーズでは確定。
@@ -1597,7 +1950,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.state.voice_channel = SimpleNamespace(
             id=channel.id, members=[player.member]
         )
-        runner.state.village_channel = SimpleNamespace(set_permissions=AsyncMock())
+        runner.state.village_channel = permission_text_channel()
         runner.state.mute_marker_enabled = True
         effect = {
             "event_id": "run-1:襲撃:1",
@@ -1643,7 +1996,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         denied = discord.Forbidden(
             SimpleNamespace(status=403, reason="Forbidden", headers={}), "denied"
         )
-        runner.state.village_channel = SimpleNamespace(
+        runner.state.village_channel = permission_text_channel(
             set_permissions=AsyncMock(side_effect=denied)
         )
         player.member.edit = AsyncMock(side_effect=denied)
@@ -1714,7 +2067,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         returning.guild = guild
         returning.edit = AsyncMock(side_effect=restore_member)
         runner.state.guild = guild
-        runner.state.spirit_channel = SimpleNamespace(
+        runner.state.spirit_channel = permission_text_channel(
             set_permissions=AsyncMock(side_effect=block_spirit)
         )
 
@@ -1733,7 +2086,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         denied = discord.Forbidden(
             SimpleNamespace(status=403, reason="Forbidden", headers={}), "denied"
         )
-        runner.state.spirit_channel = SimpleNamespace(
+        runner.state.spirit_channel = permission_text_channel(
             set_permissions=AsyncMock(side_effect=denied)
         )
 
@@ -2029,7 +2382,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         )
         runner.state.guild = guild
         runner.state.voice_channel = SimpleNamespace(id=10, members=[player.member])
-        runner.state.village_channel = SimpleNamespace(set_permissions=AsyncMock())
+        runner.state.village_channel = permission_text_channel()
         runner.state.mute_marker_enabled = True
         runner._enable_mute_markers = AsyncMock(return_value=marker)
         runner._remove_alive_role = AsyncMock(return_value=True)

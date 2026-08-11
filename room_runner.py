@@ -8,6 +8,7 @@ import asyncio
 import logging
 import random
 import secrets
+from dataclasses import replace
 from typing import TYPE_CHECKING, Callable, Optional
 
 import discord
@@ -21,12 +22,14 @@ from config import (
     CH_VILLAGE, CH_SPIRIT, CH_LOBBY, VC_GAME,
     RUNOFF_SPEECH_TIME, LAST_WILL_TIME, DISCUSSION_GRACE_TIME,
     MUTE_GRACE_TIME, MUTE_RETRY_DELAY,
-    POSTGAME_RECOMMENDATION_TIMEOUT,
+    POSTGAME_RECOMMENDATION_TIMEOUT, BONUS_POSTGAME_VOTE,
     WOLF_GUESS_TIMEOUT, BONUS_WOLF_GUESS_DEATH_CAUSES,
     SE_ENABLED,
     ADOPT_EXISTING_LAYOUT,
     PRIVATE_ROOM_CREATOR_ROLE_NAMES, PRIVATE_ROOM_CREATOR_ROLE_LABEL,
+    RECRUITMENT_UNRANKED_LABEL,
     RATED_ROOM_IDS, RoomDefinition, VariantDefinition, get_variant_definition,
+    USER_VISIBLE_VARIANT_IDS,
 )
 from models import Player, GameState, by_number
 from views import (
@@ -49,7 +52,7 @@ log = logging.getLogger(__name__)
 
 
 class StateDurabilityError(RuntimeError):
-    """ゲーム結果をDiscord副作用より先に保存できなかった。
+    """進行継続に必要な外部副作用または保存を安全に完了できなかった。
 
     通常の予期せぬ例外と違い、自動廃村で状態を捨てず、
     GMが状況確認できる安全停止のまま残す。
@@ -347,6 +350,9 @@ class RoomRunner:
         self.state_persist_lock = asyncio.Lock()
         # 3狼提出の受付が終わったら霊界を開けるタイマー。GCで消えないよう保持する
         self._spirit_release_tasks: set[asyncio.Task] = set()
+        # 終了後投票中に次ゲームを始めると旧#昼の投票パネルが削除されるため、
+        # 受付が終わるまでは開始だけを止める。
+        self._postgame_vote_pending = False
         self.state = GameState()
         self.state.room_id = self.room_def.room_id
         self.state.room_name = self.room_def.name
@@ -365,7 +371,32 @@ class RoomRunner:
         self._game_views: list[discord.ui.View] = []
 
     def is_private_room(self) -> bool:
-        return self.room_def.private_owner_id is not None and self.room_def.private_role_name is not None
+        """GMが作成した名前村か。旧参加ロール列の有無には依存しない。"""
+        return self.room_def.private_owner_id is not None
+
+    def uses_manual_static_permissions(self) -> bool:
+        """カテゴリ・参加受付・VCの平常時権限をDiscordへ委ねる卓か。"""
+        return not getattr(self.room_def, "sync_permissions", True)
+
+    def _configured_public_access_boundary(self) -> bool:
+        """開始時点でカテゴリ・VCの閲覧境界が一般公開だった卓か。"""
+        return not bool(
+            getattr(self.room_def, "strict_access_role_names", None)
+            or getattr(self.room_def, "access_role_names", None)
+            or self.uses_manual_static_permissions()
+        )
+
+    @staticmethod
+    def _carry_pending_vc_restore(source: GameState, target: GameState) -> None:
+        """Discord一時失敗で未完のVC復元記録を次ロビーへ引き継ぐ。"""
+        target.vc_default_permissions_captured = (
+            source.vc_default_permissions_captured
+        )
+        target.vc_default_speak_before_game = source.vc_default_speak_before_game
+        target.vc_default_send_before_game = source.vc_default_send_before_game
+        target.vc_gm_speak_captured = source.vc_gm_speak_captured
+        target.vc_gm_speak_user_id = source.vc_gm_speak_user_id
+        target.vc_gm_speak_before_game = source.vc_gm_speak_before_game
 
     @property
     def variant(self) -> VariantDefinition:
@@ -374,8 +405,140 @@ class RoomRunner:
     def is_turn_discussion_mode(self) -> bool:
         return self.variant.discussion_mode == "turn"
 
+    async def change_lobby_variant(self, actor_id: int, variant_id: str) -> str:
+        """GM村の開始前形式を、募集カードと同じtransactionで変更する。"""
+        if not self.is_private_room():
+            return "ゲーム形式を変更できるのはGM村だけです。"
+        if variant_id not in USER_VISIBLE_VARIANT_IDS:
+            return "公開されていないゲーム形式には変更できません。"
+        # 募集の参加・取消・開催と同じ manager→room の順で固定し、
+        # 旧定員のrosterを新形式へ移す競合を作らない。
+        async with self.manager.recruitment_manager.lock, self.action_lock:
+            state = self.state
+            if state.phase != Phase.LOBBY or self._is_game_in_progress():
+                return "ゲーム開始後は形式を変更できません。"
+            if state.players:
+                return "参加者を確定した後はゲーム形式を変更できません。"
+            if state.recruitment_id is not None:
+                linked_recruitment = await database.get_recruitment(
+                    int(state.recruitment_id)
+                )
+                if (
+                    linked_recruitment is None
+                    or linked_recruitment["status"] != database.RECRUITMENT_OPEN
+                ):
+                    return (
+                        "開催処理中または開催済みの募集が紐づいているため、"
+                        "ゲーム形式を変更できません。"
+                    )
+            if actor_id not in {state.gm_id, self.room_def.private_owner_id}:
+                return "現在のGMだけがゲーム形式を変更できます。"
+            new_variant = get_variant_definition(variant_id)
+            if len(state.players) > new_variant.player_count:
+                return (
+                    f"参加者が{new_variant.player_count}人を超えているため変更できません。"
+                    "参加者を自動では外しません。"
+                )
+            old_variant_id = self.room_def.variant_id
+            if old_variant_id == variant_id:
+                return f"現在も **{new_variant.label}** です。"
+            guild = state.guild
+            if guild is None or self.room_def.private_owner_id is None:
+                return "村の保存先を確認できないため変更できません。"
+            open_recruitment = await database.get_open_recruitment_for_room(
+                guild.id, state.room_id,
+            )
+            before_entry_kinds: dict[int, str] = {}
+            if open_recruitment is not None:
+                before_entries = await database.list_recruitment_entries(
+                    int(open_recruitment["id"])
+                )
+                before_entry_kinds = {
+                    int(entry["user_id"]): str(entry["kind"])
+                    for entry in before_entries
+                }
+                allowed_ranks = open_recruitment["allowed_ranks"]
+                if allowed_ranks is not None:
+                    rank_map = await database.get_current_rank_map(
+                        guild.id, new_variant.ladder_id,
+                    )
+                    ineligible_ids = [
+                        user_id
+                        for user_id in before_entry_kinds
+                        if (
+                            rank_map[user_id].rank_name
+                            if user_id in rank_map
+                            else RECRUITMENT_UNRANKED_LABEL
+                        ) not in allowed_ranks
+                    ]
+                    if ineligible_ids:
+                        names = [
+                            (
+                                member.display_name
+                                if (member := guild.get_member(user_id)) is not None
+                                else f"ID:{user_id}"
+                            )
+                            for user_id in ineligible_ids
+                        ]
+                        return (
+                            "変更先ラダーでは募集の参加ランク条件外になる人がいます: "
+                            + ", ".join(names)
+                            + "。参加者・補欠を自動では外しません。"
+                        )
+            variant_db_changed = False
+            recruitment_id: Optional[int] = None
+            try:
+                recruitment_id = (
+                    await database.update_private_room_and_open_recruitment_variant(
+                        guild.id,
+                        state.room_id,
+                        self.room_def.private_owner_id,
+                        variant_id,
+                    )
+                )
+                variant_db_changed = True
+                self.room_def = replace(self.room_def, variant_id=variant_id)
+                await self._persist_room_state()
+            except database.RecruitmentConflict as exc:
+                return str(exc)
+            except Exception as exc:
+                self.room_def = replace(self.room_def, variant_id=old_variant_id)
+                if variant_db_changed:
+                    try:
+                        if recruitment_id is None:
+                            await database.update_private_room_variant(
+                                guild.id, state.room_id, old_variant_id,
+                            )
+                        else:
+                            await database.restore_private_room_and_open_recruitment_variant(
+                                guild.id,
+                                state.room_id,
+                                self.room_def.private_owner_id,
+                                recruitment_id,
+                                old_variant_id,
+                                before_entry_kinds,
+                            )
+                    except Exception:
+                        log.exception(
+                            "GM村形式変更の巻き戻しに失敗 (%s)", state.room_id
+                        )
+                log.exception("GM村形式変更の保存に失敗 (%s): %s", state.room_id, exc)
+                detail = f" ({exc})" if isinstance(exc, RuntimeError) else ""
+                return "ゲーム形式を安全に保存できなかったため変更しませんでした。" + detail
+
+        if recruitment_id is not None:
+            await self.manager.recruitment_manager.refresh_message(recruitment_id)
+            await self.manager.recruitment_manager.notify_ready_if_needed(
+                await database.get_recruitment(recruitment_id)
+            )
+        else:
+            await self._post_lobby_ui()
+        return f"✅ ゲーム形式を **{new_variant.label}** へ変更しました。"
+
     def is_rated_room(self) -> bool:
-        return self.room_def.room_id in RATED_ROOM_IDS and not self.is_private_room()
+        # 正常終了した全村を対象にする。固定・ローカル卓は静的集合、
+        # 作成時にIDが決まるGM名前村はprivate属性で判定する。
+        return self.room_def.room_id in RATED_ROOM_IDS or self.is_private_room()
 
     def turn_actions_open(self) -> bool:
         """現在の発言枠がターン用ボタンを受け付けるか。"""
@@ -489,6 +652,96 @@ class RoomRunner:
     # セットアップ
     # ============================================================
 
+    async def _sync_active_gm_named_game_channel_visibility(
+        self,
+        guild: discord.Guild,
+        channel_ids: dict,
+    ) -> None:
+        """進行中の旧GM名前村を、個人制御を残したまま公開基準へ移行する。
+
+        復元処理が完了した後、保存済みIDでBot所有を確認できる進行中の
+        #昼/#霊界と、現在のカテゴリ・受付・VCを公開基準へ収束させる。
+        生存者の霊界denyや生存ロールの書込許可は保持し、呼出元が戻った後に
+        旧閲覧ロールを削除できる状態にする。復元中にゲームが終了した場合は、
+        まだ元カテゴリにある終了チャンネルも退避まで読み取り専用で公開する。
+        """
+        if not self.is_private_room():
+            return
+
+        async def sync_targets(channel, desired) -> None:
+            if channel is None:
+                return
+            for target in (guild.default_role, guild.me):
+                try:
+                    await self.manager._set_permission_if_changed(
+                        channel,
+                        target,
+                        desired[target],
+                        reason="GM名前村を公開観戦型へ移行",
+                    )
+                except (discord.Forbidden, discord.HTTPException) as error:
+                    raise RuntimeError(
+                        f"{self.room_def.name}/{getattr(channel, 'name', 'カテゴリ')} "
+                        "を公開観戦型へ移行できません"
+                    ) from error
+
+        # カテゴリを先に公開すると、子チャンネルが旧カテゴリ権限を継承していた
+        # 場合に霊界denyやVC発言禁止より先に見える。子を安全な完成形へ収束させ、
+        # 最後にカテゴリを公開する。
+        lobby = self.state.lobby_channel
+        if lobby is not None:
+            await sync_targets(
+                lobby,
+                self.manager._build_room_overwrites(
+                    guild, self.room_def, send_messages=False,
+                ),
+            )
+
+        game_still_active = self.state.phase not in (Phase.LOBBY, Phase.GAME_OVER)
+        vc = self.state.voice_channel
+        if vc is not None:
+            default_vc = vc.overwrites_for(guild.default_role)
+            default_vc.view_channel = True
+            default_vc.read_messages = True
+            default_vc.connect = True
+            default_vc.speak = False if game_still_active else None
+            default_vc.send_messages = False if game_still_active else None
+            bot_vc = vc.overwrites_for(guild.me)
+            bot_vc.view_channel = True
+            bot_vc.read_messages = True
+            bot_vc.connect = True
+            bot_vc.speak = True
+            bot_vc.send_messages = True
+            bot_vc.manage_channels = True
+            await sync_targets(
+                vc,
+                {guild.default_role: default_vc, guild.me: bot_vc},
+            )
+
+        for key, village in (("village", True), ("spirit", False)):
+            channel_id = channel_ids.get(key)
+            if not isinstance(channel_id, int):
+                continue
+            channel = next(
+                (item for item in guild.text_channels if item.id == channel_id),
+                None,
+            )
+            if channel is None:
+                continue
+            desired = self.manager._build_room_overwrites(
+                guild,
+                self.room_def,
+                # 進行中の霊界だけ会話可。復元中に終了・廃村へ移った
+                # チャンネルは、削除/公開ログ退避まで読み取り専用にする。
+                send_messages=(not village and game_still_active),
+            )
+            await sync_targets(channel, desired)
+
+        await sync_targets(
+            self.state.category,
+            self.manager._build_room_overwrites(guild, self.room_def),
+        )
+
     async def setup_channels(
         self,
         guild: discord.Guild,
@@ -503,25 +756,19 @@ class RoomRunner:
         # 古いallow除去だけが適用されて卓が見えなくなる。変更前に止める。
         self.manager._validate_room_access_roles(guild, self.room_def)
 
-        if self.is_private_room():
-            role = await self.manager._ensure_private_room_role(guild, self.room_def)
-            if role is None:
-                raise RuntimeError(
-                    f"専用村ロールを作成または取得できません: {self.room_def.private_role_name}"
-                )
-            await self.manager._sync_private_room_member_roles(guild, self.room_def)
-
         channel_ids = snapshot.get("channel_ids", {}) if snapshot else {}
         active_snapshot = (
             snapshot is not None
             and snapshot.get("phase") not in (Phase.LOBBY.name, Phase.GAME_OVER.name)
         )
-        # 公開可否を持たない旧snapshotは、限定卓だった可能性を否定できない。
-        # 設定を一般公開へ切り替えた直後に進行中のVCを公開しないよう、開始時の
-        # アクセス境界を保存済みカテゴリのまま維持する。新方式で公開卓として開始
-        # したゲームだけが明示的なTrueを持つため、通常どおり公開権限を再同期する。
+        # 互換キー名はpublic_log_archive_allowedだが、ここでは進行中カテゴリ・VCの
+        # アクセス境界を守るためだけに使う。終了ログはこの値にかかわらず全村で
+        # 公開ログへ退避する。値を持たない旧snapshotは限定卓だった可能性を否定
+        # できないため、固定卓は保存済みカテゴリのアクセス境界を維持する。
+        # GM名前村は公開観戦型へ統一したため、旧snapshotでも現在の公開基準へ移す。
         preserve_snapshot_access_boundary = (
             active_snapshot
+            and not self.is_private_room()
             and snapshot.get("public_log_archive_allowed") is not True
         )
 
@@ -553,6 +800,11 @@ class RoomRunner:
                 )
             category = named_category
         if category is None:
+            if self.uses_manual_static_permissions():
+                raise RuntimeError(
+                    f"{self.room_def.name} は権限を手動管理する卓です。"
+                    "既存カテゴリが見つからないため、Botでは自動作成しません"
+                )
             # 作成後に閲覧拒否を付けると、Discord API応答間だけ
             # 新規カテゴリが公開になる。作成リクエスト自体に完成形の
             # overwriteを含め、最初からfail-closedにする。
@@ -566,18 +818,48 @@ class RoomRunner:
                 "進行中ゲームの開始時アクセス境界を維持します (%s)",
                 self.room_def.name,
             )
+        elif active_snapshot and self.is_private_room():
+            # 旧GM村はrestore側で霊界の生存者denyとVC発言禁止を確定してから、
+            # 子チャンネル→カテゴリの順で公開する。ここで先に公開しない。
+            log.info(
+                "進行中GM名前村の公開移行を復元完了まで保留します (%s)",
+                self.room_def.name,
+            )
         else:
             await self.manager._apply_room_visibility(guild, category, self.room_def)
 
         # 起動時の孤立 #昼 / #霊界 チャンネル削除 (同名の重複残骸も全て掃除する)
         # (前回起動でクラッシュ等によりゲーム途中終了した場合、残骸が残っている可能性)
         if not active_snapshot:
+            owned_game_channel_ids = {
+                int(channel_id)
+                for channel_id in (snapshot or {}).get(
+                    "managed_game_channel_ids", []
+                )
+                if isinstance(channel_id, int)
+            }
+            owned_game_channel_ids.update(
+                channel_id
+                for channel_id in (
+                    channel_ids.get("village"),
+                    channel_ids.get("spirit"),
+                )
+                if isinstance(channel_id, int)
+            )
             orphans = [
                 ch for ch in guild.text_channels
                 if ch.category is not None and ch.category.id == category.id
                 and ch.name in (CH_VILLAGE, CH_SPIRIT)
             ]
             for orphan in orphans:
+                if (
+                    self.uses_manual_static_permissions()
+                    and orphan.id not in owned_game_channel_ids
+                ):
+                    raise RuntimeError(
+                        f"{self.room_def.name}/#{orphan.name} はBot所有IDを確認できない"
+                        "手動チャンネルです。誤削除を避けるため起動を停止しました"
+                    )
                 try:
                     await orphan.delete(reason="起動時クリーンアップ: 前回ゲームの残骸")
                     log.info(f"起動時に孤立した #{orphan.name} チャンネルを削除しました")
@@ -595,8 +877,39 @@ class RoomRunner:
         if lobby is None:
             lobby = discord.utils.get(guild.text_channels, name=CH_LOBBY, category=category)
         if lobby is None:
+            if self.uses_manual_static_permissions():
+                raise RuntimeError(
+                    f"{self.room_def.name}/#{CH_LOBBY} は手動管理対象です。"
+                    "既存チャンネルが見つからないため、Botでは自動作成しません"
+                )
             lobby = await guild.create_text_channel(CH_LOBBY, category=category)
         self.state.lobby_channel = lobby
+        if self.is_private_room():
+            # GM名前村はカテゴリ・VC・ゲーム中チャンネルまで公開観戦型。
+            # #参加受付は全員が読める一方、募集カード以外の書込みは許可しない。
+            await self.manager._set_permission_if_changed(
+                lobby,
+                guild.default_role,
+                discord.PermissionOverwrite(
+                    view_channel=True,
+                    read_messages=True,
+                    read_message_history=True,
+                    send_messages=False,
+                ),
+                reason="GM村の募集受付を公開",
+            )
+            await self.manager._set_permission_if_changed(
+                lobby,
+                guild.me,
+                discord.PermissionOverwrite(
+                    view_channel=True,
+                    read_messages=True,
+                    read_message_history=True,
+                    send_messages=True,
+                    manage_channels=True,
+                ),
+                reason="GM村の募集受付を公開",
+            )
 
         saved_voice_id = channel_ids.get("voice")
         vc = next(
@@ -606,26 +919,90 @@ class RoomRunner:
         if vc is None:
             vc = discord.utils.get(guild.voice_channels, name=VC_GAME, category=category)
         if vc is None:
+            if self.uses_manual_static_permissions():
+                raise RuntimeError(
+                    f"{self.room_def.name}/{VC_GAME} は手動管理対象です。"
+                    "既存VCが見つからないため、Botでは自動作成しません"
+                )
             vc = await guild.create_voice_channel(VC_GAME, category=category)
         self.state.voice_channel = vc
 
-        # 前回クラッシュ等で残ったVCのメンバー個別上書き (GM/弁明者のspeak許可)
-        # を掃除する。残すと次ゲームの夜に該当者だけ発言できてしまう。
-        # (@everyoneのspeak残留は上の _apply_room_visibility の上書きで消えている)
+        # 前回クラッシュ等で残ったVCの一時権限を掃除する。
         if not active_snapshot:
-            for target in list(vc.overwrites):
-                if not isinstance(target, discord.Member):
-                    continue
-                try:
-                    await self._paced_discord_api_call(
-                        vc.set_permissions, target, overwrite=None,
-                        reason="人狼: 起動時クリーンアップ (VC個別権限残骸)",
+            if self.uses_manual_static_permissions():
+                # 手動値の所有記録がある項目だけを三値へ戻す。旧snapshotで
+                # 記録がない個別overwriteは、Bot所有と断定できないため触らない。
+                raw_snapshot = snapshot or {}
+                if raw_snapshot.get("vc_default_permissions_captured") is True:
+                    default_ow = vc.overwrites_for(guild.default_role)
+                    speak_before = raw_snapshot.get(
+                        "vc_default_speak_before_game"
                     )
-                    log.info(f"起動時にVC個別権限の残骸を削除しました ({target.display_name})")
-                except (discord.Forbidden, discord.HTTPException) as e:
-                    raise RuntimeError(
-                        f"VC個別権限残骸を削除できません ({target.display_name})"
-                    ) from e
+                    send_before = raw_snapshot.get(
+                        "vc_default_send_before_game"
+                    )
+                    default_ow.speak = (
+                        speak_before if isinstance(speak_before, bool) else None
+                    )
+                    default_ow.send_messages = (
+                        send_before if isinstance(send_before, bool) else None
+                    )
+                    await self._paced_discord_api_call(
+                        vc.set_permissions,
+                        guild.default_role,
+                        overwrite=None if default_ow.is_empty() else default_ow,
+                        reason="人狼: 起動時クリーンアップ (VC発言権限復元)",
+                    )
+                    raw_snapshot["vc_default_permissions_captured"] = False
+                    raw_snapshot["vc_default_speak_before_game"] = None
+                    raw_snapshot["vc_default_send_before_game"] = None
+
+                if raw_snapshot.get("vc_gm_speak_captured") is True:
+                    gm_user_id = raw_snapshot.get("vc_gm_speak_user_id")
+                    gm_target = next(
+                        (
+                            target for target in vc.overwrites
+                            if getattr(target, "id", None) == gm_user_id
+                        ),
+                        guild.get_member(gm_user_id)
+                        if isinstance(gm_user_id, int) else None,
+                    )
+                    if gm_target is not None:
+                        gm_ow = vc.overwrites_for(gm_target)
+                        gm_speak_before = raw_snapshot.get(
+                            "vc_gm_speak_before_game"
+                        )
+                        gm_ow.speak = (
+                            gm_speak_before
+                            if isinstance(gm_speak_before, bool) else None
+                        )
+                        await self._paced_discord_api_call(
+                            vc.set_permissions,
+                            gm_target,
+                            overwrite=None if gm_ow.is_empty() else gm_ow,
+                            reason="人狼: 起動時クリーンアップ (GM発言権限復元)",
+                        )
+                    raw_snapshot["vc_gm_speak_captured"] = False
+                    raw_snapshot["vc_gm_speak_user_id"] = None
+                    raw_snapshot["vc_gm_speak_before_game"] = None
+            else:
+                # 自動管理卓では、従来どおりゲーム中のメンバー個別許可を掃除。
+                for target in list(vc.overwrites):
+                    if not isinstance(target, discord.Member):
+                        continue
+                    try:
+                        await self._paced_discord_api_call(
+                            vc.set_permissions, target, overwrite=None,
+                            reason="人狼: 起動時クリーンアップ (VC個別権限残骸)",
+                        )
+                        log.info(
+                            "起動時にVC個別権限の残骸を削除しました (%s)",
+                            target.display_name,
+                        )
+                    except (discord.Forbidden, discord.HTTPException) as e:
+                        raise RuntimeError(
+                            f"VC個別権限残骸を削除できません ({target.display_name})"
+                        ) from e
 
             # 前回クラッシュ等で残った「Bot自身の」サーバーミュートだけを掃除する。
             # VC内の全ミュートを解除すると、モデレーターが手動でミュートした人まで
@@ -911,6 +1288,13 @@ class RoomRunner:
             "game_run_id": state.game_run_id,
             "recruitment_id": state.recruitment_id,
             "public_log_archive_allowed": state.public_log_archive_allowed,
+            "vc_default_permissions_captured": state.vc_default_permissions_captured,
+            "vc_default_speak_before_game": state.vc_default_speak_before_game,
+            "vc_default_send_before_game": state.vc_default_send_before_game,
+            "vc_gm_speak_captured": state.vc_gm_speak_captured,
+            "vc_gm_speak_user_id": state.vc_gm_speak_user_id,
+            "vc_gm_speak_before_game": state.vc_gm_speak_before_game,
+            "managed_game_channel_ids": sorted(state.managed_game_channel_ids),
             "day_generation": state.day_generation,
             "night_generation": state.night_generation,
             "day_execution_resolved": state.day_execution_resolved,
@@ -1212,20 +1596,65 @@ class RoomRunner:
 
         saved_variant_id = payload.get("variant_id", self.room_def.variant_id)
         if saved_variant_id != self.room_def.variant_id:
-            raise StateDurabilityError(
-                "進行中ゲームの変種が現在の卓設定と一致しません "
-                f"({saved_variant_id} != {self.room_def.variant_id})"
+            saved_phase_name = str(payload.get("phase") or "")
+            safe_dynamic_lobby_change = (
+                self.is_private_room()
+                and saved_phase_name in {Phase.LOBBY.name, Phase.GAME_OVER.name}
+                and not payload.get("players")
             )
+            if not safe_dynamic_lobby_change:
+                raise StateDurabilityError(
+                    "進行中ゲームの変種が現在の卓設定と一致しません "
+                    f"({saved_variant_id} != {self.room_def.variant_id})"
+                )
+            # private_rooms+募集のtransaction完了後、room_state保存前に停止した
+            # 場合だけ成立する差。ゲーム中のsnapshotは従来どおりfail-closed。
+            log.info(
+                "GM村ロビーの形式変更をDB正本から復旧: %s (%s -> %s)",
+                state.room_id,
+                saved_variant_id,
+                self.room_def.variant_id,
+            )
+            payload["variant_id"] = self.room_def.variant_id
 
         state.day_number = payload.get("day_number", 0)
         state.gm_id = payload.get("gm_id")
         state.game_run_id = payload.get("game_run_id") or secrets.token_hex(16)
         state.recruitment_id = payload.get("recruitment_id")
-        # 旧snapshotにこの項目はない。現在の卓設定から推測すると、限定試験中に
-        # 開始された卓を公開後に復元したとき終了ログが漏れるため、安全側へ倒す。
+        # 互換キー名はpublic_log_archive_allowedだが、現在は進行中カテゴリ・VCの
+        # 開始時アクセス境界を復元するためだけに保持する。終了ログはこの値に
+        # かかわらず全村で公開ログへ退避する。
         state.public_log_archive_allowed = (
             payload.get("public_log_archive_allowed") is True
+            and self._configured_public_access_boundary()
         )
+        state.vc_default_permissions_captured = (
+            payload.get("vc_default_permissions_captured") is True
+        )
+        speak_before = payload.get("vc_default_speak_before_game")
+        send_before = payload.get("vc_default_send_before_game")
+        state.vc_default_speak_before_game = (
+            speak_before if isinstance(speak_before, bool) else None
+        )
+        state.vc_default_send_before_game = (
+            send_before if isinstance(send_before, bool) else None
+        )
+        state.vc_gm_speak_captured = (
+            payload.get("vc_gm_speak_captured") is True
+        )
+        gm_speak_user_id = payload.get("vc_gm_speak_user_id")
+        state.vc_gm_speak_user_id = (
+            gm_speak_user_id if isinstance(gm_speak_user_id, int) else None
+        )
+        gm_speak_before = payload.get("vc_gm_speak_before_game")
+        state.vc_gm_speak_before_game = (
+            gm_speak_before if isinstance(gm_speak_before, bool) else None
+        )
+        state.managed_game_channel_ids = {
+            int(channel_id)
+            for channel_id in payload.get("managed_game_channel_ids", [])
+            if isinstance(channel_id, int)
+        }
         state.day_generation = int(payload.get("day_generation", state.day_number or 0))
         state.night_generation = int(payload.get("night_generation", 0))
         state.day_execution_resolved = bool(payload.get("day_execution_resolved", False))
@@ -1477,11 +1906,26 @@ class RoomRunner:
         if state.prep_confirmed:
             state.prep_ready_event.set()
 
+        if (
+            self.is_private_room()
+            and (state.village_channel is None or state.spirit_channel is None)
+        ):
+            # 旧限定GM村の復元中に新しい公開チャンネルを作ると、生存者の
+            # 霊界denyを付け終えるまで閲覧できる隙間が生じる。欠損時は
+            # 勝手に作り直さず、状態と旧閲覧ロールを保持したまま停止する。
+            raise StateDurabilityError(
+                "進行中GM名前村の #昼 / #霊界 が見つかりません"
+            )
+
         if (state.village_channel is None or state.spirit_channel is None) and state.guild is not None:
             try:
                 await self._create_game_channels(state.guild)
             except Exception as e:
                 log.warning(f"復元用ゲームチャンネル作成失敗 ({state.room_name}): {e}")
+            if state.village_channel is None or state.spirit_channel is None:
+                raise StateDurabilityError(
+                    "進行中ゲームの #昼 / #霊界 を安全に復元できません"
+                )
 
         await self._disable_recovered_turn_panel()
 
@@ -1514,14 +1958,12 @@ class RoomRunner:
         # 復元: 一時「生存」ロールを再付与 (再開時に発言制御が効くように)
         # #霊界 の生存者ブロックも現在の生死に合わせて再適用する
         await self._assign_alive_role()
-        await self._restrict_vc_for_game()
-        await self._grant_alive_vc_access()
+        await self._prepare_game_vc_permissions("復元時のVC権限設定")
         # _apply_spirit_blocks は死亡者の霊界を開けるので、保留も同時に解ける。
         # 再起動をまたいでまで提出を待つと、その間に霊界の話を聞けてしまうため、
         # 未提出のぶんは0点で確定させる
         state.spirit_hold_ids.clear()
-        await self._apply_spirit_blocks()
-
+        await self._apply_spirit_blocks(required=self.is_private_room())
         await self._post_lobby_ui()
         if state.village_channel:
             restore_text = (
@@ -1547,7 +1989,11 @@ class RoomRunner:
     async def get_join_rank_info(self, user_id: int) -> dict:
         if self.state.guild is None:
             return {"rank_name": "ブロンズ", "provisional": True}
-        info = await database.get_player_current_rank_info(user_id, self.state.guild.id)
+        info = await database.get_player_current_rank_info(
+            user_id,
+            self.state.guild.id,
+            ladder_id=self.variant.ladder_id,
+        )
         if info is None:
             return {"rank_name": "ブロンズ", "provisional": True}
         return info
@@ -1609,11 +2055,6 @@ class RoomRunner:
         if other_room is not None:
             return f"既に **{other_room.state.room_name}** に参加またはGM登録しています。"
 
-        if self.is_private_room():
-            member_role_names = {role.name for role in member.roles}
-            if self.room_def.private_role_name not in member_role_names:
-                return "この専用村に参加する権限がありません。村主に招待してもらってください。"
-
         strict_access_error = self._strict_access_error(member, action="参加")
         if strict_access_error:
             return strict_access_error
@@ -1649,9 +2090,9 @@ class RoomRunner:
         member_role_names = {role.name for role in member.roles}
         if self.is_private_room():
             if member.id != self.room_def.private_owner_id:
-                return "この専用村では村主だけがGM取得できます。"
+                return "このGM村では村主だけがGM取得できます。"
             if not (PRIVATE_ROOM_CREATOR_ROLE_NAMES & member_role_names):
-                return f"専用村のGM取得には **{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロールが必要です。"
+                return f"GM村のGM取得には **{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロールが必要です。"
             return None
         strict_access_error = self._strict_access_error(member, action="GM取得")
         if strict_access_error:
@@ -1792,14 +2233,15 @@ class RoomRunner:
             try:
                 await self._start_game_locked(interaction)
             except StateDurabilityError as e:
-                # 外部Discord副作用後のcheckpoint保存失敗。
+                # 外部Discord副作用またはそのcheckpointを安全に完了できなかった。
                 # _stop_for_durability_errorでPREPARATION復元フラグは済んでいるので
                 # GMパネルを確保し、コールバックを例外終了させない。
                 log.error(f"開始フェーズを安全停止: {e}")
                 await self._repost_gm_panel()
                 try:
                     await interaction.followup.send(
-                        "⚠️ 開始状態の保存に失敗したため安全停止しました。DB復旧後にGMパネルの「再開」を押してください。",
+                        "⚠️ 開始処理を安全に完了できなかったため停止しました。"
+                        "原因を解消後、GMパネルの「再開」を押してください。",
                         ephemeral=True,
                     )
                 except (discord.NotFound, discord.HTTPException):
@@ -1825,6 +2267,48 @@ class RoomRunner:
     async def _start_game_locked(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
         state = self.state
+        if self._postgame_vote_pending:
+            try:
+                await interaction.followup.send(
+                    "終了後投票を集計中です。受付終了後にもう一度開始してください。",
+                    ephemeral=True,
+                )
+            except (discord.NotFound, discord.HTTPException):
+                pass
+            return
+        if (
+            state.phase != Phase.LOBBY
+            or state.ending
+            or self.manager.rooms.get(state.room_id) is not self
+        ):
+            try:
+                await interaction.followup.send(
+                    "村の状態が変わったためゲームを開始しませんでした。",
+                    ephemeral=True,
+                )
+            except (discord.NotFound, discord.HTTPException):
+                pass
+            return
+        if (
+            state.vc_default_permissions_captured
+            or state.vc_gm_speak_captured
+        ):
+            # 前ゲーム終了時の一時HTTP失敗を、そのまま次ゲームの開始前値として
+            # 再捕捉しない。まず保存済みの本当の開始前値へ戻してからだけ進める。
+            await self._release_vc_after_game()
+            if (
+                state.vc_default_permissions_captured
+                or state.vc_gm_speak_captured
+            ):
+                try:
+                    await interaction.followup.send(
+                        "前ゲームのVC権限を開始前へ戻せていません。"
+                        "Discordのチャンネル管理権限を確認してから、もう一度開始してください。",
+                        ephemeral=True,
+                    )
+                except (discord.NotFound, discord.HTTPException):
+                    pass
+                return
         if len(state.players) != self.variant.player_count:
             try:
                 await interaction.followup.send(
@@ -1837,10 +2321,11 @@ class RoomRunner:
             return
         state.guild = guild
         state.game_run_id = secrets.token_hex(16)
-        # 終了ログの公開可否は、ゲーム開始時のアクセス境界で固定する。途中で
-        # 限定卓を一般公開しても、進行中だった試験卓の会話を公開しない。
-        state.public_log_archive_allowed = not bool(
-            getattr(self.room_def, "strict_access_role_names", None) or ()
+        # 互換キー名はpublic_log_archive_allowedだが、進行中カテゴリ・VCの
+        # 開始時アクセス境界を再起動後も守るために保存する。終了ログは全村で
+        # 共通の公開ログへ退避するため、この値では制限しない。
+        state.public_log_archive_allowed = (
+            self._configured_public_access_boundary()
         )
         state.day_generation = 0
         state.night_generation = 0
@@ -1894,7 +2379,7 @@ class RoomRunner:
 
         progress_message = await self._safe_village_send(
             "⏳ **ゲーム開始準備中 (1/3)**\n"
-            "ニックネーム・初期ミュート・参加ロールを順番に設定しています。"
+            "ニックネーム・初期ミュート・進行用ロールを順番に設定しています。"
         )
 
         # これ以降のBot muteは、muteと同一PATCHで専用ロールを
@@ -2131,8 +2616,7 @@ class RoomRunner:
         # 統合PATCHに失敗した参加者、またはロール作成が一時失敗した場合だけ
         # add_rolesへフォールバックする。
         await self._assign_alive_role(exclude_ids=alive_role_assigned_ids)
-        await self._restrict_vc_for_game()
-        await self._grant_alive_vc_access()
+        await self._prepare_game_vc_permissions("ゲーム開始時のVC権限設定")
         # member.edit完了直後はGateway上のvoice.mute反映が遅れる場合がある。
         # 反映前に_mute_allを呼んで同じ13件を再送しないよう先に待つ。
         if not await self._await_mute_applied(initial_mute_targets, MUTE_GRACE_TIME):
@@ -2164,6 +2648,58 @@ class RoomRunner:
         )
         state.game_task = asyncio.create_task(self._game_loop())
 
+    def _build_game_channel_overwrites(
+        self,
+        guild: discord.Guild,
+        *,
+        village: bool,
+    ) -> dict[discord.abc.Snowflake, discord.PermissionOverwrite]:
+        """#昼/#霊界の開始時overwriteを組み立てる。
+
+        手動管理卓ではカテゴリの現在値を静的な正本として複製し、ゲーム中に
+        必須な書込制御とBot自身の権限だけを重ねる。カテゴリ側の閲覧許可・拒否を
+        access_role_namesから作り直さないため、Discordでの手動設定が保たれる。
+        """
+        if not self.uses_manual_static_permissions():
+            return self.manager._build_room_overwrites(
+                guild,
+                self.room_def,
+                send_messages=False if village else True,
+            )
+
+        category = self.state.category
+        source = getattr(category, "overwrites", {}) if category is not None else {}
+        overwrites = {
+            target: discord.PermissionOverwrite.from_pair(*overwrite.pair())
+            for target, overwrite in source.items()
+        }
+
+        bot_ow = overwrites.get(guild.me, discord.PermissionOverwrite())
+        bot_ow.view_channel = True
+        bot_ow.read_messages = True
+        bot_ow.read_message_history = True
+        bot_ow.send_messages = True
+        bot_ow.manage_channels = True
+        overwrites[guild.me] = bot_ow
+
+        if village:
+            # #昼は生存ロールだけをフェーズに応じて開閉する。カテゴリで手動allow
+            # された観戦者・死亡者が書けないよう、他targetは開始時に閉じる。
+            player_ids = set(self.state.players)
+            if guild.default_role not in overwrites:
+                overwrites[guild.default_role] = discord.PermissionOverwrite()
+            for target, overwrite in overwrites.items():
+                if target == guild.me:
+                    continue
+                # メンバー個別denyはロールallowより強い。参加者に既存の個別
+                # overwriteがある場合だけ未設定へ戻し、生存ロールで開けるようにする。
+                overwrite.send_messages = (
+                    None
+                    if getattr(target, "id", None) in player_ids
+                    else False
+                )
+        return overwrites
+
     async def _create_game_channels(self, guild: discord.Guild) -> None:
         state = self.state
         category = state.category
@@ -2189,46 +2725,55 @@ class RoomRunner:
                 continue
             if ch.name not in (CH_VILLAGE, CH_SPIRIT) or ch.id in keep_ids:
                 continue
+            if (
+                self.uses_manual_static_permissions()
+                and ch.id not in state.managed_game_channel_ids
+            ):
+                raise RuntimeError(
+                    f"#{ch.name} はBot所有IDを確認できない手動チャンネルです。"
+                    "誤削除を避けるためゲームを開始しません"
+                )
             try:
                 await self._paced_discord_api_call(
                     ch.delete, reason="人狼: 前ゲームの残骸削除"
                 )
+                state.managed_game_channel_ids.discard(ch.id)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
                 log.warning(f"残骸チャンネル削除失敗 (#{ch.name}): {e}")
 
         # #昼
         if state.village_channel is None:
-            overwrites_village = self.manager._build_room_overwrites(
-                guild,
-                self.room_def,
-                send_messages=False,
+            overwrites_village = self._build_game_channel_overwrites(
+                guild, village=True,
             )
             state.village_channel = await guild.create_text_channel(
                 CH_VILLAGE, category=category, overwrites=overwrites_village,
             )
+            state.managed_game_channel_ids.add(state.village_channel.id)
 
         # #霊界: 死亡者+観戦者の雑談チャンネル。
         # 部屋の表示権限をベースに書き込みを許可し、生存者には
         # 「メンバー個別上書き」で閲覧拒否を付ける。
         # 注意: Discordの権限解決はロール層でdenyを集約→allowを集約の順に
-        # 適用するため、ロールdenyは別ロール (ランクロール/専用村ロール) の
+        # 適用するため、ロールdenyは別ロール (ランクロール等) の
         # view allowに打ち消される。メンバー上書きはロール層の後に適用される
         # ので、制限卓でも確実に生存者から隠せる。
         if state.spirit_channel is None:
-            overwrites_spirit = self.manager._build_room_overwrites(
-                guild,
-                self.room_def,
-                send_messages=True,
+            overwrites_spirit = self._build_game_channel_overwrites(
+                guild, village=False,
             )
             for player in state.players.values():
                 if player.alive:
-                    overwrites_spirit[player.member] = discord.PermissionOverwrite(
-                        view_channel=False,
-                        read_messages=False,
+                    player_ow = overwrites_spirit.get(
+                        player.member, discord.PermissionOverwrite()
                     )
+                    player_ow.view_channel = False
+                    player_ow.read_messages = False
+                    overwrites_spirit[player.member] = player_ow
             state.spirit_channel = await guild.create_text_channel(
                 CH_SPIRIT, category=category, overwrites=overwrites_spirit,
             )
+            state.managed_game_channel_ids.add(state.spirit_channel.id)
             try:
                 await state.spirit_channel.send(
                     "👻 ここは **霊界** です。死亡したプレイヤーと観戦者だけが見えます。\n"
@@ -3629,29 +4174,139 @@ class RoomRunner:
         await self._apply_death_effect(effect)
 
     def _can_archive_to_public_log(self) -> bool:
-        """終了ログを共通の公開ログカテゴリへ退避してよいか。
+        """総合・ローカル固定卓・GM名前村の終了ログを公開ログへ退避する。"""
+        return True
 
-        可否はゲーム開始時にsnapshotへ保存した値を使う。設定変更後に終了する
-        進行中の限定卓を公開カテゴリへ移さないためであり、旧snapshotもFalseで
-        復元される。Falseなら従来どおり遅延削除へ倒す。
-        """
-        return bool(getattr(self.state, "public_log_archive_allowed", False))
+    @staticmethod
+    def _public_log_overwrite(
+        current: Optional[discord.PermissionOverwrite] = None,
+    ) -> discord.PermissionOverwrite:
+        """既存の無関係な設定を保ちつつ、公開ログの読み書き境界を固定する。"""
+        overwrite = (
+            discord.PermissionOverwrite()
+            if current is None
+            else discord.PermissionOverwrite.from_pair(*current.pair())
+        )
+        overwrite.update(
+            view_channel=True,
+            read_message_history=True,
+            send_messages=False,
+            add_reactions=False,
+            manage_channels=False,
+            manage_roles=False,
+            manage_messages=False,
+            manage_threads=False,
+            manage_webhooks=False,
+            create_public_threads=False,
+            create_private_threads=False,
+            send_messages_in_threads=False,
+            send_voice_messages=False,
+            send_polls=False,
+            use_application_commands=False,
+            use_external_apps=False,
+        )
+        return overwrite
+
+    @classmethod
+    def _public_log_bot_overwrite(
+        cls,
+        current: Optional[discord.PermissionOverwrite] = None,
+    ) -> discord.PermissionOverwrite:
+        """通常メンバーを閉じたまま、Botの整理権限だけを確保する。"""
+        overwrite = cls._public_log_overwrite(current)
+        overwrite.manage_channels = True
+        overwrite.manage_roles = True
+        return overwrite
+
+    def _public_log_overwrites(
+        self, channel: discord.abc.GuildChannel,
+    ) -> dict[object, discord.PermissionOverwrite]:
+        """既存対象を落とさず、公開ログ用の上書き一式を組み立てる。"""
+        guild = self.state.guild
+        if guild is None:
+            raise ValueError("guildがありません")
+        existing = dict(channel.overwrites)
+        existing.setdefault(guild.default_role, discord.PermissionOverwrite())
+        bot_member = getattr(guild, "me", None)
+        if bot_member is not None:
+            existing.setdefault(bot_member, discord.PermissionOverwrite())
+        bot_id = getattr(bot_member, "id", None)
+        return {
+            target: (
+                self._public_log_bot_overwrite(current)
+                if bot_id is not None and getattr(target, "id", None) == bot_id
+                else self._public_log_overwrite(current)
+            )
+            for target, current in existing.items()
+        }
+
+    @staticmethod
+    def _is_managed_log_channel_name(category_name: str, channel_name: str) -> bool:
+        """同名の手動カテゴリや専用村をログとして誤採用しない。"""
+        expected = {
+            LOG_CATEGORY_VILLAGE: CH_VILLAGE,
+            LOG_CATEGORY_SPIRIT: CH_SPIRIT,
+        }.get(category_name)
+        sequence, separator, suffix = channel_name.partition("-")
+        return bool(expected and separator and sequence.isdecimal() and suffix == expected)
+
+    async def _sync_log_category_permissions(
+        self, category: discord.CategoryChannel,
+    ) -> None:
+        """既存allow/denyを含め、通常メンバーを「閲覧可・書込不可」へ揃える。"""
+        guild = self.state.guild
+        if guild is None:
+            return
+        unexpected = next(
+            (
+                channel for channel in category.channels
+                if not self._is_managed_log_channel_name(category.name, channel.name)
+            ),
+            None,
+        )
+        if unexpected is not None:
+            raise ValueError(
+                f"管理外チャンネルを含む同名カテゴリです: #{unexpected.name}"
+            )
+
+        desired = self._public_log_overwrites(category)
+        if dict(category.overwrites) != desired:
+            await self._paced_discord_api_call(
+                category.edit,
+                overwrites=desired,
+                reason="人狼: 公開ログカテゴリ権限更新",
+            )
+        # カテゴリと権限非同期だった既存ログも同じ境界へ戻す。上書き一式を
+        # 直接PATCHするため、category.edit後のGatewayキャッシュ反映を待たない。
+        for channel in category.channels:
+            if dict(channel.overwrites) == desired:
+                continue
+            await self._paced_discord_api_call(
+                channel.edit,
+                overwrites=desired,
+                reason="人狼: 既存公開ログ権限更新",
+            )
 
     async def _ensure_log_category(self, name: str) -> Optional[discord.CategoryChannel]:
-        """ログカテゴリを用意する (全員が読めて、誰も書き込めない)。"""
+        """通常メンバーが読めて書き込めないログカテゴリを用意する。"""
         guild = self.state.guild
         if guild is None:
             return None
         category = discord.utils.get(guild.categories, name=name)
         if category is not None:
+            try:
+                await self._sync_log_category_permissions(category)
+            except (discord.Forbidden, discord.HTTPException, TypeError, ValueError) as e:
+                # 誤った権限のカテゴリへ同期して公開するより、従来の削除へ倒す。
+                log.warning(f"ログカテゴリ権限更新失敗 ({name}): {e}")
+                return None
             return category
         overwrites = {
-            guild.default_role: discord.PermissionOverwrite(
-                view_channel=True, read_messages=True, send_messages=False,
-                add_reactions=False, create_public_threads=False,
-                create_private_threads=False, send_messages_in_threads=False,
-            ),
+            guild.default_role: self._public_log_overwrite(),
         }
+        bot_member = getattr(guild, "me", None)
+        if bot_member is not None:
+            overwrites[bot_member] = self._public_log_bot_overwrite()
         try:
             return await self._discord_api_call(
                 guild.create_category, name, overwrites=overwrites
@@ -3681,19 +4336,13 @@ class RoomRunner:
         channel: discord.TextChannel,
         category_name: str,
         seq: int,
-        *,
-        public_log_archive_allowed: bool,
     ) -> bool:
         """終了した卓チャンネルをログカテゴリへ移す。成功したらTrue。
 
         名前は「04-昼」のように試合番号を先頭へ置く。Discordはカテゴリ内を
         名前順に並べるため、番号が前にあると自然に試合順で並ぶ。
-        権限はカテゴリへ同期させる (書き込み不可・全員閲覧可)。
+        権限はカテゴリと同じ読み取り専用上書きを直接指定する。
         """
-        # 呼び出し元がゲーム終了前に捕捉した開始時の値を渡す。遅延タスクは
-        # その間にself.stateが次のロビーへ差し替わるため、ここで再読しない。
-        if not public_log_archive_allowed:
-            return False
         category = await self._ensure_log_category(category_name)
         if category is None:
             return False
@@ -3703,7 +4352,7 @@ class RoomRunner:
                 channel.edit,
                 name=f"{seq:02d}-{channel.name}",
                 category=category,
-                sync_permissions=True,
+                overwrites=self._public_log_overwrites(category),
                 reason="人狼: 終了した卓のログを保管",
             )
             return True
@@ -3838,9 +4487,14 @@ class RoomRunner:
         village_blocked = False
         if state.village_channel is not None:
             try:
+                village_ow = state.village_channel.overwrites_for(player.member)
+                village_ow.read_messages = True
+                village_ow.send_messages = False
                 await self._discord_api_call(
                     state.village_channel.set_permissions,
-                    player.member, read_messages=True, send_messages=False,
+                    player.member,
+                    overwrite=village_ow,
+                    reason="人狼: 死亡者の昼書き込み禁止",
                 )
                 village_blocked = True
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
@@ -5359,6 +6013,7 @@ class RoomRunner:
         # 通常の勝敗精算を確定してから、推薦だけを独立した冪等処理として受け付ける。
         # バックグラウンドにすることで、ニックネーム/VC復元と次村受付を3分止めない。
         if settled and self.is_rated_room() and game_id is not None:
+            finished_ladder_id = self.variant.ladder_id
             recommendation_voters = self._postgame_recommendation_voters(state)
             postgame_voters: set[int] = set()
             loser_ids: set[int] = set()
@@ -5400,9 +6055,17 @@ class RoomRunner:
                         "⚠️ 終了後投票の受付を開始できませんでした。ログを確認してください。"
                     )
                 else:
+                    # 次ゲーム開始は旧#昼を削除するため、投票が終わるまでは
+                    # 全卓で開始だけを止める。GM名前村も公開なのでアクセス
+                    # ロールを保持・回収する処理は不要。
+                    self._postgame_vote_pending = True
                     self.manager.spawn_bg_task(
-                        self._run_postgame_recommendations(
-                            state, int(game_id), ballot_keys, loser_ids,
+                        self._run_postgame_recommendations_task(
+                            state,
+                            int(game_id),
+                            ballot_keys,
+                            loser_ids,
+                            ladder_id=finished_ladder_id,
                         )
                     )
 
@@ -5457,7 +6120,6 @@ class RoomRunner:
                         ch,
                         category_name,
                         seq,
-                        public_log_archive_allowed=archive_to_public_log,
                     )
                 ):
                     continue
@@ -5484,6 +6146,8 @@ class RoomRunner:
         self.state.lobby_channel = state.lobby_channel
         self.state.stats_channel = state.stats_channel
         self.state.voice_channel = state.voice_channel
+        self._carry_pending_vc_restore(state, self.state)
+        self.state.managed_game_channel_ids = set(state.managed_game_channel_ids)
         await self._post_lobby_ui()
         for attempt, delay in enumerate((0, 1, 2), start=1):
             if delay:
@@ -5527,6 +6191,8 @@ class RoomRunner:
         game_id: int,
         ballot_keys: set[tuple[int, str]],
         loser_ids: set[int],
+        *,
+        ladder_id: str,
     ) -> None:
         """終了後の投票パネルを `#昼` に1枚だけ出し、締切後に匿名で集計する。
 
@@ -5565,14 +6231,24 @@ class RoomRunner:
                 timeout=POSTGAME_RECOMMENDATION_TIMEOUT,
                 on_confirmed=on_confirmed,
             )
-            view.message = await self._safe_village_send(
-                "🗳️ **終了後の投票**（受付 "
-                f"**{POSTGAME_RECOMMENDATION_TIMEOUT // 60}分**・1票につきレート+1）\n"
-                "・**勝利陣営**は、手強かった敗北陣営の1人へ\n"
-                "・**霊媒師 / 初日の処刑者 / 初夜の襲撃死者**は、参加者の1人へ\n"
-                "投票権のある人だけが操作できます。投票者名は公開されません。",
-                view=view,
-            )
+            channel = finished_state.village_channel
+            if channel is not None:
+                try:
+                    view.message = await channel.send(
+                        "🗳️ **終了後の投票**（受付 "
+                        f"**{POSTGAME_RECOMMENDATION_TIMEOUT // 60}分**・"
+                        f"1票につきレート+{BONUS_POSTGAME_VOTE}）\n"
+                        "・**勝利陣営**は、手強かった敗北陣営の1人へ\n"
+                        "・**霊媒師 / 初日の処刑者 / 初夜の襲撃死者**は、参加者の1人へ\n"
+                        "投票権のある人だけが操作できます。投票者名は公開されません。",
+                        view=view,
+                    )
+                except (
+                    discord.NotFound,
+                    discord.Forbidden,
+                    discord.HTTPException,
+                ) as exc:
+                    log.warning("終了後投票パネルの投稿失敗: %s", exc)
 
         if not pending:
             all_done.set()
@@ -5585,13 +6261,13 @@ class RoomRunner:
 
         async with self.manager.rating_lock:
             before_rank_map = await database.get_current_rank_map(
-                guild.id, self.variant.ladder_id
+                guild.id, ladder_id
             )
             results = await database.finalize_game_recommendations(
                 game_id, guild.id, close_pending=True
             )
             after_rank_map = await database.get_current_rank_map(
-                guild.id, self.variant.ladder_id
+                guild.id, ladder_id
             )
         if not results:
             return
@@ -5613,7 +6289,7 @@ class RoomRunner:
                     member,
                     rank_ctx.rank_name,
                     roles_map=roles_map,
-                    ladder_id=self.variant.ladder_id,
+                    ladder_id=ladder_id,
                 )
             except Exception as e:
                 log.warning(f"推薦後ランクロール同期失敗 (ID:{player_id}): {e}")
@@ -5631,13 +6307,36 @@ class RoomRunner:
             description="\n".join(lines),
             color=discord.Color.gold(),
         )
-        embed.set_footer(text="推薦者名は非公開です。推薦は1票につきレート+1。")
+        embed.set_footer(
+            text=f"推薦者名は非公開です。推薦は1票につきレート+{BONUS_POSTGAME_VOTE}。"
+        )
         channel = finished_state.village_channel
         if channel is not None:
             try:
                 await channel.send(embed=embed)
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
                 log.warning(f"終了後推薦結果の投稿失敗: {e}")
+
+    async def _run_postgame_recommendations_task(
+        self,
+        finished_state: GameState,
+        game_id: int,
+        ballot_keys: set[tuple[int, str]],
+        loser_ids: set[int],
+        *,
+        ladder_id: str,
+    ) -> None:
+        """終了後投票を実行し、完了後に次ゲーム開始を解放する。"""
+        try:
+            await self._run_postgame_recommendations(
+                finished_state,
+                game_id,
+                ballot_keys,
+                loser_ids,
+                ladder_id=ladder_id,
+            )
+        finally:
+            self._postgame_vote_pending = False
 
     async def _post_rating_results(
         self,
@@ -5958,8 +6657,9 @@ class RoomRunner:
                 return
 
             await self._assign_alive_role()
-            await self._restrict_vc_for_game()
-            await self._grant_alive_vc_access()
+            await self._prepare_game_vc_permissions(
+                "開始フェーズ復元時のVC権限設定"
+            )
             await self._mute_all()
             await self._persist_room_state()
             await self._safe_village_send(
@@ -5968,6 +6668,9 @@ class RoomRunner:
             await self._game_loop()
         except asyncio.CancelledError:
             log.info("開始復元タスクがキャンセルされました")
+        except StateDurabilityError as e:
+            # VC権限などの失敗時は呼出元で既に安全停止・保存・告知済み。
+            log.error(f"開始フェーズ復元を安全停止: {e}")
         except Exception as e:
             log.exception(f"開始フェーズ復元エラー: {e}")
             await self._stop_for_durability_error("開始フェーズの復元", e)
@@ -6443,6 +7146,8 @@ class RoomRunner:
         self.state.lobby_channel = lobby
         self.state.stats_channel = stats
         self.state.voice_channel = vc
+        self._carry_pending_vc_restore(state, self.state)
+        self.state.managed_game_channel_ids = set(state.managed_game_channel_ids)
         await self._post_lobby_ui()
         for attempt, delay in enumerate((0, 1, 2), start=1):
             if delay:
@@ -6697,16 +7402,15 @@ class RoomRunner:
         """
         role = await self._ensure_alive_role()
         vc = vc or self.state.voice_channel
-        if role is None or vc is None:
-            return
-        try:
-            await self._paced_discord_api_call(
-                vc.set_permissions, role,
-                view_channel=True, connect=True, speak=True,
-                reason="人狼: 生存者のVCアクセス保証",
-            )
-        except (discord.Forbidden, discord.HTTPException) as e:
-            log.warning(f"VC生存ロール権限更新失敗 ({self.state.room_name}): {e}")
+        if role is None:
+            raise RuntimeError("進行中ロールを作成または取得できません")
+        if vc is None:
+            raise RuntimeError("ゲームVCを確認できません")
+        await self._paced_discord_api_call(
+            vc.set_permissions, role,
+            view_channel=True, connect=True, speak=True,
+            reason="人狼: 生存者のVCアクセス保証",
+        )
 
     def _effective_phase(self) -> Optional[Phase]:
         """一時停止中は停止前のフェーズを返す (PAUSEDを透過して扱う)"""
@@ -7093,6 +7797,17 @@ class RoomRunner:
             changed, set(), "発言者の再ミュート"
         )
 
+    async def _prepare_game_vc_permissions(self, context: str) -> None:
+        """観戦者denyと生存者allowの両方を必須化し、失敗時は安全停止する。"""
+        try:
+            await self._restrict_vc_for_game()
+            await self._grant_alive_vc_access()
+        except Exception as error:
+            await self._stop_for_durability_error(context, error)
+            if isinstance(error, StateDurabilityError):
+                raise
+            raise StateDurabilityError(f"{context}に失敗しました") from error
+
     async def _restrict_vc_for_game(self) -> None:
         """ゲーム中はVCの@everyoneを発言禁止にする (観戦者・死亡者対策)。
 
@@ -7114,52 +7829,136 @@ class RoomRunner:
         state = self.state
         vc = state.voice_channel
         if vc is None or state.guild is None:
-            return
-        try:
-            ow = vc.overwrites_for(state.guild.default_role)
-            ow.speak = False
-            ow.send_messages = False
-            await self._paced_discord_api_call(
-                vc.set_permissions, state.guild.default_role,
-                overwrite=ow, reason="人狼: ゲーム中の観戦者発言禁止",
-            )
-        except (discord.Forbidden, discord.HTTPException) as e:
-            log.warning(f"VC観戦者制限失敗 ({state.room_name}): {e}")
+            raise RuntimeError("ゲームVCまたはサーバー情報を確認できません")
 
-        # GMが参加者を兼ねていない場合は個別に発言許可 (進行のため常時発言可)
+        default_overwrite = vc.overwrites_for(state.guild.default_role)
+        gm_member: Optional[discord.Member] = None
+        gm_overwrite: Optional[discord.PermissionOverwrite] = None
+        captured_manual_value = False
+
+        # ねいとくん村などの手動管理卓では、ゲーム中に一時変更する2項目だけ
+        # 開始前の三値を保存する。保存をDiscord PATCHより先に確定させれば、
+        # 直後にプロセスが落ちても次回起動で元へ戻せる。
+        if (
+            self.uses_manual_static_permissions()
+            and not state.vc_default_permissions_captured
+        ):
+            state.vc_default_permissions_captured = True
+            state.vc_default_speak_before_game = default_overwrite.speak
+            state.vc_default_send_before_game = default_overwrite.send_messages
+            captured_manual_value = True
+
+        # GMが参加者を兼ねていない場合は個別に発言許可する。手動管理卓では
+        # 既存overwriteを丸ごと置換せず、speakだけを一時変更して元値を保存する。
         if state.gm_id is not None and state.gm_id not in state.players:
             gm_member = state.guild.get_member(state.gm_id)
             if gm_member is not None:
-                try:
+                gm_overwrite = vc.overwrites_for(gm_member)
+                if (
+                    self.uses_manual_static_permissions()
+                    and not state.vc_gm_speak_captured
+                ):
+                    state.vc_gm_speak_captured = True
+                    state.vc_gm_speak_user_id = gm_member.id
+                    state.vc_gm_speak_before_game = gm_overwrite.speak
+                    captured_manual_value = True
+
+        if captured_manual_value:
+            await self._persist_room_state()
+
+        default_overwrite.speak = False
+        default_overwrite.send_messages = False
+        await self._paced_discord_api_call(
+            vc.set_permissions, state.guild.default_role,
+            overwrite=default_overwrite,
+            reason="人狼: ゲーム中の観戦者発言禁止",
+        )
+
+        if gm_member is not None and gm_overwrite is not None:
+            try:
+                if self.uses_manual_static_permissions():
+                    gm_overwrite.speak = True
+                    await self._paced_discord_api_call(
+                        vc.set_permissions, gm_member,
+                        overwrite=gm_overwrite,
+                        reason="人狼: GM発言許可",
+                    )
+                else:
                     await self._paced_discord_api_call(
                         vc.set_permissions, gm_member,
                         speak=True, reason="人狼: GM発言許可",
                     )
-                except (discord.Forbidden, discord.HTTPException) as e:
-                    log.warning(f"GM発言許可失敗 ({state.room_name}): {e}")
+            except (discord.Forbidden, discord.HTTPException) as e:
+                raise RuntimeError(
+                    f"GMのVC発言許可を設定できません ({state.room_name})"
+                ) from e
 
     async def _release_vc_after_game(self) -> None:
         """ゲーム終了時に@everyoneの発言制限だけを解除する (表示権限は維持)。
 
-        _restrict_vc_for_game で伏せた音声とテキストを揃って None
-        (未設定=サーバー既定) へ戻す。片方だけ残すと、ゲーム外でも
-        VCのチャットが使えないままになる。
+        自動管理卓は従来どおり未設定へ戻す。手動管理卓は
+        _restrict_vc_for_game 前に保存した三値へ戻し、Discordで設定していた
+        speak/send_messagesやGM個別overwriteの他項目を失わせない。
         """
         state = self.state
         vc = state.voice_channel
         if vc is None or state.guild is None:
             return
+        snapshot_changed = False
         try:
             ow = vc.overwrites_for(state.guild.default_role)
-            ow.speak = None
-            ow.send_messages = None
+            if state.vc_default_permissions_captured:
+                ow.speak = state.vc_default_speak_before_game
+                ow.send_messages = state.vc_default_send_before_game
+            else:
+                ow.speak = None
+                ow.send_messages = None
             await self._paced_discord_api_call(
                 vc.set_permissions, state.guild.default_role,
                 overwrite=None if ow.is_empty() else ow,
                 reason="人狼: ゲーム終了で発言制限解除",
             )
+            if state.vc_default_permissions_captured:
+                state.vc_default_permissions_captured = False
+                state.vc_default_speak_before_game = None
+                state.vc_default_send_before_game = None
+                snapshot_changed = True
         except (discord.Forbidden, discord.HTTPException) as e:
             log.warning(f"VC発言制限解除失敗 ({state.room_name}): {e}")
+
+        if state.vc_gm_speak_captured and state.vc_gm_speak_user_id is not None:
+            gm_target = next(
+                (
+                    target for target in vc.overwrites
+                    if getattr(target, "id", None) == state.vc_gm_speak_user_id
+                ),
+                state.guild.get_member(state.vc_gm_speak_user_id),
+            )
+            if gm_target is not None:
+                try:
+                    gm_ow = vc.overwrites_for(gm_target)
+                    gm_ow.speak = state.vc_gm_speak_before_game
+                    await self._paced_discord_api_call(
+                        vc.set_permissions,
+                        gm_target,
+                        overwrite=None if gm_ow.is_empty() else gm_ow,
+                        reason="人狼: ゲーム終了でGM発言許可を復元",
+                    )
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    log.warning(f"GM発言許可復元失敗 ({state.room_name}): {e}")
+                else:
+                    state.vc_gm_speak_captured = False
+                    state.vc_gm_speak_user_id = None
+                    state.vc_gm_speak_before_game = None
+                    snapshot_changed = True
+
+        if snapshot_changed:
+            try:
+                await self._persist_room_state()
+            except Exception as e:
+                # Discord側は既に開始前へ戻っている。旧snapshotの復元処理は
+                # 同じ値を再適用するだけなので、終了処理全体は止めない。
+                log.exception("VC手動権限の復元済み状態を保存できません: %s", e)
 
     async def _mute_all(
         self, *, skip_ids: Optional[set[int]] = None
@@ -7240,9 +8039,23 @@ class RoomRunner:
                 except (discord.Forbidden, discord.HTTPException) as e:
                     log.warning(f"VC個別権限解除失敗 ({member.display_name}): {e}")
 
-            perm_targets = [p.member for p in state.players.values()]
-            # 参加者を兼ねていないGMの個別発言許可も撤去
-            if state.gm_id is not None and state.gm_id not in state.players and state.guild:
+            # 手動管理卓の個別overwriteは _release_vc_after_game がspeakだけを
+            # 元値へ戻す。ここで丸ごと削除すると手動設定まで失うため触らない。
+            manual_vc_permissions = (
+                self.uses_manual_static_permissions()
+                or state.vc_gm_speak_captured
+            )
+            perm_targets = (
+                [] if manual_vc_permissions
+                else [p.member for p in state.players.values()]
+            )
+            # 自動管理卓だけ、参加者を兼ねていないGMの個別許可を従来どおり撤去。
+            if (
+                not manual_vc_permissions
+                and state.gm_id is not None
+                and state.gm_id not in state.players
+                and state.guild
+            ):
                 gm_member = state.guild.get_member(state.gm_id)
                 if gm_member is not None:
                     perm_targets.append(gm_member)
@@ -7273,7 +8086,10 @@ class RoomRunner:
     # ニックネーム管理
     # ============================================================
 
-    async def _restore_nicknames(self, state: Optional[GameState] = None) -> None:
+    async def _restore_nicknames(
+        self,
+        state: Optional[GameState] = None,
+    ) -> None:
         # force_end が self.state を差し替えた後に旧stateの改名を戻すケースが
         # あるため、明示指定できるようにする (省略時は現在のstate)
         state = state or self.state
@@ -7284,7 +8100,6 @@ class RoomRunner:
             )
             if state.guild is not None else None
         )
-
         async def restore_one(member_id: int, nick: Optional[str]) -> None:
             member = state.guild.get_member(member_id)
             if not member or member.bot:
@@ -7307,9 +8122,10 @@ class RoomRunner:
                     getattr(role, "id", None) == marker.id
                     for role in getattr(member, "roles", [])
                 ):
-                    kwargs["roles"] = self._roles_with_mute_marker(
-                        member, marker, present=False
-                    )
+                    kwargs["roles"] = [
+                        role for role in member_roles_for_edit(member)
+                        if getattr(role, "id", None) != marker.id
+                    ]
             try:
                 if not kwargs:
                     return
@@ -7319,9 +8135,14 @@ class RoomRunner:
             except (discord.Forbidden, discord.HTTPException) as e:
                 log.warning(f"ニックネーム復元失敗 (ID:{member_id}, nick:{nick}): {e}")
 
-        if state.original_nicknames:
-            for member_id, nickname in state.original_nicknames.items():
-                await restore_one(member_id, nickname)
+        restore_ids = set(state.players) | set(state.original_nicknames)
+        for member_id in restore_ids:
+            player = state.players.get(member_id)
+            nickname = state.original_nicknames.get(
+                member_id,
+                player.original_nickname if player is not None else None,
+            )
+            await restore_one(member_id, nickname)
 
     # ============================================================
     # 安全な村チャンネル送信ヘルパー
@@ -7436,6 +8257,37 @@ class RoomRunner:
         for player_id in list(self.state.spirit_hold_ids):
             await self._release_spirit_hold(player_id)
 
+    def _spirit_member_overwrite(
+        self,
+        member: discord.Member,
+        *,
+        blocked: bool,
+    ) -> Optional[discord.PermissionOverwrite]:
+        """霊界の個人denyだけを変更し、他の手動bitを保つ。"""
+        ch = self.state.spirit_channel
+        if ch is None:
+            return None
+        if blocked:
+            overwrite = ch.overwrites_for(member)
+            overwrite.view_channel = False
+            overwrite.read_messages = False
+            return overwrite
+        if not self.uses_manual_static_permissions():
+            return None
+
+        # 手動管理卓はカテゴリの現在値を静的な正本とする。ゲーム中に運営が
+        # 別bitを調整していても消さず、Botが伏せた閲覧2項目だけ戻す。
+        overwrite = ch.overwrites_for(member)
+        category = self.state.category
+        base = (
+            category.overwrites_for(member)
+            if category is not None
+            else discord.PermissionOverwrite()
+        )
+        overwrite.view_channel = base.view_channel
+        overwrite.read_messages = base.read_messages
+        return None if overwrite.is_empty() else overwrite
+
     async def _open_spirit_for(self, member: discord.Member) -> None:
         """死亡/除外したメンバーの #霊界 閲覧ブロック (メンバー個別上書き) を解除する"""
         ch = self.state.spirit_channel
@@ -7443,21 +8295,25 @@ class RoomRunner:
             return
         try:
             await self._discord_api_call(
-                ch.set_permissions, member, overwrite=None,
+                ch.set_permissions,
+                member,
+                overwrite=self._spirit_member_overwrite(member, blocked=False),
                 reason="人狼: 死亡により霊界を開放",
             )
         except (discord.Forbidden, discord.HTTPException) as e:
             log.warning(f"霊界開放失敗 ({member.display_name}): {e}")
 
-    async def _apply_spirit_blocks(self) -> None:
+    async def _apply_spirit_blocks(self, *, required: bool = False) -> None:
         """#霊界 の生存者ブロックを現在の生死に合わせて再適用する (復元時の冪等処理)"""
         ch = self.state.spirit_channel
         if ch is None:
+            if required:
+                raise RuntimeError("#霊界を確認できないため閲覧制御を再適用できません")
             return
         for player in self.state.players.values():
-            overwrite = (
-                discord.PermissionOverwrite(view_channel=False, read_messages=False)
-                if player.alive else None
+            overwrite = self._spirit_member_overwrite(
+                player.member,
+                blocked=player.alive,
             )
             try:
                 await self._paced_discord_api_call(
@@ -7465,6 +8321,10 @@ class RoomRunner:
                     reason="人狼: 復元時の霊界権限再適用",
                 )
             except (discord.Forbidden, discord.HTTPException) as e:
+                if required:
+                    raise RuntimeError(
+                        f"霊界権限を安全に再適用できません ({player.display_name})"
+                    ) from e
                 log.warning(f"霊界権限再適用失敗 ({player.display_name}): {e}")
 
     async def _safe_spirit_send(
@@ -7709,8 +8569,8 @@ class RoomRunner:
                 await self._discord_api_call(
                     state.spirit_channel.set_permissions,
                     member,
-                    overwrite=discord.PermissionOverwrite(
-                        view_channel=False, read_messages=False
+                    overwrite=self._spirit_member_overwrite(
+                        member, blocked=True,
                     ),
                     reason="人狼: サーバー復帰 (生存者の霊界ブロック再適用)",
                 )
@@ -7768,28 +8628,31 @@ class RoomRunner:
     # ============================================================
 
     async def on_member_remove(self, member: discord.Member) -> None:
-        state = self.state
-
         # ロビー中の退出: GM枠/参加枠を解放してUIを更新する
         # (これがないと、退出した人が GM/参加者のままロックされ
-        #  ボット再起動以外で復旧できなくなる)
-        if state.phase == Phase.LOBBY:
-            changed = False
-            if state.gm_id == member.id:
-                state.gm_id = None
-                changed = True
-            if member.id in state.players:
-                del state.players[member.id]
-                changed = True
-            if changed and not state.players and state.gm_id is None:
-                state.recruitment_id = None
-            if changed:
-                try:
-                    await self._post_lobby_ui()
-                    await self._persist_room_state()
-                except Exception as e:
-                    log.warning(f"ロビーUI更新失敗 (退出処理): {e}")
-            return
+        #  ボット再起動以外で復旧できなくなる)。募集transferと同じlockで
+        # 再判定し、確定rosterを並行して欠員状態へ書き換えない。
+        async with self.action_lock:
+            state = self.state
+            if state.phase == Phase.LOBBY:
+                changed = False
+                if state.gm_id == member.id:
+                    state.gm_id = None
+                    changed = True
+                if member.id in state.players:
+                    del state.players[member.id]
+                    changed = True
+                if changed and not state.players and state.gm_id is None:
+                    state.recruitment_id = None
+                if changed:
+                    try:
+                        await self._persist_room_state()
+                        await self._post_lobby_ui()
+                    except Exception as e:
+                        log.warning(f"ロビー退出状態の保存・UI更新失敗: {e}")
+                return
+
+        state = self.state
 
         # ゲーム中のGM退出: 強制終了
         if state.phase != Phase.GAME_OVER and member.id == state.gm_id:

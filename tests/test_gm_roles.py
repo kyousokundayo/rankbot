@@ -1,4 +1,4 @@
-"""GM／仮GMロールへの安全な移行を確認する。"""
+"""GM／仮GMロールの用意と、両ロールが同じ権限を持つことを確認する。"""
 from __future__ import annotations
 
 import unittest
@@ -6,17 +6,16 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import discord
+import database
 
 from config import (
     GM_ROLE_NAME,
-    LEGACY_MAYOR_ROLE_NAME,
     PRIVATE_ROOM_CREATOR_ROLE_LABEL,
     RoomDefinition,
     TEMP_GM_ROLE_NAME,
 )
 from game import GameCog
 from recruitment import _has_private_room_creator_role as recruitment_creator_role
-from recruitment import build_recruitment_help_embed
 from room_runner import RoomRunner
 
 
@@ -26,7 +25,6 @@ class _Role:
         self.name = name
         self.guild = guild
         self.position = position
-        self.deleted = False
         self.edit_calls: list[dict] = []
 
     async def edit(self, **kwargs):
@@ -35,51 +33,11 @@ class _Role:
             self.guild.move_role(self, int(kwargs["position"]))
         return self
 
-    async def delete(self, *, reason=None) -> None:
-        self.deleted = True
-        self.guild.roles.remove(self)
-
-
-class _Member:
-    def __init__(self, member_id: int, roles=None) -> None:
-        self.id = member_id
-        self.display_name = f"member-{member_id}"
-        self.roles = list(roles or [])
-        self.add_calls: list[tuple[object, ...]] = []
-        self.remove_calls: list[tuple[object, ...]] = []
-
-    async def add_roles(self, *roles, reason=None) -> None:
-        self.add_calls.append(roles)
-        for role in roles:
-            if role not in self.roles:
-                self.roles.append(role)
-
-    async def remove_roles(self, *roles, reason=None) -> None:
-        self.remove_calls.append(roles)
-        remove_ids = {role.id for role in roles}
-        self.roles = [role for role in self.roles if role.id not in remove_ids]
-
-
-class _FailingMember(_Member):
-    async def add_roles(self, *roles, reason=None) -> None:
-        raise discord.Forbidden(
-            SimpleNamespace(status=403, reason="Forbidden", headers={}),
-            "GMロールを付与できません",
-        )
-
-
-class _StaleCacheMember(_Member):
-    """HTTP成功後もrolesキャッシュが更新されないDiscord状態を再現する。"""
-
-    async def add_roles(self, *roles, reason=None) -> None:
-        self.add_calls.append(roles)
-
 
 class _Guild:
-    def __init__(self, roles: list[tuple[str, int]], members: list[_Member]) -> None:
+    def __init__(self, roles: list[tuple[str, int]]) -> None:
         self.id = 1
         self.roles: list[_Role] = []
-        self.members = members
         for role_id, (name, position) in enumerate(roles, 1):
             self.roles.append(_Role(role_id, name, self, position=position))
         self.created_roles: list[_Role] = []
@@ -112,23 +70,14 @@ class _Guild:
         return next((role for role in self.roles if role.name == name), None)
 
 
-class GmRoleMigrationTest(unittest.IsolatedAsyncioTestCase):
+class GmStaffRoleTest(unittest.IsolatedAsyncioTestCase):
     def _manager(self) -> GameCog:
         manager = GameCog(SimpleNamespace(managed_guild_id=1))
         manager.bulk_api_interval = 0
         return manager
 
-    async def test_legacy_mayor_members_move_to_gm_before_legacy_role_deletion(self) -> None:
-        member = _Member(10)
-        guild = _Guild(
-            [("@everyone", 0), ("通常ロール", 1), (LEGACY_MAYOR_ROLE_NAME, 2)],
-            [member],
-        )
-        legacy_role = guild.role_named(LEGACY_MAYOR_ROLE_NAME)
-        ordinary_role = guild.role_named("通常ロール")
-        assert legacy_role is not None
-        assert ordinary_role is not None
-        member.roles = [ordinary_role, legacy_role]
+    async def test_missing_roles_are_created_with_gm_above_temp_gm(self) -> None:
+        guild = _Guild([("@everyone", 0), ("通常ロール", 1)])
 
         await self._manager()._ensure_gm_staff_roles(guild)
 
@@ -136,11 +85,10 @@ class GmRoleMigrationTest(unittest.IsolatedAsyncioTestCase):
         temp_gm_role = guild.role_named(TEMP_GM_ROLE_NAME)
         self.assertIsNotNone(gm_role)
         self.assertIsNotNone(temp_gm_role)
-        self.assertIn(gm_role, member.roles)
-        self.assertIn(ordinary_role, member.roles)
-        self.assertNotIn(legacy_role, member.roles)
-        self.assertTrue(legacy_role.deleted)
-        self.assertNotIn(legacy_role, guild.roles)
+        self.assertEqual(
+            {role.name for role in guild.created_roles},
+            {GM_ROLE_NAME, TEMP_GM_ROLE_NAME},
+        )
         self.assertGreater(gm_role.position, temp_gm_role.position)
 
     async def test_gm_is_placed_above_temp_gm_without_recreating_either_role(self) -> None:
@@ -150,8 +98,7 @@ class GmRoleMigrationTest(unittest.IsolatedAsyncioTestCase):
                 (GM_ROLE_NAME, 1),
                 ("通常ロール", 2),
                 (TEMP_GM_ROLE_NAME, 3),
-            ],
-            [],
+            ]
         )
         gm_role = guild.role_named(GM_ROLE_NAME)
         temp_gm_role = guild.role_named(TEMP_GM_ROLE_NAME)
@@ -170,8 +117,7 @@ class GmRoleMigrationTest(unittest.IsolatedAsyncioTestCase):
                 ("@everyone", 0),
                 (GM_ROLE_NAME, 2),
                 (TEMP_GM_ROLE_NAME, 2),
-            ],
-            [],
+            ]
         )
         gm_role = guild.role_named(GM_ROLE_NAME)
         temp_gm_role = guild.role_named(TEMP_GM_ROLE_NAME)
@@ -182,54 +128,89 @@ class GmRoleMigrationTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreater(gm_role.position, temp_gm_role.position)
 
-    async def test_failed_gm_grant_keeps_legacy_role_and_stops_migration(self) -> None:
-        member = _FailingMember(10)
+    async def test_duplicate_gm_role_does_not_stop_startup(self) -> None:
+        """同名ロールが2つあっても起動を止めず、最上位を正本として使う。"""
         guild = _Guild(
-            [("@everyone", 0), (LEGACY_MAYOR_ROLE_NAME, 1)],
-            [member],
+            [
+                ("@everyone", 0),
+                (GM_ROLE_NAME, 1),
+                (GM_ROLE_NAME, 5),
+                (TEMP_GM_ROLE_NAME, 3),
+            ]
         )
-        legacy_role = guild.role_named(LEGACY_MAYOR_ROLE_NAME)
-        assert legacy_role is not None
-        member.roles = [legacy_role]
+        manager = self._manager()
 
-        with self.assertRaises(RuntimeError):
-            await self._manager()._ensure_gm_staff_roles(guild)
+        await manager._ensure_gm_staff_roles(guild)
 
-        self.assertIn(legacy_role, member.roles)
-        self.assertFalse(legacy_role.deleted)
-        self.assertIn(legacy_role, guild.roles)
+        self.assertEqual(guild.created_roles, [])
+        self.assertEqual(manager._gm_staff_roles[GM_ROLE_NAME].position, 5)
 
-    async def test_stale_member_role_cache_does_not_block_legacy_migration(self) -> None:
-        member = _StaleCacheMember(10)
+    async def test_role_creation_failure_does_not_stop_startup(self) -> None:
+        """ロールを作れなくても、他機能を巻き添えにせず起動を続ける。"""
+
+        class _FailingGuild(_Guild):
+            async def create_role(self, *, name: str, reason=None):
+                raise discord.Forbidden(
+                    SimpleNamespace(status=403, reason="Forbidden", headers={}),
+                    "ロールを作成できません",
+                )
+
+        guild = _FailingGuild([("@everyone", 0)])
+        manager = self._manager()
+
+        await manager._ensure_gm_staff_roles(guild)
+
+        self.assertEqual(manager._gm_staff_roles, {})
+
+    async def test_position_edit_failure_does_not_stop_startup(self) -> None:
+        """並び順は表示上の慣習なので、変更できなくても起動を続ける。"""
         guild = _Guild(
-            [("@everyone", 0), (LEGACY_MAYOR_ROLE_NAME, 1)],
-            [member],
+            [("@everyone", 0), (GM_ROLE_NAME, 1), (TEMP_GM_ROLE_NAME, 3)]
         )
-        legacy_role = guild.role_named(LEGACY_MAYOR_ROLE_NAME)
-        assert legacy_role is not None
-        member.roles = [legacy_role]
+        gm_role = guild.role_named(GM_ROLE_NAME)
+        assert gm_role is not None
+
+        async def _refuse(**kwargs):
+            raise discord.Forbidden(
+                SimpleNamespace(status=403, reason="Forbidden", headers={}),
+                "階層が足りません",
+            )
+
+        gm_role.edit = _refuse
 
         await self._manager()._ensure_gm_staff_roles(guild)
 
-        self.assertEqual(len(member.add_calls), 1)
-        self.assertEqual(len(member.remove_calls), 1)
-        self.assertTrue(legacy_role.deleted)
+        self.assertLess(gm_role.position, guild.role_named(TEMP_GM_ROLE_NAME).position)
 
-    async def test_startup_cleanup_keeps_a_migrated_owner_with_stale_role_cache(self) -> None:
+    async def test_legacy_access_role_cleanup_requires_stable_id_and_name(self) -> None:
+        guild = _Guild([("@everyone", 0), ("旧GM村", 1)])
+        guild.default_role = guild.role_named("@everyone")
+        legacy_role = guild.role_named("旧GM村")
+        assert legacy_role is not None
+        legacy_role.delete = AsyncMock()
+        guild.get_role = lambda role_id: legacy_role if role_id == legacy_role.id else None
         manager = self._manager()
-        owner = _StaleCacheMember(10)
-        guild = SimpleNamespace(
-            id=1,
-            get_member=lambda member_id: owner if member_id == owner.id else None,
+        row = {
+            "room_id": "private_10",
+            "role_id": legacy_role.id,
+            "role_name": "旧GM村",
+        }
+
+        with patch.object(
+            database, "load_private_rooms", AsyncMock(return_value=[row]),
+        ), patch.object(
+            database,
+            "clear_private_room_access_role",
+            AsyncMock(return_value=True),
+        ) as clear_role:
+            await manager._cleanup_legacy_private_room_access_roles(
+                guild, "private_10",
+            )
+
+        legacy_role.delete.assert_awaited_once()
+        clear_role.assert_awaited_once_with(
+            guild.id, "private_10", expected_role_id=legacy_role.id,
         )
-        manager._legacy_migration_owner_ids.add(owner.id)
-        manager._delete_private_room_by_row = AsyncMock()
-        row = {"owner_id": owner.id, "room_name": "テスト専用村"}
-
-        with patch("game.database.load_private_rooms", AsyncMock(return_value=[row])):
-            await manager._cleanup_private_rooms_without_creator_role(guild)
-
-        manager._delete_private_room_by_row.assert_not_awaited()
 
     def test_gm_and_temp_gm_are_both_private_room_creator_roles(self) -> None:
         manager = self._manager()
@@ -243,11 +224,6 @@ class GmRoleMigrationTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(manager._has_private_room_creator_role(outsider))
         self.assertFalse(recruitment_creator_role(outsider))
 
-    def test_recruitment_help_identifies_both_gm_roles(self) -> None:
-        embed = build_recruitment_help_embed()
-        create_field = next(field for field in embed.fields if field.name == "募集を作る")
-        self.assertIn(PRIVATE_ROOM_CREATOR_ROLE_LABEL, create_field.value)
-
     async def test_both_roles_can_manage_and_claim_a_private_room(self) -> None:
         manager = SimpleNamespace(
             find_user_room=lambda _user_id, *, exclude_room_id=None: None,
@@ -259,7 +235,6 @@ class GmRoleMigrationTest(unittest.IsolatedAsyncioTestCase):
                 "private_10",
                 "テスト専用村",
                 private_owner_id=10,
-                private_role_name="テスト専用村",
             ),
         )
         for role_name in (GM_ROLE_NAME, TEMP_GM_ROLE_NAME):
@@ -280,3 +255,7 @@ class GmRoleMigrationTest(unittest.IsolatedAsyncioTestCase):
             PRIVATE_ROOM_CREATOR_ROLE_LABEL,
             await runner.validate_gm_claim(outsider),
         )
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,4 +1,4 @@
-"""#統計 の4変種セレクトと2ラダー表示の回帰テスト。"""
+"""#統計 の変種セレクトと3ラダー表示の回帰テスト。"""
 from __future__ import annotations
 
 import unittest
@@ -52,7 +52,7 @@ class StatsVariantSelectTest(unittest.TestCase):
                 )
                 self.assertEqual(selector.row, 0)
 
-    def test_overall_room_options_follow_variant_and_reset_stale_room(self) -> None:
+    def test_overall_room_options_hide_retired_fixed_rooms_and_reset_stale_room(self) -> None:
         view = OverallStatsFilterView(123, variant_id="v9_turn")
         room_select = next(
             item for item in view.children
@@ -60,7 +60,7 @@ class StatsVariantSelectTest(unittest.TestCase):
         )
         self.assertEqual(
             [option.value for option in room_select.options],
-            ["all", "open_9_turn"],
+            ["all"],
         )
 
         view.room_id = "open_9_turn"
@@ -107,12 +107,12 @@ class StatsVariantDatabaseRoutingTest(unittest.IsolatedAsyncioTestCase):
             embed = await view.load_embed(_guild())
 
         stats.assert_awaited_once_with(9, 123, variant_id="v9_turn")
-        rank.assert_awaited_once_with(9, 123, ladder_id="l9")
-        season.assert_awaited_once_with(9, 123, ladder_id="l9")
+        rank.assert_awaited_once_with(9, 123, ladder_id="l9_turn")
+        season.assert_awaited_once_with(9, 123, ladder_id="l9_turn")
         rendered = str(embed.to_dict())
         self.assertIn("この変種はまだプレイしていません", rendered)
-        self.assertIn("9人村ラダーで共通", rendered)
-        self.assertIn("グランドマスター（9人村）", rendered)
+        self.assertIn("9人ターン制専用ラダー", rendered)
+        self.assertIn("グランドマスター9T", rendered)
 
     async def test_rating_leaderboard_uses_ladder_and_other_metrics_use_variant(self) -> None:
         view = LeaderboardView(123, 9, variant_id="v13_turn")
@@ -172,15 +172,15 @@ class StatsVariantDatabaseRoutingTest(unittest.IsolatedAsyncioTestCase):
         games.assert_awaited_once_with(123, room_id=None, variant_id="v9_cross")
         ranks.assert_awaited_once_with(123, rank_name=None, variant_id="v9_cross")
 
-    async def test_season_views_route_both_modes_to_the_selected_ladder(self) -> None:
+    async def test_season_views_route_to_the_selected_variant_ladder(self) -> None:
         view = SeasonHistoryView(variant_id="v9_cross")
         with patch(
             "database.get_latest_season_results",
             new=AsyncMock(return_value=(0, [])),
         ) as previous:
             previous_embed = await view.load_embed(_guild())
-        previous.assert_awaited_once_with(123, limit=20, ladder_id="l9")
-        self.assertIn("9人村ラダーで共通", str(previous_embed.to_dict()))
+        previous.assert_awaited_once_with(123, limit=20, ladder_id="l9_cross")
+        self.assertIn("9人クロストーク専用ラダー", str(previous_embed.to_dict()))
 
         view.mode = "grandmasters"
         with patch(
@@ -188,8 +188,8 @@ class StatsVariantDatabaseRoutingTest(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(return_value=[]),
         ) as history:
             history_embed = await view.load_embed(_guild())
-        history.assert_awaited_once_with(123, ladder_id="l9")
-        self.assertIn("グランドマスター（9人村）", str(history_embed.to_dict()))
+        history.assert_awaited_once_with(123, ladder_id="l9_cross")
+        self.assertIn("グランドマスター9", str(history_embed.to_dict()))
 
     async def test_recent_and_personal_history_keep_selector_when_empty(self) -> None:
         recent = RecentGamesVariantView(123, variant_id="v9_turn")
@@ -209,8 +209,8 @@ class StatsVariantDatabaseRoutingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("まだプレイしていません", str(personal_embed.to_dict()))
         self.assertNotIn("**", recent_embed.footer.text)
         self.assertNotIn("**", personal_embed.footer.text)
-        self.assertIn("9人村ラダーで共通", recent_embed.footer.text)
-        self.assertIn("9人村ラダーで共通", personal_embed.footer.text)
+        self.assertIn("9人ターン制専用ラダー", recent_embed.footer.text)
+        self.assertIn("9人ターン制専用ラダー", personal_embed.footer.text)
         self.assertTrue(any(isinstance(item, StatsVariantSelect) for item in recent.children))
         self.assertTrue(any(isinstance(item, StatsVariantSelect) for item in personal.children))
 
@@ -234,7 +234,7 @@ class RankSpecVariantTest(unittest.TestCase):
             ("+37〜+38", "-18〜-19"),
         )
 
-    def test_rank_spec_lists_public_variant_values_and_both_ladders(self) -> None:
+    def test_rank_spec_lists_public_variant_values_and_three_ladders(self) -> None:
         rendered = str([embed.to_dict() for embed in build_rank_spec_embeds()])
         for variant_id in USER_VISIBLE_VARIANT_IDS:
             variant = VARIANT_DEFINITIONS[variant_id]
@@ -249,8 +249,10 @@ class RankSpecVariantTest(unittest.TestCase):
                 )
         self.assertNotIn(VARIANT_DEFINITIONS["v13_turn"].label, rendered)
         self.assertIn("13人村ラダー", rendered)
-        self.assertIn("9人村ラダー", rendered)
-        self.assertIn("グランドマスター（9人村）", rendered)
+        self.assertIn("9人クロストークラダー", rendered)
+        self.assertIn("9人ターン制ラダー", rendered)
+        self.assertIn("グランドマスター9", rendered)
+        self.assertIn("グランドマスター9T", rendered)
 
 
 if __name__ == "__main__":

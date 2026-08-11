@@ -199,7 +199,7 @@ class GameStatsDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ranks, [("ダイヤ",)])
         self.assertEqual(bucket, "ダイヤ")
 
-    async def test_nine_player_settlement_isolated_in_l9_ladder(self) -> None:
+    async def test_nine_cross_settlement_isolated_in_its_ladder(self) -> None:
         records = self._nine_records()
         primary_player_id = NINE_WOLF_IDS[0]
         voter_id = NINE_WOLF_IDS[1]
@@ -237,8 +237,8 @@ class GameStatsDatabaseTest(unittest.IsolatedAsyncioTestCase):
                 "SELECT SUM(elo_delta) FROM rating_history WHERE game_id=?",
                 (game_id,),
             ))[0][0]
-        self.assertEqual(game, ("v9_cross", "l9"))
-        self.assertEqual(history, [("v9_cross", "l9")])
+        self.assertEqual(game, ("v9_cross", "l9_cross"))
+        self.assertEqual(history, [("v9_cross", "l9_cross")])
         self.assertEqual(
             settlement_parameters,
             (
@@ -249,7 +249,8 @@ class GameStatsDatabaseTest(unittest.IsolatedAsyncioTestCase):
             ),
         )
         self.assertEqual(elo_sum, 0)
-        self.assertEqual(len(await database.get_all_player_ratings(1, "l9")), 9)
+        self.assertEqual(len(await database.get_all_player_ratings(1, "l9_cross")), 9)
+        self.assertEqual(await database.get_all_player_ratings(1, "l9_turn"), [])
         self.assertEqual(await database.get_all_player_ratings(1), [])
 
         async with database.connect_db() as db:
@@ -265,9 +266,9 @@ class GameStatsDatabaseTest(unittest.IsolatedAsyncioTestCase):
                 "VALUES (?, 1, ?, 'recommend', ?, 'confirmed', '2026-01-01')",
                 (game_id, voter_id, primary_player_id),
             )
-            before_l9 = (await db.execute_fetchall(
+            before_l9_cross = (await db.execute_fetchall(
                 "SELECT rating FROM player_ratings "
-                "WHERE player_id=? AND guild_id=1 AND ladder_id='l9'",
+                "WHERE player_id=? AND guild_id=1 AND ladder_id='l9_cross'",
                 (primary_player_id,),
             ))[0][0]
             await db.commit()
@@ -284,8 +285,42 @@ class GameStatsDatabaseTest(unittest.IsolatedAsyncioTestCase):
                 "WHERE game_id=? AND player_id=?",
                 (game_id, primary_player_id),
             )
-        self.assertEqual(ratings, [("l13", 2222), ("l9", before_l9 + 1)])
-        self.assertEqual(histories, [("l9", 1)])
+        self.assertEqual(
+            ratings, [("l13", 2222), ("l9_cross", before_l9_cross + 1)],
+        )
+        self.assertEqual(histories, [("l9_cross", 1)])
+
+    async def test_nine_discussion_modes_keep_same_players_in_separate_ladders(self) -> None:
+        for variant_id in ("v9_cross", "v9_turn"):
+            room_id = f"room-{variant_id}"
+            run_id = f"run-{variant_id}-split"
+            await database.stage_game_settlement(
+                1,
+                room_id,
+                run_id,
+                room_name=variant_id,
+                rated=True,
+                winner_team=Team.VILLAGE.value,
+                player_records=self._nine_records(),
+                variant_id=variant_id,
+            )
+            _game_id, _results, created = await database.settle_game_settlement(
+                1, room_id, run_id,
+            )
+            self.assertTrue(created)
+
+        async with database.connect_db() as db:
+            ratings = await db.execute_fetchall(
+                "SELECT ladder_id, games FROM player_ratings "
+                "WHERE guild_id=1 AND player_id=? ORDER BY ladder_id",
+                (NINE_WOLF_IDS[0],),
+            )
+            histories = await db.execute_fetchall(
+                "SELECT DISTINCT ladder_id FROM rating_history "
+                "WHERE guild_id=1 ORDER BY ladder_id"
+            )
+        self.assertEqual(ratings, [("l9_cross", 1), ("l9_turn", 1)])
+        self.assertEqual(histories, [("l9_cross",), ("l9_turn",)])
 
     async def test_nine_variants_share_rated_settlement_play_and_postgame_bonuses(self) -> None:
         """9人クロストークとターン制は、実配役でも精算ルールを共有する。"""
@@ -366,7 +401,9 @@ class GameStatsDatabaseTest(unittest.IsolatedAsyncioTestCase):
                     (game_id, NINE_VILLAGER_IDS[0]),
                 ))[0][0]
 
-            self.assertEqual(game, (variant_id, "l9"))
+            self.assertEqual(
+                game, (variant_id, VARIANT_DEFINITIONS[variant_id].ladder_id),
+            )
             self.assertEqual(parameters[2:], (2, 4))
             self.assertEqual(wolf_guess_hits, 2)
             outcomes[variant_id] = {
@@ -563,6 +600,61 @@ class GameStatsDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue({"died_on_day", "death_cause", "rank_at_game", "rank_provisional"} <= player_columns)
         self.assertEqual(old_player, (None, None, None, None))
         self.assertEqual(old_stats, 0)
+
+
+class VariantBalanceStatsTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="werewolf-balance-test-")
+        self._original_db_path = database.DB_PATH
+        database.DB_PATH = str(Path(self._tmp.name) / "balance.db")
+        await database.init_db()
+
+    async def asyncTearDown(self) -> None:
+        database.DB_PATH = self._original_db_path
+        self._tmp.cleanup()
+
+    async def test_aggregates_public_nine_player_variants_without_writes(self) -> None:
+        async with database.connect_db() as db:
+            for game_id, variant_id, winner in (
+                (1, "v9_cross", Team.WOLF.value),
+                (2, "v9_cross", Team.VILLAGE.value),
+                (3, "v9_turn", Team.WOLF.value),
+                (4, "v13_cross", Team.WOLF.value),
+            ):
+                await db.execute(
+                    "INSERT INTO games "
+                    "(game_id, guild_id, variant_id, ladder_id, room_id, room_name, "
+                    "game_run_id, winner_team) VALUES (?, 1, ?, ?, 'private', '村', ?, ?)",
+                    (
+                        game_id,
+                        variant_id,
+                        VARIANT_DEFINITIONS[variant_id].ladder_id,
+                        f"run-{game_id}",
+                        winner,
+                    ),
+                )
+            await db.commit()
+
+        async with database.connect_db() as db:
+            before_games = await db.execute_fetchall(
+                "SELECT game_id, variant_id, winner_team FROM games ORDER BY game_id"
+            )
+
+        rows = await database.get_variant_balance_stats(1)
+
+        async with database.connect_db() as db:
+            after_games = await db.execute_fetchall(
+                "SELECT game_id, variant_id, winner_team FROM games ORDER BY game_id"
+            )
+
+        self.assertEqual(
+            rows,
+            [
+                {"variant_id": "v9_cross", "games": 2, "wolf_wins": 1},
+                {"variant_id": "v9_turn", "games": 1, "wolf_wins": 1},
+            ],
+        )
+        self.assertEqual(after_games, before_games)
 
 
 class GameSequenceNumberTest(unittest.IsolatedAsyncioTestCase):

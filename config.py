@@ -15,7 +15,7 @@ from room_config import (
 )
 
 # Botのバージョン (ヘルプに表示。ソース公開された派生でも識別できるように)
-BOT_VERSION = "v0.38"
+BOT_VERSION = "v0.40"
 
 # 新規導入先に同名カテゴリが既にある場合、無関係なDiscord構成をBot所有と
 # 誤認しない。既存運用は保存済みchannel IDで自動再利用できる。
@@ -122,8 +122,6 @@ class LadderDefinition:
     grandmaster_slots: int
     grandmaster_role_name: str
     grandmaster_role_color: int
-    # Discordのメンバー一覧では最上位hoist欄1件だけに表示される。
-    role_position_priority: int
 
 
 _ROLE_DISTRIBUTION_13 = MappingProxyType({
@@ -161,14 +159,14 @@ VARIANT_DEFINITIONS = {
         turn_interrupts_per_day=2,
     ),
     "v9_cross": VariantDefinition(
-        "v9_cross", "9人クロストーク", "l9", 9,
+        "v9_cross", "9人クロストーク", "l9_cross", 9,
         # 9人村は狼陣営勝率45%を基準に、W/V=11/9となるよう設定する。
-        # ターン制とクロストークでレート・加点条件を分けない。
+        # 現時点のプール値は同じでも、レートと順位の母集団は進行別に分ける。
         _ROLE_DISTRIBUTION_9, "crosstalk", 90, 110, 2, 4,
         crosstalk_discussion_seconds=CROSSTALK_DISCUSSION_SECONDS_9,
     ),
     "v9_turn": VariantDefinition(
-        "v9_turn", "9人ターン制", "l9", 9,
+        "v9_turn", "9人ターン制", "l9_turn", 9,
         _ROLE_DISTRIBUTION_9, "turn", 90, 110, 2, 4,
         turn_round_seconds=(
             TURN_DAY1_ROUND1_SECONDS,
@@ -182,19 +180,28 @@ VARIANT_TO_LADDER = {
     variant_id: definition.ladder_id
     for variant_id, definition in VARIANT_DEFINITIONS.items()
 }
+# v0.38まで9人2変種が共有していたラダー。v0.40初回起動時に、
+# 現在の変種定義へ安全に分割するためだけに残す互換情報。
+LEGACY_NINE_LADDER_ID = "l9"
+LEGACY_NINE_LADDER_SPLIT = MappingProxyType({
+    variant_id: VARIANT_TO_LADDER[variant_id]
+    for variant_id in ("v9_cross", "v9_turn")
+})
 LADDER_DEFINITIONS = {
     "l13": LadderDefinition(
-        "l13", "13人村", 13, "グランドマスター", 0xE74C3C, 2,
+        "l13", "13人村", 13, "グランドマスター", 0xE74C3C,
     ),
-    "l9": LadderDefinition(
-        "l9", "9人村", 9, "グランドマスター（9人村）", 0xF39C12, 1,
+    "l9_cross": LadderDefinition(
+        "l9_cross", "9人クロストーク", 9, "グランドマスター9", 0xF39C12,
+    ),
+    "l9_turn": LadderDefinition(
+        "l9_turn", "9人ターン制", 9, "グランドマスター9T", 0x3498DB,
     ),
 }
 
-# ラダーは共通でも、変種ごとに狼勝率が違えばプール比も違う。比率を
-# 揃えると勝ちやすい変種でレートを稼げてしまう。実測が30〜50試合
-# たまったら変種ごとに W/V = (1-p)/p で直すこと。倍率を一律に
-# 変えても均衡勝率は動かない。
+# 9人2変種はラダーも分離する。狼勝率の実測が30〜50試合たまったら、
+# 変種ごとに W/V = (1-p)/p でプール比を再評価する。倍率を一律に
+# 変えても均衡勝率は動かないため、必要なら比率を個別に直す。
 
 
 def _validate_variant_definitions() -> None:
@@ -236,21 +243,11 @@ def _validate_variant_definitions() -> None:
         if min(definition.village_win_pool, definition.wolf_win_pool) <= 0:
             raise RuntimeError(f"invalid rating pool: {variant_id}")
 
-    # 9人クロストークと9人ターン制は同一ラダーを共有する。進行方式によって
-    # レート・活躍ボーナスの入口が変わらないよう、変種ごとの値も固定する。
-    nine_rating_fields = (
-        "village_win_pool",
-        "wolf_win_pool",
-        "wolf_guess_slots",
-        "final_day_threshold",
-    )
-    nine_cross = VARIANT_DEFINITIONS["v9_cross"]
-    nine_turn = VARIANT_DEFINITIONS["v9_turn"]
-    if any(
-        getattr(nine_cross, field) != getattr(nine_turn, field)
-        for field in nine_rating_fields
+    if (
+        VARIANT_DEFINITIONS["v9_cross"].ladder_id
+        == VARIANT_DEFINITIONS["v9_turn"].ladder_id
     ):
-        raise RuntimeError("v9 rating settings must match across discussion modes")
+        raise RuntimeError("v9 discussion modes must use separate ladders")
 
 
 _validate_variant_definitions()
@@ -269,13 +266,6 @@ ROLE_DISTRIBUTION = dict(
     VARIANT_DEFINITIONS[DEFAULT_VARIANT_ID].role_distribution
 )
 MAX_PLAYERS = VARIANT_DEFINITIONS[DEFAULT_VARIANT_ID].player_count
-
-# 陣営ごとの人数。プール配分の説明や表示で手書きするとズレるので配分から導く
-WOLF_TEAM_SIZE = sum(
-    count for role, count in ROLE_DISTRIBUTION.items()
-    if ROLE_TEAM[role] is Team.WOLF
-)
-VILLAGE_TEAM_SIZE = MAX_PLAYERS - WOLF_TEAM_SIZE
 
 # Discordの1メッセージあたりの文字数上限。超えると送信自体が
 # HTTPException (50035 Invalid Form Body) で失敗するため、
@@ -320,8 +310,9 @@ BULK_DISCORD_API_INTERVAL = 1.1
 # 段階ごとの所要時間も一緒に出す (views.InteractionTimer)。
 SLOW_INTERACTION_SECONDS = 2.0
 
-# シーン切替SE (朝/処刑/投票/投票開示/遺言/夜)。
-# 依存 (davey/PyNaCl/libopus) が無い環境ではTrueでも自動で無効になる
+# シーン切替SE (役職確認終了/議論開始・終了/投票開示/決戦弁明/遺言/処刑/夜/夜明け)。
+# Trueでは起動前にdavey/PyNaCl/libopusを検査し、欠落時はBotを起動しない。
+# Falseでは依存検査とSE再生を行わず、無音で運用する。
 SE_ENABLED = True
 VOTE_TIMEOUT = 60              # 投票制限時間 (秒)
 CHANNEL_DELETE_DELAY = 300     # 結果発表後の削除待ち (秒)
@@ -339,14 +330,20 @@ CH_VILLAGE = "昼"
 CH_SPIRIT = "霊界"
 CH_LOBBY = "参加受付"
 CH_STATS = "統計"
+# 旧 #募集 を識別して移行・撤去するための名前。新規作成には使わない。
 CH_RECRUITMENT = "募集"
 CH_OPERATIONS = "運営"
 VC_GAME = "人狼ゲーム"
-CH_GM_INFO = "専用村作成"
+CH_GM_INFO = "村作成"
+
+# 募集作成時のメンションを希望する人が自分で付け外しする通知専用ロール。
+# Discord上では @通知 と表示される。閲覧権限などは持たせず、Botだけが
+# 募集作成時にこのロールをメンションする。
+RECRUITMENT_NOTIFICATION_ROLE_NAME = "通知"
 
 # 統計チャンネルの配置先
 STATS_PARENT_CHANNEL_NAME = "総合"
-GM_INFO_CATEGORY_NAME = "GMロール説明"
+GM_INFO_CATEGORY_NAME = "GM"
 
 # 終了した #昼 / #霊界 を消さずに退避するログカテゴリ。
 # 試合番号を先頭に付けて移す (Discordはカテゴリ内を名前順に並べるため、
@@ -357,7 +354,23 @@ LOG_CATEGORY_SPIRIT = "ログ-霊界"
 # 古い順にまとめて減らす (毎回1つずつ消すより整理の頻度が下がる)。
 LOG_CATEGORY_LIMIT = 50
 LOG_CATEGORY_TRIM_TO = 40
+# #運営はこの既存カテゴリ内だけで探し、移動・改名・新規作成しない。
+# 開発カテゴリまたは#運営が無くてもゲーム本体は継続し、運営UI・通知だけを
+# 無効化する。
+# @everyoneを含む閲覧者設定はDiscord側の手動運用を正本として変更しない。
+# Bot自身の必要権限だけを保証できない場合は通知先に採用しない。
 OPERATIONS_CATEGORY_NAME = "開発"
+# Administratorと同等に#運営メニューを操作できるロール名。チャンネル閲覧は
+# Discord側で手動設定し、この値からBotが閲覧overwriteを追加・削除しない。
+# 公開コードへ個別サーバーのロール名を含めないため.envから受け取る
+# (例: WEREWOLF_OPERATIONS_STAFF_ROLES=ねいと,運営)。未設定ならAdministratorと
+# サーバー所有者だけ。既存#運営でDiscordから手動設定した閲覧権限は、
+# この設定に含まれなくても起動時に削除しない。
+OPERATIONS_STAFF_ROLE_NAMES = frozenset(
+    name.strip()
+    for name in os.getenv("WEREWOLF_OPERATIONS_STAFF_ROLES", "").split(",")
+    if name.strip()
+)
 
 # 募集システム。占有区間は [開催時刻, 開催時刻+90分) とし、
 # 終端と次の開始が同時刻なら重複扱いにしない。
@@ -365,18 +378,19 @@ RECRUITMENT_OCCUPANCY_MINUTES = 90
 RECRUITMENT_MAX_DAYS_AHEAD = 7
 # 「今すぐ」募集の開始までの猶予 (分)。
 # _schedule_out_of_range が「現在より後」を要求するので0にはできない。
-# 通知は開催15分以内で飛ぶので、この値を15より小さくしておくと
-# 作成直後の巡回で参加者へDMが届く。
+# 通知対象には作成時点から入り、10分巡回が開始時刻をまたいだ場合も
+# 開催枠内で補完する。通知後に参加・補欠繰上げとなった人は処理直後に
+# 個別台帳を確認し、補完失敗時だけ次回巡回で再試行する。
 RECRUITMENT_IMMEDIATE_LEAD_MINUTES = 10
 RECRUITMENT_MAX_PER_HOST = 3
 RECRUITMENT_CAPACITY = MAX_PLAYERS
 RECRUITMENT_BACKUP_CAPACITY = 3
 RECRUITMENT_NOTIFICATION_WINDOW_MINUTES = 15
-RECRUITMENT_ARCHIVE_RETENTION_DAYS = 30
-# 「参加者へ一括連絡」の再送までの間隔 (秒)。1回で最大16人へDMが飛ぶため、
+# 「参加者へ一括連絡」の再送までの間隔 (秒)。1回で最大17人へDMが飛ぶため、
 # 連打・誤操作で参加者のDMが埋まるのを防ぐ
 RECRUITMENT_CONTACT_COOLDOWN_SECONDS = 300
-PLAYER_BLOCK_LIMIT = 10
+# Discordの選択肢上限25件を2ページまで使い、本人ごとに最大50人を管理する。
+PLAYER_BLOCK_LIMIT = 50
 
 # 不具合・改善報告の1人あたり投稿上限 (直近24時間)。
 # 誰でも押せるフォームなので、連投でDBとバックアップが膨らむのを防ぐ。
@@ -388,27 +402,33 @@ FEEDBACK_MAX_PER_DAY = 10
 VARIANT_ROLLOUT_ROOM_IDS = frozenset({
     "open_13_turn",
 })
-ADMIN_ONLY_ROOM_IDS = frozenset({
-    "beginner",
-    "intermediate",
-    "advanced",
-})
-
 # 13人ターン制だけは実装のみで完全未公開とし、募集も停止する。
 RECRUITMENT_DISABLED_ROOM_IDS = VARIANT_ROLLOUT_ROOM_IDS
 
-# GM／仮GM制度を一般公開するときはFalseへ戻す。
-GM_INFO_ADMIN_ONLY = True
+# GM／仮GMがGM/#村作成へ到達できるよう、両ロールへ閲覧を許可する。
+# 作成ボタン側でも同じロール名を再検証する。
+GM_INFO_ADMIN_ONLY = False
 
 
 _BUILTIN_ROOM_DEFINITIONS = [
-    RoomDefinition("beginner", "初心者", frozenset({"アイアン", "ブロンズ", "シルバー"})),
+    RoomDefinition(
+        "beginner",
+        "初心者",
+        frozenset({"アイアン", "ブロンズ", "シルバー"}),
+        enabled=False,
+    ),
     RoomDefinition(
         "intermediate",
         "中級者",
         frozenset({"ゴールド", "プラチナ", "エメラルド"}),
+        enabled=False,
     ),
-    RoomDefinition("advanced", "上級者", frozenset({"ダイヤ", "マスター", "グランドマスター"})),
+    RoomDefinition(
+        "advanced",
+        "上級者",
+        frozenset({"ダイヤ", "マスター", "グランドマスター"}),
+        enabled=False,
+    ),
     RoomDefinition("open", "総合"),
     RoomDefinition(
         "open_13_turn", "総合-13ターン", variant_id="v13_turn", enabled=False,
@@ -417,13 +437,13 @@ _BUILTIN_ROOM_DEFINITIONS = [
         "open_9_cross",
         "総合-9クロストーク",
         variant_id="v9_cross",
-        enabled=True,
+        enabled=False,
     ),
     RoomDefinition(
         "open_9_turn",
         "総合-9ターン",
         variant_id="v9_turn",
-        enabled=True,
+        enabled=False,
     ),
 ]
 
@@ -436,7 +456,14 @@ _LOCAL_ROOMS_RAW = load_local_room_json(
 _LOCAL_ROOM_REGISTRATIONS = parse_local_room_config(
     _LOCAL_ROOMS_RAW,
     reserved_room_ids={room.room_id for room in _BUILTIN_ROOM_DEFINITIONS},
-    reserved_room_names={room.name for room in _BUILTIN_ROOM_DEFINITIONS},
+    reserved_room_names={
+        *(room.name for room in _BUILTIN_ROOM_DEFINITIONS),
+        LOG_CATEGORY_VILLAGE,
+        LOG_CATEGORY_SPIRIT,
+    },
+    # このサーバーでDiscord側の静的権限を正本にする既存ローカル卓。
+    # 他のローカル卓はsync_permissionsを省略すると従来どおり自動同期する。
+    manual_static_room_names={"ねいとくん村"},
 )
 
 ROOM_DEFINITIONS = [
@@ -456,47 +483,32 @@ ACTIVE_ROOM_DEFINITIONS = tuple(
     room for room in ROOM_DEFINITIONS if room.enabled
 )
 ACTIVE_ROOM_IDS = frozenset(room.room_id for room in ACTIVE_ROOM_DEFINITIONS)
-# 利用者向けの変種選択も、有効な固定卓に対応するものだけを出す。無効卓の
-# 定義・履歴・シミュレーションは残るが、将来 enabled を戻すまでUIでは公開しない。
-USER_VISIBLE_VARIANT_IDS = tuple(
-    dict.fromkeys(room.variant_id for room in ACTIVE_ROOM_DEFINITIONS)
+# 利用者向けの変種選択は固定卓の有効・無効とは分離する。9人固定卓を廃止しても、
+# GMが作成する名前村では13人クロストーク／9人クロストーク／9人ターン制を選べる。
+# 13人ターン制は実装・履歴だけを保持し、引き続き非公開とする。
+USER_VISIBLE_VARIANT_IDS = (
+    "v13_cross",
+    "v9_cross",
+    "v9_turn",
 )
 
-# 全員に表示される公開卓 / レート変動の対象卓。無効卓はカテゴリ・VC・参加受付を
-# 作らず、これらのライブ集合にも含めない。
+# 全員に表示される公開卓。無効卓はカテゴリ・VC・参加受付を作らず、
+# ライブ集合にも含めない。
 _OPEN_ROOM_CANDIDATE_IDS = frozenset({
     "open", "open_13_turn", "open_9_cross", "open_9_turn",
 })
 OPEN_ROOM_IDS = _OPEN_ROOM_CANDIDATE_IDS & ACTIVE_ROOM_IDS
 PUBLIC_ROOM_IDS = OPEN_ROOM_IDS
-RATED_ROOM_IDS = frozenset(
-    [room.room_id for room in _BUILTIN_ROOM_DEFINITIONS if room.enabled]
-    + [
-        registration.room.room_id
-        for registration in _LOCAL_ROOM_REGISTRATIONS
-        if registration.rated and registration.room.enabled
-    ]
-)
-RECRUITMENT_ROOM_IDS = frozenset(
-    [room.room_id for room in _BUILTIN_ROOM_DEFINITIONS if room.enabled]
-    + [
-        registration.room.room_id
-        for registration in _LOCAL_ROOM_REGISTRATIONS
-        if registration.recruitment_enabled and registration.room.enabled
-    ]
-)
-RATED_ROOM_NAMES = tuple(
-    room.name for room in ACTIVE_ROOM_DEFINITIONS if room.room_id in RATED_ROOM_IDS
-)
-
+# 正常終了した全村をレート対象にする。動的なGM名前村はこの静的集合へ
+# 列挙できないため、RoomRunner.is_rated_room() 側で追加判定する。
+# ローカル設定の旧 rated 値は設定互換のため読み込むが、対象外指定には使わない。
+RATED_ROOM_IDS = ACTIVE_ROOM_IDS
 if not (OPEN_ROOM_IDS <= ACTIVE_ROOM_IDS):
     raise RuntimeError("OPEN_ROOM_IDS contains a disabled room")
 if not (PUBLIC_ROOM_IDS <= ACTIVE_ROOM_IDS):
     raise RuntimeError("PUBLIC_ROOM_IDS contains a disabled room")
 if not (RATED_ROOM_IDS <= ACTIVE_ROOM_IDS):
     raise RuntimeError("RATED_ROOM_IDS contains a disabled room")
-if not (RECRUITMENT_ROOM_IDS <= ACTIVE_ROOM_IDS):
-    raise RuntimeError("RECRUITMENT_ROOM_IDS contains a disabled room")
 
 # 専用村・募集を管理できるDiscordロール。
 # `GM` は `仮GM` より上に置く。グランドマスターの略称には使わない。
@@ -505,10 +517,6 @@ TEMP_GM_ROLE_NAME = "仮GM"
 PRIVATE_ROOM_CREATOR_ROLE_NAMES = frozenset({GM_ROLE_NAME, TEMP_GM_ROLE_NAME})
 PRIVATE_ROOM_CREATOR_ROLE_LABEL = "GM または 仮GM"
 
-# v0.38で一度だけGMへ移す旧ロール。通常の認可には使わない。
-LEGACY_MAYOR_ROLE_NAME = "村長"
-LEGACY_MAYOR_INFO_CATEGORY_NAME = "村長ロール説明"
-
 # ============================================================
 # レーティング設定
 # ============================================================
@@ -516,15 +524,6 @@ INITIAL_RATING = 1500
 
 # 勝利陣営への参加ボーナス（本体ゼロサムとは別枠でレートに加算）
 WIN_PARTICIPATION_BONUS = 1
-
-# 13人村 (狼勝率60%を基準) の従来互換固定プール。
-# 狼勝ち: 狼4人で +120 / 村9人で -120
-# 村勝ち: 村9人で +180 / 狼4人で -180
-# 比 120:180 は「狼勝率60%で全体EV=0」を意味する。9人村は変種定義内で
-# 狼勝率45%を基準に 110:90 としている。勝率の実測が溜まったら変種ごとに
-# W/V = (1-p)/p に合わせ直す。倍率だけを変えても均衡勝率は動かない。
-WOLF_WIN_FIXED_POOL = 120
-VILLAGE_WIN_FIXED_POOL = 180
 
 # 卓帯 (初心者/中級者/上級者) のインデックス。制限卓の参加条件をそのまま流用し、
 # 卓の定義とランク帯の対応がずれないようにする。
@@ -577,10 +576,6 @@ GRANDMASTER_SLOTS = 13
 # マスター帯（上位10%）のうち、上位5%相当をGMにする。
 # 人数が増えてもGMは最大13人まで。
 GRANDMASTER_PERCENTAGE = 0.05
-GRANDMASTER_SLOTS_BY_LADDER = {
-    ladder_id: definition.grandmaster_slots
-    for ladder_id, definition in LADDER_DEFINITIONS.items()
-}
 
 # シーズン長 (日)。経過すると #統計 に管理者向けのリセットリマインダーを出す。
 # リセット自体は /season_reset で手動実行する

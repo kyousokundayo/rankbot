@@ -23,14 +23,17 @@ from config import (
     RATING_FLOOR,
     ROLE_TEAM,
     Role,
-    ROOM_DEFINITION_MAP,
     SEASON_RANK_MIN_GAMES,
     SEASON_RANK_PERCENTAGES,
-    VILLAGE_WIN_FIXED_POOL,
+    VARIANT_DEFINITIONS,
     WIN_PARTICIPATION_BONUS,
-    WOLF_WIN_FIXED_POOL,
     Team,
 )
+
+
+V13_RATING_PARAMETERS = VARIANT_DEFINITIONS["v13_cross"]
+WOLF_WIN_FIXED_POOL = V13_RATING_PARAMETERS.wolf_win_pool
+VILLAGE_WIN_FIXED_POOL = V13_RATING_PARAMETERS.village_win_pool
 
 
 def make_players(
@@ -753,10 +756,10 @@ class TestBuildRankContextMap(unittest.TestCase):
             self.assertIsNone(c.position)
 
     def test_rank_survives_a_season_reset(self):
-        """ハーフリセットで今季戦績が0になってもランクと順位は維持される。
+        """同着後もID順が元の順位と一致するデータではランクを維持する。
 
-        レート変換は単調増加なので順位関係が保たれる。母集団を通算で
-        数えることで、リセット直後に全員が暫定ブロンズへ落ちない。
+        母集団を通算で数えることで、リセット直後に全員が暫定ブロンズへ
+        落ちないことも確認する。
         """
         rows = make_rows(100)
         before = rating_lib.build_rank_context_map(rows)
@@ -777,6 +780,39 @@ class TestBuildRankContextMap(unittest.TestCase):
             self.assertEqual(ctx.rank_name, after[player_id].rank_name, player_id)
             self.assertEqual(ctx.position, after[player_id].position, player_id)
             self.assertFalse(after[player_id].provisional, player_id)
+
+    def test_half_reset_can_reorder_adjacent_ratings_that_become_tied(self):
+        """整数丸めで同着になれば、リセット後のタイブレークで順位は変わりうる。"""
+        rows = [
+            {
+                "player_id": 2,
+                "rating": 1503,
+                "games": SEASON_RANK_MIN_GAMES,
+                "season_games": SEASON_RANK_MIN_GAMES,
+                "season_wins": 2,
+            },
+            {
+                "player_id": 1,
+                "rating": 1502,
+                "games": SEASON_RANK_MIN_GAMES,
+                "season_games": SEASON_RANK_MIN_GAMES,
+                "season_wins": 1,
+            },
+        ]
+        before = rating_lib.build_rank_context_map(rows)
+        after = rating_lib.build_rank_context_map([
+            {
+                **row,
+                "rating": INITIAL_RATING + (row["rating"] - INITIAL_RATING) // 2,
+                "season_games": 0,
+                "season_wins": 0,
+            }
+            for row in rows
+        ])
+
+        self.assertEqual(before[2].position, 1)
+        self.assertEqual(after[2].position, 2)
+        self.assertEqual(after[1].position, 1)
 
     def test_brand_new_player_is_still_provisional_bronze(self):
         """通算0戦だけが暫定ブロンズ (初心者卓へ入れる状態にしておく)。"""
@@ -843,9 +879,6 @@ class TestBuildRankContextMap(unittest.TestCase):
         _, emoji, color_hex = specs[0]
         self.assertTrue(emoji)
         self.assertTrue(color_hex.startswith("#"))
-        self.assertIn(
-            "エメラルド", ROOM_DEFINITION_MAP["intermediate"].allowed_ranks
-        )
 
     def test_rank_distribution_sums_to_population(self):
         rows = make_rows(137)
@@ -870,13 +903,19 @@ class TestBuildRankContextMap(unittest.TestCase):
             rating_lib.special_grandmaster_role_name("l13"),
             rating_lib.get_rank_role_name("グランドマスター"),
         )
-        l9_role = rating_lib.get_rank_role_name("グランドマスター（9人村）")
-        self.assertEqual(rating_lib.special_grandmaster_role_name("l9"), l9_role)
-        self.assertIn(l9_role, rating_lib.all_rank_role_names())
-        self.assertNotIn(
-            "グランドマスター（9人村）",
-            {row[0] for row in RANK_SPECS},
+        l9_role = rating_lib.get_rank_role_name("グランドマスター9")
+        l9t_role = rating_lib.get_rank_role_name("グランドマスター9T")
+        self.assertEqual(
+            rating_lib.special_grandmaster_role_name("l9_cross"), l9_role,
         )
+        self.assertEqual(
+            rating_lib.special_grandmaster_role_name("l9_turn"), l9t_role,
+        )
+        self.assertIn(l9_role, rating_lib.all_rank_role_names())
+        self.assertIn(l9t_role, rating_lib.all_rank_role_names())
+        rank_specs = {row[0] for row in RANK_SPECS}
+        self.assertNotIn("グランドマスター9", rank_specs)
+        self.assertNotIn("グランドマスター9T", rank_specs)
 
 
 class TestSeasonHalfResetProduction(unittest.IsolatedAsyncioTestCase):
@@ -955,7 +994,8 @@ class TestSeasonHalfResetProduction(unittest.IsolatedAsyncioTestCase):
                 "season_games, season_wins) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 [
                     (1, guild_id, "l13", 1900, 1900, 10, 10, 6),
-                    (1, guild_id, "l9", 1700, 1700, 4, 4, 2),
+                    (1, guild_id, "l9_cross", 1700, 1700, 4, 4, 2),
+                    (1, guild_id, "l9_turn", 1300, 1500, 3, 3, 1),
                 ],
             )
             await db.commit()
@@ -975,10 +1015,17 @@ class TestSeasonHalfResetProduction(unittest.IsolatedAsyncioTestCase):
                 "WHERE season_reset_id=? ORDER BY ladder_id",
                 (reset_id,),
             )
-        self.assertEqual(current, [("l13", 1700, 0), ("l9", 1600, 0)])
+        self.assertEqual(
+            current,
+            [("l13", 1700, 0), ("l9_cross", 1600, 0), ("l9_turn", 1400, 0)],
+        )
         self.assertEqual(
             snapshots,
-            [("l13", 1900, 1700), ("l9", 1700, 1600)],
+            [
+                ("l13", 1900, 1700),
+                ("l9_cross", 1700, 1600),
+                ("l9_turn", 1300, 1400),
+            ],
         )
 
 
@@ -1027,11 +1074,173 @@ class TestLadderSchemaMigration(unittest.IsolatedAsyncioTestCase):
             await db.execute(
                 "INSERT INTO player_ratings "
                 "(player_id, guild_id, ladder_id, rating, peak_rating) "
-                "VALUES (10, 1, 'l9', 1500, 1500)"
+                "VALUES (10, 1, 'l9_cross', 1500, 1500)"
             )
             await db.commit()
         self.assertEqual(pk_columns, ["player_id", "guild_id", "ladder_id"])
         self.assertEqual(migrated, [(10, 1, "l13", 1600, 1700, 5, 3)])
+
+    async def test_shared_l9_is_split_across_all_rating_tables_once(self):
+        await database.init_db()
+        async with database.connect_db() as db:
+            await db.execute(
+                "DELETE FROM bot_meta WHERE guild_id=0 AND key=?",
+                (database.NINE_LADDER_SPLIT_MIGRATION_KEY,),
+            )
+            await db.execute(
+                "INSERT INTO player_ratings "
+                "(player_id, guild_id, ladder_id, rating, peak_rating, games, "
+                "wins, season_games, season_wins, last_updated) "
+                "VALUES (10, 1, 'l9', 1612, 1700, 3, 2, 2, 2, '2026-08-01')"
+            )
+            reset = await db.execute(
+                "INSERT INTO season_resets (guild_id, executed_by, reset_at) "
+                "VALUES (1, 999, '2026-07-01')"
+            )
+            await db.execute(
+                "INSERT INTO rating_snapshots "
+                "(season_reset_id, player_id, guild_id, ladder_id, "
+                "rating_before, rating_after, season_rank, rank_position, "
+                "top_percent, season_games, season_wins) "
+                "VALUES (?, 10, 1, 'l9', 1640, 1570, 'ゴールド', 3, 25.0, 6, 4)",
+                (int(reset.lastrowid),),
+            )
+            legacy_games = (
+                ("v9_cross", 0, "2026-06-01 12:00:00"),
+                ("v9_cross", 1, "2026-08-01 12:00:00"),
+                ("v9_turn", 1, "2026-08-02 12:00:00"),
+            )
+            for index, (variant_id, won, created_at) in enumerate(legacy_games):
+                game = await db.execute(
+                    "INSERT INTO games "
+                    "(guild_id, variant_id, ladder_id, room_id, winner_team) "
+                    "VALUES (1, ?, 'l9', ?, '村陣営')",
+                    (variant_id, f"{variant_id}-{index}"),
+                )
+                game_id = int(game.lastrowid)
+                await db.execute(
+                    "INSERT INTO game_players "
+                    "(game_id, player_id, role, team, won) "
+                    "VALUES (?, 10, '村人', '村陣営', ?)",
+                    (game_id, won),
+                )
+                await db.execute(
+                    "INSERT INTO rating_history "
+                    "(player_id, guild_id, game_id, variant_id, ladder_id, "
+                    "rating_before, rating_after, elo_delta, created_at) "
+                    "VALUES (10, 1, ?, ?, 'l9', 1600, 1612, 12, ?)",
+                    (game_id, variant_id, created_at),
+                )
+            await db.execute(
+                "INSERT INTO game_settlements "
+                "(guild_id, room_id, game_run_id, variant_id, ladder_id, "
+                "rated, winner_team, player_records, status) "
+                "VALUES (1, 'old-nine', 'pending-1', 'v9_turn', 'l9', "
+                "1, '村陣営', '[]', 'pending')"
+            )
+            await db.commit()
+
+        await database.init_db()
+        async with database.connect_db() as db:
+            current = await db.execute_fetchall(
+                "SELECT ladder_id, rating, peak_rating, games, wins, "
+                "season_games, season_wins, last_updated FROM player_ratings "
+                "WHERE player_id=10 ORDER BY ladder_id"
+            )
+            games = await db.execute_fetchall(
+                "SELECT variant_id, ladder_id FROM games ORDER BY game_id"
+            )
+            history = await db.execute_fetchall(
+                "SELECT variant_id, ladder_id FROM rating_history ORDER BY id"
+            )
+            snapshots = await db.execute_fetchall(
+                "SELECT ladder_id, rating_before, rating_after, season_rank, "
+                "season_games, season_wins FROM rating_snapshots ORDER BY ladder_id"
+            )
+            settlements = await db.execute_fetchall(
+                "SELECT variant_id, ladder_id, status FROM game_settlements"
+            )
+            marker = await db.execute_fetchall(
+                "SELECT value FROM bot_meta WHERE guild_id=0 AND key=?",
+                (database.NINE_LADDER_SPLIT_MIGRATION_KEY,),
+            )
+        self.assertEqual(
+            current,
+            [
+                ("l9_cross", 1612, 1700, 2, 1, 1, 1, "2026-08-01"),
+                ("l9_turn", 1612, 1700, 1, 1, 1, 1, "2026-08-01"),
+            ],
+        )
+        self.assertEqual(
+            games,
+            [
+                ("v9_cross", "l9_cross"),
+                ("v9_cross", "l9_cross"),
+                ("v9_turn", "l9_turn"),
+            ],
+        )
+        self.assertEqual(history, games)
+        self.assertEqual(
+            snapshots,
+            [
+                ("l9_cross", 1640, 1570, "ゴールド", 6, 4),
+                ("l9_turn", 1640, 1570, "ゴールド", 6, 4),
+            ],
+        )
+        self.assertEqual(settlements, [("v9_turn", "l9_turn", "pending")])
+        self.assertEqual(marker, [("done",)])
+
+        # marker後の再起動で複製が増えず、season_resetも未知のl9で落ちない。
+        await database.init_db()
+        async with database.connect_db() as db:
+            snapshot_count = int((await db.execute_fetchall(
+                "SELECT COUNT(*) FROM rating_snapshots"
+            ))[0][0])
+        self.assertEqual(snapshot_count, 2)
+        season_start = await database.get_season_start(1)
+        reset_id, affected = await database.season_half_reset(
+            1, 999, expected_season_start=season_start,
+        )
+        self.assertGreater(reset_id, 0)
+        self.assertEqual(affected, 1)
+
+        async with database.connect_db() as db:
+            await db.execute(
+                "INSERT INTO games "
+                "(guild_id, variant_id, ladder_id, room_id, winner_team) "
+                "VALUES (1, 'v9_cross', 'l9', 'marker-regression', '村陣営')"
+            )
+            await db.commit()
+        with self.assertRaisesRegex(RuntimeError, "旧l9"):
+            await database.init_db()
+
+    async def test_shared_l9_conflict_rolls_back_without_marker(self):
+        await database.init_db()
+        async with database.connect_db() as db:
+            await db.execute(
+                "DELETE FROM bot_meta WHERE guild_id=0 AND key=?",
+                (database.NINE_LADDER_SPLIT_MIGRATION_KEY,),
+            )
+            await db.executemany(
+                "INSERT INTO player_ratings "
+                "(player_id, guild_id, ladder_id, rating, peak_rating) "
+                "VALUES (10, 1, ?, ?, 1700)",
+                [("l9", 1612), ("l9_cross", 1500)],
+            )
+            await db.commit()
+
+        with self.assertRaisesRegex(RuntimeError, "player_ratings"):
+            await database.init_db()
+        async with database.connect_db() as db:
+            rows = await db.execute_fetchall(
+                "SELECT ladder_id, rating FROM player_ratings ORDER BY ladder_id"
+            )
+            marker = await db.execute_fetchall(
+                "SELECT value FROM bot_meta WHERE guild_id=0 AND key=?",
+                (database.NINE_LADDER_SPLIT_MIGRATION_KEY,),
+            )
+        self.assertEqual(rows, [("l9", 1612), ("l9_cross", 1500)])
+        self.assertEqual(marker, [])
 
     @staticmethod
     async def _create_legacy_table(db) -> None:
@@ -1179,7 +1388,7 @@ class TestLadderSchemaMigration(unittest.IsolatedAsyncioTestCase):
                 "INSERT INTO rating_snapshots "
                 "(season_reset_id, player_id, guild_id, ladder_id, "
                 "rating_before, rating_after) VALUES (?, 10, 1, ?, 1600, 1550)",
-                [(reset_id, "l13"), (reset_id, "l9")],
+                [(reset_id, "l13"), (reset_id, "l9_cross")],
             )
             with self.assertRaises(database.aiosqlite.IntegrityError):
                 await db.execute(
@@ -1195,69 +1404,6 @@ class TestLadderSchemaMigration(unittest.IsolatedAsyncioTestCase):
             await db.rollback()
         id_info = next(row for row in table_info if row[1] == "id")
         self.assertEqual(id_info[5], 1)
-
-
-class TestRatingScaleMigration(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory(prefix="werewolf-rating-migration-")
-        self.original_db_path = database.DB_PATH
-        database.DB_PATH = str(Path(self.temp_dir.name) / "migration.db")
-        await database.init_db()
-
-    async def asyncTearDown(self):
-        database.DB_PATH = self.original_db_path
-        self.temp_dir.cleanup()
-
-    async def test_existing_values_shift_once_without_changing_deltas(self):
-        async with database.connect_db() as db:
-            game_cursor = await db.execute(
-                "INSERT INTO games (guild_id, winner_team) VALUES (1, '村人陣営')"
-            )
-            game_id = int(game_cursor.lastrowid)
-            reset_cursor = await db.execute(
-                "INSERT INTO season_resets (guild_id, executed_by) VALUES (1, 999)"
-            )
-            reset_id = int(reset_cursor.lastrowid)
-            await db.execute(
-                "INSERT INTO player_ratings "
-                "(player_id, guild_id, rating, peak_rating) VALUES (10, 1, 1200, 1600)"
-            )
-            await db.execute(
-                "INSERT INTO rating_history "
-                "(player_id, guild_id, game_id, rating_before, rating_after, elo_delta, bonus) "
-                "VALUES (10, 1, ?, 1200, 1213, 10, 3)",
-                (game_id,),
-            )
-            await db.execute(
-                "INSERT INTO rating_snapshots "
-                "(season_reset_id, player_id, guild_id, rating_before, rating_after) "
-                "VALUES (?, 10, 1, 1600, 1400)",
-                (reset_id,),
-            )
-            await db.commit()
-
-        self.assertTrue(await database.rating_scale_migration_needed())
-        affected = await database.migrate_rating_scale_to_1500()
-        self.assertEqual(affected, 1)
-        self.assertFalse(await database.rating_scale_migration_needed())
-
-        async with database.connect_db() as db:
-            current = await db.execute_fetchall(
-                "SELECT rating, peak_rating FROM player_ratings WHERE player_id = 10"
-            )
-            history = await db.execute_fetchall(
-                "SELECT rating_before, rating_after, elo_delta, bonus "
-                "FROM rating_history WHERE player_id = 10"
-            )
-            snapshot = await db.execute_fetchall(
-                "SELECT rating_before, rating_after FROM rating_snapshots "
-                "WHERE player_id = 10"
-            )
-
-        self.assertEqual(current, [(1500, 1900)])
-        self.assertEqual(history, [(1500, 1513, 10, 3)])
-        self.assertEqual(snapshot, [(1900, 1700)])
-        self.assertEqual(await database.migrate_rating_scale_to_1500(), 0)
 
 
 if __name__ == "__main__":

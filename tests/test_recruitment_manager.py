@@ -8,27 +8,25 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
 import database
 from config import (
-    ADMIN_ONLY_ROOM_IDS,
+    CH_OPERATIONS,
     GM_ROLE_NAME,
+    OPERATIONS_CATEGORY_NAME,
+    RECRUITMENT_NOTIFICATION_ROLE_NAME,
     TEMP_GM_ROLE_NAME,
-    RECRUITMENT_DISABLED_ROOM_IDS,
     Phase,
 )
 from recruitment import (
     RecruitmentCardView,
     RecruitmentCreateModal,
-    RecruitmentDuplicateModal,
-    RecruitmentHostView,
-    RecruitmentHomeView,
     RecruitmentManager,
     RecruitmentOptionsView,
+    PlayerBlockSettingsView,
     RecruitmentScheduleView,
-    build_recruitment_help_embed,
 )
 import recruitment as recruitment_lib
 from views import LobbyView
@@ -88,6 +86,118 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         if gm_id is not None:
             await database.set_recruitment_gm(recruitment_id, gm_id)
         return recruitment_id
+
+    async def test_player_block_view_pages_all_candidates_and_registered_users(self) -> None:
+        members = [
+            SimpleNamespace(
+                id=user_id,
+                display_name=f"user-{user_id:03d}",
+                name=f"user-{user_id:03d}",
+                bot=False,
+            )
+            for user_id in range(1, 62)
+        ]
+        by_id = {member.id: member for member in members}
+        guild = SimpleNamespace(
+            id=1,
+            members=members,
+            get_member=lambda user_id: by_id.get(user_id),
+        )
+        manager = SimpleNamespace(
+            bot=SimpleNamespace(get_guild=lambda guild_id: guild if guild_id == 1 else None),
+            notify_block_added=AsyncMock(),
+        )
+
+        candidate_ids: set[int] = set()
+        for page in range(3):
+            view = PlayerBlockSettingsView(
+                manager, 1, 1, [], add_page=page,
+            )
+            select = discord.utils.get(
+                view.children, custom_id="player_blocks:add_page",
+            )
+            self.assertIsNotNone(select)
+            candidate_ids.update(int(option.value) for option in select.options)
+        self.assertEqual(candidate_ids, set(range(2, 62)))
+
+        blocked_ids = list(range(2, 52))
+        visible_blocked_ids: set[int] = set()
+        for page in range(2):
+            view = PlayerBlockSettingsView(
+                manager, 1, 1, blocked_ids, remove_page=page,
+            )
+            select = discord.utils.get(
+                view.children, custom_id="player_blocks:remove",
+            )
+            self.assertIsNotNone(select)
+            visible_blocked_ids.update(int(option.value) for option in select.options)
+        self.assertEqual(visible_blocked_ids, set(blocked_ids))
+
+    async def _insert_legacy_recruitment(
+        self,
+        *,
+        status: str = database.RECRUITMENT_OPEN,
+        room_id: str = "open_9_cross",
+        variant_id: str = "v9_cross",
+    ) -> int:
+        """現行APIが拒否する廃止固定卓の既存DB行を移行テスト用に再現する。"""
+        variant = recruitment_lib.VARIANT_DEFINITIONS[variant_id]
+        async with database.connect_db() as db:
+            cursor = await db.execute(
+                "INSERT INTO recruitments "
+                "(guild_id, host_id, title, scheduled_at, room_id, streaming, "
+                "status, variant_id, capacity, backup_capacity, occupancy_minutes) "
+                "VALUES (1, 1, '旧固定卓募集', ?, ?, 0, ?, ?, ?, 3, ?)",
+                (
+                    (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+                    room_id,
+                    status,
+                    variant_id,
+                    variant.player_count,
+                    variant.recruitment_occupancy_minutes,
+                ),
+            )
+            await db.commit()
+            return int(cursor.lastrowid)
+
+    def _install_private_room(
+        self,
+        room_id: str,
+        *,
+        variant_id: str,
+        lobby_channel=None,
+    ):
+        state = SimpleNamespace(
+            phase=Phase.LOBBY,
+            players={},
+            gm_id=1,
+            recruitment_id=None,
+            room_id=room_id,
+            room_name="GM村",
+            lobby_channel=lobby_channel,
+            lobby_message=None,
+            guild=self.guild,
+        )
+        room = SimpleNamespace(
+            state=state,
+            room_def=SimpleNamespace(
+                room_id=room_id,
+                name="GM村",
+                variant_id=variant_id,
+                private_owner_id=1,
+                allowed_ranks=None,
+                allowed_gm_user_ids=None,
+                access_role_names=None,
+                strict_access_role_names=None,
+            ),
+            is_private_room=lambda: True,
+            action_lock=asyncio.Lock(),
+            _is_game_in_progress=lambda: False,
+            _persist_room_state=AsyncMock(),
+            _post_lobby_ui=AsyncMock(),
+        )
+        self.cog.rooms[room_id] = room
+        return room
 
     def _interaction(self):
         return SimpleNamespace(
@@ -205,18 +315,379 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         self.members[100].send.assert_awaited_once()
         self.members[1].send.assert_awaited_once()
 
+    async def test_notification_just_after_start_is_still_sent_once(self) -> None:
+        now = datetime(2026, 8, 9, 12, 0, 1, tzinfo=timezone.utc)
+        recruitment_id = await database.create_recruitment(
+            1,
+            1,
+            title="今すぐ通知",
+            scheduled_at=now - timedelta(seconds=1),
+            room_id="open",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        await database.add_recruitment_entry(recruitment_id, 100)
+
+        await self.manager.process_notifications(self.guild, now=now)
+        await self.manager.process_notifications(self.guild, now=now + timedelta(minutes=1))
+
+        self.members[100].send.assert_awaited_once()
+        self.assertIn("開催予定時刻を迎えています", self.members[100].send.await_args.args[0])
+
+    async def test_late_participant_is_notified_without_waiting_for_next_poll(self) -> None:
+        now = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+        recruitment_id = await database.create_recruitment(
+            1,
+            1,
+            title="後参加通知",
+            scheduled_at=now + timedelta(minutes=10),
+            room_id="open",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        await database.add_recruitment_entry(recruitment_id, 100)
+        await self.manager.process_notifications(self.guild, now=now)
+        await database.add_recruitment_entry(recruitment_id, 101)
+
+        sent = await self.manager.notify_participant_if_due(
+            self.guild, recruitment_id, 101, now=now,
+        )
+        await self.manager.process_notifications(self.guild, now=now)
+
+        self.assertTrue(sent)
+        self.members[100].send.assert_awaited_once()
+        self.members[101].send.assert_awaited_once()
+
+    async def test_immediate_and_periodic_notification_are_serialized(self) -> None:
+        now = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+        recruitment_id = await database.create_recruitment(
+            1,
+            1,
+            title="通知競合",
+            scheduled_at=now + timedelta(minutes=10),
+            room_id="open",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        await database.add_recruitment_entry(recruitment_id, 100)
+
+        await asyncio.gather(
+            self.manager.notify_participant_if_due(
+                self.guild, recruitment_id, 100, now=now,
+            ),
+            self.manager.process_notifications(self.guild, now=now),
+        )
+
+        self.members[100].send.assert_awaited_once()
+
+    async def test_cancel_committed_before_poll_lock_prevents_stale_dm(self) -> None:
+        now = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+        recruitment_id = await database.create_recruitment(
+            1,
+            1,
+            title="取消競合",
+            scheduled_at=now + timedelta(minutes=10),
+            room_id="open",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        await database.add_recruitment_entry(recruitment_id, 100)
+
+        await self.manager.lock.acquire()
+        try:
+            polling = asyncio.create_task(
+                self.manager.process_notifications(self.guild, now=now)
+            )
+            await asyncio.sleep(0)
+            await database.remove_recruitment_entry(recruitment_id, 100)
+        finally:
+            self.manager.lock.release()
+        await polling
+
+        self.members[100].send.assert_not_awaited()
+
+    async def test_forbidden_notification_is_not_retried_every_poll(self) -> None:
+        now = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+        recruitment_id = await database.create_recruitment(
+            1,
+            1,
+            title="DM拒否",
+            scheduled_at=now + timedelta(minutes=10),
+            room_id="open",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        await database.add_recruitment_entry(recruitment_id, 100)
+        denied = discord.Forbidden(
+            SimpleNamespace(status=403, reason="Forbidden", headers={}), "denied",
+        )
+        self.members[100].send.side_effect = denied
+
+        await self.manager.process_notifications(self.guild, now=now)
+        await self.manager.process_notifications(self.guild, now=now + timedelta(minutes=1))
+
+        self.members[100].send.assert_awaited_once()
+        self.assertEqual(
+            await database.list_pending_recruitment_notification_user_ids(recruitment_id),
+            [],
+        )
+
+    async def test_temporary_failure_is_retried_after_transfer_while_slot_is_active(
+        self,
+    ) -> None:
+        now = datetime(2026, 8, 9, 12, 0, tzinfo=timezone.utc)
+        recruitment_id = await database.create_recruitment(
+            1,
+            1,
+            title="移行直前の一時失敗",
+            scheduled_at=now + timedelta(minutes=10),
+            room_id="open",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        await database.add_recruitment_entry(recruitment_id, 100)
+        temporary = discord.HTTPException(
+            SimpleNamespace(status=503, reason="Unavailable", headers={}),
+            "retry",
+        )
+        self.members[100].send.side_effect = [temporary, None]
+
+        sent = await self.manager.notify_participant_if_due(
+            self.guild, recruitment_id, 100, now=now,
+        )
+        self.assertFalse(sent)
+        self.assertTrue(
+            await database.set_recruitment_status(
+                recruitment_id, database.RECRUITMENT_HELD
+            )
+        )
+
+        await self.manager.process_notifications(
+            self.guild, now=now + timedelta(minutes=1)
+        )
+
+        self.assertEqual(self.members[100].send.await_count, 2)
+        self.assertEqual(
+            await database.list_pending_recruitment_notification_user_ids(recruitment_id),
+            [],
+        )
+
+    async def test_notification_failure_does_not_turn_successful_join_into_error(self) -> None:
+        recruitment_id = await database.create_recruitment(
+            1,
+            1,
+            title="参加成功優先",
+            scheduled_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+            room_id="open",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        card = RecruitmentCardView(self.manager, recruitment_id)
+        interaction = SimpleNamespace(
+            user=self.members[100],
+            guild=self.guild,
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+            message=SimpleNamespace(edit=AsyncMock()),
+        )
+        self.manager.notify_participant_if_due = AsyncMock(
+            side_effect=RuntimeError("notification DB down")
+        )
+        self.manager.build_embed = AsyncMock(return_value=discord.Embed())
+        self.manager.notify_ready_if_needed = AsyncMock()
+
+        with patch.object(recruitment_lib.discord, "Member", SimpleNamespace):
+            await card.join(interaction)
+
+        entries = await database.list_recruitment_entries(recruitment_id)
+        self.assertEqual([entry["user_id"] for entry in entries], [100])
+        self.assertIn("参加として登録しました", interaction.followup.send.await_args.args[0])
+        self.manager.notify_participant_if_due.assert_awaited_once_with(
+            self.guild, recruitment_id, 100
+        )
+
+    async def test_join_revalidates_current_conditions_inside_manager_lock(self) -> None:
+        recruitment_id = await database.create_recruitment(
+            1,
+            1,
+            title="変更後は参加不可",
+            scheduled_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+            room_id="open",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        card = RecruitmentCardView(self.manager, recruitment_id)
+        interaction = SimpleNamespace(
+            user=self.members[100],
+            guild=self.guild,
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+            message=SimpleNamespace(edit=AsyncMock()),
+        )
+        self.manager.validate_candidate = AsyncMock(
+            side_effect=[None, "形式変更後のランク条件を満たしていません。"],
+        )
+
+        with patch.object(recruitment_lib.discord, "Member", SimpleNamespace):
+            await card.join(interaction)
+
+        self.assertEqual(await database.list_recruitment_entries(recruitment_id), [])
+        self.assertEqual(self.manager.validate_candidate.await_count, 2)
+        self.assertIn(
+            "形式変更後のランク条件を満たしていません。",
+            interaction.followup.send.await_args.args[0],
+        )
+
+    async def test_promoted_backup_is_connected_to_immediate_notification(self) -> None:
+        recruitment_id = await self._full_recruitment()
+        promoted = SimpleNamespace(
+            id=200, nick=None, display_name="user-200", send=AsyncMock()
+        )
+        self.members[200] = promoted
+        await database.add_recruitment_entry(recruitment_id, 200)
+        card = RecruitmentCardView(self.manager, recruitment_id)
+        interaction = SimpleNamespace(
+            user=self.members[100],
+            guild=self.guild,
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+            message=SimpleNamespace(edit=AsyncMock()),
+        )
+        self.manager.notify_participant_if_due = AsyncMock(return_value=True)
+        self.manager.build_embed = AsyncMock(return_value=discord.Embed())
+
+        await card.leave(interaction)
+
+        promoted.send.assert_awaited_once_with("補欠から参加者へ繰り上がりました。")
+        self.manager.notify_participant_if_due.assert_awaited_once_with(
+            self.guild, recruitment_id, 200
+        )
+
+    async def test_participant_leave_updates_roster_without_access_role(self) -> None:
+        recruitment_id = await database.create_recruitment(
+            1,
+            1,
+            title="公開村の参加取消",
+            scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            room_id="open",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        await database.add_recruitment_entry(recruitment_id, 100)
+        self.room.is_private_room = lambda: True
+        self.room.room_def.private_owner_id = 1
+        card = RecruitmentCardView(self.manager, recruitment_id)
+        interaction = SimpleNamespace(
+            user=self.members[100],
+            guild=self.guild,
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+            message=SimpleNamespace(edit=AsyncMock()),
+        )
+
+        await card.leave(interaction)
+
+        entries = await database.list_recruitment_entries(recruitment_id)
+        self.assertEqual(entries, [])
+        self.assertIn("参加を取り消しました", interaction.followup.send.await_args.args[0])
+        interaction.message.edit.assert_awaited_once()
+
+    async def test_operations_channel_preserves_manual_view_allows(self) -> None:
+        class Target:
+            def __init__(self, target_id: int, *, administrator: bool = False) -> None:
+                self.id = target_id
+                self.permissions = discord.Permissions.none()
+                self.permissions.administrator = administrator
+
+        category = SimpleNamespace(name=OPERATIONS_CATEGORY_NAME)
+        default = Target(1)
+        bot_member = Target(2)
+        stale = Target(3)
+        administrator = Target(4, administrator=True)
+        channel = SimpleNamespace(
+            name=CH_OPERATIONS,
+            category=category,
+            overwrites={
+                stale: discord.PermissionOverwrite(view_channel=True, manage_messages=True),
+                administrator: discord.PermissionOverwrite(view_channel=True),
+            },
+        )
+
+        async def edit_channel(*, overwrites, reason=None):
+            channel.overwrites = dict(overwrites)
+            return channel
+
+        channel.edit = AsyncMock(side_effect=edit_channel)
+        guild = SimpleNamespace(
+            categories=[category],
+            text_channels=[channel],
+            default_role=default,
+            me=bot_member,
+            create_text_channel=AsyncMock(),
+        )
+
+        result = await self.manager._ensure_operations_channel(guild)
+
+        self.assertIs(result, channel)
+        channel.edit.assert_awaited_once()
+        self.assertNotIn(default, channel.overwrites)
+        self.assertTrue(channel.overwrites[bot_member].view_channel)
+        self.assertTrue(channel.overwrites[stale].view_channel)
+        self.assertTrue(channel.overwrites[stale].manage_messages)
+        self.assertTrue(channel.overwrites[administrator].view_channel)
+
+    async def test_operations_channel_edit_failure_is_fail_closed(self) -> None:
+        class Target:
+            def __init__(self, target_id: int) -> None:
+                self.id = target_id
+
+        category = SimpleNamespace(name=OPERATIONS_CATEGORY_NAME)
+        default = Target(1)
+        bot_member = Target(2)
+        stale = Target(3)
+        channel = SimpleNamespace(
+            name=CH_OPERATIONS,
+            category=category,
+            overwrites={
+                stale: discord.PermissionOverwrite(view_channel=True),
+            },
+            edit=AsyncMock(
+                side_effect=discord.Forbidden(
+                    SimpleNamespace(status=403, reason="Forbidden", headers={}),
+                    "denied",
+                )
+            ),
+        )
+        guild = SimpleNamespace(
+            categories=[category],
+            text_channels=[channel],
+            default_role=default,
+            me=bot_member,
+            create_text_channel=AsyncMock(),
+        )
+
+        result = await self.manager._ensure_operations_channel(guild)
+
+        self.assertIsNone(result)
+        channel.edit.assert_awaited_once()
+
     async def test_new_recruitment_is_archived_if_card_cannot_be_published(self) -> None:
+        room_id = "private_1"
         recruitment_id = await database.create_recruitment(
             1, 1, title="掲示失敗テスト",
             scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
-            room_id="open", streaming=False, allowed_ranks=None,
+            room_id=room_id, variant_id="v13_cross",
+            streaming=False, allowed_ranks=None,
         )
         denied = discord.Forbidden(
             SimpleNamespace(status=403, reason="Forbidden", headers={}), "denied"
         )
-        self.manager.channel = SimpleNamespace(
+        lobby_channel = SimpleNamespace(
             guild=self.guild,
             send=AsyncMock(side_effect=denied),
+        )
+        self._install_private_room(
+            room_id, variant_id="v13_cross", lobby_channel=lobby_channel,
         )
 
         with self.assertRaisesRegex(RuntimeError, "作成を取り消しました"):
@@ -226,15 +697,7 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["status"], database.RECRUITMENT_ARCHIVED)
 
     async def test_disabled_recruitment_is_never_published(self) -> None:
-        recruitment_id = await database.create_recruitment(
-            1,
-            1,
-            title="段階導入中",
-            scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
-            room_id="open_9_cross",
-            streaming=False,
-            allowed_ranks=None,
-        )
+        recruitment_id = await self._insert_legacy_recruitment()
         channel = SimpleNamespace(guild=self.guild, send=AsyncMock())
         self.manager.channel = channel
 
@@ -247,20 +710,17 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["status"], database.RECRUITMENT_ARCHIVED)
 
     async def test_existing_disabled_card_is_deleted(self) -> None:
-        recruitment_id = await database.create_recruitment(
-            1,
-            1,
-            title="回収対象",
-            scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
-            room_id="open_9_cross",
-            streaming=False,
-            allowed_ranks=None,
-        )
+        recruitment_id = await self._insert_legacy_recruitment()
         await database.set_recruitment_message_id(recruitment_id, 999)
         message = SimpleNamespace(delete=AsyncMock())
         self.manager.channel = SimpleNamespace(
             guild=self.guild,
             fetch_message=AsyncMock(return_value=message),
+        )
+        self._install_private_room(
+            "open_9_cross",
+            variant_id="v9_cross",
+            lobby_channel=self.manager.channel,
         )
         row = await database.get_recruitment(recruitment_id)
 
@@ -271,28 +731,20 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone((await database.get_recruitment(recruitment_id))["message_id"])
 
     async def test_setup_removes_held_rollout_card_after_room_is_hidden_again(self) -> None:
-        recruitment_id = await database.create_recruitment(
-            1,
-            1,
-            title="公開試験終了後",
-            scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
-            room_id="open_9_cross",
-            streaming=False,
-            allowed_ranks=None,
+        recruitment_id = await self._insert_legacy_recruitment(
+            status=database.RECRUITMENT_HELD,
         )
         await database.set_recruitment_message_id(recruitment_id, 1001)
-        await database.set_recruitment_status(
-            recruitment_id, database.RECRUITMENT_HELD,
-        )
         message = SimpleNamespace(delete=AsyncMock())
         channel = SimpleNamespace(
             guild=self.guild,
             fetch_message=AsyncMock(return_value=message),
         )
-        self.manager._ensure_public_channel = AsyncMock(return_value=channel)
+        self._install_private_room(
+            "open_9_cross", variant_id="v9_cross", lobby_channel=channel,
+        )
         self.manager._ensure_operations_channel = AsyncMock(return_value=None)
         self.manager._upsert_panel = AsyncMock()
-        self.manager.cleanup_old_messages = AsyncMock()
 
         with self._hide_nine_recruitment():
             await self.manager.setup(self.guild)
@@ -303,19 +755,10 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(row["message_id"])
 
     async def test_notification_loop_retries_hidden_card_after_discord_error(self) -> None:
-        recruitment_id = await database.create_recruitment(
-            1,
-            1,
-            title="一時削除失敗",
-            scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
-            room_id="open_9_cross",
-            streaming=False,
-            allowed_ranks=None,
+        recruitment_id = await self._insert_legacy_recruitment(
+            status=database.RECRUITMENT_HELD,
         )
         await database.set_recruitment_message_id(recruitment_id, 1002)
-        await database.set_recruitment_status(
-            recruitment_id, database.RECRUITMENT_HELD,
-        )
         unavailable = discord.HTTPException(
             SimpleNamespace(
                 status=503, reason="Service Unavailable", headers={},
@@ -329,8 +772,11 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             guild=self.guild,
             fetch_message=AsyncMock(return_value=message),
         )
-        self.manager.cleanup_old_messages = AsyncMock()
-
+        self._install_private_room(
+            "open_9_cross",
+            variant_id="v9_cross",
+            lobby_channel=self.manager.channel,
+        )
         with self._hide_nine_recruitment():
             await self.manager.process_notifications(self.guild)
             self.assertEqual(
@@ -343,17 +789,13 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             (await database.get_recruitment(recruitment_id))["message_id"]
         )
 
-    async def test_stale_hidden_card_rejects_host_menu_and_host_view(self) -> None:
+    async def test_stale_hidden_card_rejects_host_menu(self) -> None:
         """削除失敗で残ったカードからも、段階導入中卓を操作できない。"""
-        recruitment_id = await database.create_recruitment(
-            1,
-            1,
-            title="旧9人募集",
-            scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
-            room_id="open_9_cross",
-            streaming=False,
-            allowed_ranks=None,
+        room_id = "private_hidden"
+        recruitment_id = await self._insert_legacy_recruitment(
+            room_id=room_id, variant_id="v13_turn",
         )
+        self._install_private_room(room_id, variant_id="v13_turn")
         card = RecruitmentCardView(self.manager, recruitment_id)
         menu_interaction = SimpleNamespace(
             user=self.members[1],
@@ -361,39 +803,21 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             response=SimpleNamespace(send_message=AsyncMock()),
         )
 
-        with self._hide_nine_recruitment():
-            await card.host_menu(menu_interaction)
+        await card.host_menu(menu_interaction)
 
         text = menu_interaction.response.send_message.await_args.args[0]
         self.assertIn("段階導入中", text)
         self.assertIn("主催者メニュー", text)
 
-        host_view = RecruitmentHostView(self.manager, recruitment_id, 1)
-        note_interaction = SimpleNamespace(
-            user=self.members[1],
-            guild=self.guild,
-            response=SimpleNamespace(
-                send_message=AsyncMock(), send_modal=AsyncMock(),
-            ),
-        )
-        note_button = next(
-            item for item in host_view.children if item.label == "備考を変更"
-        )
-        with self._hide_nine_recruitment():
-            await note_button.callback(note_interaction)
-
-        text = note_interaction.response.send_message.await_args.args[0]
-        self.assertIn("段階導入中", text)
-        self.assertIn("備考変更", text)
-        note_interaction.response.send_modal.assert_not_awaited()
-
     async def test_embed_uses_saved_variant_capacity_and_occupancy(self) -> None:
+        self._install_private_room("private_1", variant_id="v9_cross")
         recruitment_id = await database.create_recruitment(
             1,
             1,
             title="9人snapshot",
             scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
-            room_id="open_9_cross",
+            room_id="private_1",
+            variant_id="v9_cross",
             streaming=False,
             allowed_ranks=None,
         )
@@ -402,24 +826,27 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("占有時間: 90分", embed.footer.text)
 
     async def test_public_nine_player_recruitment_is_published(self) -> None:
+        channel = SimpleNamespace(guild=self.guild, send=AsyncMock())
+        self._install_private_room(
+            "private_1", variant_id="v9_cross", lobby_channel=channel,
+        )
         recruitment_id = await database.create_recruitment(
             1,
             1,
             title="公開9人募集",
             scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
-            room_id="open_9_cross",
+            room_id="private_1",
+            variant_id="v9_cross",
             streaming=False,
             allowed_ranks=None,
         )
         message = SimpleNamespace(id=900, delete=AsyncMock())
-        self.manager.channel = SimpleNamespace(
-            guild=self.guild,
-            send=AsyncMock(return_value=message),
-        )
+        channel.send.return_value = message
+        self.manager._notify_new_recruitment = AsyncMock()
 
         await self.manager.publish_new_recruitment(self.guild, recruitment_id)
 
-        self.manager.channel.send.assert_awaited_once()
+        channel.send.assert_awaited_once()
         self.assertEqual(
             (await database.get_recruitment(recruitment_id))["message_id"], 900,
         )
@@ -439,26 +866,21 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         self.room._persist_room_state.assert_not_awaited()
 
     async def test_hidden_variant_ready_dm_is_suppressed(self) -> None:
-        recruitment_id = await database.create_recruitment(
-            1,
-            1,
-            title="非公開9人",
-            scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
-            room_id="open_9_cross",
-            streaming=False,
-            allowed_ranks=None,
+        room_id = "private_hidden"
+        recruitment_id = await self._insert_legacy_recruitment(
+            room_id=room_id, variant_id="v13_turn",
         )
-        for user_id in range(100, 109):
+        self._install_private_room(room_id, variant_id="v13_turn")
+        for user_id in range(100, 113):
             await database.add_recruitment_entry(recruitment_id, user_id)
         await database.set_recruitment_gm(recruitment_id, 1)
         row = await database.get_recruitment(recruitment_id)
 
-        with self._hide_nine_recruitment():
-            await self.manager.notify_ready_if_needed(row)
+        await self.manager.notify_ready_if_needed(row)
 
         self.members[1].send.assert_not_awaited()
 
-    async def test_admin_cannot_submit_stale_hidden_room_creation_form(self) -> None:
+    async def test_stale_room_creation_form_without_variant_is_rejected(self) -> None:
         class FakeMember:
             def __init__(self) -> None:
                 self.id = 1
@@ -483,54 +905,13 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             guild=SimpleNamespace(id=1, owner_id=1),
             response=SimpleNamespace(send_message=AsyncMock()),
         )
-        with self._hide_nine_recruitment(), patch.object(
+        with patch.object(
             recruitment_lib.discord, "Member", FakeMember,
         ):
             await modal.on_submit(interaction)
         text = interaction.response.send_message.await_args.args[0]
-        self.assertIn("段階導入中", text)
+        self.assertIn("ゲーム形式が見つからない", text)
         self.assertIn("作成できません", text)
-
-    async def test_admin_cannot_duplicate_hidden_room_recruitment(self) -> None:
-        recruitment_id = await database.create_recruitment(
-            1,
-            1,
-            title="複製不可",
-            scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
-            room_id="open_9_cross",
-            streaming=False,
-            allowed_ranks=None,
-        )
-
-        class FakeMember:
-            def __init__(self) -> None:
-                self.id = 1
-                self.roles = [SimpleNamespace(name=TEMP_GM_ROLE_NAME)]
-                self.guild_permissions = SimpleNamespace(administrator=True)
-
-        modal = RecruitmentDuplicateModal(self.manager, recruitment_id, 1)
-        interaction = SimpleNamespace(
-            user=FakeMember(),
-            guild=SimpleNamespace(id=1, owner_id=1),
-            response=SimpleNamespace(send_message=AsyncMock()),
-        )
-        with self._hide_nine_recruitment(), patch.object(
-            recruitment_lib.discord, "Member", FakeMember,
-        ):
-            await modal.on_submit(interaction)
-        text = interaction.response.send_message.await_args.args[0]
-        self.assertIn("段階導入中", text)
-        self.assertIn("複製できません", text)
-
-    def test_gm_and_temp_gm_can_create_recruitment(self) -> None:
-        for role_name in (GM_ROLE_NAME, TEMP_GM_ROLE_NAME):
-            member = SimpleNamespace(roles=[SimpleNamespace(name=role_name)])
-            self.assertTrue(recruitment_lib._has_private_room_creator_role(member))
-        self.assertFalse(
-            recruitment_lib._has_private_room_creator_role(
-                SimpleNamespace(roles=[SimpleNamespace(name="村長")])
-            )
-        )
 
     async def test_temp_gm_can_open_recruitment_creation(self) -> None:
         class FakeMember:
@@ -545,12 +926,8 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
             followup=SimpleNamespace(send=AsyncMock()),
         )
-        home = RecruitmentHomeView(self.manager)
-        create_button = next(
-            item for item in home.children if item.custom_id == "recruitment:create"
-        )
         with patch.object(recruitment_lib.discord, "Member", FakeMember):
-            await create_button.callback(interaction)
+            await self.manager.start_village_creation(interaction)
 
         interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
         interaction.user.send.assert_awaited_once()
@@ -568,75 +945,220 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ID: 100", text)
         self.assertIn("ID: 101", text)
 
-    async def test_persistent_card_ids_and_open_only_options(self) -> None:
-        home = RecruitmentHomeView(self.manager)
-        self.assertIsNone(home.timeout)
-        self.assertEqual(
-            {item.custom_id for item in home.children},
-            {"recruitment:create", "recruitment:help"},
-        )
-        help_embed = build_recruitment_help_embed()
-        self.assertEqual(help_embed.title, "募集の使い方")
-        self.assertEqual(len(help_embed.fields), 3)
-        self.assertIn("GM または 仮GM", help_embed.fields[1].value)
-
+    async def test_integrated_card_and_rank_preset_options(self) -> None:
         card = RecruitmentCardView(self.manager, 42)
         self.assertIsNone(card.timeout)
         self.assertEqual(
             {item.custom_id for item in card.children},
             {
                 "recruitment:42:join", "recruitment:42:leave",
-                "recruitment:42:gm", "recruitment:42:transfer",
-                "recruitment:42:host",
+                "recruitment:42:transfer", "recruitment:42:host",
+                "recruitment:42:notify",
             },
         )
         base = {
             "date": "2026-08-03", "hour": "20", "minute": "0",
             "streaming": "0",
         }
-        restricted = RecruitmentOptionsView(
-            self.manager, 1, {**base, "room": "beginner"},
+        unrestricted = RecruitmentOptionsView(
+            self.manager, 1, base,
         )
-        self.assertFalse(any(isinstance(item, discord.ui.Select) for item in restricted.children))
-        open_room = RecruitmentOptionsView(
-            self.manager, 1, {**base, "room": "open"},
-        )
-        selects = [item for item in open_room.children if isinstance(item, discord.ui.Select)]
+        selects = [
+            item for item in unrestricted.children
+            if isinstance(item, discord.ui.Select)
+        ]
         self.assertEqual(len(selects), 1)
-        self.assertEqual(selects[0].min_values, 0)
-        self.assertEqual(selects[0].max_values, 10)
-        self.assertEqual(len(selects[0].options), 10)
-        self.assertEqual(selects[0].options[-1].value, "ランク未設定")
+        self.assertEqual(
+            [option.value for option in selects[0].options],
+            ["all", "beginner", "intermediate", "advanced", "custom"],
+        )
 
-        for allow_admin_rooms in (False, True):
-            schedule = RecruitmentScheduleView(
-                self.manager, 1, allow_admin_rooms=allow_admin_rooms,
-            )
-            room_select = next(
-                item for item in schedule.children
-                if getattr(item, "key", None) == "room"
-            )
-            offered = {option.value for option in room_select.options}
-            self.assertTrue(offered.isdisjoint(RECRUITMENT_DISABLED_ROOM_IDS))
-            self.assertTrue(
-                (ADMIN_ONLY_ROOM_IDS - RECRUITMENT_DISABLED_ROOM_IDS) <= offered
-            )
+        beginner = RecruitmentOptionsView(
+            self.manager,
+            1,
+            {
+                **base,
+                "allowed_ranks": list(
+                    recruitment_lib._RANK_PRESET_RANKS["beginner"]
+                ),
+            },
+        )
+        beginner_select = next(
+            item for item in beginner.children
+            if isinstance(item, discord.ui.Select)
+        )
+        self.assertTrue(
+            next(
+                option for option in beginner_select.options
+                if option.value == "beginner"
+            ).default
+        )
+        self.assertIn(
+            "ランク未設定",
+            beginner.values["allowed_ranks"],
+        )
 
-        with patch.object(
-            recruitment_lib, "RECRUITMENT_DISABLED_ROOM_IDS", frozenset(),
-        ):
-            unlocked = RecruitmentScheduleView(self.manager, 1)
-            room_select = next(
-                item for item in unlocked.children
-                if getattr(item, "key", None) == "room"
+        custom = RecruitmentOptionsView(
+            self.manager, 1, {**base, "allowed_ranks": ["ダイヤ"]},
+        )
+        custom_selects = [
+            item for item in custom.children if isinstance(item, discord.ui.Select)
+        ]
+        self.assertEqual(len(custom_selects), 2)
+        rank_select = next(
+            item for item in custom_selects
+            if item.placeholder == "個別に参加可能ランクを選択"
+        )
+        self.assertEqual(rank_select.min_values, 1)
+        self.assertEqual(rank_select.max_values, 10)
+        self.assertEqual(len(rank_select.options), 10)
+
+        schedule = RecruitmentScheduleView(self.manager, 1)
+        self.assertFalse(
+            any(getattr(item, "key", None) == "room" for item in schedule.children)
+        )
+        variant_select = next(
+            item for item in schedule.children
+            if getattr(item, "key", None) == "variant"
+        )
+        self.assertEqual(
+            {option.value for option in variant_select.options},
+            set(recruitment_lib.USER_VISIBLE_VARIANT_IDS),
+        )
+
+    async def test_notification_role_button_toggles_without_refetch(self) -> None:
+        role = MagicMock(spec=discord.Role)
+        role.id = 808
+        role.name = RECRUITMENT_NOTIFICATION_ROLE_NAME
+        role.permissions = discord.Permissions.none()
+        role.managed = False
+        role.mentionable = False
+        role.is_assignable.return_value = True
+        default_role = SimpleNamespace(id=1)
+        bot_member = SimpleNamespace(id=2)
+        guild = MagicMock(spec=discord.Guild)
+        guild.id = 1
+        guild.roles = [role]
+        guild.channels = []
+        guild.default_role = default_role
+        guild.me = bot_member
+        role.guild = guild
+
+        member = MagicMock(spec=discord.Member)
+        member.id = 100
+        member.roles = []
+        member.add_roles = AsyncMock()
+        member.remove_roles = AsyncMock()
+        interaction = SimpleNamespace(
+            guild=guild,
+            user=member,
+            response=SimpleNamespace(
+                defer=AsyncMock(), send_message=AsyncMock(),
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        async def paced(func, *args, **kwargs):
+            return await func(*args, **kwargs)
+
+        self.cog.paced_discord_api_call = paced
+        await self.manager.toggle_notification_role(interaction)
+        await self.manager.toggle_notification_role(interaction)
+
+        member.add_roles.assert_awaited_once_with(
+            role, reason="本人が募集通知をON",
+        )
+        member.remove_roles.assert_awaited_once_with(
+            role, reason="本人が募集通知をOFF",
+        )
+        self.assertIn("ON", interaction.followup.send.await_args_list[0].args[0])
+        self.assertIn("OFF", interaction.followup.send.await_args_list[1].args[0])
+
+    async def test_new_recruitment_mentions_only_notification_role_once(self) -> None:
+        role = MagicMock(spec=discord.Role)
+        role.id = 809
+        role.name = RECRUITMENT_NOTIFICATION_ROLE_NAME
+        role.permissions = discord.Permissions.none()
+        role.managed = False
+        role.mentionable = False
+        role.mention = "<@&809>"
+        role.members = [SimpleNamespace(id=100)]
+        role.is_assignable.return_value = True
+        default_role = SimpleNamespace(id=1)
+        bot_member = SimpleNamespace(id=2)
+        channel = SimpleNamespace(
+            name="参加受付",
+            overwrites={},
+            send=AsyncMock(),
+            permissions_for=lambda _member: SimpleNamespace(mention_everyone=True),
+        )
+        guild = MagicMock(spec=discord.Guild)
+        guild.id = 1
+        guild.roles = [role]
+        guild.channels = [channel]
+        guild.default_role = default_role
+        guild.me = bot_member
+        role.guild = guild
+        room = SimpleNamespace(
+            state=SimpleNamespace(
+                lobby_channel=channel,
+                lobby_message=SimpleNamespace(jump_url="https://discord.test/card"),
             )
-            offered = {option.value for option in room_select.options}
-            # 完全未公開の固定卓は募集停止を一時解除しても選択肢へ戻さない。
-            # 有効卓だけが募集フォームの候補になる。
-            self.assertTrue(
-                (RECRUITMENT_DISABLED_ROOM_IDS
-                 & recruitment_lib.RECRUITMENT_ROOM_IDS) <= offered
+        )
+        self.cog.rooms = {"private_1": room}
+        row = {"id": 42, "room_id": "private_1"}
+
+        await self.manager._notify_new_recruitment(guild, row)
+        await self.manager._notify_new_recruitment(guild, row)
+
+        channel.send.assert_awaited_once()
+        content = channel.send.await_args.args[0]
+        allowed = channel.send.await_args.kwargs["allowed_mentions"]
+        self.assertTrue(content.startswith("<@&809>"))
+        self.assertNotIn("@everyone", content)
+        self.assertEqual(allowed.roles, [role])
+        self.assertFalse(allowed.users)
+        self.assertFalse(allowed.replied_user)
+
+    async def test_recent_notification_role_opt_in_is_not_treated_as_no_subscribers(self) -> None:
+        role = MagicMock(spec=discord.Role)
+        role.id = 809
+        role.name = RECRUITMENT_NOTIFICATION_ROLE_NAME
+        role.permissions = discord.Permissions.none()
+        role.managed = False
+        role.mentionable = False
+        role.mention = "<@&809>"
+        role.members = []
+        role.is_assignable.return_value = True
+        default_role = SimpleNamespace(id=1)
+        bot_member = SimpleNamespace(id=2)
+        channel = SimpleNamespace(
+            name="参加受付",
+            overwrites={},
+            send=AsyncMock(),
+            permissions_for=lambda _member: SimpleNamespace(mention_everyone=True),
+        )
+        guild = MagicMock(spec=discord.Guild)
+        guild.id = 1
+        guild.roles = [role]
+        guild.channels = [channel]
+        guild.default_role = default_role
+        guild.me = bot_member
+        role.guild = guild
+        self.cog.rooms = {
+            "private_1": SimpleNamespace(
+                state=SimpleNamespace(lobby_channel=channel, lobby_message=None),
             )
+        }
+        self.manager._notification_membership_intent = {
+            100: (True, recruitment_lib.time.monotonic()),
+        }
+
+        await self.manager._notify_new_recruitment(
+            guild, {"id": 43, "room_id": "private_1"},
+        )
+
+        channel.send.assert_awaited_once()
 
     async def test_open_room_uses_selected_rank_names_and_keeps_unranked_distinct(self) -> None:
         permissions = SimpleNamespace(administrator=False, manage_guild=False)
@@ -724,7 +1246,7 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-    async def test_strict_role_blocks_existing_card_gm_registration_and_transfer(self) -> None:
+    async def test_strict_role_blocks_existing_card_transfer(self) -> None:
         strict_room = SimpleNamespace(
             room_id="open",
             name="ねいと限定卓",
@@ -743,39 +1265,14 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             administrator=False, manage_guild=True,
         )
         recruitment_id = await self._full_recruitment()
-        row = await database.get_recruitment(recruitment_id)
-        card = RecruitmentCardView(self.manager, recruitment_id)
-
-        class FakeMember:
-            def __init__(self) -> None:
-                self.id = 1
-                self.roles = []
-                self.guild_permissions = SimpleNamespace(
-                    administrator=False, manage_guild=True,
-                )
-
-        interaction = SimpleNamespace(
-            user=FakeMember(),
-            guild=self.guild,
-            response=SimpleNamespace(defer=AsyncMock()),
-            followup=SimpleNamespace(send=AsyncMock()),
-        )
-
-        # 公開済みカードが旧設定から残っていたとしても、GM登録・移行の
-        # どちらでも管理権限だけでは厳格卓へ入れない。
-        with patch.object(recruitment_lib.discord, "Member", FakeMember), patch.object(
-            database, "get_recruitment", AsyncMock(return_value=row),
-        ), patch.object(
+        # 公開済みカードが旧設定から残っていても、管理権限だけでは
+        # 厳格ロール卓のゲームを開始できない。
+        with patch.object(
             recruitment_lib, "_recruitment_snapshot", return_value=snapshot,
-        ), patch.object(
-            database, "set_recruitment_gm", AsyncMock(),
-        ) as set_gm:
-            await card.gm(interaction)
-            self.assertIn("ねいと", interaction.followup.send.await_args.args[0])
-            set_gm.assert_not_awaited()
+        ):
             result = await self.manager.transfer(self._interaction(), recruitment_id)
 
-        self.assertIn("移行", result)
+        self.assertIn("ゲーム開始", result)
         self.assertIn("ねいと", result)
         self.room.validate_gm_claim.assert_not_awaited()
         self.assertEqual(self.state.players, {})

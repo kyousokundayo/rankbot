@@ -22,14 +22,22 @@ class RecruitmentDatabaseTest(unittest.IsolatedAsyncioTestCase):
         database.DB_PATH = self._old_path
         self._tmp.cleanup()
 
-    async def _create(self, *, host: int, room: str = "open", offset: int = 0) -> int:
+    async def _create(
+        self,
+        *,
+        host: int,
+        room: str = "open",
+        offset: int = 0,
+        variant_id: str | None = None,
+    ) -> int:
         return await database.create_recruitment(
             1, host, title=f"募集{host}",
             scheduled_at=self.base + timedelta(minutes=offset), room_id=room,
+            variant_id=variant_id,
             streaming=False, allowed_ranks=None,
         )
 
-    async def test_allowed_ranks_round_trip_and_open_room_only(self) -> None:
+    async def test_allowed_ranks_round_trip_for_fixed_and_gm_rooms(self) -> None:
         recruitment_id = await database.create_recruitment(
             1, 1, title="ランク指定", scheduled_at=self.base,
             room_id="open", streaming=False,
@@ -41,11 +49,17 @@ class RecruitmentDatabaseTest(unittest.IsolatedAsyncioTestCase):
             frozenset({"ゴールド", "ダイヤ", "ランク未設定"}),
         )
 
-        with self.assertRaisesRegex(ValueError, "総合卓だけ"):
-            await database.create_recruitment(
-                1, 2, title="不正な指定", scheduled_at=self.base + timedelta(hours=2),
-                room_id="beginner", streaming=False, allowed_ranks={"アイアン"},
-            )
+        gm_recruitment_id = await database.create_recruitment(
+            1, 2, title="GM村ランク指定",
+            scheduled_at=self.base + timedelta(hours=2),
+            room_id="private_2", variant_id="v9_turn", streaming=False,
+            allowed_ranks={"アイアン", "ランク未設定"},
+        )
+        gm_row = await database.get_recruitment(gm_recruitment_id)
+        self.assertEqual(
+            gm_row["allowed_ranks"],
+            frozenset({"アイアン", "ランク未設定"}),
+        )
 
     async def test_legacy_beginner_block_migrates_to_gold_and_above(self) -> None:
         recruitment_id = await self._create(host=1)
@@ -73,11 +87,15 @@ class RecruitmentDatabaseTest(unittest.IsolatedAsyncioTestCase):
             await self._create(host=2, offset=89)
         touching = await self._create(host=2, offset=90)
         self.assertGreater(touching, 0)
-        other_room = await self._create(host=3, room="beginner", offset=30)
+        other_room = await self._create(
+            host=3, room="private_3", offset=30, variant_id="v13_cross",
+        )
         self.assertGreater(other_room, 0)
 
     async def test_enabled_variant_capacity_and_occupancy_are_snapshotted(self) -> None:
-        nine = await self._create(host=1, room="open_9_cross")
+        nine = await self._create(
+            host=1, room="private_1", variant_id="v9_cross",
+        )
         row = await database.get_recruitment(nine)
         self.assertEqual(row["variant_id"], "v9_cross")
         self.assertEqual(row["capacity"], 9)
@@ -98,7 +116,8 @@ class RecruitmentDatabaseTest(unittest.IsolatedAsyncioTestCase):
             1,
             title="9人ランク指定",
             scheduled_at=self.base,
-            room_id="open_9_turn",
+            room_id="private_1",
+            variant_id="v9_turn",
             streaming=False,
             allowed_ranks={"ゴールド"},
         )
@@ -111,7 +130,9 @@ class RecruitmentDatabaseTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_archive_uses_each_recruitments_occupancy(self) -> None:
         first = await self._create(host=1, room="open")
-        cross = await self._create(host=2, room="open_9_cross")
+        cross = await self._create(
+            host=2, room="private_2", variant_id="v9_cross",
+        )
         archived = await database.archive_expired_recruitments(
             1, self.base + timedelta(minutes=91),
         )
@@ -128,13 +149,17 @@ class RecruitmentDatabaseTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(database.RecruitmentConflict):
             await self._create(host=2, room="open", offset=30)
 
-        second = await self._create(host=2, room="beginner", offset=30)
+        second = await self._create(
+            host=2, room="private_2", offset=30, variant_id="v13_cross",
+        )
         with self.assertRaises(database.RecruitmentConflict):
             await database.add_recruitment_entry(second, 999)
 
     async def test_participant_overlap_includes_backup(self) -> None:
         first = await self._create(host=1, room="open")
-        second = await self._create(host=2, room="beginner", offset=30)
+        second = await self._create(
+            host=2, room="private_2", offset=30, variant_id="v13_cross",
+        )
         for user_id in range(100, 113):
             self.assertEqual(await database.add_recruitment_entry(first, user_id), "参加")
         self.assertEqual(await database.add_recruitment_entry(first, 999), "補欠")
@@ -154,6 +179,103 @@ class RecruitmentDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kinds[200], "参加")
         self.assertEqual(kinds[201], "補欠")
 
+    async def test_notification_delivery_is_tracked_per_participant(self) -> None:
+        recruitment_id = await self._create(host=1)
+        await database.add_recruitment_entry(recruitment_id, 100)
+        self.assertEqual(
+            await database.list_pending_recruitment_notification_user_ids(
+                recruitment_id
+            ),
+            [100],
+        )
+
+        self.assertTrue(
+            await database.mark_recruitment_participant_notified(
+                recruitment_id, 100, self.base, status="sent"
+            )
+        )
+        await database.add_recruitment_entry(recruitment_id, 101)
+        self.assertEqual(
+            await database.list_pending_recruitment_notification_user_ids(
+                recruitment_id
+            ),
+            [101],
+        )
+
+        # 通知済みの人が退出・再参加しても同じ募集では再送しない。
+        await database.remove_recruitment_entry(recruitment_id, 100)
+        await database.add_recruitment_entry(recruitment_id, 100)
+        self.assertEqual(
+            await database.list_pending_recruitment_notification_user_ids(
+                recruitment_id
+            ),
+            [101],
+        )
+
+    async def test_delivery_migration_does_not_reclassify_new_failures_on_restart(
+        self,
+    ) -> None:
+        recruitment_id = await self._create(host=1)
+        await database.add_recruitment_entry(recruitment_id, 100)
+        # 新版の巡回では、募集単位の初回時刻が立っても個人DMは一時失敗で
+        # pendingのままという状態があり得る。
+        await database.mark_recruitment_notified(recruitment_id, self.base)
+
+        await database.init_db()
+
+        self.assertEqual(
+            await database.list_pending_recruitment_notification_user_ids(
+                recruitment_id
+            ),
+            [100],
+        )
+        self.assertEqual(
+            await database.get_meta(
+                0, database.RECRUITMENT_NOTIFICATION_DELIVERY_MIGRATION_KEY
+            ),
+            "done",
+        )
+
+    async def test_legacy_delivery_migration_only_marks_preexisting_participants(
+        self,
+    ) -> None:
+        recruitment_id = await self._create(host=1)
+        await database.add_recruitment_entry(recruitment_id, 100)
+        await database.add_recruitment_entry(recruitment_id, 101)
+        before = (self.base - timedelta(minutes=1)).isoformat()
+        notified = self.base.isoformat()
+        after = (self.base + timedelta(minutes=1)).isoformat()
+        async with database.connect_db() as db:
+            await db.execute(
+                "UPDATE recruitments SET notified_at=? WHERE id=?",
+                (notified, recruitment_id),
+            )
+            await db.execute(
+                "UPDATE recruitment_entries SET joined_at=? "
+                "WHERE recruitment_id=? AND user_id=100",
+                (before, recruitment_id),
+            )
+            await db.execute(
+                "UPDATE recruitment_entries SET joined_at=? "
+                "WHERE recruitment_id=? AND user_id=101",
+                (after, recruitment_id),
+            )
+            await db.execute("DELETE FROM recruitment_notification_deliveries")
+            await db.execute(
+                "DELETE FROM bot_meta WHERE guild_id=0 AND key=?",
+                (database.RECRUITMENT_NOTIFICATION_DELIVERY_MIGRATION_KEY,),
+            )
+            await db.commit()
+
+        await database.init_db()
+
+        self.assertEqual(
+            await database.list_pending_recruitment_notification_user_ids(
+                recruitment_id
+            ),
+            [101],
+        )
+
     async def test_block_direction_only_existing_players_block_newcomer(self) -> None:
         recruitment_id = await self._create(host=1)
         # Bが先、Aが後。A自身の「B拒否」は参加判定に使わない。
@@ -161,7 +283,9 @@ class RecruitmentDatabaseTest(unittest.IsolatedAsyncioTestCase):
         await database.add_player_block(1, 10, 20)
         self.assertEqual(await database.add_recruitment_entry(recruitment_id, 10), "参加")
 
-        second = await self._create(host=2, room="beginner", offset=120)
+        second = await self._create(
+            host=2, room="private_2", offset=120, variant_id="v13_cross",
+        )
         # Aが先、Bが後。既存Aの「B拒否」が効く。
         await database.add_recruitment_entry(second, 10)
         with self.assertRaises(database.RecruitmentConflict):
@@ -169,18 +293,24 @@ class RecruitmentDatabaseTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_host_limit_and_player_block_limit(self) -> None:
         await self._create(host=1, room="open", offset=0)
-        await self._create(host=1, room="beginner", offset=120)
-        await self._create(host=1, room="intermediate", offset=240)
+        await self._create(
+            host=1, room="private_1", offset=120, variant_id="v13_cross",
+        )
+        await self._create(
+            host=1, room="private_2", offset=240, variant_id="v13_cross",
+        )
         with self.assertRaises(database.RecruitmentConflict):
-            await self._create(host=1, room="advanced", offset=360)
+            await self._create(
+                host=1, room="private_3", offset=360, variant_id="v13_cross",
+            )
 
-        for blocked_id in range(100, 110):
+        for blocked_id in range(100, 150):
             count = await database.add_player_block(1, 50, blocked_id)
-        self.assertEqual(count, 10)
+        self.assertEqual(count, 50)
         with self.assertRaises(database.PlayerBlockLimitReached):
-            await database.add_player_block(1, 50, 111)
+            await database.add_player_block(1, 50, 150)
         self.assertTrue(await database.remove_player_block(1, 50, 100))
-        self.assertEqual(await database.add_player_block(1, 50, 111), 10)
+        self.assertEqual(await database.add_player_block(1, 50, 150), 50)
 
     async def test_game_records_base_room_and_recruitment(self) -> None:
         records = [{
@@ -243,24 +373,24 @@ class RecruitmentScheduleViewTest(unittest.TestCase):
     def _keys(self) -> list[str]:
         return [item.key for item in self.view.children]
 
-    def test_default_flow_needs_date_hour_minute_room_streaming(self):
+    def test_default_flow_needs_date_hour_minute_variant_streaming(self):
         self.assertEqual(
-            self._keys(), ["date", "hour", "minute", "room", "streaming"],
+            self._keys(), ["date", "hour", "minute", "variant", "streaming"],
         )
         self.assertFalse(self.view.is_complete())
         self.view.values.update({
             "date": "2026-08-10", "hour": "20", "minute": "30",
-            "room": "open", "streaming": "0",
+            "variant": "v9_cross", "streaming": "0",
         })
         self.assertTrue(self.view.is_complete())
 
     def test_immediate_hides_time_selects(self):
         self.view.values["date"] = self.recruitment.IMMEDIATE_DATE_VALUE
         self.view.rebuild()
-        self.assertEqual(self._keys(), ["date", "room", "streaming"])
+        self.assertEqual(self._keys(), ["date", "variant", "streaming"])
         self.assertTrue(self.view.immediate)
         self.assertFalse(self.view.is_complete())
-        self.view.values.update({"room": "open", "streaming": "0"})
+        self.view.values.update({"variant": "v9_turn", "streaming": "0"})
         self.assertTrue(self.view.is_complete())
 
     def test_switching_back_to_a_date_restores_time_selects(self):
@@ -269,7 +399,7 @@ class RecruitmentScheduleViewTest(unittest.TestCase):
         self.view.values["date"] = "2026-08-10"
         self.view.rebuild()
         self.assertEqual(
-            self._keys(), ["date", "hour", "minute", "room", "streaming"],
+            self._keys(), ["date", "hour", "minute", "variant", "streaming"],
         )
         self.assertFalse(self.view.immediate)
 
@@ -289,7 +419,7 @@ class RecruitmentScheduleViewTest(unittest.TestCase):
         ).replace(second=0, microsecond=0)
         self.assertGreater(start, now)
         self.assertFalse(self.recruitment._schedule_out_of_range(start, now))
-        # 通知ウィンドウより内側なら、作成直後の巡回で参加者へDMが飛ぶ
+        # 通知ウィンドウより内側なら、作成時点から開催前DMの対象になる
         self.assertLess(
             RECRUITMENT_IMMEDIATE_LEAD_MINUTES,
             RECRUITMENT_NOTIFICATION_WINDOW_MINUTES,

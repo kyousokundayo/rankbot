@@ -21,6 +21,7 @@ _LOCAL_ROOM_KEYS = frozenset(
         "access_role_names",
         "rated",
         "recruitment_enabled",
+        "sync_permissions",
     }
 )
 _LOCAL_ROOMS_ENV_KEY = "WEREWOLF_LOCAL_ROOMS_JSON"
@@ -40,6 +41,7 @@ class RoomDefinition:
     # GM取得を許可するユーザーID (Noneなら制限なし)
     allowed_gm_user_ids: frozenset[int] | None = None
     private_owner_id: int | None = None
+    # v0.39以前のGM名前村閲覧ロールとのDB互換用。v0.40以降は常にNone。
     private_role_name: str | None = None
     # 指定ロール・サーバー管理者だけにカテゴリ全体を表示する固定卓。
     access_role_names: frozenset[str] | None = None
@@ -52,13 +54,14 @@ class RoomDefinition:
     # 通常の閲覧許可とは別に、指定ロールだけへ厳格に公開する固定卓用。
     # 実際の権限適用は permissions.py が担う。
     strict_access_role_names: frozenset[str] | None = None
+    # Falseならカテゴリ・参加受付・VCの平常時overwriteをDiscordの手動設定へ
+    # 委ねる。#昼/#霊界とゲーム中VCの一時制御は秘密保持のため引き続きBot管理。
+    sync_permissions: bool = True
 
 
 @dataclass(frozen=True)
 class LocalRoomRegistration:
     room: RoomDefinition
-    rated: bool
-    recruitment_enabled: bool
 
 
 def load_local_room_json(
@@ -158,6 +161,7 @@ def parse_local_room_config(
     *,
     reserved_room_ids: Collection[str] = (),
     reserved_room_names: Collection[str] = (),
+    manual_static_room_names: Collection[str] = (),
 ) -> tuple[LocalRoomRegistration, ...]:
     """JSON設定を厳格に検証し、固定卓定義へ変換する。
 
@@ -179,6 +183,7 @@ def parse_local_room_config(
 
     used_ids = set(reserved_room_ids)
     used_names = set(reserved_room_names)
+    manual_static_names = set(manual_static_room_names)
     registrations: list[LocalRoomRegistration] = []
     for index, item in enumerate(decoded):
         if not isinstance(item, dict):
@@ -208,6 +213,13 @@ def parse_local_room_config(
         if name in used_names:
             raise LocalRoomConfigError(f"卓の表示名が重複しています: {name}")
 
+        # v0.40では全村がレート対象で、募集はGM名前村の参加受付へ統合した。
+        # 既存.envを壊さないため旧キーは受理・型検証のみ行う。
+        if "rated" in item:
+            _boolean(item, "rated", index=index, default=True)
+        if "recruitment_enabled" in item:
+            _boolean(item, "recruitment_enabled", index=index, default=True)
+
         used_ids.add(room_id)
         used_names.add(name)
         registrations.append(
@@ -221,10 +233,14 @@ def parse_local_room_config(
                     access_role_names=_role_names(
                         item["access_role_names"], index=index
                     ),
-                ),
-                rated=_boolean(item, "rated", index=index, default=True),
-                recruitment_enabled=_boolean(
-                    item, "recruitment_enabled", index=index, default=True
+                    # 指定されたサーバー固有卓だけ、Discord側の手動overwriteを
+                    # 既定の正本にする。他のローカル卓は従来どおり自動同期。
+                    sync_permissions=_boolean(
+                        item,
+                        "sync_permissions",
+                        index=index,
+                        default=name not in manual_static_names,
+                    ),
                 ),
             )
         )
