@@ -36,8 +36,8 @@ class VariantDefinitionTest(unittest.TestCase):
             {
                 "v13_cross": "l13",
                 "v13_turn": "l13",
-                "v9_cross": "l9",
-                "v9_turn": "l9",
+                "v9_cross": "l9_cross",
+                "v9_turn": "l9_turn",
             },
         )
 
@@ -129,17 +129,14 @@ class VariantDefinitionTest(unittest.TestCase):
         self.assertNotIn(disabled.room_id, config.OPEN_ROOM_IDS)
         self.assertNotIn(disabled.room_id, config.PUBLIC_ROOM_IDS)
         self.assertNotIn(disabled.room_id, config.RATED_ROOM_IDS)
-        self.assertNotIn(disabled.room_id, config.RECRUITMENT_ROOM_IDS)
 
         for room_id in ("open_9_cross", "open_9_turn"):
             room = config.ROOM_DEFINITION_MAP[room_id]
-            self.assertTrue(room.enabled)
-            self.assertIn(room, config.ACTIVE_ROOM_DEFINITIONS)
-            self.assertIn(room.room_id, config.ACTIVE_ROOM_IDS)
+            self.assertFalse(room.enabled)
+            self.assertNotIn(room, config.ACTIVE_ROOM_DEFINITIONS)
+            self.assertNotIn(room.room_id, config.ACTIVE_ROOM_IDS)
             self.assertIsNone(room.strict_access_role_names)
-            self.assertNotIn(room.room_id, config.ADMIN_ONLY_ROOM_IDS)
-            self.assertIn(room.room_id, config.PUBLIC_ROOM_IDS)
-            self.assertIn(room.room_id, config.RECRUITMENT_ROOM_IDS)
+            self.assertNotIn(room.room_id, config.PUBLIC_ROOM_IDS)
             self.assertNotIn(room.room_id, config.RECRUITMENT_DISABLED_ROOM_IDS)
 
         self.assertEqual(config.VARIANT_ROLLOUT_ROOM_IDS, frozenset({"open_13_turn"}))
@@ -154,12 +151,13 @@ class VariantDefinitionTest(unittest.TestCase):
         self.assertEqual(set(cog.rooms), set(config.ACTIVE_ROOM_IDS))
         self.assertNotIn("open_13_turn", cog.rooms)
 
-    def test_ladder_grandmaster_roles_have_an_explicit_priority(self) -> None:
+    def test_ladder_grandmaster_roles_are_distinct(self) -> None:
         ladder_13 = config.LADDER_DEFINITIONS["l13"]
-        ladder_9 = config.LADDER_DEFINITIONS["l9"]
+        ladder_9 = config.LADDER_DEFINITIONS["l9_cross"]
+        ladder_9t = config.LADDER_DEFINITIONS["l9_turn"]
         self.assertEqual(ladder_13.grandmaster_role_name, "グランドマスター")
-        self.assertEqual(ladder_9.grandmaster_role_name, "グランドマスター（9人村）")
-        self.assertGreater(ladder_13.role_position_priority, ladder_9.role_position_priority)
+        self.assertEqual(ladder_9.grandmaster_role_name, "グランドマスター9")
+        self.assertEqual(ladder_9t.grandmaster_role_name, "グランドマスター9T")
 
 
 class VariantSimulationPlanTest(unittest.TestCase):

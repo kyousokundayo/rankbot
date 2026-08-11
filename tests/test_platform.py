@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import discord
 import database
 import rating as rating_lib
-from config import RoomDefinition, Team
+from config import LOG_CATEGORY_SPIRIT, LOG_CATEGORY_VILLAGE, RoomDefinition, Team
 from game import GameCog
 from permissions import RoomPermissionMixin, RoomVisibilityError
 
@@ -93,6 +93,82 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
             rows = await db.execute_fetchall("PRAGMA foreign_keys")
         self.assertEqual(rows[0][0], 1)
 
+    async def test_legacy_private_room_role_schema_migrates_without_data_loss(self) -> None:
+        """v0.39のNOT NULL列を、旧閲覧ロール行ごと安全にNULL許可へ移す。"""
+        current_path = database.DB_PATH
+        database.DB_PATH = str(Path(self._tmp.name) / "legacy-private-room.db")
+        try:
+            async with database.connect_db() as db:
+                await db.execute("""
+                    CREATE TABLE private_rooms (
+                        guild_id INTEGER NOT NULL,
+                        room_id TEXT NOT NULL,
+                        owner_id INTEGER NOT NULL,
+                        room_name TEXT NOT NULL,
+                        role_name TEXT NOT NULL,
+                        variant_id TEXT NOT NULL DEFAULT 'v13_cross',
+                        status TEXT NOT NULL DEFAULT 'active',
+                        category_id INTEGER,
+                        role_id INTEGER,
+                        last_error TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (guild_id, room_id),
+                        UNIQUE (guild_id, owner_id),
+                        UNIQUE (guild_id, room_name),
+                        UNIQUE (guild_id, role_name)
+                    )
+                """)
+                await db.execute("""
+                    CREATE TABLE private_room_members (
+                        guild_id INTEGER NOT NULL,
+                        room_id TEXT NOT NULL,
+                        member_id INTEGER NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'active',
+                        last_error TEXT,
+                        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        PRIMARY KEY (guild_id, room_id, member_id),
+                        FOREIGN KEY (guild_id, room_id)
+                            REFERENCES private_rooms(guild_id, room_id)
+                    )
+                """)
+                await db.execute(
+                    "INSERT INTO private_rooms "
+                    "(guild_id, room_id, owner_id, room_name, role_name, "
+                    "variant_id, status, category_id, role_id) "
+                    "VALUES (1, 'private_10', 10, '旧村', '旧村', "
+                    "'v13_cross', 'active', 100, 200)"
+                )
+                await db.execute(
+                    "INSERT INTO private_room_members "
+                    "(guild_id, room_id, member_id) VALUES (1, 'private_10', 20)"
+                )
+                await db.commit()
+
+            await database.init_db()
+
+            async with database.connect_db() as db:
+                columns = await db.execute_fetchall(
+                    "PRAGMA table_info(private_rooms)"
+                )
+                members = await db.execute_fetchall(
+                    "SELECT member_id FROM private_room_members"
+                )
+            role_name = next(row for row in columns if row[1] == "role_name")
+            self.assertEqual(role_name[3], 0)
+            self.assertEqual(members, [(20,)])
+            legacy = await database.get_private_room_by_owner(1, 10)
+            self.assertEqual(legacy["role_id"], 200)
+            self.assertEqual(legacy["role_name"], "旧村")
+
+            await database.save_private_room(
+                1, "private_11", 11, "新村", None,
+            )
+            self.assertIsNone(
+                (await database.get_private_room_by_owner(1, 11))["role_name"]
+            )
+        finally:
+            database.DB_PATH = current_path
+
     async def test_backup_names_are_unique_and_retention_is_per_label(self) -> None:
         original_backup_dir = database.BACKUP_DIR
         database.BACKUP_DIR = Path(self._tmp.name) / "backups"
@@ -145,7 +221,7 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         # 残す世代には手を付けない
         self.assertTrue(Path(second).exists())
 
-    async def test_restricted_room_removes_arbitrary_stale_view_allows(self) -> None:
+    async def test_gm_named_room_uses_public_visibility_without_access_role(self) -> None:
         default = _PermissionTarget(1, "@everyone")
         bot_member = _PermissionTarget(2, "bot")
         private_role = _PermissionTarget(3, "招待ロール")
@@ -172,10 +248,47 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
             allowed_ranks=frozenset(),
         )
         await _PermissionManager()._apply_room_visibility(guild, category, room_def)
-        self.assertNotIn(stale_role, category.overwrites)
-        self.assertNotIn(stale_member, category.overwrites)
-        self.assertNotIn(stale_role, lobby.overwrites)
-        self.assertIn(private_role, category.overwrites)
+        self.assertTrue(category.overwrites[default].view_channel)
+        self.assertTrue(category.overwrites[default].read_messages)
+        self.assertTrue(category.overwrites[default].connect)
+        self.assertTrue(lobby.overwrites[default].view_channel)
+        self.assertTrue(lobby.overwrites[default].connect)
+        self.assertNotIn(private_role, category.overwrites)
+
+    async def test_manual_room_skips_static_permission_sync(self) -> None:
+        default = _PermissionTarget(1, "@everyone")
+        bot_member = _PermissionTarget(2, "bot")
+        manual_role = _PermissionTarget(3, "手動閲覧ロール")
+        category = _PermissionChannel(100, "ねいとくん村")
+        lobby = _PermissionChannel(101, "参加受付", category=category)
+        category.overwrites[manual_role] = discord.PermissionOverwrite(
+            view_channel=True,
+            send_messages=False,
+        )
+        lobby.overwrites[manual_role] = discord.PermissionOverwrite(
+            read_message_history=True,
+        )
+        before_category = dict(category.overwrites)
+        before_lobby = dict(lobby.overwrites)
+        guild = SimpleNamespace(
+            default_role=default,
+            me=bot_member,
+            roles=[manual_role],
+            text_channels=[lobby],
+            voice_channels=[],
+        )
+        room_def = SimpleNamespace(
+            room_id="nate",
+            name="ねいとくん村",
+            sync_permissions=False,
+        )
+        manager = _PacedPermissionManager()
+
+        await manager._apply_room_visibility(guild, category, room_def)
+
+        self.assertEqual(manager.paced_calls, 0)
+        self.assertEqual(category.overwrites, before_category)
+        self.assertEqual(lobby.overwrites, before_lobby)
 
     async def test_permission_diff_uses_pacer_and_skips_unchanged_write(self) -> None:
         manager = _PacedPermissionManager()
@@ -193,19 +306,28 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(manager.paced_calls, 1)
         self.assertEqual(channel.overwrites[target], overwrite)
 
-    async def test_temporarily_hidden_rank_room_has_no_human_role_allow(self) -> None:
+    async def test_rank_room_is_visible_only_to_its_own_rank_roles(self) -> None:
+        """ランク別卓は該当ランクにだけ見せる。
+
+        以前は ADMIN_ONLY_ROOM_IDS で人間のロールへ一切allowを付けず、
+        Administratorだけが@everyone denyを迂回できる「一時的に隠す」運用
+        だった。正式リリースに向けてその措置をやめ、該当ランクの保持者には
+        見えるのが正しい状態になった。
+        """
         default = _PermissionTarget(1, "@everyone")
         bot_member = _PermissionTarget(2, "bot")
-        manager_role = _PermissionTarget(3, "運営")
-        manager_role.permissions = SimpleNamespace(manage_guild=True)
-        rank_role = _PermissionTarget(
-            4, rating_lib.get_rank_role_name("ブロンズ")
+        allowed_rank_role = _PermissionTarget(
+            3, rating_lib.get_rank_role_name("ブロンズ")
         )
-        rank_role.permissions = SimpleNamespace(manage_guild=False)
+        allowed_rank_role.permissions = SimpleNamespace(manage_guild=False)
+        other_rank_role = _PermissionTarget(
+            4, rating_lib.get_rank_role_name("ゴールド")
+        )
+        other_rank_role.permissions = SimpleNamespace(manage_guild=False)
         guild = SimpleNamespace(
             default_role=default,
             me=bot_member,
-            roles=[default, manager_role, rank_role],
+            roles=[default, allowed_rank_role, other_rank_role],
         )
         room_def = SimpleNamespace(
             room_id="beginner",
@@ -217,9 +339,12 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
 
         overwrites = _PermissionManager()._build_room_overwrites(guild, room_def)
 
+        # @everyone は拒否のまま。参加条件のランクだけが迂回できる。
         self.assertFalse(overwrites[default].view_channel)
-        self.assertNotIn(manager_role, overwrites)
-        self.assertNotIn(rank_role, overwrites)
+        self.assertIn(allowed_rank_role, overwrites)
+        self.assertTrue(overwrites[allowed_rank_role].view_channel)
+        # 帯が違うランクへは広げない。
+        self.assertNotIn(other_rank_role, overwrites)
 
     async def test_local_room_allows_access_roles_and_server_managers(self) -> None:
         default = _PermissionTarget(1, "@everyone")
@@ -425,12 +550,13 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await runner.validate_gm_claim(allowed))
 
     async def test_private_room_owner_and_name_queries(self) -> None:
-        await database.save_private_room(1, "private_10", 10, "十村", "十村")
+        await database.save_private_room(1, "private_10", 10, "十村", None)
         by_owner = await database.get_private_room_by_owner(1, 10)
         by_name = await database.get_private_room_by_name(1, "十村")
         self.assertEqual(by_owner["room_id"], "private_10")
         self.assertEqual(by_name["owner_id"], 10)
         self.assertEqual(by_owner["status"], "creating")
+        self.assertIsNone(by_owner["role_name"])
 
     async def test_feedback_report_keeps_game_context(self) -> None:
         report_id = await database.save_feedback_report(
@@ -708,54 +834,24 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         # 再読込しても重複せず、移行済みの値を失わない。
         self.assertEqual(await database.load_pending_unmute_ids(1), {11, 22, 33})
 
-    async def test_private_room_member_and_rename_journals(self) -> None:
-        await database.save_private_room(1, "private_10", 10, "旧村", "旧村")
+    async def test_private_room_rename_journal(self) -> None:
+        await database.save_private_room(1, "private_10", 10, "旧村", None)
         await database.mark_private_room_active(
-            1, "private_10", category_id=100, role_id=200
+            1, "private_10", category_id=100, role_id=None
         )
-        await database.stage_private_room_member_add(1, "private_10", 20)
-        members = await database.load_private_room_members(1, "private_10")
-        self.assertEqual(
-            {item["member_id"]: item["status"] for item in members},
-            {10: "active", 20: "adding"},
-        )
-        await database.add_private_room_member(1, "private_10", 20)
-        await database.stage_private_room_member_remove(1, "private_10", 20)
-        members = await database.load_private_room_members(1, "private_10")
-        self.assertEqual(
-            {item["member_id"]: item["status"] for item in members},
-            {10: "active", 20: "removing"},
-        )
-
-        await database.update_private_room_names(1, "private_10", "新村", "新村")
+        await database.update_private_room_names(1, "private_10", "新村", None)
         renamed = await database.get_private_room_by_name(1, "新村")
         self.assertEqual(renamed["status"], "renaming")
         self.assertEqual(renamed["category_id"], 100)
-        self.assertEqual(renamed["role_id"], 200)
+        self.assertIsNone(renamed["role_id"])
+        self.assertIsNone(renamed["role_name"])
 
-    async def test_private_room_reconcile_removes_unrecorded_role_access(self) -> None:
-        await database.save_private_room(1, "private_10", 10, "十村", "十村")
-        private_role = _PermissionTarget(500, "十村")
-        guild = SimpleNamespace(id=1, roles=[private_role], members=[])
-        owner = _PrivateMember(guild, 10, "owner")
-        outsider = _PrivateMember(guild, 20, "outsider", roles=[private_role])
-        guild.members = [owner, outsider]
-        guild.get_member = lambda member_id: {
-            owner.id: owner,
-            outsider.id: outsider,
-        }.get(member_id)
+    async def test_public_log_category_names_are_reserved_for_private_rooms(self) -> None:
         manager = GameCog(SimpleNamespace(managed_guild_id=1))
-        manager.bulk_api_interval = 0
-        room_def = RoomDefinition(
-            room_id="private_10",
-            name="十村",
-            allowed_gm_user_ids=frozenset({10}),
-            private_owner_id=10,
-            private_role_name="十村",
-        )
-        await manager._sync_private_room_member_roles(guild, room_def)
-        self.assertIn(private_role, owner.roles)
-        self.assertNotIn(private_role, outsider.roles)
+        guild = SimpleNamespace(categories=[], roles=[])
+
+        for name in (LOG_CATEGORY_VILLAGE, LOG_CATEGORY_SPIRIT):
+            self.assertIsNotNone(manager._private_room_name_error(guild, name))
 
     async def test_rank_role_replacement_is_one_atomic_member_patch(self) -> None:
         ordinary = _PermissionTarget(100, "通常ロール")
@@ -791,7 +887,7 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(member.edit_calls), 1)
         self.assertEqual(member.roles, [ordinary, target_rank])
 
-    async def test_both_ladder_rank_roles_are_merged_into_one_member_patch(self) -> None:
+    async def test_three_ladder_rank_roles_are_merged_into_one_member_patch(self) -> None:
         ordinary = _PermissionTarget(110, "通常ロール")
         old_l13_rank = _PermissionTarget(
             111, rating_lib.get_rank_role_name("アイアン")
@@ -800,11 +896,17 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
             112, rating_lib.get_rank_role_name("シルバー")
         )
         target_l9_gm = _PermissionTarget(
-            113, rating_lib.special_grandmaster_role_name("l9")
+            113, rating_lib.special_grandmaster_role_name("l9_cross")
+        )
+        target_l9t_gm = _PermissionTarget(
+            114, rating_lib.special_grandmaster_role_name("l9_turn")
         )
         guild = SimpleNamespace(
             id=1,
-            roles=[ordinary, old_l13_rank, target_l13_rank, target_l9_gm],
+            roles=[
+                ordinary, old_l13_rank, target_l13_rank,
+                target_l9_gm, target_l9t_gm,
+            ],
             members=[],
         )
         member = _PrivateMember(
@@ -820,17 +922,68 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
             roles_map={
                 target_l13_rank.name: target_l13_rank,
                 target_l9_gm.name: target_l9_gm,
+                target_l9t_gm.name: target_l9t_gm,
             },
             rank_names_by_ladder={
                 "l13": "シルバー",
-                "l9": "グランドマスター",
+                "l9_cross": "グランドマスター",
+                "l9_turn": "グランドマスター",
             },
         )
 
         self.assertEqual(outcome, "updated")
         self.assertEqual(len(member.edit_calls), 1)
         self.assertEqual(member.roles[0], ordinary)
-        self.assertCountEqual(member.roles[1:], [target_l13_rank, target_l9_gm])
+        self.assertCountEqual(
+            member.roles[1:], [target_l13_rank, target_l9_gm, target_l9t_gm],
+        )
+
+    async def test_legacy_nine_grandmaster_role_is_renamed_to_exact_cross_name(self) -> None:
+        class EditableRole(_PermissionTarget):
+            def __init__(self, target_id: int, name: str, position: int) -> None:
+                super().__init__(target_id, name)
+                self.hoist = False
+                self.position = position
+                self.edit_calls: list[dict] = []
+
+            async def edit(self, **kwargs):
+                self.edit_calls.append(dict(kwargs))
+                if "name" in kwargs:
+                    self.name = str(kwargs["name"])
+                if "hoist" in kwargs:
+                    self.hoist = bool(kwargs["hoist"])
+                if "position" in kwargs:
+                    self.position = int(kwargs["position"])
+                return self
+
+        cross_name = rating_lib.special_grandmaster_role_name("l9_cross")
+        roles = [
+            EditableRole(300 + index, name, index)
+            for index, (name, _color) in enumerate(
+                rating_lib.all_rank_role_specs(), 1,
+            )
+            if name != cross_name
+        ]
+        legacy = EditableRole(
+            999, rating_lib.LEGACY_NINE_GRANDMASTER_ROLE_NAME, 20,
+        )
+        roles.append(legacy)
+
+        async def unexpected_create_role(**_kwargs):
+            self.fail("旧9人GMロールを再利用できるためcreate_roleは不要です")
+
+        guild = SimpleNamespace(id=1, roles=roles, create_role=unexpected_create_role)
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        manager.bulk_api_interval = 0
+
+        result = await manager._ensure_rank_roles(guild)
+
+        self.assertIs(result[cross_name], legacy)
+        self.assertEqual(legacy.name, "グランドマスター9")
+        self.assertTrue(legacy.hoist)
+        self.assertTrue(
+            any(call.get("name") == "グランドマスター9" for call in legacy.edit_calls)
+        )
 
     async def test_only_grandmaster_roles_are_forced_to_hoist(self) -> None:
         class EditableRole(_PermissionTarget):
@@ -866,11 +1019,15 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
             rating_lib.special_grandmaster_role_name("l13")
         ]
         l9_gm = roles_by_name[
-            rating_lib.special_grandmaster_role_name("l9")
+            rating_lib.special_grandmaster_role_name("l9_cross")
+        ]
+        l9t_gm = roles_by_name[
+            rating_lib.special_grandmaster_role_name("l9_turn")
         ]
         # 並びも逆にし、13人村側を上へ直す経路を同時に確認する。
         l13_gm.position = 5
         l9_gm.position = 10
+        l9t_gm.position = 11
         silver = roles_by_name[rating_lib.get_rank_role_name("シルバー")]
 
         async def unexpected_create_role(**_kwargs):
@@ -889,10 +1046,12 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(result), set(roles_by_name))
         self.assertTrue(l13_gm.hoist)
         self.assertTrue(l9_gm.hoist)
+        self.assertTrue(l9t_gm.hoist)
         self.assertTrue(silver.hoist)
         self.assertEqual(silver.edit_calls, [])
         self.assertTrue(any(call.get("hoist") is True for call in l13_gm.edit_calls))
         self.assertTrue(any(call.get("hoist") is True for call in l9_gm.edit_calls))
+        self.assertTrue(any(call.get("hoist") is True for call in l9t_gm.edit_calls))
         self.assertTrue(any("position" in call for call in l13_gm.edit_calls))
 
     async def test_legacy_duplicate_history_does_not_block_migration(self) -> None:

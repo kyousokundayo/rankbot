@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from config import BOT_VERSION, Phase, SLOW_INTERACTION_SECONDS
+from recruitment import OperationsView
 from views import (
     DangerConfirmView,
     GMControlView,
@@ -53,6 +54,28 @@ class UsabilityViewLayoutTest(unittest.TestCase):
                         if item.custom_id == "lobby_gm_menu"
                     )
                 )
+                notification = next(
+                    item for item in view.children
+                    if item.custom_id == "recruitment_notification_toggle"
+                )
+                self.assertEqual(notification.row, 0)
+
+        public = LobbyView(self._lobby_cog(private=False))
+        rows = {
+            row: [item.custom_id for item in public.children if item.row == row]
+            for row in (0, 1)
+        }
+        self.assertEqual(
+            rows[0],
+            [
+                "join_game", "leave_game", "get_gm", "release_gm",
+                "recruitment_notification_toggle",
+            ],
+        )
+        self.assertEqual(
+            rows[1],
+            ["start_game", "rematch_game", "lobby_gm_menu", "rule_btn", "help_btn"],
+        )
 
     def test_stats_panel_stays_within_three_rows(self) -> None:
         view = StatsView(SimpleNamespace())
@@ -60,6 +83,21 @@ class UsabilityViewLayoutTest(unittest.TestCase):
         _assert_within_three_rows(self, view)
         self.assertIsNotNone(
             next(item for item in view.children if item.custom_id == "feedback_report")
+        )
+        self.assertFalse(
+            any(item.custom_id == "stats_variant_balance" for item in view.children)
+        )
+
+    def test_variant_balance_is_in_operations_panel(self) -> None:
+        manager = SimpleNamespace()
+        view = OperationsView(manager)
+
+        _assert_within_three_rows(self, view)
+        self.assertIsNotNone(
+            next(
+                item for item in view.children
+                if item.custom_id == "operations:variant_balance"
+            )
         )
 
     def test_public_gm_panel_is_one_button_and_private_menu_is_two_rows(self) -> None:
@@ -137,12 +175,25 @@ class HelpAndRuleEmbedTest(unittest.TestCase):
                     f"{embed.title}/{field.name}",
                 )
 
-    def test_help_shows_current_release_and_restricted_log_policy(self) -> None:
+    def test_help_shows_current_release_and_all_room_log_policy(self) -> None:
         help_embed = build_help_embeds()[0]
         fields = {field.name: field.value for field in help_embed.fields}
         self.assertIn(f"{BOT_VERSION}の変更", fields)
-        self.assertIn("9人クロストーク／ターン制を公開", fields[f"{BOT_VERSION}の変更"])
-        self.assertIn("公開卓", fields["終わった試合を読み返す"])
+        self.assertIn("GM村と募集", fields[f"{BOT_VERSION}の変更"])
+        self.assertIn("募集通知", fields[f"{BOT_VERSION}の変更"])
+        self.assertIn("正常終了した全村", fields[f"{BOT_VERSION}の変更"])
+        self.assertIn("役職確認を締切", fields["GMの操作"])
+        self.assertIn("全村", fields["終わった試合を読み返す"])
+        self.assertIn("書き込みはできません", fields["終わった試合を読み返す"])
+
+    def test_vote_help_explains_timeout_instead_of_claiming_no_abstention(self) -> None:
+        rule_embed = build_rule_embeds()[0]
+        fields = {field.name: field.value for field in rule_embed.fields}
+        vote_help = fields["投票と処刑"]
+        self.assertIn("棄権ボタン", vote_help)
+        self.assertIn("既投票分だけで集計", vote_help)
+        self.assertIn("1票もなければ処刑なし", vote_help)
+        self.assertNotIn("棄権もできません", vote_help)
 
 
 class InteractionTimerTest(unittest.TestCase):

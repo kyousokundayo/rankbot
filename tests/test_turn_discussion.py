@@ -6,6 +6,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import discord
+
 from config import Phase, Role, RoomDefinition, Team, get_variant_definition
 from models import GameState, Player
 from room_runner import RoomRunner, StateDurabilityError, turn_timer_should_update
@@ -606,14 +608,24 @@ class TurnDurabilityAndSafetyTest(unittest.IsolatedAsyncioTestCase):
         source.state.turn_co_declarations = [
             {"user_id": 2, "number": 2, "display_name": "02.user-2"},
         ]
+        village_channel = Mock(spec=discord.TextChannel)
+        village_channel.id = 101
+        spirit_channel = Mock(spec=discord.TextChannel)
+        spirit_channel.id = 102
+        source.state.village_channel = village_channel
+        source.state.spirit_channel = spirit_channel
         payload = source._build_room_snapshot()
         payload["phase"] = Phase.DAY_DISCUSSION.name
 
         restored = make_runner("v9_turn")
         members = {player.user_id: player.member for player in source.state.players.values()}
+        channels = {
+            village_channel.id: village_channel,
+            spirit_channel.id: spirit_channel,
+        }
         restored.state.guild = SimpleNamespace(
             get_member=lambda user_id: members.get(user_id),
-            get_channel=lambda _channel_id: None,
+            get_channel=lambda channel_id: channels.get(channel_id),
         )
         restored._enable_mute_markers = AsyncMock()
         restored._reconcile_mute_marker_ownership = AsyncMock()
@@ -918,6 +930,8 @@ class TurnDurabilityAndSafetyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("50秒", text)
         self.assertIn("1日 **1回**", text)
         self.assertIn("仮投票はありません", text)
+        self.assertIn("役職確認を締切", text)
+        self.assertIn("次の発言へ", text)
 
     async def test_settlement_kwargs_freeze_variant_parameters(self) -> None:
         runner = make_runner("v9_turn")
@@ -925,7 +939,7 @@ class TurnDurabilityAndSafetyTest(unittest.IsolatedAsyncioTestCase):
             runner._settlement_variant_kwargs(),
             {
                 "variant_id": "v9_turn",
-                "ladder_id": "l9",
+                "ladder_id": "l9_turn",
                 "village_win_pool": 90,
                 "wolf_win_pool": 110,
                 "wolf_guess_slots": 2,

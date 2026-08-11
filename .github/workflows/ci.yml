@@ -6,7 +6,11 @@ permissions:
   contents: read
 
 on:
+  # PRブランチはpull_requestだけで検証し、同じコミットにpush用CIまで
+  # 二重起動しない。マージ後のmainはpushで改めて確認する。
   push:
+    branches:
+      - main
   pull_request:
 
 concurrency:

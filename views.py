@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Awaitable, Callable, Optional
@@ -20,12 +21,12 @@ from config import (
     RANK_SPECS, SEASON_RANK_PERCENTAGES,
     RATING_FLOOR, INITIAL_RATING, WIN_PARTICIPATION_BONUS,
     WOLF_GUESS_TIMEOUT, BONUS_WOLF_GUESS_SLOTS,
-    POSTGAME_RECOMMENDATION_TIMEOUT,
+    POSTGAME_RECOMMENDATION_TIMEOUT, BONUS_POSTGAME_VOTE,
     BONUS_WOLF_EXECUTION_VOTE, BONUS_FINAL_DAY_WOLF,
     BONUS_WOLF_GUESS_HIT, BONUS_WOLF_GUESS_EARLY_MULTIPLIER,
     BONUS_WOLF_GUESS_EARLY_MAX_DAY, BONUS_GUARD_SUCCESS, BONUS_NIGHT1_SEER_KILL,
     PRIVATE_ROOM_CREATOR_ROLE_LABEL, BOT_VERSION,
-    ACTIVE_ROOM_DEFINITIONS, RATED_ROOM_NAMES, STATS_MIN_SAMPLES, PLAYER_BLOCK_LIMIT,
+    ACTIVE_ROOM_DEFINITIONS, STATS_MIN_SAMPLES,
     SLOW_INTERACTION_SECONDS,
     DEFAULT_VARIANT_ID, VariantDefinition, get_variant_definition,
     VARIANT_DEFINITIONS, LADDER_DEFINITIONS, USER_VISIBLE_VARIANT_IDS,
@@ -126,9 +127,9 @@ class PrivateRoomInfoView(discord.ui.View):
         super().__init__(timeout=None)
         self.manager = manager
 
-    @discord.ui.button(label="専用村を作成", style=discord.ButtonStyle.success, custom_id="mayor_room_create")
+    @discord.ui.button(label="村・募集を作成", style=discord.ButtonStyle.success, custom_id="mayor_room_create")
     async def create_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self.manager.create_private_room_for_member(interaction)
+        await self.manager.recruitment_manager.start_village_creation(interaction)
 
     @discord.ui.button(label="村名変更", style=discord.ButtonStyle.secondary, custom_id="mayor_room_rename")
     async def rename_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -141,12 +142,12 @@ class PrivateRoomInfoView(discord.ui.View):
             )
         await interaction.response.send_modal(PrivateRoomRenameModal(self.manager))
 
-    @discord.ui.button(label="専用村を削除", style=discord.ButtonStyle.danger, custom_id="mayor_room_delete")
+    @discord.ui.button(label="村を削除", style=discord.ButtonStyle.danger, custom_id="mayor_room_delete")
     async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.manager.delete_private_room_for_member(interaction)
 
 
-class PrivateRoomRenameModal(discord.ui.Modal, title="専用村名変更"):
+class PrivateRoomRenameModal(discord.ui.Modal, title="GM村名変更"):
     new_name = discord.ui.TextInput(
         label="新しい村名",
         placeholder="例: Aくん村",
@@ -169,24 +170,32 @@ class PrivateRoomRenameModal(discord.ui.Modal, title="専用村名変更"):
 class LobbyView(discord.ui.View):
     """参加受付画面のUI"""
 
+    _GM_VILLAGE_RECRUITMENT_ONLY_CONTROLS = frozenset({
+        "join_game",
+        "leave_game",
+        "get_gm",
+        "release_gm",
+        "rematch_game",
+    })
+
     def __init__(self, cog: RoomRunner) -> None:
         super().__init__(timeout=None)
         self.cog = cog
         if self.cog.is_private_room():
-            manage_button = discord.ui.Button(
-                label="専用村管理",
-                style=discord.ButtonStyle.secondary,
-                custom_id=f"private_room_manage:{self.cog.state.room_id}",
-                row=1,
-            )
-            manage_button.callback = self.private_room_manage_button
-            self.add_item(manage_button)
+            # GM村は募集カードでのみ参加者・GMを受け付ける。
+            # 開始直前に一時的に戻すLobbyViewでは「ゲーム開始」を
+            # 残し、募集を通さない参加や次村だけを閉じる。
+            for item in tuple(self.children):
+                if getattr(item, "custom_id", None) in self._GM_VILLAGE_RECRUITMENT_ONLY_CONTROLS:
+                    self.remove_item(item)
         # 再起動復元などでUIを再投稿した時点で13人+GMが揃っている場合に備え、
         # 生成時に開始ボタンの有効/無効を計算する
         self._refresh_start_button()
         if self.cog.state.phase != Phase.LOBBY:
             for item in self.children:
-                item.disabled = True
+                # 募集通知はゲーム状態と無関係な本人設定なので常に操作できる。
+                if getattr(item, "custom_id", None) != "recruitment_notification_toggle":
+                    item.disabled = True
 
     @property
     def player_count(self) -> int:
@@ -228,12 +237,20 @@ class LobbyView(discord.ui.View):
         elif self.cog.room_def.owner_only_gm:
             room_note = "サーバーオーナー専用GM卓"
 
-        embed = discord.Embed(
-            title=f"{state.room_name} - 参加受付",
-            description=(
+        if self.cog.is_private_room():
+            description = (
+                "参加者とGMの登録は、公開中の募集カードから行います。\n"
+                f"参加条件: **{room_note}**"
+            )
+        else:
+            description = (
                 f"参加者が{self.player_count}人揃ったらGMが「ゲーム開始」を押してください。\n"
                 f"参加条件: **{room_note}**"
-            ),
+            )
+
+        embed = discord.Embed(
+            title=f"{state.room_name} - 参加受付",
+            description=description,
             color=discord.Color.dark_gold(),
         )
         embed.add_field(
@@ -241,13 +258,14 @@ class LobbyView(discord.ui.View):
             value=player_list,
             inline=False,
         )
+        variant = getattr(self.cog, "variant", None)
+        variant_label = getattr(
+            variant,
+            "label",
+            get_variant_definition(DEFAULT_VARIANT_ID).label,
+        )
+        embed.add_field(name="ゲーム形式", value=variant_label, inline=False)
         embed.add_field(name="GM", value=gm_name, inline=False)
-        if self.cog.is_private_room():
-            embed.add_field(
-                name="専用村",
-                value="村主だけが「専用村管理」から招待と削除を操作できます。",
-                inline=False,
-            )
         return embed
 
     async def _update(self, interaction: discord.Interaction) -> None:
@@ -260,6 +278,11 @@ class LobbyView(discord.ui.View):
 
     @discord.ui.button(label="参加", style=discord.ButtonStyle.success, custom_id="join_game", row=0)
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.cog.is_private_room():
+            return await interaction.response.send_message(
+                "GM村への参加は、公開中の募集カードから行ってください。",
+                ephemeral=True,
+            )
         await interaction.response.defer(ephemeral=True, thinking=True)
         # join_lock (全卓共通) → action_lock (卓ローカル) の順で取る。
         # 二重参加チェックからstate.playersへの書き込みまでの間にDM送信テストの
@@ -303,6 +326,11 @@ class LobbyView(discord.ui.View):
 
     @discord.ui.button(label="参加取消", style=discord.ButtonStyle.danger, custom_id="leave_game", row=0)
     async def leave_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.cog.is_private_room():
+            return await interaction.response.send_message(
+                "GM村の参加取消は、公開中の募集カードから行ってください。",
+                ephemeral=True,
+            )
         async with self.cog.action_lock:
             state = self.cog.state
             if state.phase != Phase.LOBBY:
@@ -317,8 +345,13 @@ class LobbyView(discord.ui.View):
             await self._update(interaction)
             await self.cog._persist_room_state()
 
-    @discord.ui.button(label="GM取得", style=discord.ButtonStyle.primary, custom_id="get_gm", row=1)
+    @discord.ui.button(label="GM取得", style=discord.ButtonStyle.success, custom_id="get_gm", row=0)
     async def gm_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.cog.is_private_room():
+            return await interaction.response.send_message(
+                "GM村のGM登録は、公開中の募集カードから行ってください。",
+                ephemeral=True,
+            )
         # 参加ボタンと同じ理由で全卓共通のjoin_lockを先に取る。
         # validate_gm_claim はランク確認でDBを待つため、卓ローカルのロック
         # だけでは別卓が同じ人をGMにできてしまう。取得順序は参加側と揃える
@@ -340,8 +373,13 @@ class LobbyView(discord.ui.View):
             await self._update(interaction)
             await self.cog._persist_room_state()
 
-    @discord.ui.button(label="GM放棄", style=discord.ButtonStyle.primary, custom_id="release_gm", row=1)
+    @discord.ui.button(label="GM放棄", style=discord.ButtonStyle.danger, custom_id="release_gm", row=0)
     async def gm_release_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.cog.is_private_room():
+            return await interaction.response.send_message(
+                "GM村のGM登録解除は、公開中の募集カードから行ってください。",
+                ephemeral=True,
+            )
         async with self.cog.action_lock:
             state = self.cog.state
             if state.phase != Phase.LOBBY:
@@ -356,8 +394,17 @@ class LobbyView(discord.ui.View):
             await self._update(interaction)
             await self.cog._persist_room_state()
 
-    @discord.ui.button(label="ゲーム開始", style=discord.ButtonStyle.primary, custom_id="start_game",
-                       disabled=True, row=2)
+    @discord.ui.button(
+        label="通知", emoji="🔔", style=discord.ButtonStyle.primary,
+        custom_id="recruitment_notification_toggle", row=0,
+    )
+    async def notification_button(
+        self, interaction: discord.Interaction, button: discord.ui.Button,
+    ) -> None:
+        await self.cog.manager.recruitment_manager.toggle_notification_role(interaction)
+
+    @discord.ui.button(label="ゲーム開始", style=discord.ButtonStyle.success, custom_id="start_game",
+                       disabled=True, row=1)
     async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         async with self.cog.action_lock:
             state = self.cog.state
@@ -381,15 +428,20 @@ class LobbyView(discord.ui.View):
                 pass
             await self.cog.start_game(interaction)
 
-    @discord.ui.button(label="次村", style=discord.ButtonStyle.primary, custom_id="rematch_game", row=2)
+    @discord.ui.button(label="次村", style=discord.ButtonStyle.primary, custom_id="rematch_game", row=1)
     async def rematch_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if self.cog.is_private_room():
+            return await interaction.response.send_message(
+                "GM村の次回参加は、新しい募集カードから受け付けます。",
+                ephemeral=True,
+            )
         await interaction.response.defer(ephemeral=True, thinking=True)
         async with self.cog.action_lock:
             result = await self.cog.rematch(interaction.user)
             await self._update(interaction)
             await interaction.followup.send(result, ephemeral=True)
 
-    @discord.ui.button(label="GM管理", style=discord.ButtonStyle.secondary, custom_id="lobby_gm_menu", row=2)
+    @discord.ui.button(label="GM管理", style=discord.ButtonStyle.secondary, custom_id="lobby_gm_menu", row=1)
     async def gm_menu_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
@@ -410,25 +462,15 @@ class LobbyView(discord.ui.View):
             ephemeral=True,
         )
 
-    @discord.ui.button(label="ルール", style=discord.ButtonStyle.secondary, custom_id="rule_btn", row=2)
+    @discord.ui.button(label="ルール", style=discord.ButtonStyle.secondary, custom_id="rule_btn", row=1)
     async def rule_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         embeds = build_rule_embeds(getattr(self.cog, "variant", None))
         await interaction.response.send_message(embeds=embeds, ephemeral=True)
 
-    @discord.ui.button(label="ヘルプ", style=discord.ButtonStyle.secondary, custom_id="help_btn", row=2)
+    @discord.ui.button(label="ヘルプ", style=discord.ButtonStyle.secondary, custom_id="help_btn", row=1)
     async def help_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         embeds = build_help_embeds(getattr(self.cog, "variant", None))
         await interaction.response.send_message(embeds=embeds, ephemeral=True)
-
-    async def private_room_manage_button(self, interaction: discord.Interaction) -> None:
-        if not self.cog.can_manage_private_room(interaction.user):
-            return await interaction.response.send_message("この専用村を管理できるのは村主だけです。", ephemeral=True)
-        await interaction.response.send_message(
-            "専用村の参加権限を管理します。",
-            view=PrivateRoomManageView(self.cog),
-            ephemeral=True,
-        )
-
 
 class LobbyGMMenuView(discord.ui.View):
     """ロビーを3段以内に保つため、低頻度のGM操作を一時表示する。"""
@@ -436,10 +478,29 @@ class LobbyGMMenuView(discord.ui.View):
     def __init__(self, cog: RoomRunner) -> None:
         super().__init__(timeout=180)
         self.cog = cog
+        if self.cog.is_private_room():
+            variant_button = discord.ui.Button(
+                label="ゲーム形式を変更",
+                style=discord.ButtonStyle.primary,
+                custom_id=f"lobby_variant_change:{self.cog.state.room_id}",
+            )
+            variant_button.callback = self.change_variant_btn
+            self.add_item(variant_button)
 
     def _is_gm(self, interaction: discord.Interaction) -> bool:
         state = self.cog.state
         return state.phase == Phase.LOBBY and interaction.user.id == state.gm_id
+
+    async def change_variant_btn(self, interaction: discord.Interaction) -> None:
+        if not self._is_gm(interaction):
+            return await interaction.response.send_message(
+                "現在のGMだけが操作できます。", ephemeral=True
+            )
+        await interaction.response.send_message(
+            "変更先のゲーム形式を選んでください。",
+            view=LobbyVariantSelectView(self.cog, interaction.user.id),
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="参加者を除外", style=discord.ButtonStyle.secondary)
     async def remove_btn(
@@ -493,72 +554,50 @@ class LobbyGMMenuView(discord.ui.View):
         )
 
 
-class PrivateRoomManageView(discord.ui.View):
-    def __init__(self, cog: RoomRunner) -> None:
+class LobbyVariantSelectView(discord.ui.View):
+    """GM村の参加受付中に、公開済みの3形式から選択する。"""
+
+    _VARIANT_IDS = ("v13_cross", "v9_cross", "v9_turn")
+
+    def __init__(self, cog: RoomRunner, actor_id: int) -> None:
         super().__init__(timeout=180)
         self.cog = cog
-
-    def _can_manage(self, interaction: discord.Interaction) -> bool:
-        return self.cog.can_manage_private_room(interaction.user)
-
-    @discord.ui.button(label="招待", style=discord.ButtonStyle.success, custom_id="private_room_invite")
-    async def invite_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not self._can_manage(interaction):
-            return await interaction.response.send_message("この専用村を管理できるのは村主だけです。", ephemeral=True)
-        await interaction.response.send_message(
-            "招待するユーザーを選んでください。",
-            view=PrivateRoomMemberSelectView(self.cog, mode="invite"),
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="削除", style=discord.ButtonStyle.danger, custom_id="private_room_remove")
-    async def remove_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not self._can_manage(interaction):
-            return await interaction.response.send_message("この専用村を管理できるのは村主だけです。", ephemeral=True)
-        await interaction.response.send_message(
-            "削除するユーザーを選んでください。",
-            view=PrivateRoomMemberSelectView(self.cog, mode="remove"),
-            ephemeral=True,
-        )
-
-
-class PrivateRoomMemberSelectView(discord.ui.View):
-    def __init__(self, cog: RoomRunner, *, mode: str) -> None:
-        super().__init__(timeout=180)
-        self.cog = cog
-        self.mode = mode
-        select = discord.ui.UserSelect(
-            placeholder="ユーザーを選択",
+        self.actor_id = actor_id
+        current_variant_id = getattr(self.cog.variant, "variant_id", "")
+        self.variant_select = discord.ui.Select(
+            placeholder="ゲーム形式を選択",
             min_values=1,
             max_values=1,
-            custom_id=f"private_room_{mode}_select",
+            options=[
+                discord.SelectOption(
+                    label=VARIANT_DEFINITIONS[variant_id].label,
+                    value=variant_id,
+                    default=variant_id == current_variant_id,
+                )
+                for variant_id in self._VARIANT_IDS
+            ],
+            custom_id=f"lobby_variant_select:{self.cog.state.room_id}",
         )
-        select.callback = self.select_callback
-        self.add_item(select)
-
-    def _resolve_member(self, interaction: discord.Interaction, selected) -> Optional[discord.Member]:
-        if isinstance(selected, discord.Member):
-            return selected
-        if interaction.guild is None:
-            return None
-        return interaction.guild.get_member(selected.id)
+        self.variant_select.callback = self.select_callback
+        self.add_item(self.variant_select)
 
     async def select_callback(self, interaction: discord.Interaction) -> None:
-        if not self.cog.can_manage_private_room(interaction.user):
-            return await interaction.response.send_message("この専用村を管理できるのは村主だけです。", ephemeral=True)
-        if interaction.guild is None:
-            return await interaction.response.send_message("サーバー内でのみ使用できます。", ephemeral=True)
-
-        selected = self.children[0].values[0]
-        member = self._resolve_member(interaction, selected)
-        if member is None:
-            return await interaction.response.send_message("対象メンバーが見つかりません。", ephemeral=True)
-
-        if self.mode == "invite":
-            message = await self.cog.manager.add_private_room_member(self.cog, member)
-        else:
-            message = await self.cog.manager.remove_private_room_member(self.cog, member)
-        await interaction.response.send_message(message, ephemeral=True)
+        state = self.cog.state
+        if (
+            interaction.user.id != self.actor_id
+            or state.phase != Phase.LOBBY
+            or state.gm_id != interaction.user.id
+        ):
+            return await interaction.response.send_message(
+                "現在のGMだけが操作できます。", ephemeral=True
+            )
+        variant_id = self.variant_select.values[0]
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        message = await self.cog.change_lobby_variant(
+            interaction.user.id,
+            variant_id,
+        )
+        await interaction.followup.send(message, ephemeral=True)
 
 
 # ============================================================
@@ -2159,7 +2198,7 @@ class PostgameRecommendationView(discord.ui.View):
     kind で2種類の票を使い分ける:
       recommend — 霊媒師・初日処刑者・初夜襲撃死者が参加者の誰かへ+1
       postgame  — 勝利陣営が敗北陣営の誰かへ+1
-    どちらも匿名で、1票につきレート+1。
+    どちらも匿名で、1票につき設定されたレートボーナスを加える。
     """
 
     def __init__(
@@ -2564,16 +2603,21 @@ def _stats_variant(variant_id: str) -> VariantDefinition:
 def _variant_scope_note(variant_id: str) -> str:
     variant = _stats_variant(variant_id)
     ladder = LADDER_DEFINITIONS[variant.ladder_id]
-    shared = " / ".join(
+    shared_variants = [
         definition.label
-        for variant_id, definition in VARIANT_DEFINITIONS.items()
-        if variant_id in USER_VISIBLE_VARIANT_IDS
+        for definition in VARIANT_DEFINITIONS.values()
         if definition.ladder_id == variant.ladder_id
-    )
+    ]
+    if len(shared_variants) == 1:
+        rating_scope = f"レート・順位も **{ladder.label}専用ラダー** です。"
+    else:
+        rating_scope = (
+            f"レート・順位は **{ladder.label}ラダーで共通** "
+            f"（{' / '.join(shared_variants)}）です。"
+        )
     return (
         f"試合成績は **{variant.label}** だけを集計します。\n"
-        f"レート・順位は **{ladder.label}ラダーで共通** "
-        f"（{shared}）です。"
+        + rating_scope
     )
 
 
@@ -2637,7 +2681,7 @@ def _build_unplayed_variant_embed(
     if rating_info is not None:
         provisional = "（暫定）" if rating_info["provisional"] else ""
         embed.add_field(
-            name=f"共通レート（{LADDER_DEFINITIONS[variant.ladder_id].label}）",
+            name=f"レート（{LADDER_DEFINITIONS[variant.ladder_id].label}）",
             value=(
                 f"{rating_info['emoji']} **{rating_info['rating']}** "
                 f"[{rating_info['rank_name']}{provisional}]\n"
@@ -3495,13 +3539,22 @@ class StatsView(discord.ui.View):
         # 書き込み側のBEGIN IMMEDIATEと競合して待たされると
         # Unknown interaction (10062) になり、押した人には何も返せなくなる
         await interaction.response.defer(ephemeral=True, thinking=True)
+        if getattr(interaction.guild, "chunked", True) is False:
+            try:
+                # UserSelectの名前検索だけでなく候補ページにも全在籍者を載せる。
+                # 通常は起動時に完了済みで、未完の時だけGatewayへ1回要求する。
+                await interaction.guild.chunk(cache=True)
+            except Exception as exc:
+                # 名前検索は引き続き使えるため、UI自体は止めない。
+                log.warning("同村拒否の全メンバー候補取得に失敗: %s", exc)
         blocked_ids = await list_player_blocks(interaction.guild.id, interaction.user.id)
+        settings_view = PlayerBlockSettingsView(
+            manager, interaction.guild.id, interaction.user.id, blocked_ids,
+        )
         await interaction.followup.send(
-            f"同村拒否リスト: {len(blocked_ids)}/{PLAYER_BLOCK_LIMIT}\n"
-            "この設定と解除は本人にだけ表示されます。",
-            view=PlayerBlockSettingsView(
-                manager, interaction.guild.id, interaction.user.id, blocked_ids,
-            ),
+            settings_view.summary_content
+            + "\nこの設定と解除は本人にだけ表示されます。",
+            view=settings_view,
             ephemeral=True,
         )
 
@@ -3569,6 +3622,88 @@ def _format_average(value: Optional[float], samples: int, *, suffix: str = "日"
     if samples < STATS_MIN_SAMPLES or value is None:
         return f"試合数不足（{samples}/{STATS_MIN_SAMPLES}）"
     return f"{value:.2f}{suffix}（n={samples}）"
+
+
+def _wilson_interval(successes: int, samples: int) -> tuple[float, float]:
+    """二項比率の95% Wilson信頼区間。少数試合の運営判断を過敏にしない。"""
+    if samples <= 0:
+        return 0.0, 1.0
+    z = 1.959963984540054
+    proportion = successes / samples
+    denominator = 1 + z * z / samples
+    center = (proportion + z * z / (2 * samples)) / denominator
+    margin = (
+        z
+        * math.sqrt(
+            proportion * (1 - proportion) / samples
+            + z * z / (4 * samples * samples)
+        )
+        / denominator
+    )
+    return max(0.0, center - margin), min(1.0, center + margin)
+
+
+def build_variant_balance_embed(rows: list[dict]) -> discord.Embed:
+    """9人公開変種の試合数・狼勝率・固定プール均衡を運営向けに表示する。"""
+    embed = discord.Embed(
+        title="9人村 変種別均衡モニター",
+        description=(
+            "既存の正常終了した試合履歴を変種別に集計します。\n"
+            "50戦以上の見直し要否は、狼勝率の95% Wilson信頼区間に"
+            "設定上の均衡勝率が含まれるかで判定します。"
+        ),
+        color=discord.Color.orange(),
+    )
+    by_variant = {str(row["variant_id"]): row for row in rows}
+    for variant_id in ("v9_cross", "v9_turn"):
+        variant = _stats_variant(variant_id)
+        row = by_variant.get(variant_id, {})
+        games = int(row.get("games", 0))
+        wolf_wins = int(row.get("wolf_wins", 0))
+        target = variant.village_win_pool / (
+            variant.wolf_win_pool + variant.village_win_pool
+        )
+        pool_ratio = variant.wolf_win_pool / variant.village_win_pool
+        if games:
+            wolf_rate = wolf_wins / games
+            difference = wolf_rate - target
+            rate_text = f"{wolf_rate * 100:.1f}%（{wolf_wins}/{games}）"
+            difference_text = f"{difference * 100:+.1f}ポイント"
+        else:
+            wolf_rate = 0.0
+            rate_text = "記録なし"
+            difference_text = "算出不可"
+
+        if games < 30:
+            decision = "🟡 観測中（30戦未満のため結論を出しません）"
+        elif games < 50:
+            decision = "🟠 再評価候補（50戦到達後に見直し要否を判定）"
+        else:
+            low, high = _wilson_interval(wolf_wins, games)
+            if low <= target <= high:
+                decision = (
+                    "🟢 現時点で見直し不要 "
+                    f"（95%区間 {low * 100:.1f}〜{high * 100:.1f}%）"
+                )
+            else:
+                decision = (
+                    "🔴 見直し要検討 "
+                    f"（95%区間 {low * 100:.1f}〜{high * 100:.1f}%）"
+                )
+        embed.add_field(
+            name=variant.label,
+            value=(
+                f"試合数: **{games}戦**\n"
+                f"狼勝率: **{rate_text}**\n"
+                f"均衡勝率との差: **{difference_text}**（基準 {target * 100:.1f}%）\n"
+                f"レートプール: 狼{variant.wolf_win_pool} / 村{variant.village_win_pool} "
+                f"（W/V = {pool_ratio:.3f}）\n"
+                f"判定: {decision}"
+            ),
+            inline=False,
+        )
+    embed.set_footer(text="この表示は参照専用です。レート設定や試合履歴は変更しません。")
+    return embed
 
 
 def build_overall_stats_embed(
@@ -3953,14 +4088,16 @@ def build_rule_embeds(
     embed.add_field(
         name="投票と処刑",
         value=(
-            "自分には投票できず、棄権もできません。\n"
+            "自分には投票できず、棄権ボタンもありません。\n"
+            "時間切れでは未投票者を公開し、既投票分だけで集計します"
+            "（1票もなければ処刑なし）。\n"
             "同票なら候補者が順番に弁明してから決戦投票、**再び同票ならランダム**で処刑します。\n"
             "処刑が確定した人には遺言時間があります。**処刑・襲撃された人の役職は非公開**です。"
         ),
         inline=False,
     )
     embed.add_field(
-        name="亡くなったら（村side）",
+        name="亡くなったら（村側）",
         value=(
             f"**人狼だと思う{variant.wolf_guess_slots}人**を提出できます"
             "（当たるとレートに加点。既に亡くなった人を選んでも構いません）。\n"
@@ -4028,8 +4165,9 @@ def build_help_embeds(
     embed3.add_field(
         name=f"{BOT_VERSION}の変更",
         value=(
-            "9人クロストーク／ターン制を公開。"
-            "9人は13人村と別レート・統計です。13人ターン制は準備中です。"
+            "GM村と募集を `GM/#村作成` へ統合し、募集カードを各村の `#参加受付` へ移しました。"
+            "公開3形式・参加ランクプリセット・募集通知に対応し、正常終了した全村を"
+            "統計・ランキング・レート・ランクへ反映します。終了ログも全村で公開保存します。"
         ),
         inline=False,
     )
@@ -4063,7 +4201,7 @@ def build_help_embeds(
         value=(
             f"受付中は `#{CH_LOBBY}` の「GM管理」で除外・リセット。\n"
             f"ゲーム中は `#{CH_VILLAGE}` の「GMメニュー・状況」から一時停止 / 再開 / 朝"
-            f"{gm_turn_help} / 強制終了 / リセット / 除外ができます。"
+            f" / 役職確認を締切{gm_turn_help} / 強制終了 / リセット / 除外ができます。"
         ),
         inline=False,
     )
@@ -4078,8 +4216,9 @@ def build_help_embeds(
     embed3.add_field(
         name="終わった試合を読み返す",
         value=(
-            f"公開卓は `#{CH_VILLAGE}` / `#{CH_SPIRIT}` を"
+            f"全村で `#{CH_VILLAGE}` / `#{CH_SPIRIT}` を"
             f"**{LOG_CATEGORY_VILLAGE}** / **{LOG_CATEGORY_SPIRIT}** へ保存します。\n"
+            f"終了後は全員が読み返せますが書き込みはできません。\n"
             f"試合番号で `#統計` と照合できます（直近{LOG_CATEGORY_LIMIT}試合）。"
         ),
         inline=False,
@@ -4152,7 +4291,8 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
         name="共通ルール",
         value=(
             f"初期値 **{INITIAL_RATING}**、下限 **{RATING_FLOOR}**（これ以上は下がりません）。\n"
-            "試合成績は変種別、レート計算は対応する13人村 / 9人村ラダーで共通です。\n"
+            "試合成績は変種別です。レート・順位も、13人村／9人クロストーク／"
+            "9人ターン制の3ラダーで分けます。\n"
             f"下の変動値は勝った陣営へのボーナス +{WIN_PARTICIPATION_BONUS} を含み、"
             "端数は決まったルールで分配します。"
         ),
@@ -4186,14 +4326,14 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
             "陣営ごとに所属ランクの帯（初心者 / 中級者 / 上級者）の中央値を出し、"
             "その差で倍率が決まります。\n"
             "同じ帯 **1.0倍** ／ 1段差 **0.9倍・1.1倍** ／ 2段差 **0.8倍・1.2倍**\n"
-            "初心者・中級者・上級者の卓は参加条件で帯が揃うため、常に1.0倍です。"
+            "同じ区分の参加条件プリセットで集めた村は帯が揃うため、常に1.0倍です。"
         ),
         inline=False,
     )
     rate.add_field(
         name="活躍ボーナス（勝敗とは別枠）",
         value=(
-            f"🗳️ **処刑された人狼に投票していた村side** … +{BONUS_WOLF_EXECUTION_VOTE}\n"
+            f"🗳️ **処刑された人狼に投票していた村側** … +{BONUS_WOLF_EXECUTION_VOTE}\n"
             "　（処刑を決めた最終ラウンドの票のみ。ランダム処刑は対象外）\n"
             "🐺 **変種ごとの終盤回数に到達したときの人狼** … "
             f"+{BONUS_FINAL_DAY_WOLF}\n"
@@ -4208,7 +4348,7 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
     rate.add_field(
         name="人狼予想",
         value=(
-            f"村sideで亡くなると、`#{CH_VILLAGE}` のボタンから"
+            f"村側で亡くなると、`#{CH_VILLAGE}` のボタンから"
             "**人狼だと思う人数を変種ごとの枠数で**提出できます。\n"
             f"受付は**死亡から{WOLF_GUESS_TIMEOUT // 60}分**で、"
             "**提出するか時間切れになるまで霊界へ入れません**"
@@ -4221,7 +4361,8 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
         name="終了後の投票",
         value=(
             f"レート対象卓の終了後、`#{CH_VILLAGE}` にパネルが1枚出ます"
-            f"（受付 **{POSTGAME_RECOMMENDATION_TIMEOUT // 60}分**・1票につき **+1**）。\n"
+            f"（受付 **{POSTGAME_RECOMMENDATION_TIMEOUT // 60}分**・"
+            f"1票につき **+{BONUS_POSTGAME_VOTE}**）。\n"
             "・**勝利陣営**は、手強かった**敗北陣営**の1人へ1票\n"
             "・**霊媒師 / 初日の処刑者 / 初夜の襲撃死者**は、参加者の1人へ1票\n"
             "両方に当てはまる人は2票持ちます。初夜が平和なら襲撃死者枠はありません。\n"
@@ -4232,9 +4373,8 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
     rate.add_field(
         name="対象",
         value=(
-            f"レートが動くのは **{' / '.join(RATED_ROOM_NAMES)}** "
-            f"の{len(RATED_ROOM_NAMES)}卓です。\n"
-            "各試合は変種に対応するラダーだけを更新します。シーズン境界は両ラダー共通ですが、"
+            "正常終了した**すべての村**で、レート・ランク・統計・ランキングが更新されます。\n"
+            "各試合は変種に対応するラダーだけを更新します。シーズン境界は3ラダー共通ですが、"
             "順位・レート・履歴は混ぜません。"
         ),
         inline=False,
@@ -4260,13 +4400,16 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
             f"レート順の**相対評価**で決まります（{ratios}）。\n"
             f"グランドマスターは全体上位{GRANDMASTER_PERCENTAGE * 100:g}%相当、"
             f"13人村ラダーは最大{LADDER_DEFINITIONS['l13'].grandmaster_slots}人、"
-            f"9人村ラダーは最大{LADDER_DEFINITIONS['l9'].grandmaster_slots}人です。\n"
+            f"9人クロストークは最大{LADDER_DEFINITIONS['l9_cross'].grandmaster_slots}人、"
+            f"9人ターン制は最大{LADDER_DEFINITIONS['l9_turn'].grandmaster_slots}人です。\n"
             f"**1戦目からランクが付き**、通算{SEASON_RANK_MIN_GAMES}戦以上で順位と上位%も確定します。\n"
-            "13人村は9段階のDiscordロールを同期します。9人村は"
-            f"**{LADDER_DEFINITIONS['l9'].grandmaster_role_name}**だけを付与し、"
-            "ほかの段階は統計画面に表示します。両方のグランドマスターを保持できます。\n"
-            "**シーズンリセット後もランクは維持されます**"
-            "（レートは半減しますが全員同じ比率なので順位関係は変わりません）。"
+            "13人村は9段階のDiscordロールを同期します。9人は各ラダーのGM到達時だけ"
+            f" **{LADDER_DEFINITIONS['l9_cross'].grandmaster_role_name}**／"
+            f"**{LADDER_DEFINITIONS['l9_turn'].grandmaster_role_name}**を付与し、"
+            "ほかの段階は統計画面に表示します。3種類のグランドマスターロールを同時に保持できます。\n"
+            "**シーズンリセットで全員ブロンズには戻りません**。"
+            "レート圧縮の丸めで同点になった場合や暫定ランクでは、"
+            "順位・ランクが変わることがあります。"
         ),
         inline=False,
     )

@@ -33,6 +33,7 @@ from config import (
 
 DEFAULT_VARIANT_ID = config_lib.DEFAULT_VARIANT_ID
 DEFAULT_LADDER_ID = config_lib.DEFAULT_LADDER_ID
+LEGACY_NINE_GRANDMASTER_ROLE_NAME = "グランドマスター（9人村）"
 
 
 def ladder_id_for_variant(variant_id: str) -> str:
@@ -57,7 +58,9 @@ def grandmaster_slots_for_ladder(ladder_id: str) -> int:
 def special_grandmaster_role_name(ladder_id: str) -> str:
     """ラダー固有のGM Discordロール名を返す。
 
-    l13 は従来ロール、l9 は ``グランドマスター（9人村）`` を使う。
+    l13 / 9人クロストーク / 9人ターン制で、それぞれ指定された
+    ``グランドマスター`` / ``グランドマスター9`` /
+    ``グランドマスター9T`` を使う。
     通常ランク9段の ``RANK_SPECS`` 自体は増やさない。
     """
     try:
@@ -482,9 +485,9 @@ def build_rank_context_map(
     `season_games` をゼロにするので、今季の試合数を条件にすると
     リセット直後は全員が母集団から外れ、レートを保持しているのに
     ランクだけ暫定ブロンズへ落ちてしまう。
-    レート変換 (1500 + (r - 1500) / 2) は単調増加でレート順を保つため、
-    通算で数えればリセットをまたいでランク分布がそのまま維持される。
-    インフレ分だけが圧縮され、順位関係は変わらない。
+    レート変換 (1500 + (r - 1500) // 2) は単調非減少なので基本の並びを
+    保つ。ただし整数除算で隣接レートが同着になると、season_winsをゼロへ
+    戻した後のplayer_idタイブレークで順位・ランクが入れ替わる場合がある。
 
     player_rows:
       [{"player_id", "rating", "games", "season_games", "season_wins"}]
@@ -627,6 +630,10 @@ def all_rank_role_names() -> list[str]:
         role_name = special_grandmaster_role_name(str(ladder_id))
         if role_name not in names:
             names.append(role_name)
+    # v0.40以前に自動作成された旧9人GMロールは、新ロールへの移行時だけ
+    # Bot管理ロールとして扱う。新規作成対象には含めない。
+    if LEGACY_NINE_GRANDMASTER_ROLE_NAME not in names:
+        names.append(LEGACY_NINE_GRANDMASTER_ROLE_NAME)
     return names
 
 

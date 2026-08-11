@@ -51,15 +51,22 @@ class LocalRoomConfigTest(unittest.TestCase):
             registration.room.access_role_names,
             frozenset({"コミュニティ参加者"}),
         )
-        self.assertTrue(registration.rated)
-        self.assertTrue(registration.recruitment_enabled)
+        self.assertTrue(registration.room.sync_permissions)
 
-    def test_rating_and_recruitment_can_be_disabled_independently(self) -> None:
-        registration = parse_local_room_config(
-            self._json(rated=False, recruitment_enabled=False)
+        manual = parse_local_room_config(
+            self._json(), manual_static_room_names={"コミュニティ村"}
         )[0]
-        self.assertFalse(registration.rated)
-        self.assertFalse(registration.recruitment_enabled)
+        self.assertFalse(manual.room.sync_permissions)
+
+    def test_legacy_rating_and_recruitment_keys_are_accepted(self) -> None:
+        registration = parse_local_room_config(
+            self._json(
+                rated=False,
+                recruitment_enabled=False,
+                sync_permissions=True,
+            )
+        )[0]
+        self.assertTrue(registration.room.sync_permissions)
 
     def test_reserved_or_duplicate_id_is_rejected(self) -> None:
         with self.assertRaises(LocalRoomConfigError):
@@ -91,6 +98,8 @@ class LocalRoomConfigTest(unittest.TestCase):
             parse_local_room_config(self._json(typo=True))
         with self.assertRaises(LocalRoomConfigError):
             parse_local_room_config(self._json(rated="true"))
+        with self.assertRaises(LocalRoomConfigError):
+            parse_local_room_config(self._json(sync_permissions="false"))
         with self.assertRaises(LocalRoomConfigError):
             parse_local_room_config(self._json(allowed_gm_user_ids=[True]))
 
@@ -131,7 +140,7 @@ class LocalRoomConfigTest(unittest.TestCase):
             "import config; "
             "room=config.ROOM_DEFINITION_MAP['community']; "
             "print(room.name, 'community' in config.RATED_ROOM_IDS, "
-            "'community' in config.RECRUITMENT_ROOM_IDS)"
+            "set(config.ACTIVE_ROOM_IDS) <= set(config.RATED_ROOM_IDS))"
         )
         env = os.environ.copy()
         env["WEREWOLF_LOCAL_ROOMS_JSON"] = raw
@@ -145,7 +154,8 @@ class LocalRoomConfigTest(unittest.TestCase):
             timeout=10,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout.strip(), "コミュニティ村 False False")
+        # `rated` は旧設定互換として読み込むが、稼働中の全村をレート対象にする。
+        self.assertEqual(completed.stdout.strip(), "コミュニティ村 True True")
 
     def test_invalid_environment_fails_before_runtime_initialization(self) -> None:
         env = os.environ.copy()

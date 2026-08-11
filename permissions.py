@@ -7,7 +7,7 @@ from typing import Optional
 import discord
 
 import rating as rating_lib
-from config import ADMIN_ONLY_ROOM_IDS, CH_SPIRIT, CH_VILLAGE, PUBLIC_ROOM_IDS
+from config import CH_SPIRIT, CH_VILLAGE, PUBLIC_ROOM_IDS
 
 log = logging.getLogger(__name__)
 
@@ -204,22 +204,13 @@ class RoomPermissionMixin:
         *,
         send_messages: Optional[bool] = None,
     ) -> dict[discord.abc.Snowflake, discord.PermissionOverwrite]:
-        private_room = room_def.private_owner_id is not None and room_def.private_role_name is not None
+        gm_named_room = room_def.private_owner_id is not None
         strict_access_role_names = self._strict_access_role_names(room_def)
-        # strict卓はADMIN_ONLYより優先する。管理権限ロールへの明示allowを
-        # 付けず、指定ロールだけを許可するためである。
-        admin_only = (
-            room_def.room_id in ADMIN_ONLY_ROOM_IDS
-            and not private_room
-            and not strict_access_role_names
-        )
         access_role_names = frozenset(
             getattr(room_def, "access_role_names", None) or ()
         )
         public_room = (
-            room_def.room_id in PUBLIC_ROOM_IDS
-            and not private_room
-            and not admin_only
+            (room_def.room_id in PUBLIC_ROOM_IDS or gm_named_room)
             and not access_role_names
             and not strict_access_role_names
         )
@@ -245,12 +236,6 @@ class RoomPermissionMixin:
                 manage_channels=True,
             ),
         }
-
-        # 管理者限定カテゴリでは、Bot以外のロールへ明示allowを付けない。
-        # Administrator権限保持者とサーバー所有者だけがDiscord側で拒否を
-        # バイパスできる。manage_guildだけのロールも閲覧不可にする。
-        if admin_only:
-            return overwrites
 
         if strict_access_role_names:
             strict_roles = self._resolve_strict_access_roles(guild, room_def)
@@ -302,19 +287,6 @@ class RoomPermissionMixin:
                 overwrites[role] = overwrite
             return overwrites
 
-        if private_room:
-            role = discord.utils.get(guild.roles, name=room_def.private_role_name)
-            if role is not None:
-                overwrite = discord.PermissionOverwrite(
-                    view_channel=True,
-                    read_messages=True,
-                    connect=True,
-                )
-                if send_messages is not None:
-                    overwrite.send_messages = send_messages
-                overwrites[role] = overwrite
-            return overwrites
-
         if room_def.allowed_ranks:
             roles_by_name = self._rank_role_by_name(guild)
             for rank_name in room_def.allowed_ranks:
@@ -338,13 +310,13 @@ class RoomPermissionMixin:
         category: discord.CategoryChannel,
         room_def,
     ) -> None:
+        if not getattr(room_def, "sync_permissions", True):
+            # ローカル固定卓の手動モード。@everyoneを含むカテゴリと既存子の
+            # overwriteは、Discordで設定した値を一切変更しない。
+            log.debug("村の静的権限同期を省略します: %s", room_def.name)
+            return
         overwrites = self._build_room_overwrites(guild, room_def)
         strict_access_role_names = self._strict_access_role_names(room_def)
-        admin_only = (
-            room_def.room_id in ADMIN_ONLY_ROOM_IDS
-            and room_def.private_owner_id is None
-            and not strict_access_role_names
-        )
         restricted = overwrites[guild.default_role].view_channel is False
         managed_rank_role_names = set(rating_lib.all_rank_role_names())
         stale_rank_roles = [
@@ -378,13 +350,12 @@ class RoomPermissionMixin:
             )
 
         # ゲーム中チャンネル (#昼/#霊界) は通常RoomRunnerに任せるが、
-        # 管理者限定・厳格ロール限定カテゴリでは例外なく同じ閲覧境界に揃える。
+        # 厳格ロール限定カテゴリでは例外なく同じ閲覧境界に揃える。
         children = [
             ch for ch in [*guild.text_channels, *guild.voice_channels]
             if ch.category and ch.category.id == category.id
             and (
-                admin_only
-                or strict_access_role_names
+                strict_access_role_names
                 or ch.name not in (CH_VILLAGE, CH_SPIRIT)
             )
         ]

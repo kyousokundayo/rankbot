@@ -28,6 +28,7 @@ except LocalRoomConfigError as exc:
     print(f"❌ ローカル卓設定が不正なため起動を中止します: {exc}", file=sys.stderr)
     sys.exit(1)
 import sounds
+from command_sync import sync_application_commands
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -187,6 +188,57 @@ _ready_done = False
 _ready_lock = asyncio.Lock()
 
 
+async def _notify_startup_failure(
+    guild: discord.Guild,
+    error: BaseException,
+    *,
+    verified_operations_channel: discord.TextChannel | None = None,
+) -> None:
+    """起動失敗を #運営 へ残す。
+
+    失敗するとBotはオフラインになるだけで、原因はローカルのログにしか残らない。
+    Gatewayへは繋がっている段階なので、閉じる前に運営が読める場所へ書いておく。
+    通知自体の失敗で元の例外を隠さないよう、ここでは絶対に投げない。
+    """
+    try:
+        from config import CH_OPERATIONS, OPERATIONS_CATEGORY_NAME
+
+        category = discord.utils.get(guild.categories, name=OPERATIONS_CATEGORY_NAME)
+        channel = verified_operations_channel
+        if (
+            channel is None
+            or channel not in guild.text_channels
+            or category is None
+            or channel.category != category
+            or channel.name != CH_OPERATIONS
+        ):
+            # 名前だけで既存チャンネルを拾うと、募集層が既存チャンネルと
+            # Bot必須権限を確認する前に例外本文を送る恐れがある。
+            log.warning(
+                "確認済みの既存#%sが無いため起動失敗を通知できません",
+                CH_OPERATIONS,
+            )
+            return
+        embed = discord.Embed(
+            title="🚨 Botの起動に失敗しました",
+            description=(
+                "セットアップ途中で停止したため、Botはオフラインになります。\n"
+                "サーバー側でBotを再起動してください。直らない場合は"
+                "`logs/bot.log` の詳細を確認してください。"
+            ),
+            color=discord.Color.red(),
+        )
+        embed.add_field(
+            name="エラー",
+            value=f"```{type(error).__name__}: {error}```"[:1024],
+            inline=False,
+        )
+        await channel.send(embed=embed)
+        log.info("起動失敗を #%s へ通知しました", CH_OPERATIONS)
+    except Exception as notify_error:
+        log.warning("起動失敗の通知に失敗しました: %s", notify_error)
+
+
 @bot.event
 async def on_ready():
     global _ready_done
@@ -229,9 +281,9 @@ async def on_ready():
             # DB初期化
             from database import (
                 backup_db,
+                get_meta,
                 init_db,
-                migrate_rating_scale_to_1500,
-                rating_scale_migration_needed,
+                set_meta,
             )
 
             # init_db自身がスキーマmigrationを含む。既存DBは変更前の復旧点を
@@ -247,26 +299,6 @@ async def on_ready():
             await init_db()
             log.info("データベース初期化完了")
 
-            # 起動時バックアップ。レート基準移行前の復旧点も兼ねる。
-            backup_path = None
-            try:
-                backup_path = await backup_db(label="startup")
-                if backup_path:
-                    log.info(f"DBバックアップ作成: {backup_path}")
-            except Exception as e:
-                log.warning(f"起動時DBバックアップ失敗: {e}")
-
-            if await rating_scale_migration_needed():
-                if backup_path is None:
-                    raise RuntimeError(
-                        "レート基準移行前のDBバックアップを作成できないため起動を中止します"
-                    )
-                migrated = await migrate_rating_scale_to_1500()
-                log.info(
-                    "レート基準を1200から1500へ移行しました: %d人 (+300)",
-                    migrated,
-                )
-
             try:
                 await bot.load_extension("game")
                 log.info("GameCog読み込み完了")
@@ -279,14 +311,28 @@ async def on_ready():
             await cog.setup_channels(guild)
             log.info(f"チャンネルセットアップ完了: {guild.name}")
 
-            # 対象guildへコピー後、グローバル公開を消して単一guildだけへ同期する
-            bot.tree.copy_global_to(guild=guild)
-            bot.tree.clear_commands(guild=None)
-            await bot.tree.sync()
-            synced = await bot.tree.sync(guild=guild)
-            log.info(f"スラッシュコマンド同期完了 ({guild.name}): {len(synced)}件")
+            command_sync = await sync_application_commands(
+                bot.tree, guild, get_meta=get_meta, set_meta=set_meta,
+            )
+            log.info(
+                "スラッシュコマンド確認完了 (%s): %d件 / guild=%s / global=%s",
+                guild.name,
+                command_sync.command_count,
+                command_sync.guild_action,
+                command_sync.global_action,
+            )
         except Exception as e:
             log.exception(f"Bot初期化失敗: {e}")
+            failed_cog = bot.get_cog("GameCog")
+            recruitment_manager = getattr(failed_cog, "recruitment_manager", None)
+            verified_operations_channel = getattr(
+                recruitment_manager, "operations_channel", None
+            )
+            await _notify_startup_failure(
+                guild,
+                e,
+                verified_operations_channel=verified_operations_channel,
+            )
             await bot.close()
             return
 

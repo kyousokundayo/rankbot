@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 import discord
 
-from views import StatsView, build_overall_stats_embed
+from views import StatsView, build_overall_stats_embed, build_variant_balance_embed
 
 
 class StatsViewInteractionTest(unittest.IsolatedAsyncioTestCase):
@@ -164,6 +164,27 @@ class StatsViewInteractionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("試合数不足", rendered)
         self.assertIn("相対評価", embed.description)
         self.assertNotIn("rank_bucket", rendered)
+
+    def test_variant_balance_embed_uses_all_three_sample_stages(self):
+        cases = (
+            ("v9_cross", 29, 13, "観測中"),
+            ("v9_cross", 30, 14, "再評価候補"),
+            ("v9_cross", 50, 22, "現時点で見直し不要"),
+            ("v9_cross", 50, 35, "見直し要検討"),
+        )
+        for variant_id, games, wolf_wins, expected in cases:
+            with self.subTest(games=games, wolf_wins=wolf_wins):
+                embed = build_variant_balance_embed([
+                    {"variant_id": variant_id, "games": games, "wolf_wins": wolf_wins},
+                ])
+                field = next(
+                    field for field in embed.fields
+                    if field.name == "9人クロストーク"
+                )
+                rendered = field.value
+                self.assertIn(expected, rendered)
+                self.assertIn("基準 45.0%", rendered)
+                self.assertIn("W/V = 1.222", rendered)
 
 
 if __name__ == "__main__":
