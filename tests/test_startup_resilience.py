@@ -1,11 +1,15 @@
 """起動時の失敗が、他機能や進行中ゲームを巻き添えにしないことを検証する。"""
 from __future__ import annotations
 
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-import bot as bot_module
+# CIには本番用.envもトークンも無い。起動失敗通知の関数だけを検証するため、
+# import中だけ無害なテスト値を渡し、Botの起動前検査そのものは変更しない。
+with patch.dict(os.environ, {"DISCORD_TOKEN": "unit-test-token"}):
+    import bot as bot_module
 from config import CH_OPERATIONS, OPERATIONS_CATEGORY_NAME
 from game import GameCog
 
