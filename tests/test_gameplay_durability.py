@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import discord
 
+import database
 from config import (
     LOG_CATEGORY_LIMIT,
     LOG_CATEGORY_TRIM_TO,
@@ -29,7 +30,11 @@ from views import (
     MorningReadyView,
     NightActionConfirmView,
     SeerView,
+    VoteQueueView,
     VoteView,
+    build_gm_status_embed,
+    WolfGuessSelectView,
+    WolfSurrenderView,
     WolfVoteView,
 )
 
@@ -183,6 +188,404 @@ def add_player(runner: RoomRunner, user_id: int, role: Role = Role.VILLAGER) -> 
 
 
 class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
+    async def test_wolf_guess_hold_uses_same_rule_for_every_alignment(self) -> None:
+        for role in (Role.VILLAGER, Role.MADMAN, Role.WEREWOLF):
+            with self.subTest(role=role):
+                runner = make_runner()
+                runner.state.spirit_channel = object()
+                victim = add_player(runner, 1, role)
+                victim.alive = False
+                add_player(runner, 2, Role.WEREWOLF)
+                add_player(runner, 3, Role.VILLAGER)
+                add_player(runner, 4, Role.VILLAGER)
+                add_player(runner, 5, Role.VILLAGER)
+
+                self.assertTrue(runner._should_hold_spirit(victim, "処刑"))
+
+    async def test_wolf_guess_skips_death_that_decides_winner(self) -> None:
+        runner = make_runner()
+        runner.state.spirit_channel = object()
+        last_wolf = add_player(runner, 1, Role.WEREWOLF)
+        last_wolf.alive = False
+        add_player(runner, 2, Role.VILLAGER)
+        add_player(runner, 3, Role.VILLAGER)
+
+        self.assertEqual(runner.state.check_win(), Team.VILLAGE)
+        self.assertFalse(runner._should_hold_spirit(last_wolf, "処刑"))
+
+    async def test_wolf_guess_dm_is_bound_to_run_player_and_death_event(self) -> None:
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_DISCUSSION
+        victim = add_player(runner, 1, Role.WEREWOLF)
+        victim.alive = False
+        for user_id in range(2, 6):
+            add_player(runner, user_id)
+        event_id = "run-1:処刑:4:1"
+        runner.state.spirit_hold_ids.add(victim.user_id)
+        runner.state.spirit_hold_events[victim.user_id] = event_id
+        runner._release_spirit_hold = AsyncMock()
+
+        stale = await runner.submit_wolf_guess(
+            victim.user_id,
+            [2, 3, 4],
+            game_run_id="old-run",
+            death_event_id=event_id,
+        )
+        wrong_death = await runner.submit_wolf_guess(
+            victim.user_id,
+            [2, 3, 4],
+            game_run_id="run-1",
+            death_event_id="run-1:処刑:3:1",
+        )
+        accepted = await runner.submit_wolf_guess(
+            victim.user_id,
+            [2, 3, 4],
+            game_run_id="run-1",
+            death_event_id=event_id,
+        )
+
+        self.assertFalse(stale)
+        self.assertFalse(wrong_death)
+        self.assertTrue(accepted)
+        self.assertEqual(runner.state.wolf_guesses[victim.user_id], [2, 3, 4])
+        runner._release_spirit_hold.assert_awaited_once_with(victim.user_id)
+
+    async def test_wolf_guess_dm_has_single_number_and_no_public_notice(self) -> None:
+        runner = make_runner()
+        victim = add_player(runner, 1)
+        victim.alive = False
+        for user_id in range(2, 6):
+            add_player(runner, user_id)
+        event_id = "run-1:処刑:4:1"
+
+        sent = await runner._send_wolf_guess_dm(victim, event_id)
+
+        self.assertTrue(sent)
+        kwargs = victim.member.send.await_args.kwargs
+        view = kwargs["view"]
+        self.assertIsInstance(view, WolfGuessSelectView)
+        self.assertEqual(view.game_run_id, "run-1")
+        self.assertEqual(view.death_event_id, event_id)
+        self.assertEqual(view.select.options[0].label, "02.user-2")
+        self.assertNotIn("02. 02.", view.select.options[0].label)
+        runner._safe_village_send.assert_not_awaited()
+        view.stop()
+
+    async def test_wolf_guess_dm_failure_releases_and_only_notifies_gm(self) -> None:
+        runner = make_runner()
+        victim = add_player(runner, 1)
+        victim.alive = False
+        gm = FakeMember(99, "gm")
+        runner.state.gm_id = gm.id
+        runner.state.guild = FakeGuild([victim.member, gm], [])
+        runner._release_spirit_hold = AsyncMock()
+        denied = discord.Forbidden(
+            SimpleNamespace(status=403, reason="Forbidden", headers={}),
+            "denied",
+        )
+        victim.member.send.side_effect = denied
+
+        sent = await runner._send_wolf_guess_dm(
+            victim, "run-1:処刑:4:1"
+        )
+
+        self.assertFalse(sent)
+        runner._release_spirit_hold.assert_awaited_once_with(victim.user_id)
+        gm.send.assert_awaited_once()
+        self.assertIn("霊界へ解放", gm.send.await_args.args[0])
+        runner._safe_village_send.assert_not_awaited()
+
+    async def test_releasing_wolf_guess_hold_opens_spirit_and_invalidates_dm(self) -> None:
+        runner = make_runner()
+        victim = add_player(runner, 1)
+        victim.alive = False
+        runner.state.spirit_hold_ids = {victim.user_id}
+        runner.state.spirit_hold_events = {
+            victim.user_id: "run-1:処刑:4:1"
+        }
+        runner._open_spirit_for = AsyncMock()
+
+        await runner._release_spirit_hold(victim.user_id)
+
+        self.assertNotIn(victim.user_id, runner.state.spirit_hold_ids)
+        self.assertNotIn(victim.user_id, runner.state.spirit_hold_events)
+        runner._open_spirit_for.assert_awaited_once_with(victim.member)
+        runner._safe_spirit_send.assert_awaited_once()
+        runner._persist_room_state.assert_awaited_once()
+
+    async def test_wolf_guess_death_event_is_snapshotted(self) -> None:
+        runner = make_runner()
+        runner.state.spirit_hold_ids = {1}
+        runner.state.spirit_hold_events = {1: "run-1:処刑:4:1"}
+
+        payload = runner._build_room_snapshot()
+
+        self.assertEqual(payload["spirit_hold_ids"], [1])
+        self.assertEqual(
+            payload["spirit_hold_events"],
+            [{"player_id": 1, "event_id": "run-1:処刑:4:1"}],
+        )
+
+    async def test_initial_night_opens_only_wolf_relay_and_can_be_skipped(self) -> None:
+        runner = make_runner()
+        gm = add_player(runner, 10)
+        wolf = add_player(runner, 1, Role.WEREWOLF)
+        other_wolf = add_player(runner, 2, Role.WEREWOLF)
+        add_player(runner, 3, Role.SEER)
+        runner.state.gm_id = gm.user_id
+        runner.state.phase = Phase.INITIAL_NIGHT
+        runner.state.wolf_relay_window_open = True
+        # 通常夜の解決済みフラグに影響されず、0日目専用窓で中継する。
+        runner.state.night_resolved = True
+
+        self.assertTrue(runner.wolf_relay_open())
+        self.assertFalse(runner.night_actions_open())
+        message = SimpleNamespace(
+            author=SimpleNamespace(id=wolf.user_id, bot=False),
+            channel=Mock(spec=discord.DMChannel),
+            content="よろしくお願いします",
+        )
+        await runner.on_message(message)
+        other_wolf.member.send.assert_awaited_once()
+
+        result = await runner.force_skip_wait(gm.member)
+        self.assertIn("初夜をスキップ", result)
+        self.assertTrue(runner.state.initial_night_skip_event.is_set())
+
+    async def test_initial_night_opens_relay_before_wolf_notice_and_has_no_actions(self) -> None:
+        runner = make_runner()
+        runner.state.phase = Phase.PREPARATION
+        wolf = add_player(runner, 1, Role.WEREWOLF)
+        add_player(runner, 2, Role.WEREWOLF)
+        add_player(runner, 3, Role.GUARD)
+        runner._lock_village = AsyncMock()
+        runner._mute_phase = AsyncMock()
+        runner._repost_gm_panel = AsyncMock(return_value=True)
+
+        async def inspect_notice(_wolf: Player) -> None:
+            self.assertTrue(runner.state.wolf_relay_window_open)
+            self.assertTrue(runner.wolf_relay_open())
+            self.assertFalse(runner.night_actions_open())
+            self.assertFalse(runner.state.morning_ready_open)
+
+        async def finish_countdown(_message, _content, seconds, event) -> bool:
+            self.assertEqual(seconds, 30)
+            self.assertIs(event, runner.state.initial_night_skip_event)
+            self.assertTrue(runner.state.wolf_relay_window_open)
+            return False
+
+        runner._send_initial_night_notice = AsyncMock(side_effect=inspect_notice)
+        runner._pausable_countdown = AsyncMock(side_effect=finish_countdown)
+
+        await runner._initial_night_greeting()
+
+        self.assertTrue(runner.state.initial_night_completed)
+        self.assertFalse(runner.state.wolf_relay_window_open)
+        self.assertEqual(runner._send_initial_night_notice.await_count, 2)
+        self.assertIn(wolf.user_id, runner.state.players)
+
+    async def test_initial_night_restore_reruns_greeting_then_starts_day_one(self) -> None:
+        runner = make_runner()
+        runner.state.phase = Phase.PAUSED
+        runner.state.recovery_phase = Phase.INITIAL_NIGHT
+        runner.state.initial_night_completed = False
+
+        async def complete_initial_night() -> None:
+            runner.state.initial_night_completed = True
+
+        runner._initial_night_greeting = AsyncMock(
+            side_effect=complete_initial_night
+        )
+        # 1日目の議論へ到達したところでテストだけ終了させる。
+        runner._day_discussion = AsyncMock(side_effect=asyncio.CancelledError())
+
+        await runner._resume_recovered_game()
+
+        runner._initial_night_greeting.assert_awaited_once()
+        runner._day_discussion.assert_awaited_once()
+        self.assertEqual(runner.state.day_number, 1)
+        self.assertEqual(runner.state.day_generation, 1)
+
+    async def test_surrender_requires_all_living_real_wolves_and_stays_private_until_complete(self) -> None:
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_DISCUSSION
+        first = add_player(runner, 1, Role.WEREWOLF)
+        second = add_player(runner, 2, Role.WEREWOLF)
+        madman = add_player(runner, 3, Role.MADMAN)
+        runner._relay_to_wolves = AsyncMock()
+
+        rejected = await runner.submit_surrender(
+            madman.member, expected_game_run_id="run-1"
+        )
+        first_result = await runner.submit_surrender(
+            first.member, expected_game_run_id="run-1"
+        )
+
+        self.assertIn("現在この操作はできません", rejected)
+        self.assertIn("1 / 2人", first_result)
+        self.assertEqual(runner.state.surrender_ids, {first.user_id})
+        self.assertFalse(runner.state.surrender_confirmed)
+        self.assertIsNone(runner.state.pending_winner)
+        runner._relay_to_wolves.assert_awaited_once()
+        runner._safe_village_send.assert_not_awaited()
+
+        completed = await runner.submit_surrender(
+            second.member, expected_game_run_id="run-1"
+        )
+
+        self.assertIn("全人狼が同意", completed)
+        self.assertTrue(runner.state.surrender_confirmed)
+        self.assertEqual(runner.state.pending_winner, Team.VILLAGE)
+        self.assertEqual(runner.state.surrender_ids, {first.user_id, second.user_id})
+        # FakeManagerは終了coroutineを閉じるため、公開はfinish task内だけで行われる。
+        runner._safe_village_send.assert_not_awaited()
+
+    async def test_stale_surrender_views_cannot_affect_a_new_game(self) -> None:
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_DISCUSSION
+        wolf = add_player(runner, 1, Role.WEREWOLF)
+        target = add_player(runner, 2)
+        permanent = WolfSurrenderView(runner)
+        night = WolfVoteView(runner, [target], wolf)
+        runner.state.game_run_id = "run-2"
+
+        for view, button in (
+            (permanent, permanent.surrender_btn),
+            (night, night.surrender_btn),
+        ):
+            with self.subTest(view=type(view).__name__):
+                interaction = SimpleNamespace(
+                    user=wolf.member,
+                    response=SimpleNamespace(send_message=AsyncMock()),
+                )
+                await button.callback(interaction)
+                interaction.response.send_message.assert_awaited_once()
+                self.assertIn(
+                    "終了しています" if view is permanent else "現在この操作はできません",
+                    interaction.response.send_message.await_args.args[0],
+                )
+                self.assertEqual(runner.state.surrender_ids, set())
+            view.stop()
+
+    async def test_surrender_is_rechecked_when_an_unagreed_wolf_dies(self) -> None:
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_DISCUSSION
+        agreed = add_player(runner, 1, Role.WEREWOLF)
+        unagreed = add_player(runner, 2, Role.WEREWOLF)
+        add_player(runner, 3)
+        runner.state.surrender_ids = {agreed.user_id}
+        unagreed.alive = False
+
+        completed = await runner._confirm_surrender_after_roster_change()
+
+        self.assertTrue(completed)
+        self.assertTrue(runner.state.surrender_confirmed)
+        self.assertEqual(runner.state.pending_winner, Team.VILLAGE)
+        runner._persist_room_state.assert_awaited_once()
+
+    async def test_surrender_controls_are_only_sent_to_real_wolves_and_are_run_bound(self) -> None:
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_DISCUSSION
+        wolf = add_player(runner, 1, Role.WEREWOLF)
+        madman = add_player(runner, 2, Role.MADMAN)
+
+        await runner._send_surrender_controls()
+        await runner._send_surrender_controls()
+
+        wolf.member.send.assert_awaited_once()
+        sent_view = wolf.member.send.await_args.kwargs["view"]
+        self.assertIsInstance(sent_view, WolfSurrenderView)
+        self.assertEqual(sent_view.game_run_id, "run-1")
+        madman.member.send.assert_not_awaited()
+        sent_view.stop()
+
+    async def test_night_surrender_snapshot_validation_fails_closed(self) -> None:
+        runner = make_runner()
+        add_player(runner, 1, Role.WEREWOLF)
+        add_player(runner, 2, Role.WEREWOLF)
+        add_player(runner, 3, Role.VILLAGER)
+        payload = runner._build_room_snapshot()
+        runner._validate_night_surrender_snapshot(payload)
+
+        invalid_payloads = []
+        invalid_payloads.append({**payload, "initial_night_completed": 1})
+        invalid_payloads.append({**payload, "surrender_ids": [3]})
+        invalid_payloads.append({
+            **payload,
+            "surrender_ids": [1],
+            "surrender_confirmed": True,
+            "pending_winner": Team.VILLAGE.name,
+        })
+        invalid_payloads.append({
+            **payload,
+            "surrender_ids": [1, 2],
+            "surrender_confirmed": True,
+            "pending_winner": None,
+        })
+        invalid_payloads.append({
+            **payload,
+            "morning_ready_open": False,
+            "morning_ready_ids": [1],
+        })
+
+        for invalid in invalid_payloads:
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(StateDurabilityError):
+                    runner._validate_night_surrender_snapshot(invalid)
+
+    async def test_restore_recovers_confirmed_surrender_before_normal_progress(self) -> None:
+        source = make_runner()
+        source.state.phase = Phase.NIGHT
+        wolf = add_player(source, 1, Role.WEREWOLF)
+        villager = add_player(source, 2, Role.VILLAGER)
+        source.state.surrender_ids = {wolf.user_id}
+        source.state.surrender_confirmed = True
+        source.state.pending_winner = Team.VILLAGE
+        snapshot = source._build_room_snapshot()
+        snapshot["phase"] = Phase.NIGHT.name
+
+        restored = make_runner()
+        restored.state.guild = FakeGuild([wolf.member, villager.member], [])
+        restored.state.village_channel = object()
+        restored.state.spirit_channel = object()
+        restored._enable_mute_markers = AsyncMock()
+        restored._reconcile_mute_marker_ownership = AsyncMock()
+        restored._reconcile_mute_intents = AsyncMock()
+        restored._disable_recovered_turn_panel = AsyncMock()
+        restored._reconcile_pending_death_effects = AsyncMock()
+        restored._finish_surrender = AsyncMock()
+
+        await restored.restore_from_snapshot(snapshot)
+
+        restored._finish_surrender.assert_awaited_once()
+        self.assertTrue(restored.state.surrender_confirmed)
+        self.assertEqual(restored.state.pending_winner, Team.VILLAGE)
+
+    async def test_restore_rejects_confirmed_surrender_if_no_living_wolf_remains(self) -> None:
+        source = make_runner()
+        source.state.phase = Phase.NIGHT
+        wolf = add_player(source, 1, Role.WEREWOLF)
+        villager = add_player(source, 2, Role.VILLAGER)
+        source.state.surrender_ids = {wolf.user_id}
+        source.state.surrender_confirmed = True
+        source.state.pending_winner = Team.VILLAGE
+        snapshot = source._build_room_snapshot()
+        snapshot["phase"] = Phase.NIGHT.name
+
+        # snapshot作成後に人狼だけがサーバーを退出した復元境界。
+        restored = make_runner()
+        restored.state.guild = FakeGuild([villager.member], [])
+        restored.state.village_channel = object()
+        restored.state.spirit_channel = object()
+        restored._enable_mute_markers = AsyncMock()
+        restored._reconcile_mute_marker_ownership = AsyncMock()
+        restored._reconcile_mute_intents = AsyncMock()
+        restored._disable_recovered_turn_panel = AsyncMock()
+        restored._reconcile_pending_death_effects = AsyncMock()
+
+        with self.assertRaisesRegex(StateDurabilityError, "生存実人狼"):
+            await restored.restore_from_snapshot(snapshot)
+
     async def test_private_restore_requires_spirit_channel_for_access_control(self) -> None:
         runner = RoomRunner(
             None,
@@ -392,6 +795,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
                 runner = make_runner(variant_id)
                 guard = add_player(runner, 1, Role.GUARD)
                 target = add_player(runner, 2, Role.VILLAGER)
+                runner.state.morning_ready_open = True
 
                 for _ in range(2):
                     _, error = await runner.toggle_morning_ready(guard.member)
@@ -415,6 +819,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
                 guard = add_player(runner, 2, Role.GUARD)
                 target = add_player(runner, 3, Role.VILLAGER)
                 runner.state.gm_id = gm.user_id
+                runner.state.morning_ready_open = True
 
                 _, error = await runner.force_morning(gm.member)
 
@@ -725,6 +1130,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         players = [add_player(runner, uid) for uid in (1, 2, 3)]
         dead = add_player(runner, 4)
         dead.alive = False
+        runner.state.morning_ready_open = True
         panel = SimpleNamespace(edit=AsyncMock())
         runner._safe_village_send = AsyncMock(return_value=panel)
 
@@ -752,6 +1158,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
             get_partial_message=Mock(return_value=stale)
         )
         runner.state.morning_panel_message_id = 555
+        runner.state.morning_ready_open = True
         panel = SimpleNamespace(id=777, edit=AsyncMock())
         runner._safe_village_send = AsyncMock(return_value=panel)
 
@@ -767,36 +1174,36 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         await runner._close_morning_panel()
         self.assertIsNone(runner.state.morning_panel_message_id)
 
-    async def test_morning_panel_does_not_reveal_the_count_until_time_is_up(self) -> None:
-        """夜の間は宣言人数を村へ出さず、押した本人にだけ返す。
-
-        13人固定で夜に行動があるのは狼3+占い+狩人の5人だけなので、
-        人数を常時公開すると未宣言者から生存役職を推定できてしまう。
-        """
+    async def test_morning_panel_appears_after_time_and_updates_public_count(self) -> None:
+        """夜時間中は出さず、受付開始後は0/Nから押下ごとに更新する。"""
         runner = make_runner()
         player = add_player(runner, 1)
         add_player(runner, 2)
         panel = SimpleNamespace(edit=AsyncMock())
         runner._safe_village_send = AsyncMock(return_value=panel)
 
+        # 夜の制限時間中はパネル自体を出さない。
+        await runner._post_morning_panel()
+        runner._safe_village_send.assert_not_awaited()
+
+        # 制限時間終了のdurable checkpoint後に0/Nで掲示する。
+        runner.state.morning_ready_open = True
         await runner._post_morning_panel()
         posted = runner._safe_village_send.await_args.args[0]
-        self.assertNotIn("人**", posted)
+        self.assertIn("0 / 2人", posted)
 
-        # 押した本人にも人数は返さない (押して確かめて押し直せば
-        # 進捗を測れてしまうため)
         feedback, error = await runner.toggle_morning_ready(player.member)
         self.assertIsNone(error)
         self.assertIn("宣言しました", feedback)
-        self.assertNotIn("人**", feedback)
-        self.assertNotIn("/ 2", feedback)
-        # 押下では公開パネルを編集しない
-        panel.edit.assert_not_awaited()
-
-        # 目安時間が切れたときに初めてパネルへ人数を出す
-        await runner._reveal_morning_count()
+        self.assertIn("1 / 2人", feedback)
+        # 押下の保存後、同じ公開パネルへ即時反映する。
         panel.edit.assert_awaited_once()
         self.assertIn("1 / 2人", panel.edit.await_args.kwargs["content"])
+
+        # 宣言は一方向で、同じ人が押し直しても取り消せない。
+        _, error = await runner.toggle_morning_ready(player.member)
+        self.assertIn("取り消しはできません", error)
+        self.assertIn(player.user_id, runner.state.morning_ready_ids)
 
     async def test_morning_panel_close_disables_buttons_then_stops(self) -> None:
         """#昼 に1枚なので、夜明け時にボタンを無効化して閉じられる。
@@ -806,6 +1213,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         """
         runner = make_runner()
         add_player(runner, 1)
+        runner.state.morning_ready_open = True
         panel = SimpleNamespace(edit=AsyncMock())
         runner._safe_village_send = AsyncMock(return_value=panel)
 
@@ -830,6 +1238,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         alive = add_player(runner, 1)
         dead = add_player(runner, 2)
         dead.alive = False
+        runner.state.morning_ready_open = True
         view = MorningReadyView(runner)
 
         for member in (dead.member, FakeMember(99)):
@@ -942,7 +1351,9 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner._relay_to_wolves = AsyncMock()
 
         view = WolfVoteView(runner, [victim], wolf)
-        select = view.children[0]
+        select = next(
+            item for item in view.children if isinstance(item, discord.ui.Select)
+        )
 
         def make_interaction(target_id: int) -> SimpleNamespace:
             response = SimpleNamespace(
@@ -957,6 +1368,9 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
             )
 
         # 制限時間中の変更は他の狼へ伝わる
+        runner.state.phase = Phase.NIGHT
+        runner.state.morning_confirmed = False
+        runner.state.morning_ready_event.clear()
         runner.state.wolf_relay_window_open = True
         await select.callback(make_interaction(victim.user_id))
         runner._relay_to_wolves.assert_awaited_once()
@@ -978,6 +1392,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
     async def test_morning_event_is_not_released_before_checkpoint(self) -> None:
         runner = make_runner()
         player = add_player(runner, 1)
+        runner.state.morning_ready_open = True
 
         async def fail_while_waiter_is_still_blocked() -> None:
             self.assertFalse(runner.state.morning_ready_event.is_set())
@@ -997,6 +1412,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner = make_runner()
         gm = add_player(runner, 1)
         runner.state.gm_id = gm.user_id
+        runner.state.morning_ready_open = True
 
         async def fail_while_waiter_is_still_blocked() -> None:
             self.assertFalse(runner.state.morning_ready_event.is_set())
@@ -1255,6 +1671,11 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         first = add_player(runner, 1)
         second = add_player(runner, 2)
         removed = add_player(runner, 3)
+        runner.state.vote_order = [second.user_id]
+        runner.state.vote_slot_index = 0
+        runner.state.vote_slot_token = 1
+        runner.state.vote_slot_active = True
+        runner.state.current_speaker_id = second.user_id
         view = VoteView(runner, [first, second, removed], [first, second, removed])
         removed.alive = False
         runner.state.votes = {first.user_id: second.user_id}
@@ -1280,7 +1701,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(runner.state.votes[second.user_id], first.user_id)
         runner._persist_room_state.assert_awaited()
-        self.assertTrue(runner.state.vote_complete_event.is_set())
+        self.assertTrue(runner.state.speech_done_event.is_set())
         interaction.response.defer.assert_awaited_once()
         confirm_interaction.response.defer.assert_awaited_once()
         # 確定結果は新しいephemeralではなく確認メッセージの書き換えで残す
@@ -1295,6 +1716,10 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.state.phase = Phase.DAY_VOTE
         voter = add_player(runner, 1)
         target = add_player(runner, 2)
+        runner.state.vote_order = [voter.user_id]
+        runner.state.vote_slot_token = 1
+        runner.state.vote_slot_active = True
+        runner.state.current_speaker_id = voter.user_id
         view = VoteView(runner, [voter, target], [voter, target])
         runner._persist_room_state = AsyncMock(side_effect=RuntimeError("DB down"))
         interaction = SimpleNamespace(
@@ -1333,6 +1758,10 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.state.phase = Phase.DAY_VOTE
         voter = add_player(runner, 1)
         target = add_player(runner, 2)
+        runner.state.vote_order = [voter.user_id]
+        runner.state.vote_slot_token = 1
+        runner.state.vote_slot_active = True
+        runner.state.current_speaker_id = voter.user_id
         view = VoteView(runner, [voter, target], [voter, target])
         interaction = SimpleNamespace(
             user=voter.member,
@@ -1655,68 +2084,613 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(runner.state.public_log_archive_allowed)
         self.assertTrue(runner._can_archive_to_public_log())
 
-    async def test_provisional_vote_can_be_changed_but_the_final_one_cannot(self) -> None:
-        """議論中の仮投票は入れ替え自由、投票フェーズでは確定。
-
-        議論の途中で心変わりできないと、早く入れた人が話し合いから
-        降りてしまうため、確定は投票フェーズまで遅らせる。
-        """
+    async def test_only_current_sequential_voter_can_vote(self) -> None:
         runner = make_runner()
-        runner.state.phase = Phase.DAY_DISCUSSION
+        runner.state.phase = Phase.DAY_VOTE
         voter = add_player(runner, 1)
         first = add_player(runner, 2)
         second = add_player(runner, 3)
         alive = [voter, first, second]
-
-        provisional = VoteView(runner, alive, alive, provisional=True)
-        self.assertIsNone(provisional._vote_error(voter.user_id, first.user_id))
-        result, committed = await provisional.commit_vote(voter.user_id, first.user_id)
-        self.assertTrue(committed)
-        self.assertIn("入れ替えられます", result)
-
-        # 入れ替えできる
-        self.assertIsNone(provisional._vote_error(voter.user_id, second.user_id))
-        _, committed = await provisional.commit_vote(voter.user_id, second.user_id)
-        self.assertTrue(committed)
-        self.assertEqual(runner.state.votes[voter.user_id], second.user_id)
-
-        # 投票フェーズに入ると、同じ票のまま変更を受け付けない
-        runner.state.phase = Phase.DAY_VOTE
+        runner.state.vote_order = [voter.user_id, first.user_id, second.user_id]
+        runner.state.vote_slot_index = 0
+        runner.state.vote_slot_token = 4
+        runner.state.vote_slot_active = True
+        runner.state.current_speaker_id = voter.user_id
         final = VoteView(runner, alive, alive)
-        self.assertEqual(final._vote_error(voter.user_id, first.user_id), "投票済みです。")
-        # 仮投票パネルもフェーズ違いで弾かれる
-        self.assertIsNotNone(provisional._vote_error(voter.user_id, first.user_id))
+        self.assertIsNone(final._vote_error(voter.user_id, first.user_id))
+        self.assertEqual(
+            final._vote_error(first.user_id, second.user_id),
+            "自分の番になってから投票できます。",
+        )
 
-    async def test_all_provisional_votes_end_the_discussion_early(self) -> None:
-        """生存者全員が仮投票を終えたら議論を切り上げる。"""
+    async def test_current_vote_is_visible_before_cursor_advances(self) -> None:
         runner = make_runner()
-        runner.state.phase = Phase.DAY_DISCUSSION
-        players = [add_player(runner, uid) for uid in (1, 2, 3)]
+        voter = add_player(runner, 1)
+        target = add_player(runner, 2)
+        runner.state.phase = Phase.DAY_VOTE
+        runner.state.vote_order = [voter.user_id, target.user_id]
+        runner.state.vote_slot_index = 0
+        runner.state.vote_slot_active = True
+        runner.state.current_speaker_id = voter.user_id
+        runner.state.votes = {voter.user_id: target.user_id}
 
-        view = VoteView(runner, players, players, provisional=True)
-        for voter, target in zip(players, [players[1], players[2], players[0]]):
-            await view.commit_vote(voter.user_id, target.user_id)
-            if voter is not players[-1]:
-                self.assertFalse(runner.state.vote_complete_event.is_set())
+        detail = runner._sequential_vote_detail()
 
-        self.assertTrue(runner.state.vote_complete_event.is_set())
+        self.assertIn(f"{voter.display_name} → {target.display_name}", detail)
 
-    async def test_vote_phase_keeps_votes_cast_before_it_started(self) -> None:
-        """議論中の仮投票と、復元した投票の両方をそのまま引き継ぐ。
+    async def test_vote_publication_failure_stops_without_advancing(self) -> None:
+        runner = make_runner()
+        voter = add_player(runner, 1)
+        target = add_player(runner, 2)
+        runner.state.phase = Phase.DAY_VOTE
+        runner.state.vote_order = [voter.user_id, target.user_id]
+        runner.state.vote_slot_index = 0
+        runner.state.vote_slot_token = 1
+        runner.state.vote_slot_active = True
+        runner.state.current_speaker_id = voter.user_id
+        view = VoteView(runner, [voter, target], [voter])
+        runner._refresh_sequential_vote_panel = AsyncMock(return_value=False)
 
-        投票フェーズは votes をクリアしない。議論中に入れた票が
-        持ち越され、全員そろっていればそのまま開示される。
-        """
+        result, committed = await view.commit_vote(voter.user_id, target.user_id)
+
+        self.assertTrue(committed)
+        self.assertIn("安全停止", result)
+        self.assertEqual(runner.state.votes[voter.user_id], target.user_id)
+        self.assertEqual(runner.state.vote_slot_index, 0)
+        self.assertFalse(runner.state.speech_done_event.is_set())
+
+    async def test_gm_skip_ends_current_vote_speech(self) -> None:
+        runner = make_runner()
+        voter = add_player(runner, 1)
+        gm = SimpleNamespace(id=99)
+        runner.state.gm_id = gm.id
+        runner.state.phase = Phase.DAY_VOTE
+        runner.state.vote_slot_active = True
+        runner.state.current_speaker_id = voter.user_id
+
+        result = await runner.force_skip_wait(gm)
+
+        self.assertIn("投票発言", result)
+        self.assertTrue(runner.state.speech_done_event.is_set())
+
+    async def test_empty_vote_queue_is_valid_until_someone_presses(self) -> None:
+        """発言順は「投票」を押した人だけの列。空のままでも復元を止めない。"""
+        runner = make_runner()
+        runner.state.day_generation = 2
+        payload = {
+            "players": [{"user_id": 1, "number": 1}],
+            "vote_day_generation": 2,
+            "vote_order": [],
+        }
+
+        runner._validate_vote_snapshot(payload, Phase.DAY_VOTE, [])
+
+    async def test_unknown_voter_in_vote_queue_fails_closed(self) -> None:
+        runner = make_runner()
+        runner.state.day_generation = 2
+        payload = {
+            "players": [{"user_id": 1, "number": 1}],
+            "vote_day_generation": 2,
+            "vote_order": [1, 7],
+        }
+        with self.assertRaisesRegex(StateDurabilityError, "重複なし順列"):
+            runner._validate_vote_snapshot(payload, Phase.DAY_VOTE, [1, 7])
+
+    async def test_removed_vote_target_requeues_completed_voter(self) -> None:
+        runner = make_runner()
+        voter = add_player(runner, 1)
+        target = add_player(runner, 2)
+        later = add_player(runner, 3)
+        runner.state.phase = Phase.DAY_VOTE
+        runner.state.vote_order = [voter.user_id, later.user_id]
+        runner.state.vote_slot_index = 1
+        runner.state.votes = {voter.user_id: target.user_id}
+        runner._apply_death_effect = AsyncMock()
+        runner.state.check_win = lambda: None
+
+        await runner._eliminate_player_mid_game(target, "テスト")
+
+        self.assertNotIn(voter.user_id, runner.state.votes)
+        self.assertEqual(
+            runner.state.vote_order,
+            [later.user_id, voter.user_id],
+        )
+        self.assertEqual(runner.state.vote_slot_index, 0)
+
+    async def test_removed_target_keeps_current_voter_in_current_slot(self) -> None:
+        runner = make_runner()
+        voter = add_player(runner, 1)
+        target = add_player(runner, 2)
+        later = add_player(runner, 3)
+        runner.state.phase = Phase.DAY_VOTE
+        runner.state.vote_order = [voter.user_id, later.user_id]
+        runner.state.vote_slot_index = 0
+        runner.state.vote_slot_active = True
+        runner.state.current_speaker_id = voter.user_id
+        runner.state.votes = {voter.user_id: target.user_id}
+        runner._apply_death_effect = AsyncMock()
+        runner.state.check_win = lambda: None
+
+        await runner._eliminate_player_mid_game(target, "テスト")
+
+        self.assertNotIn(voter.user_id, runner.state.votes)
+        self.assertEqual(runner.state.vote_order, [voter.user_id, later.user_id])
+        self.assertEqual(runner.state.vote_slot_index, 0)
+        self.assertFalse(runner.state.speech_done_event.is_set())
+
+    async def test_removed_vote_target_requeue_rolls_back_on_save_failure(self) -> None:
+        runner = make_runner()
+        voter = add_player(runner, 1)
+        target = add_player(runner, 2)
+        later = add_player(runner, 3)
+        runner.state.phase = Phase.DAY_VOTE
+        runner.state.vote_order = [voter.user_id, later.user_id]
+        runner.state.vote_slot_index = 1
+        runner.state.votes = {voter.user_id: target.user_id}
+        runner._persist_room_state = AsyncMock(side_effect=RuntimeError("DB down"))
+        runner._stop_for_durability_error = AsyncMock()
+
+        await runner._eliminate_player_mid_game(target, "テスト")
+
+        self.assertTrue(target.alive)
+        self.assertEqual(runner.state.votes, {voter.user_id: target.user_id})
+        self.assertEqual(runner.state.vote_order, [voter.user_id, later.user_id])
+
+    async def test_requeued_voter_order_remains_valid_for_restart(self) -> None:
+        runner = make_runner()
+        runner.state.day_generation = 4
+        payload = {
+            "players": [
+                {"user_id": 1, "number": 1},
+                {"user_id": 2, "number": 2},
+            ],
+            "vote_day_generation": 4,
+            "vote_order": [2, 1],
+            "vote_slot_index": 0,
+            "vote_slot_token": 3,
+            "vote_slot_active": False,
+        }
+
+        runner._validate_vote_snapshot(payload, Phase.DAY_VOTE, [2, 1])
+
+    async def test_vote_phase_reuses_saved_order_and_cursor(self) -> None:
         runner = make_runner()
         first = add_player(runner, 1)
         second = add_player(runner, 2)
         runner.state.votes = {first.user_id: second.user_id}
-        runner._pausable_countdown = AsyncMock(return_value=True)
+        runner.state.day_generation = 3
+        runner.state.vote_day_generation = 3
+        runner.state.vote_order = [first.user_id, second.user_id]
+        runner.state.vote_slot_index = 1
+        runner._grant_speaker = AsyncMock()
+        runner._clear_speaker = AsyncMock()
+
+        async def finish_current(*args, **kwargs):
+            runner.state.speech_done_event.set()
+            return False
+
+        runner._pausable_countdown = AsyncMock(side_effect=finish_current)
 
         executed = await runner._day_vote()
 
         self.assertEqual(executed, second.user_id)
         self.assertEqual(runner.state.votes, {first.user_id: second.user_id})
+        self.assertEqual(runner.state.vote_order, [first.user_id, second.user_id])
+        runner._grant_speaker.assert_awaited_once_with(second.member)
+
+    async def test_vote_queue_keeps_press_order(self) -> None:
+        """発言順は「投票」を押した順。二重押しと死亡者は弾く。"""
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_VOTE
+        first = add_player(runner, 1)
+        second = add_player(runner, 2)
+        third = add_player(runner, 3)
+        third.alive = False
+
+        self.assertIn("1番目", await runner.join_vote_queue(second.member))
+        self.assertIn("2番目", await runner.join_vote_queue(first.member))
+        self.assertIn("すでに", await runner.join_vote_queue(second.member))
+        self.assertIn("投票権がありません", await runner.join_vote_queue(third.member))
+
+        self.assertEqual(runner.state.vote_order, [second.user_id, first.user_id])
+        self.assertEqual(runner._vote_queue_waiting(), [])
+
+        # 枠を使い切った人には「並んでいる」と返さない (棄権は取り消せない)
+        runner.state.vote_slot_index = 2
+        self.assertIn("終了しています", await runner.join_vote_queue(second.member))
+
+    async def test_day_vote_waits_until_someone_presses(self) -> None:
+        """列が空の間は誰も発言させず、押された順にそのまま進む。"""
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_VOTE
+        runner.state.day_generation = 1
+        one = add_player(runner, 1)
+        two = add_player(runner, 2)
+        three = add_player(runner, 3)
+        runner._grant_speaker = AsyncMock()
+        runner._clear_speaker = AsyncMock()
+        runner._play_se = Mock()
+        spoken: list[int] = []
+
+        async def cast(*_args, **_kwargs) -> bool:
+            speaker_id = runner.state.current_speaker_id
+            spoken.append(speaker_id)
+            runner.state.votes[speaker_id] = (
+                three.user_id if speaker_id != three.user_id else one.user_id
+            )
+            return True
+
+        runner._pausable_countdown = AsyncMock(side_effect=cast)
+
+        task = asyncio.create_task(runner._day_vote())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        self.assertFalse(task.done())
+        self.assertEqual(spoken, [])
+
+        await runner.join_vote_queue(two.member)
+        await runner.join_vote_queue(one.member)
+        await runner.join_vote_queue(three.member)
+        executed = await asyncio.wait_for(task, timeout=1)
+
+        self.assertEqual(spoken, [two.user_id, one.user_id, three.user_id])
+        self.assertEqual(executed, three.user_id)
+
+    async def test_gm_skip_closes_vote_while_waiting(self) -> None:
+        """誰も押さず詰んだときだけ、GMが締め切って集計へ進める。"""
+        runner = make_runner()
+        gm = SimpleNamespace(id=99)
+        runner.state.gm_id = gm.id
+        runner.state.phase = Phase.DAY_VOTE
+        add_player(runner, 1)
+
+        result = await runner.force_skip_wait(gm)
+
+        self.assertIn("締め切り", result)
+        self.assertTrue(runner.state.vote_closed)
+        self.assertTrue(runner.state.vote_queue_event.is_set())
+
+    async def test_gm_status_shows_players_who_have_not_pressed(self) -> None:
+        """GMは「あと何人が押していないか」で締切要否を判断する。"""
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_VOTE
+        first = add_player(runner, 1)
+        add_player(runner, 2)
+        add_player(runner, 3)
+        runner.state.vote_order = [first.user_id]
+        runner.state.vote_slot_index = 1
+
+        embed = build_gm_status_embed(runner)
+        fields = {field.name: field.value for field in embed.fields}
+
+        self.assertIn("1 / 3人完了", fields["投票発言"])
+        self.assertIn("未押下 2人", fields["投票発言"])
+
+    async def test_vote_queue_button_rejects_without_extra_api_call(self) -> None:
+        """死亡者・締切後の押下はdeferより前に弾く (1押下=1API)。"""
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_VOTE
+        alive = add_player(runner, 1)
+        dead = add_player(runner, 2)
+        dead.alive = False
+        button = VoteQueueView(runner).children[0]
+
+        def make_interaction(member) -> SimpleNamespace:
+            return SimpleNamespace(
+                user=member,
+                response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+                followup=SimpleNamespace(send=AsyncMock()),
+            )
+
+        dead_press = make_interaction(dead.member)
+        await button.callback(dead_press)
+        dead_press.response.send_message.assert_awaited_once()
+        dead_press.response.defer.assert_not_awaited()
+
+        runner.state.vote_closed = True
+        closed_press = make_interaction(alive.member)
+        await button.callback(closed_press)
+        closed_press.response.defer.assert_not_awaited()
+        self.assertEqual(runner.state.vote_order, [])
+
+    async def test_paused_exclusion_still_returns_vote_slot(self) -> None:
+        """一時停止中の除外でも、票を失った人へ再投票枠を積み直す。"""
+        runner = make_runner()
+        voter = add_player(runner, 1)
+        target = add_player(runner, 2)
+        later = add_player(runner, 3)
+        runner.state.phase = Phase.PAUSED
+        runner.state.phase_before_pause = Phase.DAY_VOTE
+        runner.state.vote_order = [voter.user_id, later.user_id]
+        runner.state.vote_slot_index = 1
+        runner.state.votes = {voter.user_id: target.user_id}
+        runner._apply_death_effect = AsyncMock()
+        runner.state.check_win = lambda: None
+
+        await runner._eliminate_player_mid_game(target, "テスト")
+
+        self.assertNotIn(voter.user_id, runner.state.votes)
+        self.assertEqual(runner.state.vote_order, [later.user_id, voter.user_id])
+        self.assertEqual(runner.state.vote_slot_index, 0)
+
+    async def test_gm_close_while_waiting_tallies_votes_cast_so_far(self) -> None:
+        """締切後は待機を抜け、押した人ぶんの票だけで集計する。"""
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_VOTE
+        runner.state.day_generation = 1
+        gm = SimpleNamespace(id=99)
+        runner.state.gm_id = gm.id
+        one = add_player(runner, 1)
+        add_player(runner, 2)
+        three = add_player(runner, 3)
+        runner._grant_speaker = AsyncMock()
+        runner._clear_speaker = AsyncMock()
+        runner._play_se = Mock()
+
+        async def cast(*_args, **_kwargs) -> bool:
+            runner.state.votes[runner.state.current_speaker_id] = three.user_id
+            return True
+
+        runner._pausable_countdown = AsyncMock(side_effect=cast)
+
+        task = asyncio.create_task(runner._day_vote())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await runner.join_vote_queue(one.member)
+        for _ in range(100):
+            if runner.state.vote_slot_index == 1 and not runner.state.vote_slot_active:
+                break
+            await asyncio.sleep(0)
+
+        result = await runner.force_skip_wait(gm)
+        executed = await asyncio.wait_for(task, timeout=1)
+
+        self.assertIn("締め切り", result)
+        self.assertEqual(runner.state.votes, {one.user_id: three.user_id})
+        self.assertEqual(executed, three.user_id)
+        self.assertEqual(
+            await runner.force_skip_wait(gm), "⏳ 現在スキップできる時間待ちはありません。"
+        )
+
+    async def test_resume_after_tally_does_not_recount_execution(self) -> None:
+        """集計後・遺言前に落ちても、同じ処刑を二重に積まない。"""
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_VOTE
+        runner.state.recovery_phase = Phase.DAY_VOTE
+        voter = add_player(runner, 1)
+        target = add_player(runner, 2)
+        runner.state.votes = {voter.user_id: target.user_id}
+        runner.state.vote_order = [voter.user_id]
+        runner.state.vote_slot_index = 1
+        runner.state.pending_execution_target = target.user_id
+        runner.state.day_execution_resolved = False
+        # 集計時に積まれた記録が既にある (プレイボーナスの基礎データ)
+        runner.state.decisive_executions = [{
+            "day": runner.state.day_number,
+            "target": target.user_id,
+            "voters": [voter.user_id],
+        }]
+        runner._day_vote = AsyncMock()
+        runner._last_will = AsyncMock()
+        runner._execute_player = AsyncMock()
+        runner._end_game = AsyncMock()
+        runner.state.check_win = lambda: Team.VILLAGE
+
+        await runner._resume_recovered_game()
+
+        runner._day_vote.assert_not_awaited()
+        self.assertEqual(len(runner.state.decisive_executions), 1)
+        runner._last_will.assert_awaited_once()
+
+    async def test_vote_queue_state_survives_snapshot_round_trip(self) -> None:
+        """途中まで並んだ列・締切・再投票待ちを、DB検証込みで復元する。"""
+        source = make_runner()
+        source.state.phase = Phase.DAY_VOTE
+        source.state.day_generation = 1
+        source.state.vote_day_generation = 1
+        first = add_player(source, 1)
+        second = add_player(source, 2)
+        add_player(source, 3)  # まだ「投票」を押していない生存者
+        source.state.vote_order = [first.user_id, second.user_id]
+        source.state.vote_slot_index = 1
+        source.state.vote_slot_token = 4
+        source.state.votes = {first.user_id: second.user_id}
+        source.state.vote_requeue_ids = {first.user_id}
+        source.state.mute_marker_enabled = True
+        source.state.gm_id = 99
+        snapshot = source._build_room_snapshot()
+        snapshot["phase"] = Phase.DAY_VOTE.name
+
+        # 本番と同じDB側の検証を通す (型・重複・ID形式)
+        database._validate_room_snapshot(Phase.DAY_VOTE.name, snapshot)
+
+        restored = make_runner()
+        restored.state.guild = FakeGuild(
+            [player.member for player in source.state.players.values()]
+            + [FakeMember(99)],
+            [],
+        )
+        restored.state.village_channel = object()
+        restored.state.spirit_channel = object()
+        restored._assign_alive_role = AsyncMock()
+        restored._prepare_game_vc_permissions = AsyncMock()
+        restored._apply_spirit_blocks = AsyncMock()
+        restored._post_lobby_ui = AsyncMock()
+        restored._repost_gm_panel = AsyncMock()
+        restored._enable_mute_markers = AsyncMock()
+        restored._reconcile_mute_marker_ownership = AsyncMock()
+        restored._reconcile_mute_intents = AsyncMock()
+        restored._disable_recovered_turn_panel = AsyncMock()
+        restored._reconcile_pending_death_effects = AsyncMock()
+
+        await restored.restore_from_snapshot(snapshot)
+
+        self.assertEqual(restored.state.vote_order, [first.user_id, second.user_id])
+        self.assertEqual(restored.state.vote_slot_index, 1)
+        self.assertEqual(restored.state.vote_requeue_ids, {first.user_id})
+        self.assertFalse(restored.state.vote_closed)
+        # 進行中だった枠は満額でやり直すのでactiveは倒れている
+        self.assertFalse(restored.state.vote_slot_active)
+        # まだ押していない3番だけが待機対象として残る
+        self.assertEqual(
+            [player.user_id for player in restored._vote_queue_waiting()], [3]
+        )
+
+    async def test_gm_skip_does_not_close_vote_before_cursor_advances(self) -> None:
+        """枠終了〜cursor更新の間に押しても、並んでいる人の枠を捨てない。"""
+        runner = make_runner()
+        gm = SimpleNamespace(id=99)
+        runner.state.gm_id = gm.id
+        runner.state.phase = Phase.DAY_VOTE
+        speaker = add_player(runner, 1)
+        waiting = add_player(runner, 2)
+        runner.state.vote_order = [speaker.user_id, waiting.user_id]
+        # ミュート戻し・cursor更新の途中: activeは下りたが列は未消化
+        runner.state.vote_slot_index = 0
+        runner.state.vote_slot_active = False
+
+        result = await runner.force_skip_wait(gm)
+
+        self.assertNotIn("締め切り", result)
+        self.assertFalse(runner.state.vote_closed)
+
+    async def test_exclusion_wakes_vote_queue_wait(self) -> None:
+        """最後の未押下者が抜けたら、GMを待たず自動で投票を終える。"""
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_VOTE
+        runner.state.day_generation = 1
+        one = add_player(runner, 1)
+        two = add_player(runner, 2)
+        three = add_player(runner, 3)
+        runner._grant_speaker = AsyncMock()
+        runner._clear_speaker = AsyncMock()
+        runner._play_se = Mock()
+        runner._apply_death_effect = AsyncMock()
+        runner.state.check_win = lambda: None
+
+        async def cast(*_args, **_kwargs) -> bool:
+            runner.state.votes[runner.state.current_speaker_id] = three.user_id
+            return True
+
+        runner._pausable_countdown = AsyncMock(side_effect=cast)
+
+        task = asyncio.create_task(runner._day_vote())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await runner.join_vote_queue(one.member)
+        await runner.join_vote_queue(three.member)
+        for _ in range(100):
+            if runner.state.vote_slot_index == 2 and not runner.state.vote_slot_active:
+                break
+            await asyncio.sleep(0)
+
+        # 残るは未押下の two だけ。除外されたら待機を続ける理由がない
+        await runner._eliminate_player_mid_game(two, "テスト")
+        executed = await asyncio.wait_for(task, timeout=1)
+
+        self.assertFalse(runner.state.vote_closed)
+        self.assertEqual(executed, three.user_id)
+
+    async def test_vote_slot_is_returned_when_own_target_is_removed(self) -> None:
+        """自分の枠の中で投票先が除外されたら、棄権にせず枠を積み直す。"""
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_VOTE
+        runner.state.day_generation = 1
+        voter = add_player(runner, 1)
+        target = add_player(runner, 2)
+        third = add_player(runner, 3)
+        runner._grant_speaker = AsyncMock()
+        runner._clear_speaker = AsyncMock()
+        runner._play_se = Mock()
+        runner._apply_death_effect = AsyncMock()
+        runner.state.check_win = lambda: None
+        spoken: list[int] = []
+
+        async def cast(*_args, **_kwargs) -> bool:
+            speaker_id = runner.state.current_speaker_id
+            spoken.append(speaker_id)
+            if speaker_id == voter.user_id and len(spoken) == 1:
+                # 自分の枠の中で投票 → その直後に投票先が除外される
+                runner.state.votes[speaker_id] = target.user_id
+                await runner._eliminate_player_mid_game(target, "テスト")
+            else:
+                runner.state.votes[speaker_id] = third.user_id
+            return True
+
+        runner._pausable_countdown = AsyncMock(side_effect=cast)
+
+        task = asyncio.create_task(runner._day_vote())
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await runner.join_vote_queue(voter.member)
+        await runner.join_vote_queue(third.member)
+        executed = await asyncio.wait_for(task, timeout=1)
+
+        # 票を失った voter が末尾でもう一度発言している
+        self.assertEqual(spoken, [voter.user_id, third.user_id, voter.user_id])
+        self.assertEqual(runner.state.votes[voter.user_id], third.user_id)
+        self.assertEqual(executed, third.user_id)
+
+    async def test_gm_skip_does_not_close_vote_during_active_slot(self) -> None:
+        """投票確定直後の数百msに押しても、投票全体を締め切らない。"""
+        runner = make_runner()
+        gm = SimpleNamespace(id=99)
+        runner.state.gm_id = gm.id
+        runner.state.phase = Phase.DAY_VOTE
+        voter = add_player(runner, 1)
+        add_player(runner, 2)
+        runner.state.vote_order = [voter.user_id]
+        runner.state.vote_slot_active = True
+        runner.state.current_speaker_id = voter.user_id
+        # 票を確定した直後: speech_done_eventだけが立った状態
+        runner.state.speech_done_event.set()
+
+        result = await runner.force_skip_wait(gm)
+
+        self.assertNotIn("締め切り", result)
+        self.assertFalse(runner.state.vote_closed)
+
+    async def test_non_boolean_vote_closed_fails_closed(self) -> None:
+        runner = make_runner()
+        runner.state.day_generation = 2
+        payload = {
+            "players": [{"user_id": 1, "number": 1}],
+            "vote_day_generation": 2,
+            "vote_order": [],
+            "vote_closed": "yes",
+        }
+        with self.assertRaisesRegex(StateDurabilityError, "vote_closed"):
+            runner._validate_vote_snapshot(payload, Phase.DAY_VOTE, [])
+
+    async def test_vote_speech_cue_plays_before_unmuting_speaker(self) -> None:
+        """交代の合図SEはミュート解除より前に鳴らす (解除待ちを無音にしない)。"""
+        runner = make_runner()
+        first = add_player(runner, 1)
+        second = add_player(runner, 2)
+        runner.state.day_generation = 3
+        runner.state.vote_day_generation = 3
+        runner.state.vote_order = [first.user_id, second.user_id]
+        runner.state.vote_slot_index = 0
+        events: list[str] = []
+        runner._play_se = Mock(side_effect=lambda scene: events.append(f"se:{scene}"))
+
+        async def record_grant(member) -> None:
+            events.append(f"grant:{member.id}")
+
+        runner._grant_speaker = AsyncMock(side_effect=record_grant)
+        runner._clear_speaker = AsyncMock()
+        runner._pausable_countdown = AsyncMock(return_value=False)
+
+        executed = await runner._day_vote()
+
+        self.assertIsNone(executed)
+        self.assertEqual(
+            events,
+            [
+                "se:speech", f"grant:{first.user_id}",
+                "se:speech", f"grant:{second.user_id}",
+            ],
+        )
 
     async def test_runoff_random_target_is_checkpointed_before_announcement(self) -> None:
         """告知中に落ちても、抽選結果はすでに復元可能であること。"""
@@ -1749,6 +2723,63 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(runner.state.pending_execution_target, second.user_id)
         self.assertEqual(events, ["checkpoint", "announcement"])
+
+    async def test_runoff_candidates_do_not_have_vote_rights(self) -> None:
+        runner = make_runner()
+        first = add_player(runner, 1)
+        second = add_player(runner, 2)
+        voter = add_player(runner, 3)
+        runner.state.phase = Phase.DAY_RUNOFF_VOTE
+        runner.state.runoff_candidates = [first.user_id, second.user_id]
+        runner._pausable_countdown = AsyncMock(return_value=False)
+
+        await runner._runoff(
+            [first.user_id, second.user_id], resume_vote=True
+        )
+
+        sent_view = next(
+            call.kwargs["view"]
+            for call in runner._safe_village_send.await_args_list
+            if call.kwargs.get("view") is not None
+        )
+        self.assertEqual(sent_view.voters, {voter.user_id})
+        self.assertEqual(
+            sent_view._vote_error(first.user_id, second.user_id),
+            "投票権がありません。",
+        )
+
+    async def test_runoff_without_eligible_voters_does_not_wait(self) -> None:
+        runner = make_runner()
+        first = add_player(runner, 1)
+        second = add_player(runner, 2)
+        runner.state.phase = Phase.DAY_RUNOFF_VOTE
+        runner.state.runoff_candidates = [first.user_id, second.user_id]
+        runner._pausable_countdown = AsyncMock(return_value=True)
+
+        with patch("room_runner.secrets.choice", return_value=first):
+            executed = await runner._runoff(
+                [first.user_id, second.user_id], resume_vote=True
+            )
+
+        self.assertEqual(executed, first.user_id)
+        runner._pausable_countdown.assert_awaited_once()
+        self.assertTrue(runner.state.vote_complete_event.is_set())
+
+    async def test_recovered_runoff_speech_keeps_completed_cursor(self) -> None:
+        runner = make_runner()
+        first = add_player(runner, 1)
+        second = add_player(runner, 2)
+        voter = add_player(runner, 3)
+        runner.state.runoff_candidates = [first.user_id, second.user_id]
+        runner.state.runoff_speech_index = 1
+        runner._grant_speaker = AsyncMock()
+        runner._clear_speaker = AsyncMock()
+        runner._pausable_countdown = AsyncMock(return_value=True)
+
+        await runner._runoff(runner.state.runoff_candidates, resume_speech=True)
+
+        runner._grant_speaker.assert_awaited_once_with(second.member)
+        self.assertEqual(runner.state.runoff_speech_index, 2)
 
     async def test_runoff_with_no_living_candidates_has_no_execution(self) -> None:
         runner = make_runner()
@@ -2631,6 +3662,7 @@ class PauseResumePhaseConsistencyTest(unittest.IsolatedAsyncioTestCase):
 
             # ループは止まらず夜へ進み、冒頭で state.phase を上書きする
             runner.state.phase = Phase.NIGHT
+            runner.state.morning_ready_open = True
 
             await runner.resume_game()
 

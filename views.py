@@ -122,6 +122,55 @@ class DangerConfirmView(discord.ui.View):
         )
 
 
+async def _prompt_wolf_surrender(
+    cog: RoomRunner,
+    interaction: discord.Interaction,
+    expected_game_run_id: str,
+) -> None:
+    """実人狼本人のDMでだけ、サレンダー同意の最終確認を出す。"""
+    state = cog.state
+    player = state.get_player(interaction.user.id)
+    if (
+        not cog.is_current_game_view(expected_game_run_id)
+        or player is None
+        or not player.alive
+        or player.role != Role.WEREWOLF
+    ):
+        return await interaction.response.send_message(
+            "⏳ 現在この操作はできません。", ephemeral=True
+        )
+    if state.surrender_confirmed:
+        return await interaction.response.send_message(
+            "🏳️ サレンダーは既に成立しています。", ephemeral=True
+        )
+    if interaction.user.id in state.surrender_ids:
+        living_wolves = {p.user_id for p in state.alive_wolves()}
+        agreed = len(living_wolves & state.surrender_ids)
+        return await interaction.response.send_message(
+            f"🏳️ あなたは同意済みです（**{agreed} / {len(living_wolves)}人**）。",
+            ephemeral=True,
+        )
+
+    async def execute(confirm_interaction: discord.Interaction) -> None:
+        async with cog.action_lock:
+            result = await cog.submit_surrender(
+                confirm_interaction.user,
+                expected_game_run_id=expected_game_run_id,
+            )
+        await confirm_interaction.followup.send(result, ephemeral=True)
+
+    await interaction.response.send_message(
+        "⚠️ 生存中の実人狼全員が同意すると、村陣営の勝利として試合を終了し、"
+        "通常どおりレートへ反映します。サレンダーに同意しますか？",
+        view=DangerConfirmView(
+            interaction.user.id,
+            execute,
+            confirm_label="サレンダーに同意",
+        ),
+        ephemeral=True,
+    )
+
+
 class PrivateRoomInfoView(discord.ui.View):
     def __init__(self, manager: GameCog) -> None:
         super().__init__(timeout=None)
@@ -607,6 +656,7 @@ class LobbyVariantSelectView(discord.ui.View):
 _PHASE_LABELS = {
     Phase.LOBBY: "参加受付",
     Phase.PREPARATION: "役職確認・開始準備",
+    Phase.INITIAL_NIGHT: "0日目初夜（人狼の挨拶）",
     Phase.DAY_DISCUSSION: "昼の議論",
     Phase.DAY_VOTE: "投票",
     Phase.DAY_RUNOFF_SPEECH: "決戦弁明",
@@ -639,9 +689,35 @@ def build_gm_status_embed(cog: RoomRunner) -> discord.Embed:
     )
 
     if effective_phase in (Phase.DAY_VOTE, Phase.DAY_RUNOFF_VOTE):
-        alive_ids = {player.user_id for player in alive}
-        voted = len(alive_ids & set(state.votes))
-        embed.add_field(name="投票", value=f"{voted} / {len(alive_ids)}人", inline=True)
+        if effective_phase == Phase.DAY_VOTE:
+            # 列は押した人だけなので、分母は生存者数で出す。GMは
+            # 「あと何人が押していないか」を見て締切の要否を判断する。
+            queued = set(state.vote_order)
+            not_pressed = [
+                player for player in alive if player.user_id not in queued
+            ]
+            embed.add_field(
+                name="投票発言",
+                value=(
+                    f"{min(state.vote_slot_index, len(state.vote_order))}"
+                    f" / {len(alive)}人完了"
+                    + (f"（未押下 {len(not_pressed)}人）" if not_pressed else "")
+                    + ("\n締切済み" if state.vote_closed else "")
+                ),
+                inline=True,
+            )
+        else:
+            alive_ids = {player.user_id for player in alive}
+            alive_ids -= set(state.runoff_candidates)
+            voted = len(alive_ids & set(state.votes))
+            embed.add_field(name="投票", value=f"{voted} / {len(alive_ids)}人", inline=True)
+        if effective_phase == Phase.DAY_VOTE and state.current_speaker_id is not None:
+            speaker = state.get_player(state.current_speaker_id)
+            embed.add_field(
+                name="現在の投票者",
+                value=speaker.display_name if speaker is not None else "確認中",
+                inline=True,
+            )
     elif effective_phase == Phase.NIGHT:
         required = {player.user_id for player in alive}
         ready = len(required & state.morning_ready_ids)
@@ -763,7 +839,11 @@ class GMControlView(discord.ui.View):
         effective_phase = state.phase_before_pause if state.phase == Phase.PAUSED else state.phase
         self.pause_btn.disabled = state.paused or self._settlement_locked()
         self.resume_btn.disabled = not state.paused and state.pending_winner is None
-        self.force_morning_btn.disabled = effective_phase != Phase.NIGHT or self._settlement_locked()
+        self.force_morning_btn.disabled = (
+            effective_phase != Phase.NIGHT
+            or not getattr(state, "morning_ready_open", False)
+            or self._settlement_locked()
+        )
         self.force_prep_btn.disabled = (
             effective_phase != Phase.PREPARATION
             or state.paused
@@ -772,6 +852,25 @@ class GMControlView(discord.ui.View):
         turn_actions_open = getattr(cog, "turn_actions_open", None)
         self.next_turn_btn.disabled = not (
             callable(turn_actions_open) and turn_actions_open()
+        )
+        self.skip_wait_btn.disabled = not (
+            not state.paused
+            and (
+                (
+                    effective_phase == Phase.INITIAL_NIGHT
+                    and not getattr(state, "initial_night_completed", False)
+                )
+                or (
+                    # 発言中は現在の枠を、列が空の待機中は投票そのものを締め切る
+                    effective_phase == Phase.DAY_VOTE
+                    and not getattr(state, "vote_closed", False)
+                )
+                or (
+                    effective_phase in (Phase.DAY_RUNOFF_SPEECH, Phase.DAY_LAST_WILL)
+                    and getattr(state, "current_speaker_id", None) is not None
+                )
+            )
+            and not self._settlement_locked()
         )
         for item in (self.remove_btn, self.end_btn, self.reset_btn):
             item.disabled = self._settlement_locked()
@@ -878,7 +977,7 @@ class GMControlView(discord.ui.View):
             )
 
         await interaction.response.send_message(
-            "⚠️ 未確認者がいても役職確認を締め切り、議論を開始しますか？",
+            "⚠️ 未確認者がいても役職確認を締め切り、0日目初夜へ進みますか？",
             view=DangerConfirmView(
                 interaction.user.id, execute, confirm_label="締め切って開始"
             ),
@@ -905,6 +1004,28 @@ class GMControlView(discord.ui.View):
         await interaction.followup.send(
             result or "⏭️ 現在の発言を終了しました。", ephemeral=True
         )
+
+    @discord.ui.button(
+        label="スキップ",
+        style=discord.ButtonStyle.secondary,
+        custom_id="gm_skip_wait",
+        row=1,
+    )
+    async def skip_wait_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not self._is_current() or not self._is_gm(interaction):
+            return await interaction.response.send_message(
+                "現在のGMだけが操作できます。", ephemeral=True
+            )
+        if self._settlement_locked():
+            return await interaction.response.send_message(
+                "結果保存・精算中は操作できません。", ephemeral=True
+            )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        async with self.cog.action_lock:
+            result = await self.cog.force_skip_wait(interaction.user)
+        await interaction.followup.send(result, ephemeral=True)
 
     @discord.ui.button(label="強制終了", style=discord.ButtonStyle.danger, custom_id="gm_end", row=1)
     async def end_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -1176,11 +1297,58 @@ class VoteConfirmView(discord.ui.View):
         )
 
 
+class _VoteQueueButton(discord.ui.Button):
+    """「投票」= 投票発言の列へ並ぶ。誰かの発言中でも先に並べる。"""
+
+    def __init__(self, cog: RoomRunner) -> None:
+        # custom_idは候補ボタン (vote_<id>) と前方一致しない名前にする。
+        super().__init__(
+            label="🗳️ 投票", style=discord.ButtonStyle.success, custom_id="join_vote"
+        )
+        self.cog = cog
+        self.game_run_id = cog.state.game_run_id
+        self.day_generation = cog.state.day_generation
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        state = self.cog.state
+        # 公開パネルなので死亡者・観戦者にもボタンが見える。deferより前に
+        # 弾き、押されるたびにDiscord APIを2回使わないようにする。
+        if (
+            not self.cog.is_current_day_view(self.game_run_id, self.day_generation)
+            or self.cog._effective_phase() != Phase.DAY_VOTE
+            or state.vote_closed
+        ):
+            return await interaction.response.send_message(
+                "⏳ 今は投票を受け付けていません。", ephemeral=True
+            )
+        player = state.get_player(interaction.user.id)
+        if player is None or not player.alive:
+            return await interaction.response.send_message(
+                "⏳ 生存中の参加者だけが押せます。", ephemeral=True
+            )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        result = await self.cog.join_vote_queue(interaction.user)
+        await interaction.followup.send(result, ephemeral=True)
+
+
+class VoteQueueView(discord.ui.View):
+    """列が空のときの投票待ちパネル (並ぶボタンだけ)。"""
+
+    def __init__(self, cog: RoomRunner) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+        cog.register_game_view(self)
+        self.add_item(_VoteQueueButton(cog))
+
+
 class _BaseVoteView(discord.ui.View):
     expected_phase: Phase
     button_prefix: str
     button_style: discord.ButtonStyle
     persist_label: str
+    # 通常投票のパネルだけ、発言中の人の候補ボタンと並べて
+    # 「投票」(列へ並ぶ) を置く。決戦は一斉投票なので置かない。
+    with_queue_button: bool = False
 
     def __init__(
         self,
@@ -1190,12 +1358,10 @@ class _BaseVoteView(discord.ui.View):
         *,
         provisional: bool = False,
     ) -> None:
-        """provisional=True で議論中の仮投票パネルになる。
+        """通常投票・決戦投票の候補パネルを作る。
 
-        仮投票は**何度でも入れ替えられる**。議論の途中で心変わりできないと、
-        早く入れた人が話し合いから降りてしまうため。投票フェーズへ持ち越され、
-        そこで初めて確定 (変更不可) になる。全員が仮投票を終えた時点で
-        議論を切り上げる。
+        provisionalは旧snapshot/UIを安全に拒否する互換引数として残すが、
+        現行進行では議論中の仮投票パネルを生成しない。
         """
         super().__init__(timeout=None)
         self.cog = cog
@@ -1204,6 +1370,7 @@ class _BaseVoteView(discord.ui.View):
         cog.register_game_view(self)
         self.voters = {v.user_id for v in voters}
         self.provisional = provisional
+        self.vote_slot_token = int(getattr(cog.state, "vote_slot_token", 0))
         # 仮投票は議論フェーズ、確定は本来のフェーズでだけ受け付ける
         self.accept_phase = Phase.DAY_DISCUSSION if provisional else self.expected_phase
 
@@ -1216,6 +1383,8 @@ class _BaseVoteView(discord.ui.View):
             )
             btn.callback = self._make_callback(player.user_id)
             self.add_item(btn)
+        if self.with_queue_button:
+            self.add_item(_VoteQueueButton(cog))
 
     def _vote_error(self, voter_id: int, target_id: int) -> Optional[str]:
         state = self.cog.state
@@ -1226,6 +1395,18 @@ class _BaseVoteView(discord.ui.View):
             return "⏳ 現在この操作はできません。"
         if voter_id not in self.voters:
             return "投票権がありません。"
+        # 通常投票は列の先頭1人だけ受け付ける。slot tokenも照合し、
+        # 1つ前の投票者に残った古いボタンが次の人の枠へ作用しないようにする。
+        if (
+            not self.provisional
+            and self.expected_phase == Phase.DAY_VOTE
+            and (
+                not state.vote_slot_active
+                or state.current_speaker_id != voter_id
+                or self.vote_slot_token != state.vote_slot_token
+            )
+        ):
+            return "自分の番になってから投票できます。"
         # 仮投票は入れ替え自由。確定後 (投票フェーズ) だけ二重投票を弾く
         if voter_id in state.votes and not self.provisional:
             return "投票済みです。"
@@ -1305,15 +1486,25 @@ class _BaseVoteView(discord.ui.View):
                     False,
                 )
 
-            alive_voters = {
-                uid
-                for uid in self.voters
-                if state.get_player(uid) is not None and state.get_player(uid).alive
-            }
-            if alive_voters <= state.votes.keys():
-                # 仮投票でも全員そろえばイベントを立てる。議論はここで
-                # 切り上がり、投票フェーズは持ち越した票でそのまま開示される
-                state.vote_complete_event.set()
+            if not self.provisional and self.expected_phase == Phase.DAY_VOTE:
+                # 保存した票を同じ公開パネルへ反映してから、現在の20秒枠を
+                # 終了する。次の人へ進んだ後で表示すると、発言順と公開票の
+                # 対応が一瞬ずれるため、この順序は崩さない。
+                if not await self.cog._refresh_sequential_vote_panel():
+                    return (
+                        "⚠️ 投票は保存しましたが、公開できなかったため安全停止しました。"
+                        "GMが再開すると同じ順番から続けます。",
+                        True,
+                    )
+                state.speech_done_event.set()
+            else:
+                alive_voters = {
+                    uid
+                    for uid in self.voters
+                    if state.get_player(uid) is not None and state.get_player(uid).alive
+                }
+                if alive_voters <= state.votes.keys():
+                    state.vote_complete_event.set()
         if self.provisional:
             return (
                 f"✅ **{target_name}** に投票しました。\n"
@@ -1328,6 +1519,7 @@ class VoteView(_BaseVoteView):
     button_prefix = "vote"
     button_style = discord.ButtonStyle.primary
     persist_label = "投票"
+    with_queue_button = True
 
 
 class RunoffVoteView(_BaseVoteView):
@@ -1340,6 +1532,30 @@ class RunoffVoteView(_BaseVoteView):
 # ============================================================
 # 夜アクション: 人狼 (DM)
 # ============================================================
+
+class WolfSurrenderView(discord.ui.View):
+    """実人狼の役職DMへ付け、試合中いつでも使えるサレンダー操作。"""
+
+    def __init__(self, cog: RoomRunner) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.game_run_id = cog.state.game_run_id
+        cog.register_game_view(self)
+
+    @discord.ui.button(
+        label="🏳️ サレンダー",
+        style=discord.ButtonStyle.danger,
+        custom_id="wolf_surrender",
+    )
+    async def surrender_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        if not self.cog.is_current_game_view(self.game_run_id):
+            return await interaction.response.send_message(
+                "⏳ このゲームの操作は終了しています。", ephemeral=True
+            )
+        await _prompt_wolf_surrender(self.cog, interaction, self.game_run_id)
+
 
 class WolfVoteView(discord.ui.View):
     """各人狼のDMに送信される襲撃選択UI。
@@ -1384,6 +1600,16 @@ class WolfVoteView(discord.ui.View):
         if sender is None or not sender.alive or not sender.is_wolf:
             return None
         return sender
+
+    @discord.ui.button(
+        label="🏳️ サレンダー",
+        style=discord.ButtonStyle.danger,
+        row=1,
+    )
+    async def surrender_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await _prompt_wolf_surrender(self.cog, interaction, self.game_run_id)
 
     async def select_callback(self, interaction: discord.Interaction) -> None:
         state = self.cog.state
@@ -1842,7 +2068,7 @@ class GuardView(discord.ui.View):
 class PrepReadyView(discord.ui.View):
     """役職確認タイムの間 #昼 に掲示するパネル。
 
-    参加者全員が「役職を確認した」を押すと議論が始まる。目安時間が切れても
+    参加者全員が「役職を確認した」を押すと0日目初夜へ進む。目安時間が切れても
     自動では進まないので、DMを開けていない人を待てる。
     """
 
@@ -1886,23 +2112,18 @@ class PrepReadyView(discord.ui.View):
 # ============================================================
 
 class MorningReadyView(discord.ui.View):
-    """夜の間 `#昼` に1枚だけ掲示するパネル。
+    """夜の制限時間終了後、`#昼` に1枚だけ掲示するパネル。
 
-    生存者全員が「朝を迎える」を押すと夜が明ける。制限時間が切れても
-    自動では明けないので、離席したい人は押さずに待たせればよい
-    (一時停止の代わり)。AFKで止まったままにならないための強制夜明けは
+    生存者全員が「朝を迎える」を押すと夜が明ける。宣言は一方向で、
+    公開パネルの人数を押下ごとに更新する。AFKで止まったままにならないための強制夜明けは
     GMコントロールパネルの「朝」だけに置く (このパネルには参加者用の
     ボタンしか出さず、押せないボタンで紛らわせない)。
 
     夜は `#昼` の書き込みが止まっているが、**ボタン押下は送信権限とは
     無関係**なので押せる (同じ条件で PrepReadyView が動いている)。
 
-    **パネル本文は押下では編集しない。** 宣言人数を村へ出すと、夜に行動が
-    あるのが狼3・占い師・狩人の5人だけである以上、未宣言者の数から
-    生存役職が推定できてしまう。押した本人にも人数は返さず (押して
-    確かめて押し直せば測れてしまうため)、自分の操作が通ったかどうかだけを
-    ephemeralで返す。人数を出すのは目安時間切れの1回だけで、全員が同時に
-    知る (_reveal_morning_count)。
+    夜時間中はパネル自体が存在しないため、人数表示から夜行動の進捗を
+    読まれることはない。受付開始後は準備確認と同じ0/N表示にする。
     """
 
     def __init__(self, cog: RoomRunner) -> None:
@@ -1918,6 +2139,7 @@ class MorningReadyView(discord.ui.View):
             not self.cog.is_current_game_view(self.game_run_id)
             or self.cog.state.night_generation != self.night_generation
             or self.cog._effective_phase() != Phase.NIGHT
+            or not self.cog.state.morning_ready_open
         ):
             return await interaction.response.send_message("⏳ この夜のパネルは終了しています。", ephemeral=True)
         # 公開チャンネルのパネルなので死亡者・観戦者にもボタンが見える。
@@ -1936,7 +2158,7 @@ class MorningReadyView(discord.ui.View):
             timer.mark("lock")
             content, error = await self.cog.toggle_morning_ready(interaction.user)
             timer.mark("state")
-        # 成否どちらも本人にだけ返す (公開パネルは編集しない)
+        # 成否は本人へ返し、公開人数はrunner側が保存後に同じパネルへ反映する。
         await interaction.followup.send(error or content, ephemeral=True)
         timer.mark("reply")
         timer.finish()
@@ -1947,18 +2169,21 @@ class MorningReadyView(discord.ui.View):
 # ============================================================
 
 class WolfGuessSelectView(discord.ui.View):
-    """人狼予想の選択UI。押した本人にしか見えない ephemeral として出す。"""
+    """死亡者本人のDMにだけ送る人狼予想UI。"""
 
-    def __init__(self, cog: RoomRunner, user_id: int) -> None:
+    def __init__(self, cog: RoomRunner, user_id: int, death_event_id: str) -> None:
         super().__init__(timeout=WOLF_GUESS_TIMEOUT)
         self.cog = cog
         self.user_id = user_id
+        self.game_run_id = cog.state.game_run_id
+        self.death_event_id = death_event_id
         self.guess_slots = int(
             getattr(getattr(cog, "variant", None), "wolf_guess_slots", BONUS_WOLF_GUESS_SLOTS)
         )
         options = [
             discord.SelectOption(
-                label=f"{player.number:02d}. {player.display_name}"[:100],
+                # display_name自体が「01.名前」形式なので番号を重ねない。
+                label=player.display_name[:100],
                 value=str(player.user_id),
             )
             for player in sorted(cog.state.players.values(), key=lambda p: p.number)
@@ -1972,6 +2197,7 @@ class WolfGuessSelectView(discord.ui.View):
         )
         self.select.callback = self._on_select
         self.add_item(self.select)
+        cog.register_game_view(self)
 
     async def _on_select(self, interaction: discord.Interaction) -> None:
         if interaction.user.id != self.user_id:
@@ -1980,11 +2206,17 @@ class WolfGuessSelectView(discord.ui.View):
             )
             return
         targets = [int(value) for value in self.select.values]
-        accepted = await self.cog.submit_wolf_guess(self.user_id, targets)
+        accepted = await self.cog.submit_wolf_guess(
+            self.user_id,
+            targets,
+            game_run_id=self.game_run_id,
+            death_event_id=self.death_event_id,
+        )
         self.stop()
         if not accepted:
             await interaction.response.edit_message(
-                content="⏳ 受付時間が終わっているか、既に提出済みです。", view=None
+                content="⏳ この人狼予想の受付は終了しているか、既に提出済みです。",
+                view=None,
             )
             return
         names = "、".join(
@@ -1995,62 +2227,10 @@ class WolfGuessSelectView(discord.ui.View):
         await interaction.response.edit_message(
             content=(
                 f"✅ **{names}** で提出しました。\n"
-                "結果は試合終了後のレート変動に反映されます。霊界へどうぞ。"
+                "実際の人狼本人を除き、的中数が試合終了後のレート変動に反映されます。"
+                "霊界へどうぞ。"
             ),
             view=None,
-        )
-
-
-class WolfGuessView(discord.ui.View):
-    """死亡告知に添える人狼予想提出ボタン。
-
-    霊界の閲覧解放を止めているあいだ (WOLF_GUESS_TIMEOUT 秒) だけ有効。
-    霊界へ入ると先に死んだ人から答えを聞けてしまうので、提出はその前に締める。
-
-    **メッセージを増やさないため、処刑告知と朝の結果に相乗りさせる。**
-    ボタン自体は全員に見えるが、押せるのはいま保留中の死亡者だけで、
-    生存者・狼陣営・提出済みの人は ephemeral で弾く。
-    """
-
-    def __init__(self, cog: RoomRunner) -> None:
-        super().__init__(timeout=None)
-        self.cog = cog
-        self.game_run_id = cog.state.game_run_id
-        self.guess_slots = int(
-            getattr(getattr(cog, "variant", None), "wolf_guess_slots", BONUS_WOLF_GUESS_SLOTS)
-        )
-        self.submit_btn.label = f"🐺 {self.guess_slots}狼予想を提出"
-        cog.register_game_view(self)
-
-    @discord.ui.button(label="🐺 人狼予想を提出", style=discord.ButtonStyle.primary)
-    async def submit_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        cog = self.cog
-        if not cog.is_current_game_view(self.game_run_id):
-            await interaction.response.send_message(
-                "この村は既に終了しています。", ephemeral=True
-            )
-            return
-        state = cog.state
-        user_id = interaction.user.id
-        if user_id in state.wolf_guesses:
-            await interaction.response.send_message(
-                "この試合の人狼予想は提出済みです。", ephemeral=True
-            )
-            return
-        if user_id not in state.spirit_hold_ids:
-            await interaction.response.send_message(
-                "人狼予想は**亡くなった直後の村側プレイヤー**だけが提出できます。\n"
-                f"受付は死亡から{WOLF_GUESS_TIMEOUT // 60}分間です。",
-                ephemeral=True,
-            )
-            return
-        await interaction.response.send_message(
-            f"人狼だと思う{self.guess_slots}人を選んでください。\n"
-            "**確定すると変更できません。** 確定するとすぐ霊界へ入れます。",
-            view=WolfGuessSelectView(cog, user_id),
-            ephemeral=True,
         )
 
 
@@ -4038,7 +4218,7 @@ def build_rule_embeds(
             "COは初日2巡目と2日目以降に名前のみ公開。詳細はVCで話します。"
             f"本人はパス可、割り込みは村全体で1日 **{variant.turn_interrupts_per_day}回**（各30秒）。\n"
             "**仮投票はありません。** 規定の発言後に投票します。\n"
-            f"投票 **{VOTE_TIMEOUT}秒**（全員投票で即開示） ／ "
+            "通常投票 **1人20秒**（「投票」を押した順・確定ごとに公開） ／ "
             f"弁明 **{RUNOFF_SPEECH_TIME}秒** ／ 遺言 **{LAST_WILL_TIME}秒**（本人かGMが短縮可）\n"
             f"夜 **初日{NIGHT_BASE}秒 / 以降{NIGHT_MIN}秒**（目安。朝は全員の宣言で明ける）"
         )
@@ -4053,10 +4233,9 @@ def build_rule_embeds(
         )
         discussion_rule = (
             "朝の結果発表 → 議論 → 投票 →（同票なら弁明と決戦投票）→ 遺言 → 処刑 → 夜\n"
-            "**議論中から投票できます**（投票フェーズまでは入れ替え自由。"
-            "全員が入れ終わると議論を切り上げてそのまま開示します）\n"
+            "**議論中の仮投票はありません。** 議論後に「投票」を押した順で発言します。\n"
             f"議論 **初日{day_base_min}分 / 毎日{day_drop_min}分短縮 / 最低{day_min_min}分**"
-            f" ／ 投票 **{VOTE_TIMEOUT}秒**（全員投票で即開示）\n"
+            " ／ 通常投票 **1人20秒**（確定ごとに公開）\n"
             f"弁明 **{RUNOFF_SPEECH_TIME}秒** ／ 遺言 **{LAST_WILL_TIME}秒**（本人かGMが短縮可）\n"
             f"夜 **初日{NIGHT_BASE}秒 / 以降{NIGHT_MIN}秒**（目安。朝は全員の宣言で明ける）"
         )
@@ -4088,22 +4267,24 @@ def build_rule_embeds(
     embed.add_field(
         name="投票と処刑",
         value=(
-            "自分には投票できず、棄権ボタンもありません。\n"
-            "時間切れでは未投票者を公開し、既投票分だけで集計します"
-            "（1票もなければ処刑なし）。\n"
-            "同票なら候補者が順番に弁明してから決戦投票、**再び同票ならランダム**で処刑します。\n"
-            "処刑が確定した人には遺言時間があります。**処刑・襲撃された人の役職は非公開**です。"
+            "「🗳️ 投票」を押した順に1人20秒。自分の番に名前を押して確定すると"
+            "投票がすぐ公開され、次の人へ進みます（時間切れは棄権）。\n"
+            "ボタンはいつでも押せます。押した人がいなくなると全員ミュートで待機するので、"
+            "必ず押してください（棄権ボタンはなく、自分には投票できません）。\n"
+            f"同票なら候補者が順番に弁明し、候補者以外が一斉に**{VOTE_TIMEOUT}秒**で決戦投票します。"
+            "**再び同票ならランダム**で処刑します。\n"
+            "1票もなければ処刑なし。処刑が確定した人には遺言時間があります。"
+            "**処刑・襲撃された人の役職は非公開**です。"
         ),
         inline=False,
     )
     embed.add_field(
-        name="亡くなったら（村側）",
+        name="亡くなったら",
         value=(
-            f"**人狼だと思う{variant.wolf_guess_slots}人**を提出できます"
-            "（当たるとレートに加点。既に亡くなった人を選んでも構いません）。\n"
+            f"陣営に関係なく、DMで**人狼だと思う{variant.wolf_guess_slots}人**を提出できます"
+            "（実際の人狼本人を除き、的中するとレートに加点。既に亡くなった人も選べます）。\n"
             f"受付は**死亡から{WOLF_GUESS_TIMEOUT // 60}分**で、"
-            f"**提出するか時間切れになるまで `#{CH_SPIRIT}` へ入れません。**\n"
-            "ボタンは処刑の告知と朝の結果に付いています。提出は本人にしか見えません。"
+            f"**提出するか時間切れになるまで `#{CH_SPIRIT}` へ入れません。**"
         ),
         inline=False,
     )
@@ -4122,12 +4303,11 @@ def build_rule_embeds(
     embed.add_field(
         name="宣言で進みます",
         value=(
-            f"どちらも `#{CH_VILLAGE}` のパネル。**時間切れでは進みません**。\n"
-            "**📩 役職を確認した** — 参加者全員が押すと議論開始（**一度きり**）\n"
-            "**🌅 朝を迎える** — 生存者全員が押すと朝（押し直しで取り消せます）\n"
-            "離席したいときは押さずに待たせてください（これが一時停止の代わりです）。\n"
-            "**宣言した人数は夜の間は誰にも見えません。** "
-            "目安時間が切れたときに全員へ同時に表示されます。"
+            f"どちらも `#{CH_VILLAGE}` のパネル。宣言待ちは**時間切れでは進みません**。\n"
+            "**📩 役職を確認した** — 参加者全員が押すと0日目初夜へ（**一度きり**）\n"
+            "**🌅 朝を迎える** — 夜時間終了後に0/生存人数で表示。"
+            "押下ごとに人数更新し、全員が押すと朝（**取り消し不可**）\n"
+            "離席中は押さずに待たせてください。"
         ),
         inline=False,
     )
@@ -4146,15 +4326,15 @@ def build_help_embeds(
             "ターン制は**現在の話者だけ**発言できます。本人はパス、ほかの生存者は村全体で"
             f"1日{variant.turn_interrupts_per_day}回まで30秒割り込みができます。\n"
             "COは初日2巡目と2日目以降の「COを宣言」で名前のみ公開し、詳細はVCで話します。\n"
-            "投票・夜・一時停止中は全員ミュート。死亡者・観戦者は終了まで発言できません。"
-            "GMのミュートだけは手動です。"
+            "投票・弁明・遺言は発言中の本人だけ。夜と一時停止中は全員ミュート。\n"
+            "死亡者・観戦者は終了まで発言できません（GMのミュートだけは手動）。"
         )
         gm_turn_help = " / 次の発言へ"
     else:
         speech_help = (
-            "議論中は生存者のみ、弁明・遺言は本人のみ発言できます。\n"
-            "投票・夜・一時停止中は全員ミュート。死亡者・観戦者は終了まで発言できません。"
-            "GMのミュートだけは手動です。"
+            "議論中は生存者のみ、投票・弁明・遺言は発言中の本人のみ発言できます。\n"
+            "夜と一時停止中は全員ミュート。死亡者・観戦者は終了まで発言できません"
+            "（GMのミュートだけは手動）。"
         )
         gm_turn_help = ""
     embed3 = discord.Embed(
@@ -4165,19 +4345,23 @@ def build_help_embeds(
     embed3.add_field(
         name=f"{BOT_VERSION}の変更",
         value=(
-            "GM村と募集を `GM/#村作成` へ統合し、募集カードを各村の `#参加受付` へ移しました。"
-            "公開3形式・参加ランクプリセット・募集通知に対応し、正常終了した全村を"
-            "統計・ランキング・レート・ランクへ反映します。終了ログも全村で公開保存します。"
+            "**0日目初夜30秒**（人狼の挨拶のみ）を追加しました。\n"
+            "通常投票は「🗳️ 投票」を押した順に**1人20秒**で発言・確定する方式になり、"
+            "決戦は弁明30秒→候補者以外の一斉投票になりました。\n"
+            "「朝を迎える」は夜の時間が終わってから **0/生存人数** で出ます（取消不可）。\n"
+            "GMメニューに**スキップ**、人狼のDMに**サレンダー**を追加。"
+            "人狼予想は陣営に関係なくDMだけで受け付けます。"
         ),
         inline=False,
     )
     embed3.add_field(
         name="DMに届くもの",
         value=(
-            "役職確認、人狼の相談と襲撃、占い・護衛、霊媒結果はDMです。\n"
-            f"**{variant.wolf_guess_slots}狼予想と終了後の投票はDMではなく "
-            f"`#{CH_VILLAGE}` のボタン**で行います"
-            "（操作内容は本人にしか見えません）。\n"
+            "役職確認、人狼の相談と襲撃、占い・護衛、霊媒結果、"
+            f"死亡後の**{variant.wolf_guess_slots}狼予想**はDMです。\n"
+            "生存中の人狼はDMの**🏳️ サレンダー**に全員同意すると村陣営の勝利になります。\n"
+            f"終了後の投票は `#{CH_VILLAGE}` のボタンで行います"
+            "（投票内容は本人にしか見えません）。\n"
             "未行動でも朝を迎えられますが、**狩人だけは護衛先を確定するまで進めません。**"
         ),
         inline=False,
@@ -4201,7 +4385,7 @@ def build_help_embeds(
         value=(
             f"受付中は `#{CH_LOBBY}` の「GM管理」で除外・リセット。\n"
             f"ゲーム中は `#{CH_VILLAGE}` の「GMメニュー・状況」から一時停止 / 再開 / 朝"
-            f" / 役職確認を締切{gm_turn_help} / 強制終了 / リセット / 除外ができます。"
+            f" / 役職確認を締切 / スキップ{gm_turn_help} / 強制終了 / リセット / 除外ができます。"
         ),
         inline=False,
     )
@@ -4348,12 +4532,13 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
     rate.add_field(
         name="人狼予想",
         value=(
-            f"村側で亡くなると、`#{CH_VILLAGE}` のボタンから"
+            "処刑・襲撃で亡くなり、まだ勝敗が決まっていなければ、陣営に関係なくDMで"
             "**人狼だと思う人数を変種ごとの枠数で**提出できます。\n"
             f"受付は**死亡から{WOLF_GUESS_TIMEOUT // 60}分**で、"
             "**提出するか時間切れになるまで霊界へ入れません**"
             "（霊界で答えを聞けてしまわないようにするためです）。\n"
             "選ぶ相手は既に亡くなった人でも構いません。狂人は正解に含みません。"
+            "実際の人狼本人は提出できますが、採点対象外です。"
         ),
         inline=False,
     )

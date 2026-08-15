@@ -15,7 +15,7 @@ from room_config import (
 )
 
 # Botのバージョン (ヘルプに表示。ソース公開された派生でも識別できるように)
-BOT_VERSION = "v0.40"
+BOT_VERSION = "v0.41"
 
 # 新規導入先に同名カテゴリが既にある場合、無関係なDiscord構成をBot所有と
 # 誤認しない。既存運用は保存済みchannel IDで自動再利用できる。
@@ -41,6 +41,7 @@ class Team(Enum):
 class Phase(Enum):
     LOBBY = auto()
     PREPARATION = auto()
+    INITIAL_NIGHT = auto()    # 0日目: 人狼の挨拶専用（能力行使なし）
     DAY_DISCUSSION = auto()
     DAY_VOTE = auto()
     DAY_RUNOFF_SPEECH = auto()
@@ -267,6 +268,9 @@ DISCORD_MESSAGE_LIMIT = 2000
 
 # タイマー設定 (秒)
 PREPARATION_TIME = 30
+# 役職確認後、1日目の議論より前に置く人狼の挨拶専用時間。
+# この間は人狼DMの自由文中継だけを開き、襲撃・占い・護衛は行わない。
+INITIAL_NIGHT_GREETING_TIME = 30
 # 13人クロストークの従来互換エイリアス。ゲーム進行は各変種の
 # ``crosstalk_discussion_seconds`` を使うため、新規の変種設定には使わない。
 DAY_DISCUSSION_BASE, DAY_DISCUSSION_DECREASE, DAY_DISCUSSION_MIN = (
@@ -307,9 +311,10 @@ SLOW_INTERACTION_SECONDS = 2.0
 # Trueでは起動前にdavey/PyNaCl/libopusを検査し、欠落時はBotを起動しない。
 # Falseでは依存検査とSE再生を行わず、無音で運用する。
 SE_ENABLED = True
-VOTE_TIMEOUT = 60              # 投票制限時間 (秒)
+VOTE_TIMEOUT = 60              # 決戦の一斉投票制限時間 (秒)
+VOTE_SPEECH_TIME = 20          # 通常投票で1人ずつ発言・投票する時間 (秒)
 CHANNEL_DELETE_DELAY = 300     # 結果発表後の削除待ち (秒)
-# 3狼提出の受付時間 (秒)。死亡した瞬間から数え、この間だけ #霊界 を開けない。
+# 人狼予想の受付時間 (秒)。死亡した瞬間から数え、この間だけ #霊界 を開けない。
 # 霊界へ入れてしまうと先に死んだ人から答えを聞けるので、提出は必ずこの窓の中で
 # 締める。提出するか時間切れになった時点で解放する
 WOLF_GUESS_TIMEOUT = 120
@@ -532,12 +537,12 @@ BONUS_WOLF_EXECUTION_VOTE = 2
 # 6回目の議論に到達したときの人狼 (狂人は対象外)
 BONUS_FINAL_DAY_WOLF = 2
 BONUS_FINAL_DAY_THRESHOLD = 6
-# 3狼提出の的中1人につき。初日・2日目に死亡した人は倍率をかける
+# 人狼予想の的中1人につき。初日・2日目に死亡した人は倍率をかける
 BONUS_WOLF_GUESS_HIT = 1
 BONUS_WOLF_GUESS_SLOTS = 3
 BONUS_WOLF_GUESS_EARLY_MULTIPLIER = 2
 BONUS_WOLF_GUESS_EARLY_MAX_DAY = 2
-# 3狼提出の対象となる死因。除外 (途中離脱) は対象外
+# 人狼予想の対象となる死因。除外 (途中離脱) は対象外
 BONUS_WOLF_GUESS_DEATH_CAUSES = frozenset({"処刑", "襲撃"})
 # 狩人の護衛成功1回につき
 BONUS_GUARD_SUCCESS = 1
@@ -567,7 +572,7 @@ STATS_MIN_SAMPLES = 20
 
 # 項目別ランキングに載る最低サンプル数。1〜2戦の外れ値が上位を占めるのを防ぐ。
 # STATS_MIN_SAMPLES より緩いのは、母数が指標ごと (村での試合数・狼勝利数・
-# 3狼提出回数など) に分かれて全体の試合数より小さくなるため。
+# 人狼予想提出回数など) に分かれて全体の試合数より小さくなるため。
 LEADERBOARD_MIN_SAMPLES = 5
 LEADERBOARD_LIMIT = 10
 

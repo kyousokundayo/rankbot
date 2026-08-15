@@ -177,6 +177,8 @@ def _validate_room_snapshot(phase: str, payload: dict) -> None:
         "disconnected_players", "bot_muted_ids", "bot_mute_intent_ids",
         "last_game_roster",
         "runoff_candidates",
+        "vote_order",
+        "vote_requeue_ids",
     ):
         values = payload.get(key, [])
         if not isinstance(values, list) or any(not _is_snapshot_id(value) for value in values):
@@ -195,6 +197,23 @@ def _validate_room_snapshot(phase: str, payload: dict) -> None:
             or not _is_snapshot_id(row.get("target_id"))
         ):
             raise ValueError(f"votes[{index}] is invalid")
+    for key in (
+        "vote_day_generation", "vote_slot_index", "vote_slot_token",
+        "runoff_speech_index",
+    ):
+        value = payload.get(key, 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{key} must be a non-negative integer")
+    for key in ("vote_current_speaker_id", "vote_panel_message_id"):
+        value = payload.get(key)
+        if value is not None and not _is_snapshot_id(value):
+            raise ValueError(f"{key} must be an ID or null")
+    for key in ("vote_slot_active", "vote_closed"):
+        if key in payload and not isinstance(payload[key], bool):
+            raise ValueError(f"{key} is not boolean")
+    vote_order = payload.get("vote_order", [])
+    if len(vote_order) != len(set(vote_order)):
+        raise ValueError("vote_order contains duplicate IDs")
     for index, row in enumerate(payload.get("wolf_voters", [])):
         if (
             not isinstance(row, dict)
@@ -1606,7 +1625,7 @@ async def settle_game_settlement(
             )
         except Exception as exc:
             log.exception(
-                "3狼提出の的中集計に失敗しました (game_id=%s): %s", game_id, exc,
+                "人狼予想の的中集計に失敗しました (game_id=%s): %s", game_id, exc,
             )
             wolf_guess_hits = {}
 

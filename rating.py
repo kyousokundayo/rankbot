@@ -328,10 +328,10 @@ def count_wolf_guess_hits(
     *,
     wolf_guess_slots: int = BONUS_WOLF_GUESS_SLOTS,
 ) -> dict[int, int]:
-    """3狼提出の的中数を player_id -> 的中数 で返す。
+    """人狼予想の的中数を player_id -> 的中数 で返す。
 
     **提出した人は的中0でもキーを持つ** (統計の分母になるため)。
-    ボーナス計算と「3狼予想の的中率」の両方から使うので、
+    ボーナス計算と「人狼予想の的中率」の両方から使うので、
     誰の提出を有効とみなすかの判定はここへ集約する。
     """
     if isinstance(wolf_guess_slots, bool) or not isinstance(wolf_guess_slots, int) or wolf_guess_slots <= 0:
@@ -346,7 +346,9 @@ def count_wolf_guess_hits(
     for raw_id, raw_guess in (facts.get("wolf_guesses") or {}).items():
         guesser_id = _as_int(raw_id)
         record = by_id.get(guesser_id) if guesser_id is not None else None
-        if record is None or record.get("team") != Team.VILLAGE.value:
+        # 実人狼は答えを知っているため採点しない。狂人は人狼を知らず、
+        # 村役職と同じ条件で予想するため採点対象に含める。
+        if record is None or record.get("role") == Role.WEREWOLF.value:
             continue
         if record.get("death_cause") not in BONUS_WOLF_GUESS_DEATH_CAUSES:
             continue
@@ -420,7 +422,7 @@ def calculate_play_bonuses(
         for wolf_id in wolf_ids:
             add(wolf_id, BONUS_FINAL_DAY_WOLF)
 
-    # 3狼提出 (村陣営限定)。情報が少ない初日・2日目の死亡ほど倍率が高い
+    # 人狼予想 (実人狼を除く)。情報が少ない初日・2日目の死亡ほど倍率が高い
     for guesser_id, hits in count_wolf_guess_hits(
         player_records, facts, wolf_guess_slots=wolf_guess_slots,
     ).items():

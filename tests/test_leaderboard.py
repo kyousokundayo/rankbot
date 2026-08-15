@@ -231,6 +231,25 @@ class TestWolfGuessAccuracy(LeaderboardTestBase):
         board = await self.board("wolf_guess_accuracy")
         self.assertEqual(board["top"][0]["numerator"], 1)
 
+    async def test_madman_submission_counts_but_actual_wolf_is_excluded(self):
+        await self.play(
+            Team.VILLAGE,
+            {
+                MADMAN_ID: (2, "処刑"),
+                WOLF_IDS[0]: (3, "処刑"),
+            },
+            wolf_guesses={
+                MADMAN_ID: list(WOLF_IDS),
+                WOLF_IDS[0]: list(WOLF_IDS),
+            },
+        )
+
+        board = await self.board("wolf_guess_accuracy")
+        entries = {entry["player_id"]: entry for entry in board["top"]}
+        self.assertEqual(entries[MADMAN_ID]["numerator"], 3)
+        self.assertEqual(entries[MADMAN_ID]["denominator"], 3)
+        self.assertNotIn(WOLF_IDS[0], entries)
+
     async def test_nine_player_variant_uses_two_guess_slots(self):
         await self.play(
             Team.WOLF,

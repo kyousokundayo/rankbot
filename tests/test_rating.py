@@ -527,11 +527,20 @@ class TestCalculatePlayBonuses(unittest.TestCase):
                 )
                 self.assertEqual(bonuses.get(8), 6)
 
-    def test_wolf_guess_ignores_wolf_team(self):
-        """狼陣営は3狼提出の対象外 (狂人も含む)"""
+    def test_wolf_guess_scores_madman_who_does_not_know_wolves(self):
+        """人狼を知らない狂人は村役職と同じく採点する。"""
         records = make_records({MADMAN_ID: {"died_on_day": 1, "death_cause": "処刑"}})
         bonuses = rating_lib.calculate_play_bonuses(
             records, {"wolf_guesses": {MADMAN_ID: list(WOLF_IDS)}},
+        )
+        self.assertEqual(bonuses, {MADMAN_ID: 6})
+
+    def test_wolf_guess_ignores_actual_wolf_who_knows_answer(self):
+        """正解を知っている実人狼の提出は採点しない。"""
+        wolf_id = WOLF_IDS[0]
+        records = make_records({wolf_id: {"died_on_day": 1, "death_cause": "処刑"}})
+        bonuses = rating_lib.calculate_play_bonuses(
+            records, {"wolf_guesses": {wolf_id: list(WOLF_IDS)}},
         )
         self.assertEqual(bonuses, {})
 

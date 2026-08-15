@@ -160,13 +160,16 @@ class GameState:
         # プレイボーナスの材料。精算キューへ載せるのでスナップショットにも保存する。
         # decisive_executions: 投票で決まった処刑だけを積む
         #   ({"day", "target", "voters"})。0票・再同票のランダム処刑は入れない
-        # wolf_guesses: 3狼提出。死亡確定時に凍結した「死亡者ID -> 選んだ3人」
-        # spirit_hold_ids: 3狼提出のため霊界の閲覧解放を保留している死亡者。
+        # wolf_guesses: 人狼予想。死亡確定時に凍結した「死亡者ID -> 選んだ相手」
+        # spirit_hold_ids: 人狼予想のため霊界の閲覧解放を保留している死亡者。
         #   保留中だけ提出でき、提出か時間切れで解放する。霊界に入ってから
         #   先住者に答えを聞けてしまうと提出の意味が無くなるための仕組み
+        # spirit_hold_events: 保留を開始した死亡イベントID。古いDMが同じ試合や
+        #   次の試合の受付へ作用しないよう、提出時にgame_run_idと併せて照合する
         self.decisive_executions: list[dict] = []
         self.wolf_guesses: dict[int, list[int]] = {}
         self.spirit_hold_ids: set[int] = set()
+        self.spirit_hold_events: dict[int, str] = {}
 
         # チャンネル
         self.village_channel: Optional[discord.TextChannel] = None
@@ -179,6 +182,28 @@ class GameState:
         # 投票
         self.votes: dict[int, int] = {}          # voter_id -> target_id
         self.runoff_candidates: list[int] = []
+        self.runoff_speech_index: int = 0
+
+        # 通常投票のdurableな発言順とcursor。順番は「投票」ボタンを押した順で、
+        # 押した人から1人ずつ20秒だけ発言し、確定投票か時間切れで次へ進む。
+        # 列が空になったら次に押した人が来るまで待つ。進行中に落ちた場合は
+        # 完了済みcursorを維持し、未完了だった枠だけを満額でやり直す。
+        self.vote_day_generation: int = 0
+        self.vote_order: list[int] = []
+        self.vote_slot_index: int = 0
+        self.vote_slot_token: int = 0
+        self.vote_slot_active: bool = False
+        # GMが待機を打ち切って締め切った状態。未発言者は棄権として集計する。
+        self.vote_closed: bool = False
+        # 自分の発言枠の中で投票先が除外され、票だけ失った人。cursorを
+        # 進めた後でないと列を組み替えられないので、印だけ置いて
+        # _day_vote 側で末尾へ積み直す。
+        self.vote_requeue_ids: set[int] = set()
+        # 通常投票の公開パネルを再利用するためのメッセージID。
+        self.vote_panel_message_id: Optional[int] = None
+        # 現在枠の残り時間は表示更新用のプロセス内状態。復元時は同じ投票者の
+        # 20秒を満額でやり直すためsnapshotへは保存しない。
+        self.vote_remaining_seconds: float = 0.0
 
         # 決戦弁明・遺言・ターン制議論の現在話者。
         # ターン制では turn_slot_token も併用し、同じ人が2巡目に回ったときに
@@ -222,7 +247,20 @@ class GameState:
         # 拒否された操作もここへ残す (弾けていることの証跡になる)。
         self.action_log: list[dict] = []
 
-        # 朝を迎える宣言 (夜は生存者全員が押すまで明けない)
+        # 役職確認後・1日目開始前の「0日目初夜」。人狼の挨拶DM中継だけを
+        # 30秒開き、能力行使は一切行わない。完了状態を保存し、再起動後に
+        # 挨拶時間を二重実行して1日目の開始を遅らせない。
+        self.initial_night_completed: bool = False
+
+        # 生存中の実人狼によるサレンダー同意。全員同意で村陣営勝利として
+        # 通常精算する。途中経過はDMだけに留め、成立後だけ公開する。
+        self.surrender_ids: set[int] = set()
+        self.surrender_confirmed: bool = False
+        self.surrender_announced: bool = False
+
+        # 夜の目安時間が終わってから、朝を迎える宣言の受付を開く。
+        # 生存者全員が押すまで明けず、押下は一方向で取り消せない。
+        self.morning_ready_open: bool = False
         self.morning_ready_ids: set[int] = set()
         # 未行動のまま「朝を迎える」を押して警告を受けた人 (2度目の押下で確定)
         self.morning_warned_ids: set[int] = set()
@@ -265,8 +303,15 @@ class GameState:
         # 投票完了イベント
         self.vote_complete_event: asyncio.Event = asyncio.Event()
 
+        # 通常投票の列に誰かが並んだ (またはGMが締め切った) 合図。
+        # 列が空の待機中だけ待ち、起こされたら条件を見直す。
+        self.vote_queue_event: asyncio.Event = asyncio.Event()
+
         # 夜アクション完了イベント (未行動者への警告DMを省くかの判定に使う)
         self.night_complete_event: asyncio.Event = asyncio.Event()
+
+        # 0日目初夜をGMが早送りするためのイベント (完了boolは上で永続化)。
+        self.initial_night_skip_event: asyncio.Event = asyncio.Event()
 
         # 朝を迎えるイベント (生存者全員が宣言 or GMの強制で立つ)
         self.morning_ready_event: asyncio.Event = asyncio.Event()

@@ -16,7 +16,8 @@ import discord
 from config import (
     Role, Team, Phase, ROLE_TEAM,
     DISCORD_MESSAGE_LIMIT,
-    PREPARATION_TIME, CHANNEL_DELETE_DELAY, VOTE_TIMEOUT,
+    PREPARATION_TIME, INITIAL_NIGHT_GREETING_TIME,
+    CHANNEL_DELETE_DELAY, VOTE_TIMEOUT, VOTE_SPEECH_TIME,
     LOG_CATEGORY_VILLAGE, LOG_CATEGORY_SPIRIT,
     LOG_CATEGORY_LIMIT, LOG_CATEGORY_TRIM_TO,
     CH_VILLAGE, CH_SPIRIT, CH_LOBBY, VC_GAME,
@@ -33,11 +34,11 @@ from config import (
 )
 from models import Player, GameState, by_number
 from views import (
-    LobbyView, GMPanelEntryView, VoteView, RunoffVoteView,
-    WolfVoteView, SeerView, GuardView, SpeechDoneView,
+    LobbyView, GMPanelEntryView, VoteView, VoteQueueView, RunoffVoteView,
+    WolfVoteView, WolfSurrenderView, SeerView, GuardView, SpeechDoneView,
     TurnSpeechView,
     MorningReadyView, PrepReadyView, PostgameVotePanelView,
-    WolfGuessView,
+    WolfGuessSelectView,
     build_vote_result_embed,
 )
 import database
@@ -329,11 +330,16 @@ class RoomRunner:
         # snapshot構築からDB commitまでを直列化し、古い内容の遅い保存が
         # 新しい受付済み状態を後勝ちで上書きしないようにする。
         self.state_persist_lock = asyncio.Lock()
-        # 3狼提出の受付が終わったら霊界を開けるタイマー。GCで消えないよう保持する
+        # 人狼予想の受付が終わったら霊界を開けるタイマー。GCで消えないよう保持する
         self._spirit_release_tasks: set[asyncio.Task] = set()
         # 終了後投票中に次ゲームを始めると旧#昼の投票パネルが削除されるため、
         # 受付が終わるまでは開始だけを止める。
         self._postgame_vote_pending = False
+        # サレンダー成立後の公開・ゲーム停止・通常精算を二重起動しない。
+        self._surrender_finish_task: Optional[asyncio.Task] = None
+        # サレンダー操作DMは1プロセスにつき各狼へ1通。再起動後は新しい
+        # game_run_id照合Viewが必要なので、この集合は永続化しない。
+        self._surrender_control_sent_ids: set[int] = set()
         self.state = GameState()
         self.state.room_id = self.room_def.room_id
         self.state.room_name = self.room_def.name
@@ -350,6 +356,9 @@ class RoomRunner:
         # ゲーム中に作成した全View。強制終了・外部勝敗確定・例外終了でも
         # 古いボタンが次ゲームへ作用しないよう、一元的に停止する。
         self._game_views: list[discord.ui.View] = []
+        # 投票待ちパネルのView。待機中だけ保持し、列が伸びたときの
+        # 公開更新でボタンを消さずに貼り直すために使う。
+        self._vote_queue_view: Optional[discord.ui.View] = None
 
     def is_private_room(self) -> bool:
         """GMが作成した名前村か。保存済みの村主IDで判定する。"""
@@ -1304,6 +1313,20 @@ class RoomRunner:
                 for voter_id, target_id in state.votes.items()
             ],
             "runoff_candidates": list(state.runoff_candidates),
+            "runoff_speech_index": state.runoff_speech_index,
+            "vote_day_generation": state.vote_day_generation,
+            "vote_order": list(state.vote_order),
+            "vote_closed": state.vote_closed,
+            "vote_requeue_ids": list(state.vote_requeue_ids),
+            "vote_slot_index": state.vote_slot_index,
+            "vote_slot_token": state.vote_slot_token,
+            "vote_slot_active": state.vote_slot_active,
+            "vote_current_speaker_id": (
+                state.current_speaker_id
+                if self._effective_phase() == Phase.DAY_VOTE
+                else None
+            ),
+            "vote_panel_message_id": state.vote_panel_message_id,
             "turn_day_generation": state.turn_day_generation,
             "turn_anchor_number": state.turn_anchor_number,
             "next_turn_anchor_number": state.next_turn_anchor_number,
@@ -1329,6 +1352,10 @@ class RoomRunner:
                 for player_id, targets in state.wolf_guesses.items()
             ],
             "spirit_hold_ids": list(state.spirit_hold_ids),
+            "spirit_hold_events": [
+                {"player_id": player_id, "event_id": event_id}
+                for player_id, event_id in state.spirit_hold_events.items()
+            ],
             "wolf_target": state.wolf_target,
             "wolf_voters": [
                 {"user_id": user_id, "target_id": target_id}
@@ -1337,6 +1364,11 @@ class RoomRunner:
             "seer_target": state.seer_target,
             "guard_target": state.guard_target,
             "action_log": state.action_log,
+            "initial_night_completed": state.initial_night_completed,
+            "surrender_ids": list(state.surrender_ids),
+            "surrender_confirmed": state.surrender_confirmed,
+            "surrender_announced": state.surrender_announced,
+            "morning_ready_open": state.morning_ready_open,
             "morning_ready_ids": list(state.morning_ready_ids),
             "morning_warned_ids": list(state.morning_warned_ids),
             "morning_confirmed": state.morning_confirmed,
@@ -1514,6 +1546,129 @@ class RoomRunner:
                 or normalized_current_id == expected_speaker_id
             ):
                 raise StateDurabilityError("割り込み中の話者状態が不正です")
+
+    def _validate_vote_snapshot(
+        self,
+        payload: dict,
+        saved_phase: Phase,
+        raw_order: list[int],
+    ) -> None:
+        """通常投票の発言順とcursorを推測修復せず検証する。"""
+        try:
+            generation = int(payload.get("vote_day_generation", 0))
+            slot_index = int(payload.get("vote_slot_index", 0))
+            slot_token = int(payload.get("vote_slot_token", 0))
+        except (TypeError, ValueError) as error:
+            raise StateDurabilityError("投票順snapshotの数値形式が不正です") from error
+        if min(generation, slot_index, slot_token) < 0:
+            raise StateDurabilityError("投票順snapshotのcursorに負数があります")
+        if generation > self.state.day_generation:
+            raise StateDurabilityError("投票順snapshotの日世代が未来を指しています")
+
+        snapshot_player_ids = {
+            int(row["user_id"])
+            for row in payload.get("players", [])
+            if isinstance(row, dict) and row.get("user_id") is not None
+        }
+        if len(raw_order) != len(set(raw_order)) or not set(raw_order) <= snapshot_player_ids:
+            raise StateDurabilityError("保存済み投票順序が参加者の重複なし順列ではありません")
+        if saved_phase == Phase.DAY_VOTE and generation != self.state.day_generation:
+            raise StateDurabilityError("進行中の通常投票の日世代が一致しません")
+        if slot_index > len(raw_order):
+            raise StateDurabilityError("投票順snapshotのcursorが順序の範囲外です")
+        # 発言順は「投票」を押した人だけの部分列なので、生存者が全員
+        # 入っている必要はない。まだ押していない人は復元後に押して並ぶ。
+        if not isinstance(payload.get("vote_closed", False), bool):
+            raise StateDurabilityError("vote_closedがboolではありません")
+
+        active = bool(payload.get("vote_slot_active", False))
+        speaker_id = payload.get("vote_current_speaker_id")
+        if active:
+            if saved_phase != Phase.DAY_VOTE or slot_index >= len(raw_order):
+                raise StateDurabilityError("投票発言中snapshotのフェーズまたはcursorが不正です")
+            if speaker_id != raw_order[slot_index]:
+                raise StateDurabilityError("投票発言中snapshotの話者が順序と一致しません")
+        elif speaker_id is not None:
+            raise StateDurabilityError("非アクティブな投票snapshotに話者が残っています")
+
+        panel_id = payload.get("vote_panel_message_id")
+        if panel_id is not None and (
+            isinstance(panel_id, bool)
+            or not isinstance(panel_id, int)
+            or panel_id <= 0
+        ):
+            raise StateDurabilityError("投票パネルIDが不正です")
+
+    def _validate_night_surrender_snapshot(self, payload: dict) -> None:
+        """初夜・朝待機・サレンダーの勝敗境界を型変換せず検証する。"""
+        for key in (
+            "initial_night_completed",
+            "surrender_confirmed",
+            "surrender_announced",
+            "morning_ready_open",
+        ):
+            value = payload.get(key, False)
+            if not isinstance(value, bool):
+                raise StateDurabilityError(f"{key}がboolではありません")
+
+        rows = payload.get("players", [])
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise StateDurabilityError("サレンダーsnapshotの参加者一覧が不正です")
+        try:
+            snapshot_ids = {int(row["user_id"]) for row in rows}
+        except (KeyError, TypeError, ValueError) as error:
+            raise StateDurabilityError("サレンダーsnapshotの参加者IDが不正です") from error
+
+        raw_surrender_ids = payload.get("surrender_ids", [])
+        if not isinstance(raw_surrender_ids, list) or any(
+            isinstance(player_id, bool) or not isinstance(player_id, int)
+            for player_id in raw_surrender_ids
+        ):
+            raise StateDurabilityError("surrender_idsが整数ID配列ではありません")
+        if len(raw_surrender_ids) != len(set(raw_surrender_ids)):
+            raise StateDurabilityError("surrender_idsに重複があります")
+        surrender_ids = set(raw_surrender_ids)
+        if not surrender_ids <= snapshot_ids:
+            raise StateDurabilityError("surrender_idsに参加者外のIDがあります")
+
+        real_wolf_ids = {
+            int(row["user_id"])
+            for row in rows
+            if row.get("role") == Role.WEREWOLF.name
+        }
+        if not surrender_ids <= real_wolf_ids:
+            raise StateDurabilityError("実人狼以外のサレンダー同意が保存されています")
+
+        announced = payload.get("surrender_announced", False)
+        confirmed = payload.get("surrender_confirmed", False)
+        if announced and not confirmed:
+            raise StateDurabilityError("未成立のサレンダーが告知済みになっています")
+        if confirmed:
+            living_real_wolves = {
+                int(row["user_id"])
+                for row in rows
+                if row.get("role") == Role.WEREWOLF.name
+                and row.get("alive", True) is True
+            }
+            if not living_real_wolves or not living_real_wolves <= surrender_ids:
+                raise StateDurabilityError(
+                    "成立済みサレンダーと生存実人狼の同意が一致しません"
+                )
+            if payload.get("pending_winner") != Team.VILLAGE.name:
+                raise StateDurabilityError(
+                    "成立済みサレンダーの村勝利checkpointがありません"
+                )
+
+        raw_ready_ids = payload.get("morning_ready_ids", [])
+        if not isinstance(raw_ready_ids, list) or any(
+            isinstance(player_id, bool) or not isinstance(player_id, int)
+            for player_id in raw_ready_ids
+        ):
+            raise StateDurabilityError("morning_ready_idsが整数ID配列ではありません")
+        if len(raw_ready_ids) != len(set(raw_ready_ids)):
+            raise StateDurabilityError("morning_ready_idsに重複があります")
+        if raw_ready_ids and not payload.get("morning_ready_open", False):
+            raise StateDurabilityError("朝待機開始前の宣言が保存されています")
 
     async def _persist_room_state(self) -> None:
         async with self.state_persist_lock:
@@ -1696,6 +1851,7 @@ class RoomRunner:
         if saved_phase_name == Phase.PAUSED.name and recovery_phase_name:
             saved_phase_name = recovery_phase_name
         saved_phase = Phase[saved_phase_name]
+        self._validate_night_surrender_snapshot(payload)
         if saved_phase in (Phase.LOBBY, Phase.GAME_OVER):
             state.phase = Phase.LOBBY
             state.recovery_phase = None
@@ -1718,6 +1874,40 @@ class RoomRunner:
             if row.get("voter_id") is not None and row.get("target_id") is not None
         }
         state.runoff_candidates = [int(pid) for pid in payload.get("runoff_candidates", [])]
+        state.runoff_speech_index = int(payload.get("runoff_speech_index", 0))
+        if state.runoff_speech_index > len(state.runoff_candidates):
+            raise StateDurabilityError("決戦弁明cursorが候補順の範囲外です")
+        if saved_phase == Phase.DAY_RUNOFF_SPEECH and not state.runoff_candidates:
+            raise StateDurabilityError("進行中の決戦弁明順序が保存されていません")
+        try:
+            raw_vote_order = [
+                int(player_id) for player_id in payload.get("vote_order", [])
+            ]
+        except (TypeError, ValueError) as error:
+            raise StateDurabilityError("保存済み投票順序の形式が不正です") from error
+        self._validate_vote_snapshot(payload, saved_phase, raw_vote_order)
+        state.vote_day_generation = int(payload.get("vote_day_generation", 0))
+        raw_vote_slot_index = int(payload.get("vote_slot_index", 0))
+        state.vote_order = [
+            player_id for player_id in raw_vote_order if player_id in state.players
+        ]
+        state.vote_slot_index = sum(
+            1
+            for player_id in raw_vote_order[:raw_vote_slot_index]
+            if player_id in state.players
+        )
+        state.vote_slot_token = int(payload.get("vote_slot_token", 0))
+        state.vote_closed = bool(payload.get("vote_closed", False))
+        state.vote_requeue_ids = {
+            int(player_id) for player_id in payload.get("vote_requeue_ids", [])
+            if int(player_id) in state.players
+        }
+        # 進行中だった枠は同じcursorから20秒を満額でやり直す。
+        state.vote_slot_active = False
+        state.vote_panel_message_id = (
+            int(payload["vote_panel_message_id"])
+            if payload.get("vote_panel_message_id") is not None else None
+        )
         try:
             raw_turn_order = [
                 int(player_id) for player_id in payload.get("turn_order", [])
@@ -1822,6 +2012,13 @@ class RoomRunner:
         # 保留中に落ちた場合は復元時に解放する (`_release_spirit_holds`)。
         # 再起動を挟んでまで提出を待つと、その間に霊界の話を聞けてしまう
         state.spirit_hold_ids = {int(pid) for pid in payload.get("spirit_hold_ids", [])}
+        state.spirit_hold_events = {
+            int(row["player_id"]): str(row["event_id"])
+            for row in payload.get("spirit_hold_events", [])
+            if isinstance(row, dict)
+            and row.get("player_id") is not None
+            and row.get("event_id")
+        }
         state.wolf_target = payload.get("wolf_target")
         state.wolf_voters = {
             int(row["user_id"]): int(row["target_id"])
@@ -1831,6 +2028,16 @@ class RoomRunner:
         state.seer_target = payload.get("seer_target")
         state.guard_target = payload.get("guard_target")
         state.action_log = list(payload.get("action_log", []))
+        state.initial_night_completed = bool(
+            payload.get("initial_night_completed", False)
+        )
+        state.surrender_ids = {
+            int(player_id) for player_id in payload.get("surrender_ids", [])
+            if isinstance(player_id, int)
+        }
+        state.surrender_confirmed = bool(payload.get("surrender_confirmed", False))
+        state.surrender_announced = bool(payload.get("surrender_announced", False))
+        state.morning_ready_open = bool(payload.get("morning_ready_open", False))
         state.morning_ready_ids = set(payload.get("morning_ready_ids", []))
         state.morning_warned_ids = set(payload.get("morning_warned_ids", []))
         state.morning_confirmed = bool(payload.get("morning_confirmed", False))
@@ -1899,6 +2106,39 @@ class RoomRunner:
 
         await self._reconcile_pending_death_effects()
 
+        # 死亡checkpoint直後・サレンダー再判定前に落ちた場合も、復元した
+        # 生存実人狼の集合で全員同意を補完し、通常進行へ戻さない。
+        living_wolf_ids = {wolf.user_id for wolf in state.alive_wolves()}
+        if state.surrender_confirmed and (
+            not living_wolf_ids
+            or not living_wolf_ids <= state.surrender_ids
+        ):
+            # snapshot自体が整合していても、復元時にサーバー不在者を除いた
+            # 実際の参加者集合が変わることがある。生存実人狼がいない状態を
+            # サレンダー村勝利として精算せず、推測修復しない。
+            raise StateDurabilityError(
+                "復元後の生存実人狼と成立済みサレンダー同意が一致しません"
+            )
+        if (
+            not state.surrender_confirmed
+            and living_wolf_ids
+            and living_wolf_ids <= state.surrender_ids
+        ):
+            state.surrender_confirmed = True
+            state.pending_winner = Team.VILLAGE
+            await self._persist_room_state()
+
+        # サレンダーは成立理由の公開を伴うため、汎用pending_winnerより先に
+        # 回収する。成立checkpoint直後〜finish task起動前のクラッシュにも対応。
+        if state.surrender_confirmed:
+            state.recovered_from_restart = False
+            state.recovery_phase = None
+            await self._safe_village_send(
+                "♻️ **成立済みのサレンダー結果を自動精算します。**"
+            )
+            await self._finish_surrender()
+            return
+
         # 勝敗確定後の保存失敗スナップショットは、通常ゲームとして
         # 復元しない。GMが退出済みでも、保存済みのwinner/run_idで
         # 終了精算を自動再試行し、進行デッドロックを作らない。
@@ -1923,6 +2163,8 @@ class RoomRunner:
             await self.force_end(reason)
             return
 
+        await self._send_surrender_controls()
+
         # 復元: 一時「生存」ロールを再付与 (再開時に発言制御が効くように)
         # #霊界 の生存者ブロックも現在の生死に合わせて再適用する
         await self._assign_alive_role()
@@ -1931,6 +2173,7 @@ class RoomRunner:
         # 再起動をまたいでまで提出を待つと、その間に霊界の話を聞けてしまうため、
         # 未提出のぶんは0点で確定させる
         state.spirit_hold_ids.clear()
+        state.spirit_hold_events.clear()
         await self._apply_spirit_blocks(required=self.is_private_room())
         await self._post_lobby_ui()
         if state.village_channel:
@@ -2309,6 +2552,18 @@ class RoomRunner:
         state.pending_death_effects.clear()
         state.day1_executed_id = None
         state.night1_killed_id = None
+        state.initial_night_completed = False
+        state.initial_night_skip_event.clear()
+        state.surrender_ids.clear()
+        state.surrender_confirmed = False
+        state.surrender_announced = False
+        self._surrender_control_sent_ids.clear()
+        self._surrender_finish_task = None
+        state.morning_ready_open = False
+        state.morning_ready_ids.clear()
+        state.morning_warned_ids.clear()
+        state.morning_confirmed = False
+        state.morning_ready_event.clear()
         state.prep_ready_ids.clear()
         state.prep_confirmed = False
         state.prep_ready_event.clear()
@@ -2346,8 +2601,7 @@ class RoomRunner:
             return
 
         progress_message = await self._safe_village_send(
-            "⏳ **ゲーム開始準備中 (1/3)**\n"
-            "ニックネーム・初期ミュート・進行用ロールを順番に設定しています。"
+            "⏳ **ゲーム開始準備中 (1/3)** プレイヤー設定中…"
         )
 
         # これ以降のBot muteは、muteと同一PATCHで専用ロールを
@@ -2538,7 +2792,7 @@ class RoomRunner:
 
         progress_message = await self._safe_timer_edit(
             progress_message,
-            "⏳ **ゲーム開始準備中 (2/3)**\n役職DMを送信しています。",
+            "⏳ **ゲーム開始準備中 (2/3)** 役職DMを送信中…",
         )
 
         # DM送信
@@ -2579,7 +2833,7 @@ class RoomRunner:
         # 取りこぼし (改名失敗・直前入室など) だけを同期する
         progress_message = await self._safe_timer_edit(
             progress_message,
-            "⏳ **ゲーム開始準備中 (3/3)**\nVC権限を仕上げています。",
+            "⏳ **ゲーム開始準備中 (3/3)** VC権限を調整中…",
         )
         # 統合PATCHに失敗した参加者、またはロール作成が一時失敗した場合だけ
         # add_rolesへフォールバックする。
@@ -2744,9 +2998,8 @@ class RoomRunner:
             state.managed_game_channel_ids.add(state.spirit_channel.id)
             try:
                 await state.spirit_channel.send(
-                    "👻 ここは **霊界** です。死亡したプレイヤーと観戦者だけが見えます。\n"
-                    "生存者には見えないので、役職や推理の話も自由にどうぞ。\n"
-                    "(ネタバレ防止のため、生存者へのDM等での情報共有は禁止です)"
+                    "👻 **霊界** — 死亡者と観戦者だけが見えます。役職や推理の話も自由に"
+                    "どうぞ（生存者へのDMなどでの共有は禁止）。"
                 )
             except (discord.Forbidden, discord.HTTPException) as e:
                 log.warning(f"霊界の案内送信失敗 ({state.room_name}): {e}")
@@ -2788,20 +3041,25 @@ class RoomRunner:
             if player.is_wolf:
                 msg += f"\n🐺 他の人狼: {wolf_names}"
                 msg += (
-                    "\n\n夜の制限時間中、このDMにメッセージを送ると他の人狼に中継されます。"
+                    "\n🐺 0日目初夜と夜の制限時間中は、このDMが他の人狼へ中継されます。"
                 )
             msg += (
-                "\n\n━━━━━━━━━━\n"
-                "📩 **議論は参加者全員の宣言で始まります。**\n"
-                "この役職を確認したら #昼 の「役職を確認した」を押してください。\n"
-                "\n"
-                "🌅 **朝は生存者全員の宣言で明けます。**\n"
-                "夜の行動が終わったら、毎晩 #昼 に出るパネルの「朝を迎える」を押してください。\n"
-                "席を外したいときは「朝を迎える」を押さずにお待ちください "
-                "(こちらは押し直しで取り消せます。役職確認は一度きりです)。"
+                "\n\n📩 確認したら #昼 の「役職を確認した」を押してください"
+                "（全員が押すと0日目初夜へ進みます）。"
             )
             try:
-                await self._discord_api_call(player.member.send, msg)
+                surrender_view = (
+                    WolfSurrenderView(self)
+                    if player.role == Role.WEREWOLF
+                    else None
+                )
+                await self._discord_api_call(
+                    player.member.send,
+                    msg,
+                    **({"view": surrender_view} if surrender_view is not None else {}),
+                )
+                if surrender_view is not None:
+                    self._surrender_control_sent_ids.add(player.user_id)
                 state.preparation_dm_sent_ids.add(player.user_id)
             except (discord.Forbidden, discord.HTTPException) as e:
                 log.warning(f"DM送信失敗: {player.member.display_name} ({e})")
@@ -2843,6 +3101,29 @@ class RoomRunner:
                 failed.append(seer.member)
         return failed
 
+    async def _send_surrender_controls(self) -> None:
+        """復元後も使える、試合中常設のサレンダー操作を実人狼へ補完する。"""
+        if self.state.surrender_confirmed:
+            return
+        for wolf in self.state.alive_wolves():
+            if wolf.user_id in self._surrender_control_sent_ids:
+                continue
+            view = WolfSurrenderView(self)
+            try:
+                await self._discord_api_call(
+                    wolf.member.send,
+                    "🏳️ **サレンダー** — 生存中の人狼全員が同意すると村陣営の勝利で終了します。",
+                    view=view,
+                )
+                self._surrender_control_sent_ids.add(wolf.user_id)
+            except (discord.Forbidden, discord.HTTPException) as error:
+                view.stop()
+                log.warning(
+                    "サレンダー操作DM送信失敗 (%s): %s",
+                    wolf.display_name,
+                    error,
+                )
+
     # ============================================================
     # 人狼DM中継
     # ============================================================
@@ -2861,11 +3142,10 @@ class RoomRunner:
         """人狼DMの本文。現在の襲撃先を常に最新の状態で表示する"""
         return (
             f"🌙 **夜フェーズ** (制限時間 {self._format_timer(duration)})\n"
-            "襲撃対象をプルダウンから選んでください。夜の間は何度でも変更できます。\n"
-            "**最後に選択された対象** が夜明けに襲撃されます。\n"
-            "このDMに送ったメッセージは他の人狼に中継されます。\n"
-            "**制限時間を過ぎると、中継も襲撃先の変更通知も止まります**"
-            "（選び直しはできますが仲間には伝わりません）。\n"
+            "プルダウンで襲撃対象を選択（何度でも変更でき、"
+            "**最後に選んだ対象**が夜明けに襲撃されます）。\n"
+            "**制限時間を過ぎると相談の中継と襲撃先の変更通知が止まります**"
+            "（選び直しは可能ですが仲間には伝わりません）。\n"
             f"\n🎯 現在の襲撃先: {self._current_wolf_target_label()}"
         )
 
@@ -2891,6 +3171,125 @@ class RoomRunner:
         ]
         if targets:
             await asyncio.gather(*(edit_one(uid, msg) for uid, msg in targets))
+
+    async def submit_surrender(
+        self,
+        member: discord.Member,
+        *,
+        expected_game_run_id: str,
+    ) -> str:
+        """生存中の実人狼のサレンダー同意を保存し、全員同意なら通常精算する。"""
+        state = self.state
+        player = state.get_player(member.id)
+        if (
+            not self.is_current_game_view(expected_game_run_id)
+            or player is None
+            or not player.alive
+            or player.role != Role.WEREWOLF
+        ):
+            return "⏳ 現在この操作はできません。"
+        if state.surrender_confirmed:
+            return "🏳️ サレンダーは既に成立しています。"
+
+        living_wolves = {wolf.user_id for wolf in state.alive_wolves()}
+        if member.id in state.surrender_ids:
+            agreed = len(living_wolves & state.surrender_ids)
+            return f"🏳️ あなたは同意済みです（**{agreed} / {len(living_wolves)}人**）。"
+
+        old_ids = set(state.surrender_ids)
+        old_confirmed = state.surrender_confirmed
+        old_pending_winner = state.pending_winner
+        state.surrender_ids.add(member.id)
+        agreed = len(living_wolves & state.surrender_ids)
+        completed = bool(living_wolves and living_wolves <= state.surrender_ids)
+        if completed:
+            state.surrender_confirmed = True
+            # サレンダー成立と村勝利意図を同じcheckpointへ保存する。
+            # finish task起動前に落ちても、復元時は通常進行へ戻さない。
+            state.pending_winner = Team.VILLAGE
+        try:
+            await self._persist_room_state()
+        except Exception as error:
+            state.surrender_ids = old_ids
+            state.surrender_confirmed = old_confirmed
+            state.pending_winner = old_pending_winner
+            log.exception("サレンダー同意の保存に失敗: %s", error)
+            return "❌ サレンダー同意を保存できませんでした。もう一度お試しください。"
+
+        if not completed:
+            # 途中人数は人狼のDM内だけへ通知し、公開チャンネルへは出さない。
+            await self._relay_to_wolves(
+                f"🏳️ サレンダー同意: **{agreed} / {len(living_wolves)}人**",
+            )
+            return f"🏳️ サレンダーに同意しました（**{agreed} / {len(living_wolves)}人**）。"
+
+        # 成立のdurable checkpoint後にのみ、公開・ゲーム停止・通常精算を始める。
+        # 複数狼の同時押下でもfinish taskは1本だけにする。
+        self._start_surrender_finish_task()
+        return "🏳️ 全人狼が同意しました。村陣営の勝利として終了します。"
+
+    async def _finish_surrender(self) -> None:
+        state = self.state
+        try:
+            if not state.surrender_confirmed or state.phase == Phase.GAME_OVER:
+                return
+            if state.pending_winner is not Team.VILLAGE:
+                old_pending_winner = state.pending_winner
+                state.pending_winner = Team.VILLAGE
+                try:
+                    await self._persist_room_state()
+                except Exception:
+                    state.pending_winner = old_pending_winner
+                    raise
+            if not state.surrender_announced:
+                await self._safe_village_send(
+                    "🏳️ **人狼全員のサレンダーが成立しました。**\n"
+                    "村陣営の勝利として、通常どおり戦績とレートへ反映します。"
+                )
+                state.surrender_announced = True
+                try:
+                    await self._persist_room_state()
+                except Exception as error:
+                    # 成立そのものは保存済み。告知済み印の失敗で勝敗を失わない。
+                    log.warning("サレンダー成立告知状態の保存に失敗: %s", error)
+            await self._finish_game_externally(Team.VILLAGE)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log.exception("サレンダー終了処理に失敗: %s", error)
+            await self._stop_for_durability_error("サレンダー終了処理", error)
+
+    def _start_surrender_finish_task(self) -> None:
+        if self._surrender_finish_task is None or self._surrender_finish_task.done():
+            self._surrender_finish_task = self.manager.spawn_bg_task(
+                self._finish_surrender()
+            )
+
+    async def _confirm_surrender_after_roster_change(self) -> bool:
+        """死亡・除外後の生存実人狼だけで全員同意を再判定する。"""
+        state = self.state
+        if state.surrender_confirmed:
+            self._start_surrender_finish_task()
+            return True
+        living_wolves = {wolf.user_id for wolf in state.alive_wolves()}
+        if not living_wolves or not living_wolves <= state.surrender_ids:
+            return False
+        old_pending_winner = state.pending_winner
+        state.surrender_confirmed = True
+        state.pending_winner = Team.VILLAGE
+        try:
+            await self._persist_room_state()
+        except Exception as error:
+            state.surrender_confirmed = False
+            state.pending_winner = old_pending_winner
+            await self._stop_for_durability_error(
+                "サレンダー成立状態の保存", error
+            )
+            raise StateDurabilityError(
+                "サレンダー成立状態を保存できませんでした"
+            ) from error
+        self._start_surrender_finish_task()
+        return True
 
     async def _relay_to_wolves(self, message: str, exclude_id: Optional[int] = None) -> None:
         """人狼全員のDMにメッセージを中継 (並列)"""
@@ -2936,6 +3335,129 @@ class RoomRunner:
             content = content[: budget - 1] + "…"
         await self._relay_to_wolves(prefix + content, exclude_id=sender.user_id)
 
+    async def _initial_night_greeting(self) -> None:
+        """1日目開始前に、人狼だけがDMで挨拶できる0日目初夜を行う。"""
+        state = self.state
+        await state.pause_event.wait()
+        state.phase = Phase.INITIAL_NIGHT
+        state.phase_before_pause = None
+        state.initial_night_skip_event.clear()
+        await self._persist_room_state()
+
+        await self._lock_village()
+        await self._mute_phase("0日目初夜に入ります。")
+
+        def greeting_content(remaining: float) -> str:
+            return (
+                "🌙 **0日目 - 初夜（人狼の挨拶）**\n"
+                "人狼は役職DMへ送ったメッセージで挨拶できます。"
+                "この時間は能力を使用しません。\n"
+                + self._timer_line(remaining)
+            )
+
+        timer_message = await self._safe_village_send(
+            greeting_content(INITIAL_NIGHT_GREETING_TIME)
+        )
+        # GMメニューの汎用スキップは、現時点ではこの待機だけを終了する。
+        await self._repost_gm_panel()
+
+        # 最初の狼がDMを受け取って即返信しても落とさないよう、送信より前に開く。
+        state.wolf_relay_window_open = True
+        try:
+            await asyncio.gather(*(
+                self._send_initial_night_notice(wolf)
+                for wolf in state.alive_wolves()
+            ))
+            await self._pausable_countdown(
+                timer_message,
+                greeting_content,
+                INITIAL_NIGHT_GREETING_TIME,
+                state.initial_night_skip_event,
+            )
+        finally:
+            state.wolf_relay_window_open = False
+
+        await state.pause_event.wait()
+        if state.surrender_confirmed or state.ending or state.pending_winner is not None:
+            return
+        state.initial_night_completed = True
+        await self._persist_room_state()
+        await self._safe_village_send("☀️ **0日目の初夜が終了しました。1日目を開始します。**")
+
+    async def _send_initial_night_notice(self, wolf: Player) -> None:
+        try:
+            await self._discord_api_call(
+                wolf.member.send,
+                f"🌙 **0日目の初夜（{INITIAL_NIGHT_GREETING_TIME}秒）**\n"
+                "このDMのメッセージが他の人狼へ中継されます。",
+            )
+        except (discord.Forbidden, discord.HTTPException) as error:
+            log.warning(
+                "0日目初夜DM送信失敗 (%s): %s",
+                wolf.display_name,
+                error,
+            )
+
+    async def force_skip_wait(self, member: discord.Member) -> str:
+        """GMが現在の安全な時間待ちだけを終了する。"""
+        state = self.state
+        if member.id != state.gm_id:
+            return "GMのみ操作可能です。"
+        if state.paused:
+            return "⏸️ 一時停止中です。先に「再開」を押してください。"
+        phase = self._effective_phase()
+        if (
+            phase == Phase.INITIAL_NIGHT
+            and not state.initial_night_completed
+            and not state.initial_night_skip_event.is_set()
+        ):
+            state.initial_night_skip_event.set()
+            await self._safe_village_send("⏭️ **GMの操作で0日目の初夜をスキップします。**")
+            return "⏭️ 0日目の初夜をスキップしました。"
+        if (
+            phase == Phase.DAY_VOTE
+            and state.vote_slot_active
+            and not state.speech_done_event.is_set()
+        ):
+            state.speech_done_event.set()
+            await self._safe_village_send("⏭️ **GMの操作で現在の投票発言を終了します。**")
+            return "⏭️ 現在の投票発言をスキップしました。"
+        if (
+            phase == Phase.DAY_VOTE
+            and not state.vote_slot_active
+            # 列に未処理が残っている間は締め切らない。1枠の終了処理は
+            # 「vote_slot_activeを下ろす → ミュート戻し(API) → cursor更新(DB)」
+            # の順で、その数百msはactive=Falseだが列は消化しきっていない。
+            # cursorも見ないと、GMが「今の発言を飛ばす」つもりで押しただけで
+            # 並んでいた残り全員の投票権ごと締め切ってしまう。
+            and state.vote_slot_index >= len(state.vote_order)
+            and not state.vote_closed
+        ):
+            # 誰も「投票」を押さず進行が止まったときの唯一の逃げ道。
+            # 通常は締切時間を設けず、押されるまで全員ミュートで待つ。
+            state.vote_closed = True
+            try:
+                await self._persist_room_state()
+            except Exception as error:
+                state.vote_closed = False
+                log.exception(f"投票締切の保存に失敗: {error}")
+                return "❌ 保存できませんでした。もう一度押してください。"
+            state.vote_queue_event.set()
+            await self._safe_village_send(
+                "⏭️ **GMの操作で投票を締め切ります。**（未投票は棄権）"
+            )
+            return "⏭️ 投票を締め切りました。"
+        if (
+            phase in (Phase.DAY_RUNOFF_SPEECH, Phase.DAY_LAST_WILL)
+            and state.current_speaker_id is not None
+            and not state.speech_done_event.is_set()
+        ):
+            state.speech_done_event.set()
+            label = "決戦弁明" if phase == Phase.DAY_RUNOFF_SPEECH else "遺言"
+            await self._safe_village_send(f"⏭️ **GMの操作で現在の{label}を終了します。**")
+            return f"⏭️ 現在の{label}をスキップしました。"
+        return "⏳ 現在スキップできる時間待ちはありません。"
+
     # ============================================================
     # ゲームループ
     # ============================================================
@@ -2944,7 +3466,7 @@ class RoomRunner:
         state = self.state
         try:
             # 役職確認フェーズ (pause対応)。夜と同じく制限時間は目安で、
-            # 参加者全員が「役職を確認した」を押すまで議論に入らない。
+            # 参加者全員が「役職を確認した」を押すまで0日目初夜へ進まない。
             def prep_content(remaining: float) -> str:
                 return (
                     f"⏳ 役職確認タイム（{PREPARATION_TIME}秒）\n"
@@ -2955,7 +3477,7 @@ class RoomRunner:
             if not state.prep_confirmed:
                 prep_msg = await self._safe_village_send(prep_content(PREPARATION_TIME))
                 # 宣言パネルは役職DM配布後に出す (DM到着前に全員が押して
-                # 議論が始まってしまわないよう、夜の朝パネルと同じ順序にする)
+                # 0日目初夜へ進んでしまわないよう、夜の朝パネルと同じ順序にする)
                 await self._post_prep_panel()
                 await self._repost_gm_panel()
                 if self._check_prep_ready():
@@ -2970,6 +3492,14 @@ class RoomRunner:
                 await state.pause_event.wait()
                 await self._close_prep_panel()
                 self._play_se("prep_end")
+
+            # 役職確認後の0日目初夜。実人狼の自由文DM中継だけを30秒開き、
+            # 襲撃・占い・護衛・朝待機は出さない。再起動時は未完了なら
+            # 同じ挨拶時間を満額でやり直し、完了済みなら二重実行しない。
+            if not state.initial_night_completed:
+                await self._initial_night_greeting()
+            if state.surrender_confirmed or state.pending_winner is not None:
+                return
 
             # メインループ
             while True:
@@ -3051,6 +3581,7 @@ class RoomRunner:
         state = self.state
         await state.pause_event.wait()
         state.phase = Phase.DAY_DISCUSSION
+        state.votes.clear()
         await self._persist_room_state()
 
         # チャンネル権限: 生存者のみ書き込み可
@@ -3097,30 +3628,16 @@ class RoomRunner:
         def discussion_content(remaining: float) -> str:
             return (
                 f"☀️ **{state.day_number}日目 - 議論タイム** (生存者: {len(state.alive_players())}人)\n"
-                "話しながら投票できます。投票フェーズまでは何度でも入れ替えられます。\n"
+                "議論終了後、「投票」を押した順に1人ずつ投票発言を行います。\n"
                 + self._timer_line(remaining)
             )
 
-        # 議論中の仮投票。全員がそろえば議論を切り上げ、その票を
-        # 投票フェーズへ持ち越してそのまま開示する。
-        # 途中で心変わりできるので、早く入れた人が議論から降りずに済む。
-        alive = state.alive_players()
-        state.votes.clear()
-        state.vote_complete_event.clear()
-        provisional_view = VoteView(
-            self, candidates=by_number(alive), voters=alive, provisional=True
-        )
-        timer_msg = await self._safe_village_send(
-            discussion_content(duration), view=provisional_view
-        )
+        # 投票は議論終了後の20秒発言枠でのみ受け付ける。議論中の仮投票を
+        # 残すと、順番が来る前に票だけ確定して発言枠が空になるため作らない。
+        timer_msg = await self._safe_village_send(discussion_content(duration))
         await self._repost_gm_panel()
 
-        # 一時停止対応のタイマー (全員の仮投票がそろっても切り上げる)
-        await self._pausable_countdown(
-            timer_msg, discussion_content, duration, state.vote_complete_event
-        )
-        # 議論用のパネルは投票フェーズで貼り直すのでここで止める
-        provisional_view.stop()
+        await self._pausable_countdown(timer_msg, discussion_content, duration)
 
         # 議論終了。ミュートが行き渡るまで数秒かかるので、
         # 「終了 = もう喋れない」と誤解させない文言にする
@@ -3587,6 +4104,10 @@ class RoomRunner:
         state = self.state
         await state.pause_event.wait()
         state.phase = Phase.DAY_DISCUSSION
+        # 復元で投票フェーズそのものへ戻る場合はこの関数を通らない。
+        # 新しい昼議論に入る時点で前日の票だけを消す。
+        if state.vote_day_generation != state.day_generation:
+            state.votes.clear()
 
         # ターン制はVCだけで進行し、#昼のテキスト書き込みは許可しない。
         await self._lock_village()
@@ -3601,8 +4122,7 @@ class RoomRunner:
                     ordered_names.append(player.display_name)
             await self._safe_village_send(
                 f"🔁 **{state.day_number}日目 - ターン制議論**\n"
-                f"発言順: {' → '.join(ordered_names)}\n"
-                "死亡者の席は飛ばし、番号末尾の次は01へ戻ります。"
+                f"発言順: {' → '.join(ordered_names)}"
             )
             self._play_se("discussion")
         else:
@@ -3762,51 +4282,335 @@ class RoomRunner:
     # 昼フェーズ: 投票
     # ============================================================
 
+    async def _persist_vote_checkpoint(self, context: str) -> None:
+        try:
+            await self._persist_room_state()
+        except Exception as error:
+            await self._stop_for_durability_error(context, error)
+            raise StateDurabilityError(f"{context}を保存できませんでした") from error
+
+    async def _initialize_sequential_vote(self) -> bool:
+        """当日の通常投票を開始する。発言順は空から始め、押した順に伸ばす。"""
+        state = self.state
+        if state.vote_day_generation == state.day_generation:
+            return False
+        state.phase = Phase.DAY_VOTE
+        state.votes.clear()
+        state.vote_order = []
+        state.vote_day_generation = state.day_generation
+        state.vote_slot_index = 0
+        state.vote_slot_token = 0
+        state.vote_slot_active = False
+        state.vote_closed = False
+        state.vote_requeue_ids.clear()
+        state.vote_panel_message_id = None
+        state.vote_remaining_seconds = 0.0
+        state.current_speaker_id = None
+        state.speech_done_event.clear()
+        state.vote_queue_event.clear()
+        await self._persist_vote_checkpoint("通常投票の開始")
+        return True
+
+    def _vote_queue_waiting(self) -> list[Player]:
+        """まだ「投票」を押していない生存者 (押すのを待っている人)。"""
+        queued = set(self.state.vote_order)
+        return [
+            player for player in self.state.alive_players()
+            if player.user_id not in queued
+        ]
+
+    async def join_vote_queue(self, member: discord.Member) -> str:
+        """「投票」ボタン: 押した順に投票発言の列へ並ぶ。
+
+        発言中でも先に並べる。並んだ順はそのまま公開パネルへ出す。
+        """
+        async with self.action_lock:
+            state = self.state
+            if self._effective_phase() != Phase.DAY_VOTE or state.vote_closed:
+                return "⏳ 今は投票を受け付けていません。"
+            player = state.get_player(member.id)
+            if player is None or not player.alive:
+                return "投票権がありません。"
+            if member.id in state.vote_order:
+                if member.id in state.votes:
+                    return "投票済みです。"
+                # 枠を使い切っている場合は「並んでいる」と誤解させない。
+                # 発言枠は1人1回なので、時間切れの棄権は取り消せない。
+                if state.vote_order.index(member.id) < state.vote_slot_index:
+                    return "この日の投票発言は終了しています（棄権）。"
+                return (
+                    f"すでに{state.vote_order.index(member.id) - state.vote_slot_index + 1}"
+                    "番目に並んでいます。"
+                )
+            state.vote_order.append(member.id)
+            try:
+                await self._persist_room_state()
+            except Exception as error:
+                state.vote_order.pop()
+                log.exception(f"投票順の保存に失敗: {error}")
+                return "❌ 保存できませんでした。もう一度押してください。"
+            # 表示は「今から何番目に話すか」。既に終わった枠は数えない。
+            position = len(state.vote_order) - state.vote_slot_index
+            state.vote_queue_event.set()
+            # 発言中はカウントダウンの毎秒更新が列を拾うので、待機中だけ
+            # ここで公開パネルを書き換える (同じ内容の二重編集を避ける)。
+            if not state.vote_slot_active:
+                await self._refresh_vote_waiting_panel()
+        return f"✅ {position}番目に並びました。"
+
+    def _vote_panel_reference(self) -> Optional[discord.Message]:
+        state = self.state
+        channel = state.village_channel
+        get_partial_message = getattr(channel, "get_partial_message", None)
+        if state.vote_panel_message_id is None or not callable(get_partial_message):
+            return None
+        return get_partial_message(state.vote_panel_message_id)
+
+    def _sequential_vote_detail(self) -> str:
+        """公開済みの票を「A → C」で並べる (棄権もその場に残す)。"""
+        state = self.state
+        lines: list[str] = []
+        visible_count = state.vote_slot_index
+        if (
+            state.vote_slot_active
+            and state.current_speaker_id in state.votes
+            and state.vote_slot_index < len(state.vote_order)
+        ):
+            visible_count += 1
+        for voter_id in state.vote_order[:visible_count]:
+            voter = state.get_player(voter_id)
+            if voter is None:
+                continue
+            target = state.get_player(state.votes.get(voter_id))
+            lines.append(
+                f"{voter.display_name} → "
+                + (target.display_name if target is not None else "棄権")
+            )
+        return "\n".join(lines) if lines else "まだ投票はありません。"
+
+    def _vote_queue_line(self) -> str:
+        """発言待ちの列 (現在の発言者より後ろ)。"""
+        state = self.state
+        start = state.vote_slot_index + (1 if state.vote_slot_active else 0)
+        names: list[str] = []
+        for voter_id in state.vote_order[start:]:
+            voter = state.get_player(voter_id)
+            if voter is not None and voter.alive:
+                names.append(voter.display_name)
+        return " → ".join(names) if names else "なし"
+
+    def _sequential_vote_content(self, speaker: Player, remaining: float) -> str:
+        return (
+            f"🗳️ **{speaker.display_name}** の投票発言 — 名前を押して投票\n"
+            + self._timer_line(remaining)
+            + f"\n📋 待機列: {self._vote_queue_line()}"
+            + f"\n\n**ここまでの投票**\n{self._sequential_vote_detail()}"
+        )
+
+    def _vote_waiting_content(self, waiting: list[Player]) -> str:
+        """列が空のときの公開パネル。押した人から順に発言する。"""
+        return (
+            f"🗳️ **投票待ち** — 「投票」を押した順に{VOTE_SPEECH_TIME}秒ずつ発言します\n"
+            f"未投票 **{len(waiting)}人**: {'、'.join(p.display_name for p in waiting)}\n"
+            f"\n**ここまでの投票**\n{self._sequential_vote_detail()}"
+        )
+
+    async def _replace_sequential_vote_panel(
+        self,
+        message: Optional[discord.Message],
+        content: str,
+        view: Optional[discord.ui.View],
+    ) -> Optional[discord.Message]:
+        if message is not None:
+            try:
+                await self._discord_api_call(message.edit, content=content, view=view)
+                return message
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+                log.warning(f"投票パネル更新失敗 ({self.state.room_name}): {error}")
+        message = await self._safe_village_send(content, view=view)
+        if message is None:
+            return None
+        message_id = getattr(message, "id", None)
+        if message_id is not None and message_id != self.state.vote_panel_message_id:
+            self.state.vote_panel_message_id = int(message_id)
+            await self._persist_vote_checkpoint("通常投票パネルID")
+        return message
+
+    async def _refresh_sequential_vote_panel(self) -> bool:
+        """票の保存直後、同じ公開パネルへ投票者と投票先を反映する。"""
+        state = self.state
+        speaker = state.get_player(state.current_speaker_id)
+        panel = self._vote_panel_reference()
+        if speaker is None or not state.vote_slot_active:
+            return False
+        panel = await self._replace_sequential_vote_panel(
+            panel,
+            self._sequential_vote_content(speaker, state.vote_remaining_seconds),
+            None,
+        )
+        if panel is None:
+            error = StateDurabilityError(
+                "確定票を公開パネルへ反映できませんでした",
+                state_committed=True,
+            )
+            await self._stop_for_durability_error("通常投票の公開", error)
+            return False
+        return True
+
+    async def _refresh_vote_waiting_panel(self) -> None:
+        """待機中に列が伸びたことだけを公開パネルへ反映する。"""
+        view = self._vote_queue_view
+        panel = self._vote_panel_reference()
+        if view is None or panel is None:
+            return
+        await self._replace_sequential_vote_panel(
+            panel, self._vote_waiting_content(self._vote_queue_waiting()), view
+        )
+
+    async def _wait_for_vote_queue(
+        self, panel: Optional[discord.Message], view: discord.ui.View
+    ) -> Optional[discord.Message]:
+        """列が空の間、全員ミュートのまま次に押す人を待つ。
+
+        締切時間は設けない。誰も押さずに進行が止まったときだけ、GMが
+        「スキップ」で締め切って残りを棄権にできる。
+        """
+        state = self.state
+        state.vote_queue_event.clear()
+        if state.vote_slot_index < len(state.vote_order) or state.vote_closed:
+            return panel
+        panel = await self._replace_sequential_vote_panel(
+            panel, self._vote_waiting_content(self._vote_queue_waiting()), view
+        )
+        if panel is None:
+            error = StateDurabilityError("投票待ちパネルを掲示できませんでした")
+            await self._stop_for_durability_error("投票待ちパネルの掲示", error)
+            raise error
+        self._vote_queue_view = view
+        try:
+            await state.vote_queue_event.wait()
+        finally:
+            self._vote_queue_view = None
+        return panel
+
+    def _requeue_lost_vote_slot(self, voter_id: int) -> bool:
+        """票を失った人へ、順番を崩さず最後にもう一度発言枠を積む。
+
+        順序の重複はsnapshot検証と公開表示を壊すので、完了済み位置から
+        一度取り除いてcursorを補正してから末尾へ移す。
+        """
+        state = self.state
+        try:
+            completed_index = state.vote_order.index(voter_id, 0, state.vote_slot_index)
+        except ValueError:
+            return False
+        del state.vote_order[completed_index]
+        if completed_index < state.vote_slot_index:
+            state.vote_slot_index -= 1
+        state.vote_order.append(voter_id)
+        return True
+
+    async def _advance_vote_cursor(self) -> None:
+        state = self.state
+        state.vote_slot_active = False
+        state.current_speaker_id = None
+        state.vote_remaining_seconds = 0.0
+        state.vote_slot_index += 1
+        await self._persist_vote_checkpoint("通常投票発言枠の完了")
+
     async def _day_vote(self) -> Optional[int]:
         state = self.state
         await state.pause_event.wait()
-        state.phase = Phase.DAY_VOTE
-        # クロストークは議論中の仮投票をそのまま引き継ぐ (clearしない)。
-        # ターン制は昼開始時にvotesを空にしており、規定発言後から投票を始める。
-        # 全員そろっていれば下のガードで即開示になる。
-        state.vote_complete_event.clear()
-        await self._persist_room_state()
-
-        alive = state.alive_players()
-        view = VoteView(self, candidates=by_number(alive), voters=alive)
-        alive_voter_ids = {p.user_id for p in alive}
-        if alive_voter_ids and alive_voter_ids <= state.votes.keys():
-            state.vote_complete_event.set()
+        initialized = await self._initialize_sequential_vote()
         # 投票開始のSEは鳴らさない。直前の議論終了SEと数秒差で連続し、
         # 合図として区別できないため (議論終了SEに一本化)
-
-        def vote_content(remaining: float) -> str:
-            return (
-                "🗳️ **投票フェーズ** — 処刑する人を選んでください。\n"
-                + self._timer_line(remaining, "制限時間")
+        if initialized:
+            await self._safe_village_send(
+                f"🗳️ **投票**「投票」を押した順に、1人{VOTE_SPEECH_TIME}秒ずつ発言して投票します。"
             )
-
-        timer_msg = await self._safe_village_send(vote_content(VOTE_TIMEOUT), view=view)
         await self._repost_gm_panel()
 
-        # 全員投票完了 or タイムアウト (pause対応)
-        completed = await self._pausable_countdown(
-            timer_msg, vote_content, VOTE_TIMEOUT, state.vote_complete_event
-        )
-        if not completed:
-            not_voted = [
-                state.get_player(uid) for uid in view.voters if uid not in state.votes
-            ]
-            # フェーズ中に退出/除外で死亡した人は未投票者に載せない
-            not_voted = [p for p in not_voted if p and p.alive]
-            not_voted.sort(key=lambda p: p.number)
-            names = ", ".join(p.display_name for p in not_voted)
-            await self._safe_village_send(
-                f"⏰ **投票時間切れ** — 未投票者: {names}\n既投票分で集計します。"
-            )
+        panel = self._vote_panel_reference()
+        queue_view = VoteQueueView(self)
+        while not state.vote_closed:
+            await state.pause_event.wait()
+            if state.vote_slot_index >= len(state.vote_order):
+                if not self._vote_queue_waiting():
+                    break
+                panel = await self._wait_for_vote_queue(panel, queue_view)
+                continue
+            voter_id = state.vote_order[state.vote_slot_index]
+            voter = state.get_player(voter_id)
+            if voter is None or not voter.alive:
+                await self._advance_vote_cursor()
+                continue
+            state.vote_slot_token += 1
+            state.vote_slot_active = True
+            state.current_speaker_id = voter.user_id
+            state.vote_remaining_seconds = float(VOTE_SPEECH_TIME)
+            state.speech_done_event.clear()
+            await self._persist_vote_checkpoint("通常投票発言枠の開始")
+            # 交代の合図はミュート解除より前に鳴らす。VCしか見ていない人でも
+            # 「音が鳴った次が自分の番」と分かり、解除待ちの数百msを無音で
+            # 待たせない。決戦弁明と違い直前のSEから20秒近く空くため、
+            # 1.5秒の待機上限で破棄される心配もない
+            self._play_se("speech")
+            await self._grant_speaker(voter.member)
 
-        # 翌日の投票フェーズで古いボタンが反応しないよう停止する
-        view.stop()
+            alive = state.alive_players()
+            view = VoteView(self, candidates=by_number(alive), voters=[voter])
+
+            def vote_content(remaining: float, voter=voter) -> str:
+                state.vote_remaining_seconds = remaining
+                return self._sequential_vote_content(voter, remaining)
+
+            panel = await self._replace_sequential_vote_panel(
+                panel, vote_content(VOTE_SPEECH_TIME), view
+            )
+            if panel is None:
+                error = StateDurabilityError("通常投票パネルを掲示できませんでした")
+                await self._stop_for_durability_error("通常投票パネルの掲示", error)
+                raise error
+            # 票保存後・公開更新前のクラッシュから戻った場合は、この再掲示で
+            # 確定票が公開済みになる。20秒を再び待たず、そのまま次へ進む。
+            if voter.user_id in state.votes:
+                state.speech_done_event.set()
+            completed = await self._pausable_countdown(
+                panel, vote_content, VOTE_SPEECH_TIME, state.speech_done_event
+            )
+            view.stop()
+            state.vote_slot_active = False
+            await self._clear_speaker(voter.member)
+            if not completed and voter.user_id not in state.votes:
+                await self._safe_village_send(
+                    f"⏰ **{voter.display_name}** は時間切れのため無投票です。"
+                )
+            await self._advance_vote_cursor()
+            # 自分の枠の中で投票先が除外されると、票だけ消えて棄権になる。
+            # 除外側が置いた印をここで回収し、末尾へ枠を積み直す。
+            if voter.user_id in state.vote_requeue_ids:
+                state.vote_requeue_ids.discard(voter.user_id)
+                requeued = (
+                    voter.alive
+                    and voter.user_id not in state.votes
+                    and self._requeue_lost_vote_slot(voter.user_id)
+                )
+                if requeued:
+                    await self._safe_village_send(
+                        f"↩️ **{voter.display_name}** の投票先が外れたため、"
+                        "最後にもう一度投票発言を行います。"
+                    )
+                await self._persist_vote_checkpoint("失効した票の再投票枠")
+
+        state.vote_slot_active = False
+        state.current_speaker_id = None
+        queue_view.stop()
+        if panel is not None:
+            await self._replace_sequential_vote_panel(
+                panel,
+                "✅ **投票終了**\n\n**投票内訳**\n" + self._sequential_vote_detail(),
+                None,
+            )
 
         if not state.votes:
             await self._safe_village_send("⚠️ 投票が1票もなかったため、処刑なしとなります。")
@@ -3863,13 +4667,23 @@ class RoomRunner:
         return tally
 
     async def _runoff(
-        self, candidate_ids: list[int], *, resume_vote: bool = False
+        self,
+        candidate_ids: list[int],
+        *,
+        resume_vote: bool = False,
+        resume_speech: bool = False,
     ) -> Optional[int]:
         state = self.state
         await state.pause_event.wait()
         state.runoff_candidates = list(candidate_ids)
-        if not resume_vote:
+        if not resume_vote and not resume_speech:
             state.phase = Phase.DAY_RUNOFF_SPEECH
+            # 弁明順も再起動後に同じ順で続けられるよう、抽選した順序を
+            # runoff_candidates自体へ保存する。
+            shuffled_ids = list(candidate_ids)
+            random.shuffle(shuffled_ids)
+            state.runoff_candidates = shuffled_ids
+            state.runoff_speech_index = 0
             await self._persist_room_state()
 
         # 念のため None を除去 (state.players からの取得失敗に備える)
@@ -3884,17 +4698,24 @@ class RoomRunner:
             )
             return None
         if not resume_vote:
-            random.shuffle(candidates)
+            candidates = [
+                player
+                for player_id in state.runoff_candidates
+                if (player := state.get_player(player_id)) is not None
+            ]
 
-        if not resume_vote:
+        if not resume_vote and not resume_speech:
             await self._safe_village_send(
                 "⚖️ **同票のため決戦投票！** 候補者が順番に弁明します。"
             )
 
         # 弁明フェーズ
-        for candidate in candidates if not resume_vote else []:
+        while not resume_vote and state.runoff_speech_index < len(candidates):
+            candidate = candidates[state.runoff_speech_index]
             # 前の弁明中に退出/GM除外で死亡した候補はスキップ
             if not candidate.alive:
+                state.runoff_speech_index += 1
+                await self._persist_vote_checkpoint("決戦弁明枠の完了")
                 continue
             state.speech_done_event.clear()
             state.current_speaker_id = candidate.user_id
@@ -3925,7 +4746,10 @@ class RoomRunner:
             view.stop()
             state.current_speaker_id = None
             await self._clear_speaker(candidate.member)
-            await self._safe_village_send(f"🎤 {candidate.display_name} の弁明終了")
+            state.runoff_speech_index += 1
+            await self._persist_vote_checkpoint("決戦弁明枠の完了")
+            # 弁明ごとの「終了」告知は出さない。次の弁明パネルへ切り替われば
+            # 交代は分かるので、1人につき1回の送信APIを丸ごと省ける。
 
         # 決戦投票
         state.phase = Phase.DAY_RUNOFF_VOTE
@@ -3938,14 +4762,23 @@ class RoomRunner:
         # 投票ボタンだけ番号順にする。candidates 自体のランダム順は
         # 弁明順の仕様 (上の random.shuffle) で、0票時のランダム処刑も
         # この順を使うため上書きしない。
-        view = RunoffVoteView(self, candidates=by_number(candidates), voters=alive)
-        alive_voter_ids = {p.user_id for p in alive}
-        if alive_voter_ids and alive_voter_ids <= state.votes.keys():
+        runoff_candidate_ids = {
+            candidate.user_id for candidate in candidates if candidate.alive
+        }
+        eligible_voters = [
+            player for player in alive
+            if player.user_id not in runoff_candidate_ids
+        ]
+        view = RunoffVoteView(
+            self, candidates=by_number(candidates), voters=eligible_voters
+        )
+        alive_voter_ids = {p.user_id for p in eligible_voters}
+        if not alive_voter_ids or alive_voter_ids <= state.votes.keys():
             state.vote_complete_event.set()
 
         def runoff_vote_content(remaining: float) -> str:
             return (
-                "🗳️ **決戦投票** — 候補者から選んでください。\n"
+                "🗳️ **決戦投票** — 候補者以外が一斉に投票します。\n"
                 + self._timer_line(remaining, "制限時間")
             )
 
@@ -4135,6 +4968,7 @@ class RoomRunner:
             raise StateDurabilityError("死亡状態を保存できませんでした") from e
 
         await self._apply_death_effect(effect)
+        await self._confirm_surrender_after_roster_change()
 
     def _can_archive_to_public_log(self) -> bool:
         """総合・ローカル固定卓・GM名前村の終了ログを公開ログへ退避する。"""
@@ -4497,11 +5331,13 @@ class RoomRunner:
                 "死亡者の発言権を安全に剥奪できませんでした",
                 state_committed=True,
             )
-        # 村側の死亡だけは、人狼予想を締めるまで霊界を開けない。
-        # 先に入っている死者から答えを聞けてしまうと提出の意味が無くなる
+        # 陣営に関係なく同じ条件で人狼予想DMを送り、受付を締めるまで
+        # 霊界を開けない。陣営で挙動を変えると死亡者の正体が漏れる。
         held_for_guess = self._should_hold_spirit(player, method)
         if held_for_guess:
-            self._hold_spirit_for_guess(player.user_id)
+            death_event_id = str(effect.get("event_id") or "")
+            self._hold_spirit_for_guess(player.user_id, death_event_id)
+            await self._send_wolf_guess_dm(player, death_event_id)
         else:
             await self._open_spirit_for(player.member)
             await self._safe_spirit_send(
@@ -4510,16 +5346,8 @@ class RoomRunner:
 
         if method == "処刑":
             self._play_se("execution")
-            # 提出ボタンは処刑告知へ相乗りさせる (メッセージを増やさない)
             await self._safe_village_send(
                 f"⚰️ **{player.display_name}** が処刑されました。"
-                + (
-                    f"\n🐺 亡くなった方は **{WOLF_GUESS_TIMEOUT // 60}分以内**に"
-                    f"{self.variant.wolf_guess_slots}狼予想を提出できます"
-                    "（提出すると霊界へ入れます）。"
-                    if held_for_guess else ""
-                ),
-                view=WolfGuessView(self) if held_for_guess else None,
             )
 
             # 霊媒師にDM
@@ -4587,6 +5415,7 @@ class RoomRunner:
             state.seer_target = None
             state.guard_target = None
             state.night_complete_event.clear()
+            state.morning_ready_open = False
             state.morning_ready_ids.clear()
             state.morning_warned_ids.clear()
             state.morning_confirmed = False
@@ -4614,7 +5443,9 @@ class RoomRunner:
                 + self._timer_line(remaining, "目安")
             )
 
-        timer_msg = await self._safe_village_send(night_content(duration))
+        timer_msg = None
+        if not state.morning_ready_open:
+            timer_msg = await self._safe_village_send(night_content(duration))
 
         # 夜UIの参照を保持し、夜終了時に必ずstopする
         # (未行動タイムアウト等で有効なまま残ったUIが後の夜に再利用されるのを防ぐ)
@@ -4712,32 +5543,32 @@ class RoomRunner:
                     except (discord.Forbidden, discord.HTTPException):
                         pass
 
-        # 「朝を迎える」パネル (夜の終了はこのボタンで決まる)。#昼 へ1枚掲示する。
-        # 役職DMを配り終えてから出す: 先に出すと、役職DMが届く前に
-        # 全員が押して夜が終わってしまう。
-        # 前夜のパネルは夜の終わり (_close_morning_panel) で閉じて参照を
-        # 手放しているので、ここは常に新規掲示になる。同じ夜をやり直す
-        # resume_existing では参照が残っていれば冪等ガードで再利用する。
+        # 制限時間中のGMパネルでは「朝」を無効にする。安全条件を無視した
+        # 早送りにはせず、朝待機が始まってから既存の強制夜明けを使う。
+        await self._repost_gm_panel()
+
+        if not state.morning_ready_open:
+            # 全員の夜UIが届いてから中継窓と制限時間を同時に開始する。
+            # 朝ボタンはこのcountdownが完了するまで作らない。
+            state.wolf_relay_window_open = True
+            try:
+                await self._pausable_countdown(
+                    timer_msg, night_content, duration
+                )
+            finally:
+                state.wolf_relay_window_open = False
+
+            # ボタン受付開始を先にdurableにする。投稿直後に落ちても復元時は
+            # 夜時間をやり直さず、同じ0/Nパネルを再掲示できる。
+            state.morning_ready_open = True
+            await self._persist_room_state()
+
+        # 夜時間終了後に初めて、0/生存人数から始まる朝パネルを掲示する。
         await self._post_morning_panel()
-        # 夜は #昼 の書き込みが止まるため、GM入口を最後に整理する。
         await self._repost_gm_panel()
         if self._check_morning_ready():
-            # requiredが空の異常系も、夜待ちを解放する前に
-            # 夜明け確定をdurableにする。
             await self._persist_room_state()
             state.morning_ready_event.set()
-
-        # 全員の夜UIが届いてから中継窓と制限時間を同時に開始する。
-        # UI配送時間を相談時間へ上乗せせず、例外・キャンセルでも必ず閉じる。
-        state.wolf_relay_window_open = True
-        try:
-            # 夜の制限時間は目安 (pause対応)。生存者全員が「朝を迎える」を押したら
-            # 時間内でも切り上げる。時間切れでは自動的に朝にしない
-            await self._pausable_countdown(
-                timer_msg, night_content, duration, state.morning_ready_event
-            )
-        finally:
-            state.wolf_relay_window_open = False
 
         # 人狼DMの中継は制限時間で打ち切る。「朝を迎える」の宣言状況では
         # 開閉しない (全員が押すのを待っている間も相談できてしまうため)。
@@ -4887,8 +5718,7 @@ class RoomRunner:
         try:
             await self._discord_api_call(
                 guard.member.send,
-                "⚠️ **先に選んだ護衛先がゲームから除外されたため、護衛が未確定になりました。**\n"
-                "今夜の護衛先をもう一度選んでください。",
+                "⚠️ **護衛先が除外されたため未確定です。** もう一度選んでください。",
                 view=view,
             )
         except (discord.Forbidden, discord.HTTPException) as e:
@@ -4924,16 +5754,20 @@ class RoomRunner:
     async def _wait_for_morning(self) -> None:
         """夜の制限時間が切れた後、生存者全員の「朝を迎える」宣言を待つ。
 
-        時間切れでは自動的に朝にしない (離席したい人はボタンを押さずに
-        待たせることで、一時停止の代わりになる)。誰が押していないかは
-        村へ出さない。**宣言人数もここで初めて公開する** (夜の間ずっと
-        見えていると、未宣言者から生存役職を推定されるため)。
+        時間切れでは自動的に朝にしない。ここへ入ってから初めてパネルを出し、
+        0/生存人数から押下ごとに公開人数を更新する。宣言は取り消せない。
         全員が戻らない場合はGMがGMコントロールパネルの「朝」で進行できる。
         ただし生存狩人の護衛が未確定なら、護衛放棄を許さず朝へ進めない。
         """
         state = self.state
         if state.morning_ready_event.is_set():
             return
+
+        # 通常は_night_phaseが先に保存する。復元/直接再開経路でも、受付開始を
+        # パネル投稿より先にdurableにして同じ順序を守る。
+        if not state.morning_ready_open:
+            state.morning_ready_open = True
+            await self._persist_room_state()
 
         # パネルを掲示できていないと誰も押せない。取りこぼしをここで補完する
         await self._post_morning_panel()
@@ -4981,15 +5815,13 @@ class RoomRunner:
             async def warn(player: Player, action: str) -> None:
                 if action == "護衛先":
                     text = (
-                        "⚠️ **まだ護衛先を選んでいません。**\n"
-                        "夜の目安時間が終了しました。狩人は護衛放棄できないため、"
-                        "護衛先を確定するまで朝を迎えられません。"
+                        "⚠️ **まだ護衛先を選んでいません。** "
+                        "護衛放棄はできず、確定するまで朝を迎えられません。"
                     )
                 else:
                     text = (
-                        f"⚠️ **まだ{action}を選んでいません。**\n"
-                        "夜の目安時間が終了しました。選ばないまま朝になると、"
-                        "今夜の行動はなかったことになります。"
+                        f"⚠️ **まだ{action}を選んでいません。** "
+                        "選ばないまま朝になると今夜の行動はなしになります。"
                     )
                 try:
                     await self._discord_api_call(
@@ -5001,8 +5833,7 @@ class RoomRunner:
 
             await asyncio.gather(*(warn(p, action) for p, action in pending))
 
-        # 通知を新規メッセージで送るとパネルが上へ流れて見失うので、
-        # パネル本文そのものを人数入りへ書き換える。
+        # 再掲示/警告送信の間に人数が変わっていても最新表示へ揃える。
         await self._reveal_morning_count()
         await self._pausable_wait_forever(state.morning_ready_event)
 
@@ -5019,59 +5850,22 @@ class RoomRunner:
         required = self._morning_required_ids()
         return len(required & self.state.morning_ready_ids), len(required)
 
-    def _morning_panel_content(self, *, reveal_count: bool = False) -> str:
-        """#昼 に1枚だけ掲示する「朝を迎える」パネルの本文。
-
-        **夜の間は人数を出さない。** 13人固定構成で夜に行動があるのは
-        狼3・占い師・狩人の5人だけなので、宣言人数を常時公開すると
-        「まだ押していない役職者が何人いるか」が毎晩測れてしまい、
-        占い師・狩人の生存がCO前に推定できる。人狼は互いを知っていて
-        夜のDM中継で相談できるため、押す順番を申し合わせれば
-        カウンタを能動的に読む道具にもなる。
-
-        押した本人にも人数は返さない (_morning_feedback_text)。押せば
-        見えるなら、押して確かめて押し直すだけで測れてしまうため。
-        人数を出すのは**目安時間が切れた後の1回だけ** (reveal_count=True)
-        で、これは従来の「時間切れ後に #昼 へ人数を1回通知する」露出量と
-        同じ。全員が同時に知るので不公平も生まない。
-        """
-        body = (
-            "🌅 **朝を迎える**\n"
-            "夜の行動が終わったら押してください。\n"
-            "**生存者全員が押すと朝になります。**\n"
-            "押し直すと取り消せます。離席したいときは押さずにお待ちください。\n"
-            "宣言した人数は、夜の目安時間が切れたときにここへ表示されます。"
-        )
-        if not reveal_count:
-            return body
+    def _morning_panel_content(self, *, reveal_count: bool = True) -> str:
+        """夜時間終了後だけ掲示し、押下ごとに人数を更新する本文。"""
         ready, required = self._morning_ready_count()
         return (
-            f"{body}\n"
-            "\n"
-            "⏳ **夜の目安時間が終了しました。**"
-            f"（現在 **{ready} / {required}人**）\n"
-            "(戻らない人がいる場合はGMがGMメニューの「朝」で進行できます)"
+            "🌅 **朝を迎える**（夜の行動を終えた人だけ押してください。取消不可）\n"
+            f"現在 **{ready} / {required}人** — 生存者全員が押すと朝になります"
         )
 
-    def _morning_feedback_text(self, *, declared: bool) -> str:
-        """押した本人にだけ ephemeral で返す文面。
-
-        **人数は出さない。** 押せば人数が見えると、押して確かめて押し直す
-        だけで進捗を測れてしまい、夜の間は公開しない意味が薄れる。
-        自分の操作が通ったかどうかだけを返し、人数は目安時間が切れた
-        ときにパネルへ一度だけ全員へ出す (_reveal_morning_count)。
-        """
+    def _morning_feedback_text(self, *, declared: bool = True) -> str:
+        """押した本人へ、冪等な宣言結果と現在人数を返す。"""
         ready, required = self._morning_ready_count()
         if required and ready >= required:
             return "🌅 **全員が「朝を迎える」を押しました。夜が明けます。**"
-        if declared:
-            return (
-                "✅ **「朝を迎える」を宣言しました。**\n"
-                "他の生存者を待っています。押し直すと取り消せます。"
-            )
         return (
-            "↩️ **宣言を取り消しました。**\n"
-            "もう一度押すと宣言し直せます。"
+            "✅ **「朝を迎える」を宣言しました。**\n"
+            f"現在 **{ready} / {required}人**。他の生存者を待っています。"
         )
 
     async def _post_morning_panel(self) -> None:
@@ -5086,6 +5880,8 @@ class RoomRunner:
         既に掲示済みなら何もしない (再掲示は取りこぼしの補完に使う)。
         """
         state = self.state
+        if not state.morning_ready_open:
+            return
         if state.morning_panel_message is not None:
             return
         # 再起動をまたいだ前回のパネルを先に消す (下の説明を参照)
@@ -5135,18 +5931,14 @@ class RoomRunner:
             log.warning(f"前回の朝パネル削除に失敗 ({state.room_name}): {e}")
 
     async def _reveal_morning_count(self) -> None:
-        """目安時間が切れたときだけ、パネル本文に人数を出す。
-
-        新しいメッセージを送らずパネル自体を編集するのは、通知でパネルが
-        上へ流れて見失うのを避けるため。
-        """
+        """押下後、同じ公開パネルの宣言人数を最新値へ更新する。"""
         state = self.state
         msg = state.morning_panel_message
         if msg is None:
             return
         try:
             await self._discord_api_call(
-                msg.edit, content=self._morning_panel_content(reveal_count=True)
+                msg.edit, content=self._morning_panel_content()
             )
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
             log.warning(f"朝パネルの人数表示に失敗 ({state.room_name}): {e}")
@@ -5181,12 +5973,11 @@ class RoomRunner:
         view.stop()
 
     async def toggle_morning_ready(self, member: discord.Member) -> tuple[str, Optional[str]]:
-        """「朝を迎える」の宣言をトグルする。
+        """「朝を迎える」を一方向・冪等に宣言する。
 
         Returns:
             (押した本人へephemeralで返す本文, エラー文字列)
-            — どちらも本人にしか見えない。公開パネルは編集しない
-              (夜の宣言人数を村へ出さないため)
+            — 保存後、公開パネルの人数も押下ごとに更新する
         """
         state = self.state
         if state.morning_ready_event.is_set():
@@ -5195,20 +5986,14 @@ class RoomRunner:
             return "", "🌅 まもなく朝になります。"
         if not self.night_actions_open():
             return "", "⏳ 現在この操作はできません。"
+        if not state.morning_ready_open:
+            return "", "⏳ 夜の制限時間が終わるまでお待ちください。"
         player = state.get_player(member.id)
         if player is None or not player.alive:
             return "", "⏳ 生存中の参加者だけが押せます。"
 
         if member.id in state.morning_ready_ids:
-            state.morning_ready_ids.discard(member.id)
-            # 警告は1晩に1度だけ。宣言を取り消しても警告済み記録は残す。
-            try:
-                await self._persist_room_state()
-            except Exception as e:
-                state.morning_ready_ids.add(member.id)
-                log.exception(f"朝宣言の取り消し保存に失敗: {e}")
-                return "", "❌ 宣言の取り消しを保存できませんでした。もう一度お試しください。"
-            return self._morning_feedback_text(declared=False), None
+            return "", "✅ 既に「朝を迎える」を宣言しています。取り消しはできません。"
 
         if (guard := self._pending_guard_player()) is not None and member.id == guard.user_id:
             return "", (
@@ -5247,6 +6032,9 @@ class RoomRunner:
             return "", "❌ 宣言を保存できませんでした。もう一度お試しください。"
         if release_morning:
             state.morning_ready_event.set()
+        # snapshot保存後に公開表示を更新する。編集失敗でも宣言自体は成立済みで、
+        # 次の押下または復元再掲示で最新人数へ追いつく。
+        await self._reveal_morning_count()
         return self._morning_feedback_text(declared=True), None
 
     async def force_morning(self, member: discord.Member) -> tuple[str, Optional[str]]:
@@ -5259,6 +6047,8 @@ class RoomRunner:
             return "", "🌅 既に夜明けが確定しています。"
         if not self.night_actions_open():
             return "", "⏳ 現在は夜フェーズではありません。"
+        if not state.morning_ready_open:
+            return "", "⏳ 夜の制限時間が終わるまで朝には進めません。"
         if state.paused:
             # 停止中に朝にすると、再開直後に朝が流れて誰も追えない
             return "", "⏸️ 一時停止中です。先に「再開」を押してください。"
@@ -5299,7 +6089,7 @@ class RoomRunner:
             return "", "❌ 役職確認の締切を保存できませんでした。もう一度お試しください。"
         state.prep_ready_event.set()
         await self._safe_village_send(
-            "⏭️ **GMの操作で役職確認を締め切り、議論を開始します。**"
+            "⏭️ **GMの操作で役職確認を締め切り、0日目初夜へ進みます。**"
         )
         return "▶️ **役職確認を締め切りました。**", None
 
@@ -5312,6 +6102,8 @@ class RoomRunner:
         state = self.state
         if not self.night_actions_open():
             return False
+        if not state.morning_ready_open:
+            return False
         if self._pending_guard_player() is not None:
             return False
         required = self._morning_required_ids()
@@ -5321,7 +6113,7 @@ class RoomRunner:
         return False
 
     # ============================================================
-    # 役職確認の宣言 (初日はここが揃うまで議論に入らない)
+    # 役職確認の宣言 (初日はここが揃ってから0日目初夜へ進む)
     # ============================================================
 
     def prep_actions_open(self) -> bool:
@@ -5349,15 +6141,12 @@ class RoomRunner:
         ready = len(required & state.prep_ready_ids)
         if required and ready >= len(required):
             return (
-                "✅ **全員が役職を確認しました。議論を開始します。**\n"
+                "✅ **全員が役職を確認しました。0日目初夜へ進みます。**\n"
                 f"**{ready} / {len(required)}人**"
             )
         return (
-            "📩 **役職を確認した**\n"
-            "DMで届いた役職を確認したら押してください。\n"
-            "**参加者全員が押すと議論が始まります。**\n"
-            "**一度押すと取り消せません。** まだ準備できていないときは押さずにお待ちください。\n"
-            f"現在 **{ready} / {len(required)}人**"
+            "📩 **役職を確認した**（DMの役職を見てから押してください。取消不可）\n"
+            f"現在 **{ready} / {len(required)}人** — 全員が押すと0日目初夜へ進みます"
         )
 
     async def _post_prep_panel(self) -> None:
@@ -5369,7 +6158,7 @@ class RoomRunner:
         )
 
     async def _close_prep_panel(self) -> None:
-        """議論開始後にパネルのボタンを無効化する"""
+        """役職確認終了後にパネルのボタンを無効化する"""
         state = self.state
         view = self._prep_view
         msg = state.prep_panel_message
@@ -5394,16 +6183,16 @@ class RoomRunner:
 
         トグルにしていた頃は、スマホで反応が遅いと二度タップしてしまい、
         本人には何も返らないまま宣言が取り消されていた。誰が押していないかは
-        村へ出さないので、12/13 のまま理由が分からず議論が始まらない。
+        村へ出さないので、12/13 のまま理由が分からず次へ進まない。
         役職を確認し直すのにボタンを取り消す必要はないため、冪等にする。
-        (離席のために押さずに待たせる「朝を迎える」は取り消せるままにする)
+        「朝を迎える」も夜時間終了後の一方向宣言で、取り消せない。
 
         Returns:
             (パネルの新しい本文, エラー文字列) — エラー時は本文を使わない
         """
         state = self.state
         if state.prep_ready_event.is_set():
-            return "", "▶️ まもなく議論が始まります。"
+            return "", "▶️ まもなく0日目初夜へ進みます。"
         if not self.prep_actions_open():
             return "", "⏳ 現在この操作はできません。"
         player = state.get_player(member.id)
@@ -5448,18 +6237,18 @@ class RoomRunner:
     async def _wait_for_prep_ready(self) -> None:
         """役職確認タイムの目安時間が切れた後、全員の宣言を待つ。
 
-        時間切れでは自動的に議論へ進まない (夜の _wait_for_morning と同じ)。
+        時間切れでは自動的に0日目初夜へ進まない (夜の _wait_for_morning と同じ)。
         誰が押していないかは村へ出さず、人数だけ表示する。
         """
         state = self.state
         if state.prep_ready_event.is_set():
             return
 
-        # パネルが出ていないと誰も議論を始められない
+        # パネルが出ていないと誰も0日目初夜へ進めない
         if state.prep_panel_message is None:
             await self._post_prep_panel()
         if state.prep_panel_message is None:
-            log.error(f"役職確認パネルを掲示できません ({state.room_name}): 自動で議論へ進みます")
+            log.error(f"役職確認パネルを掲示できません ({state.room_name}): 自動で0日目初夜へ進みます")
             state.prep_confirmed = True
             try:
                 await self._persist_room_state()
@@ -5468,7 +6257,7 @@ class RoomRunner:
                 raise
             state.prep_ready_event.set()
             await self._safe_village_send(
-                "⚠️ 「役職を確認した」パネルを表示できないため、自動で議論を開始します。"
+                "⚠️ 「役職を確認した」パネルを表示できないため、自動で0日目初夜へ進みます。"
             )
             return
 
@@ -5483,7 +6272,7 @@ class RoomRunner:
                         player.member.send,
                         "⚠️ **まだ「役職を確認した」を押していません。**\n"
                         "役職確認タイムの目安時間が終了しました。"
-                        "#昼 のパネルを押すと議論が始まります。",
+                        "#昼 のパネルを押すと0日目初夜へ進みます。",
                     )
                 except (discord.Forbidden, discord.HTTPException) as e:
                     log.warning(f"役職確認の催促DM送信失敗 ({player.display_name}): {e}")
@@ -5491,8 +6280,8 @@ class RoomRunner:
             await asyncio.gather(*(warn(p) for p in not_ready))
 
         await self._safe_village_send(
-            "⏳ **役職確認タイムの目安時間が終了しました。**\n"
-            "参加者全員が **「📩 役職を確認した」** を押すと議論が始まります。"
+            "⏳ **役職確認タイムの目安時間が終了しました。** "
+            "未確認の方はDMの役職を確認してください。"
         )
         await self._pausable_wait_forever(state.prep_ready_event)
 
@@ -5614,23 +6403,12 @@ class RoomRunner:
 
         lines.append(f"\n現在の生存者: **{len(state.alive_players())}人**")
 
-        # 襲撃死の人狼予想ボタンは朝の結果へ相乗りさせる (メッセージを増やさない)
-        holding = bool(state.spirit_hold_ids)
-        if holding:
-            lines.append(
-                f"\n🐺 亡くなった方は **{WOLF_GUESS_TIMEOUT // 60}分以内**に"
-                f"{self.variant.wolf_guess_slots}狼予想を提出できます"
-                "（提出すると霊界へ入れます）。"
-            )
-
         embed = discord.Embed(
             title=f"🌅 {state.day_number}日目の朝",
             description="\n".join(lines),
             color=discord.Color.yellow(),
         )
-        await self._safe_village_send(
-            embed=embed, view=WolfGuessView(self) if holding else None,
-        )
+        await self._safe_village_send(embed=embed)
 
         # ログクリア
         state._last_executed = None
@@ -5644,7 +6422,7 @@ class RoomRunner:
     def _build_bonus_facts(self, game_stats: Optional[dict]) -> dict:
         """プレイボーナスの材料を精算キューへ載せる形にまとめる。
 
-        日数と護衛成功数は集計済みの統計から、投票と3狼提出はゲーム中に
+        日数と護衛成功数は集計済みの統計から、投票と人狼予想はゲーム中に
         控えたものから取る。Discord APIは呼ばない。
         """
         state = self.state
@@ -6614,6 +7392,7 @@ class RoomRunner:
                 )
                 self.manager.spawn_bg_task(self.force_end("役職DM復元失敗により中断"))
                 return
+            await self._send_surrender_controls()
 
             await self._assign_alive_role()
             await self._prepare_game_vc_permissions(
@@ -6689,7 +7468,22 @@ class RoomRunner:
                     await self._persist_room_state()
                 return await finish_night(resume_existing=False)
 
-            if resume_phase == Phase.NIGHT:
+            if resume_phase == Phase.INITIAL_NIGHT:
+                await self._safe_village_send(
+                    "♻️ **0日目の初夜** を保存状態から再開します。"
+                )
+                if not state.initial_night_completed:
+                    await self._initial_night_greeting()
+                if state.surrender_confirmed or state.pending_winner is not None:
+                    return
+                # 通常_game_loopと同じ1日目開始checkpointへ揃える。
+                state.day_number = 1
+                state.day_generation = 1
+                state.day_execution_resolved = False
+                state.day_executed_target = None
+                state.pending_execution_target = None
+                await self._persist_room_state()
+            elif resume_phase == Phase.NIGHT:
                 await self._safe_village_send(
                     f"♻️ **{state.day_number}日目の夜フェーズ** を保存状態から再開します。"
                 )
@@ -6701,13 +7495,24 @@ class RoomRunner:
                 )
                 await self._morning_log()
             elif resume_phase == Phase.DAY_VOTE and not state.day_execution_resolved:
-                await self._safe_village_send(
-                    f"♻️ **{state.day_number}日目の投票フェーズ** を投票済み状態から再開します。"
-                )
-                if await finish_recovered_vote(
-                    await self._day_vote()
-                ):
-                    return
+                # 集計まで終えて処刑対象を保存した後に落ちた場合は、投票を
+                # やり直さず保存済み対象から続ける。決戦側と同じ扱いにする。
+                # やり直すと同じ票をもう一度集計し、活躍ボーナスの基礎に
+                # なる decisive_executions が二重に積まれる。
+                if state.pending_execution_target is not None:
+                    await self._safe_village_send(
+                        "♻️ **保存済みの投票結果** から処刑処理を再開します。"
+                    )
+                    if await finish_recovered_vote(state.pending_execution_target):
+                        return
+                else:
+                    await self._safe_village_send(
+                        f"♻️ **{state.day_number}日目の投票** を保存済みの順番から再開します。"
+                    )
+                    if await finish_recovered_vote(
+                        await self._day_vote()
+                    ):
+                        return
             elif resume_phase in (Phase.DAY_RUNOFF_SPEECH, Phase.DAY_RUNOFF_VOTE) and not state.day_execution_resolved:
                 # ランダム処刑の抽選直後に落ちた場合は、
                 # 告知済み/未告知にかかわらず保存済み対象を使う。
@@ -6733,7 +7538,11 @@ class RoomRunner:
                         + "再開します。"
                     )
                     if await finish_recovered_vote(
-                        await self._runoff(state.runoff_candidates, resume_vote=resume_vote)
+                        await self._runoff(
+                            state.runoff_candidates,
+                            resume_vote=resume_vote,
+                            resume_speech=not resume_vote,
+                        )
                     ):
                         return
             elif resume_phase == Phase.DAY_LAST_WILL and not state.day_execution_resolved:
@@ -6805,6 +7614,7 @@ class RoomRunner:
         if not player.alive:
             return
         old_votes = dict(state.votes)
+        old_vote_order = list(state.vote_order)
         old_disconnected = set(state.disconnected_players)
         old_guard_target = state.guard_target
         old_ready = set(state.morning_ready_ids)
@@ -6840,8 +7650,28 @@ class RoomRunner:
         # 除外者に入っていた票も無効化する。残すと集計で死亡者が最多得票になり、
         # _execute_player の死亡済みガードで処刑が「無言で不発」になる。
         # (票を失った人は投票し直せる)
-        for voter_id in [v for v, t in state.votes.items() if t == player.user_id]:
+        invalidated_voters = [
+            voter_id for voter_id, target_id in state.votes.items()
+            if target_id == player.user_id
+        ]
+        for voter_id in invalidated_voters:
             del state.votes[voter_id]
+            # 通常投票で既に公開済みの票を失った人には、現在の順番を崩さず
+            # 最後にもう一度20秒枠を与える。同じ人を複数回は積まない。
+            if (
+                # 一時停止中の除外でも票を返す。PAUSEDを素で比較すると、
+                # GMが止めてから除外した場合だけ再投票枠が付かず、
+                # 巻き込まれた人が投票権を失ったまま集計に入る。
+                self._effective_phase() == Phase.DAY_VOTE
+            ):
+                voter = state.get_player(voter_id)
+                if voter is not None and voter.alive:
+                    # 通り過ぎた枠はその場で積み直せる。現在の枠は
+                    # _day_vote がcursorを進めてからでないと組み替えられ
+                    # ないので、印だけ置いて拾い直してもらう。
+                    if not self._requeue_lost_vote_slot(voter_id):
+                        if voter_id in state.vote_order:
+                            state.vote_requeue_ids.add(voter_id)
 
         # 弁明/遺言フェーズ中に本人が除外された場合は、タイムアウトを
         # 待たずに即終了する
@@ -6882,9 +7712,20 @@ class RoomRunner:
         release_vote_complete = False
         if state.phase in (Phase.DAY_VOTE, Phase.DAY_RUNOFF_VOTE):
             alive_ids = {p.user_id for p in state.alive_players()}
+            if state.phase == Phase.DAY_RUNOFF_VOTE:
+                alive_ids -= set(state.runoff_candidates)
             release_vote_complete = bool(
                 alive_ids and alive_ids.issubset(state.votes.keys())
             )
+        release_vote_speech = bool(
+            self._effective_phase() == Phase.DAY_VOTE
+            and state.vote_slot_active
+            and state.current_speaker_id == player.user_id
+        )
+        # 「投票」待ちで止まっている場合は、除外で生存者集合が変わった
+        # ことを知らせて条件を見直させる。最後の未押下者が抜けたときに
+        # 誰も押さない待機のまま残り、GMのスキップ頼みになるのを防ぐ。
+        release_vote_queue = self._effective_phase() == Phase.DAY_VOTE
 
         effect = {
             "event_id": f"{state.game_run_id}:除外:{state.day_generation}:{state.night_generation}:{player.user_id}",
@@ -6900,6 +7741,7 @@ class RoomRunner:
         except Exception as e:
             player.alive = True
             state.votes = old_votes
+            state.vote_order = old_vote_order
             state.disconnected_players = old_disconnected
             state.guard_target = old_guard_target
             state.morning_ready_ids = old_ready
@@ -6933,6 +7775,9 @@ class RoomRunner:
 
         await self._apply_death_effect(effect)
 
+        if await self._confirm_surrender_after_roster_change():
+            return
+
         winner = state.check_win()
         if winner and state.phase != Phase.GAME_OVER:
             await self._finish_game_externally(winner)
@@ -6947,6 +7792,10 @@ class RoomRunner:
         # 外部終了前にゲームループが先へ進み得る。
         if release_speech:
             state.speech_done_event.set()
+        if release_vote_speech:
+            state.speech_done_event.set()
+        if release_vote_queue:
+            state.vote_queue_event.set()
         if release_turn:
             state.turn_done_event.set()
             state.turn_signal_event.set()
@@ -7407,12 +8256,15 @@ class RoomRunner:
         night_actions_open のまま夜明けまで受け付ける。
         """
         state = self.state
+        phase = self._effective_phase()
         return (
             state.wolf_relay_window_open
-            and self._effective_phase() == Phase.NIGHT
+            and (
+                phase == Phase.INITIAL_NIGHT
+                or (phase == Phase.NIGHT and not state.night_resolved)
+            )
             and not state.ending
             and state.pending_winner is None
-            and not state.night_resolved
         )
 
     def _current_speaker_ids(self) -> set[int]:
@@ -7440,6 +8292,12 @@ class RoomRunner:
                     else set()
                 )
             return {p.user_id for p in state.alive_players()}
+        if phase == Phase.DAY_VOTE:
+            return (
+                {state.current_speaker_id}
+                if state.vote_slot_active and state.current_speaker_id
+                else set()
+            )
         if phase in (Phase.DAY_RUNOFF_SPEECH, Phase.DAY_LAST_WILL):
             return {state.current_speaker_id} if state.current_speaker_id else set()
         return set()
@@ -8121,30 +8979,40 @@ class RoomRunner:
             return None
 
     # ============================================================
-    # 人狼予想 (霊界を開ける前の数分だけ受け付ける)
+    # 人狼予想 (霊界を開ける前の数分だけDMで受け付ける)
     # ============================================================
 
     def _should_hold_spirit(self, player: Player, method: str) -> bool:
         """人狼予想のために #霊界 の解放を待つべき死亡かどうか。
 
-        村陣営の処刑死・襲撃死だけが対象。狼陣営・除外・勝敗確定後は待たない
-        (勝敗が決まった瞬間の死亡は、待たせても提出前に終了処理が走るため)。
+        処刑死・襲撃死は陣営に関係なく同じ挙動にする。除外、復元をまたいだ
+        受付、勝敗確定と同時の死亡は待たない。
         """
         state = self.state
-        if state.ending or state.pending_winner is not None:
+        if (
+            state.ending
+            or state.pending_winner is not None
+            or state.recovered_from_restart
+        ):
             return False
         if method not in BONUS_WOLF_GUESS_DEATH_CAUSES:
             return False
-        if player.role is None or ROLE_TEAM[player.role] is not Team.VILLAGE:
+        # player.alive=Falseを永続化した後に呼ばれるため、ここで判定すれば
+        # この死亡による勝敗確定も含められる。
+        if state.check_win() is not None:
             return False
         return state.spirit_channel is not None
 
-    def _hold_spirit_for_guess(self, player_id: int) -> None:
+    def _hold_spirit_for_guess(self, player_id: int, death_event_id: str) -> None:
         """霊界の解放を保留し、時間切れで自動解放するタイマーを仕掛ける"""
         state = self.state
-        if player_id in state.spirit_hold_ids:
+        if (
+            player_id in state.spirit_hold_ids
+            and state.spirit_hold_events.get(player_id) == death_event_id
+        ):
             return
         state.spirit_hold_ids.add(player_id)
+        state.spirit_hold_events[player_id] = death_event_id
 
         async def release_later() -> None:
             try:
@@ -8159,14 +9027,74 @@ class RoomRunner:
         self._spirit_release_tasks.add(task)
         task.add_done_callback(self._spirit_release_tasks.discard)
 
-    async def submit_wolf_guess(self, player_id: int, targets: list[int]) -> bool:
+    async def _send_wolf_guess_dm(
+        self, player: Player, death_event_id: str,
+    ) -> bool:
+        """死亡者へ人狼予想をDMし、失敗時は即解放してGMだけへ知らせる。"""
+        view = WolfGuessSelectView(self, player.user_id, death_event_id)
+        try:
+            await self._discord_api_call(
+                player.member.send,
+                "🐺 **人狼予想**\n"
+                f"死亡から{WOLF_GUESS_TIMEOUT // 60}分以内に、"
+                f"人狼だと思う{self.variant.wolf_guess_slots}人を選んでください。\n"
+                "**確定すると変更できません。** 提出するとすぐ霊界へ入れます。\n"
+                "実際の人狼本人を除き、的中数がレート変動に反映されます。",
+                view=view,
+            )
+            return True
+        except (discord.Forbidden, discord.HTTPException) as e:
+            view.stop()
+            log.warning(
+                "人狼予想DMの送信失敗 (%s / %s): %s",
+                player.display_name,
+                death_event_id,
+                e,
+            )
+            await self._release_spirit_hold(player.user_id)
+            await self._notify_gm_wolf_guess_dm_failure(player)
+            return False
+
+    async def _notify_gm_wolf_guess_dm_failure(self, player: Player) -> None:
+        """人狼予想DM失敗を公開せず、GMのDMだけへ通知する。"""
+        state = self.state
+        gm = (
+            state.guild.get_member(state.gm_id)
+            if state.guild is not None and state.gm_id is not None
+            else None
+        )
+        if gm is None:
+            log.warning(
+                "人狼予想DM失敗をGMへ通知できません (GM不在 / ID:%s)",
+                state.gm_id,
+            )
+            return
+        try:
+            await self._discord_api_call(
+                gm.send,
+                f"⚠️ {player.display_name} へ人狼予想DMを送れなかったため、"
+                "待たせず霊界へ解放しました。公開チャンネルには通知していません。",
+            )
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.warning("人狼予想DM失敗をGMへDMできませんでした: %s", e)
+
+    async def submit_wolf_guess(
+        self,
+        player_id: int,
+        targets: list[int],
+        *,
+        game_run_id: str,
+        death_event_id: str,
+    ) -> bool:
         """変種ごとの人数で人狼予想を凍結する。受付外ならFalse。"""
         state = self.state
         unique_targets = sorted({int(target) for target in targets})
         async with self.action_lock:
             valid_target_ids = set(state.players) - {player_id}
             if (
-                player_id not in state.spirit_hold_ids
+                not self.is_current_game_view(game_run_id)
+                or state.spirit_hold_events.get(player_id) != death_event_id
+                or player_id not in state.spirit_hold_ids
                 or player_id in state.wolf_guesses
                 or len(unique_targets) != self.variant.wolf_guess_slots
                 or not set(unique_targets) <= valid_target_ids
@@ -8185,8 +9113,10 @@ class RoomRunner:
     async def _release_spirit_hold(self, player_id: int) -> None:
         state = self.state
         if player_id not in state.spirit_hold_ids:
+            state.spirit_hold_events.pop(player_id, None)
             return
         state.spirit_hold_ids.discard(player_id)
+        state.spirit_hold_events.pop(player_id, None)
         player = state.get_player(player_id)
         if player is not None and player.member is not None:
             await self._open_spirit_for(player.member)
@@ -8212,6 +9142,7 @@ class RoomRunner:
         self._spirit_release_tasks.clear()
         for player_id in list(self.state.spirit_hold_ids):
             await self._release_spirit_hold(player_id)
+        self.state.spirit_hold_events.clear()
 
     def _spirit_member_overwrite(
         self,
