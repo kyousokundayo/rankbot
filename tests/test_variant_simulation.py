@@ -215,6 +215,81 @@ class VariantSimulationPlanTest(unittest.TestCase):
             self.assertEqual(sum(result["elo_delta"] for result in results), 0)
             self.assertGreater(sum(result["delta"] for result in results), 0)
 
+    def test_forced_runoff_mapping_is_shared_by_all_vote_views_for_the_day(self) -> None:
+        state = SimpleNamespace(
+            game_run_id="run-1",
+            day_generation=1,
+            day_number=1,
+        )
+        controller = simulate_games.SimulationController(
+            SimpleNamespace(state=state),
+            SimpleNamespace(),
+            [],
+            SimpleNamespace(),
+            Random(123),
+            force_runoff=True,
+        )
+        voters = list(range(1, 14))
+        candidates = list(voters)
+
+        first = controller._mapping_for_normal_vote_day(
+            game_run_id=state.game_run_id,
+            day_generation=state.day_generation,
+            voters=voters,
+            candidates=candidates,
+            day_number=state.day_number,
+        )
+        # 次の順番投票Viewでも日全体の同じmappingを使い、再抽選しない。
+        second = controller._mapping_for_normal_vote_day(
+            game_run_id=state.game_run_id,
+            day_generation=state.day_generation,
+            voters=voters,
+            candidates=candidates,
+            day_number=state.day_number,
+        )
+
+        self.assertIs(first, second)
+        self.assertTrue(controller.force_runoff_used)
+        self.assertEqual(set(first), set(voters))
+        self.assertTrue(all(voter != target for voter, target in first.items()))
+        tally = Counter(first.values())
+        max_votes = max(tally.values())
+        self.assertGreaterEqual(
+            sum(count == max_votes for count in tally.values()),
+            2,
+        )
+
+
+class SimulationFakeMessageTest(unittest.IsolatedAsyncioTestCase):
+    async def test_replacing_panel_view_dispatches_each_new_vote_view_once(self) -> None:
+        dispatched = []
+        channel = SimpleNamespace(
+            controller=SimpleNamespace(on_channel_message=dispatched.append)
+        )
+        vote_state = SimpleNamespace(
+            game_run_id="run-1",
+            day_generation=1,
+            vote_slot_token=0,
+        )
+        vote_cog = SimpleNamespace(
+            state=vote_state,
+            register_game_view=lambda _view: None,
+        )
+        first_view = simulate_games.VoteView(vote_cog, [], [])
+        second_view = simulate_games.VoteView(vote_cog, [], [])
+        message = simulate_games.FakeMessage(
+            author=None,
+            channel=channel,
+            view=first_view,
+        )
+
+        await message.edit(view=second_view)
+        await message.edit(content="timer only")
+        await message.edit(view=second_view)
+        await message.edit(view=None)
+
+        self.assertEqual(dispatched, [message])
+
 
 if __name__ == "__main__":
     unittest.main()

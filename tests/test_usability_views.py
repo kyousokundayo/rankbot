@@ -109,6 +109,10 @@ class UsabilityViewLayoutTest(unittest.TestCase):
             paused=False,
             ending=False,
             pending_winner=None,
+            initial_night_completed=False,
+            vote_slot_active=False,
+            current_speaker_id=None,
+            morning_ready_open=False,
         )
         cog = SimpleNamespace(state=state, register_game_view=lambda _view: None)
 
@@ -180,10 +184,11 @@ class HelpAndRuleEmbedTest(unittest.TestCase):
         help_embed = build_help_embeds()[0]
         fields = {field.name: field.value for field in help_embed.fields}
         self.assertIn(f"{BOT_VERSION}の変更", fields)
-        self.assertIn("GM村と募集", fields[f"{BOT_VERSION}の変更"])
-        self.assertIn("募集通知", fields[f"{BOT_VERSION}の変更"])
-        self.assertIn("正常終了した全村", fields[f"{BOT_VERSION}の変更"])
+        self.assertIn("0日目初夜", fields[f"{BOT_VERSION}の変更"])
+        self.assertIn("押した順", fields[f"{BOT_VERSION}の変更"])
+        self.assertIn("サレンダー", fields[f"{BOT_VERSION}の変更"])
         self.assertIn("役職確認を締切", fields["GMの操作"])
+        self.assertIn("スキップ", fields["GMの操作"])
         self.assertIn("全村", fields["終わった試合を読み返す"])
         self.assertIn("書き込みはできません", fields["終わった試合を読み返す"])
 
@@ -197,13 +202,16 @@ class HelpAndRuleEmbedTest(unittest.TestCase):
         self.assertIn(f"対応Bot: **{BOT_VERSION}**", spec)
         self.assertIn(f"## {BOT_VERSION}", changelog)
 
-    def test_vote_help_explains_timeout_instead_of_claiming_no_abstention(self) -> None:
+    def test_vote_help_explains_sequential_timeout_and_public_result(self) -> None:
         rule_embed = build_rule_embeds()[0]
         fields = {field.name: field.value for field in rule_embed.fields}
         vote_help = fields["投票と処刑"]
         self.assertIn("棄権ボタン", vote_help)
-        self.assertIn("既投票分だけで集計", vote_help)
+        self.assertIn("押した順", vote_help)
+        self.assertIn("1人20秒", vote_help)
+        self.assertIn("すぐ公開", vote_help)
         self.assertIn("1票もなければ処刑なし", vote_help)
+        self.assertIn("候補者以外が一斉", vote_help)
         self.assertNotIn("棄権もできません", vote_help)
 
 

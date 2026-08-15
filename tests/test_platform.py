@@ -1024,6 +1024,13 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
             **base,
             "pending_execution_target": 101,
             "runoff_candidates": [101],
+            "vote_day_generation": 1,
+            "vote_order": [101],
+            "vote_slot_index": 0,
+            "vote_slot_token": 2,
+            "vote_slot_active": True,
+            "vote_current_speaker_id": 101,
+            "vote_panel_message_id": 999,
             "votes": [{"voter_id": 101, "target_id": 102}],
             "pending_death_effects": [
                 {
@@ -1039,6 +1046,11 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         for field, value in (
             ("pending_execution_target", "bad"),
             ("runoff_candidates", [0]),
+            ("vote_order", [0]),
+            ("vote_order", [101, 101]),
+            ("vote_slot_index", -1),
+            ("vote_slot_active", "yes"),
+            ("vote_panel_message_id", 0),
             ("votes", [{"voter_id": 101}]),
             ("pending_death_effects", [{"player_id": 101, "method": "処刑"}]),
         ):

@@ -30,7 +30,8 @@ from game import GameCog
 # シミュレーションは必ずテンポラリDBへ差し替えてから実行する。
 PRODUCTION_DB_PATH = database.DB_PATH
 from views import (
-    RunoffVoteView, SeerView, SpeechDoneView, VoteView, WolfVoteView, GuardView,
+    RunoffVoteView, SeerView, SpeechDoneView, VoteView, VoteQueueView,
+    WolfVoteView, GuardView,
     MorningReadyView,
     PrepReadyView,
 )
@@ -133,6 +134,7 @@ class FakeMessage:
                    embeds: Any = _UNSET,
                    view: Any = _UNSET) -> "FakeMessage":
         # discord.pyは「引数省略」と「明示的なNone (削除)」を区別する。
+        previous_view = self.view
         if content is not _UNSET:
             self.content = content
         if embed is not _UNSET:
@@ -141,6 +143,16 @@ class FakeMessage:
             self.embeds = embeds
         if view is not _UNSET:
             self.view = view
+            # 通常投票は1枚の公開パネルを話者ごと・投票待ちごとに編集して
+            # 再利用する。実Discordでは新しいViewのボタンが操作可能になるため、
+            # fakeでも新しいViewへ差し替わった時だけUI操作をdispatchする。
+            controller = getattr(self.channel, "controller", None)
+            if (
+                isinstance(view, (VoteView, VoteQueueView))
+                and view is not previous_view
+                and controller is not None
+            ):
+                controller.on_channel_message(self)
         return self
 
     async def delete(self, *, delay: Optional[float] = None) -> None:
@@ -622,6 +634,11 @@ class SimulationController:
         self.pending_tasks: set[asyncio.Task] = set()
         self.errors: list[BaseException] = []
         self.force_runoff_used = False
+        # 通常投票は話者ごとにVoteViewが1枚ずつ現れる。強制決戦用の票を
+        # View単位で作ると最初の1人分しか同票設計されないため、日全体の
+        # mappingを一度だけ作り、各Viewでは現在投票者の1票を取り出す。
+        self._day_vote_mapping_key: Optional[tuple[str, int]] = None
+        self._day_vote_mapping: dict[int, int] = {}
 
     def _schedule(self, coro: Any) -> None:
         task = asyncio.create_task(coro)
@@ -642,6 +659,8 @@ class SimulationController:
         view = message.view
         if isinstance(view, VoteView):
             self._schedule(self._handle_vote_view(message, view))
+        elif isinstance(view, VoteQueueView):
+            self._schedule(self._handle_vote_queue_view(message, view))
         elif isinstance(view, RunoffVoteView):
             self._schedule(self._handle_runoff_vote_view(message, view))
         elif isinstance(view, SpeechDoneView):
@@ -743,18 +762,76 @@ class SimulationController:
 
         return self._random_vote_mapping(voters, candidates)
 
-    async def _handle_vote_view(self, message: FakeMessage, view: VoteView) -> None:
-        await asyncio.sleep(0)
-        voters = list(view.voters)
-        candidates = self._candidate_ids_from_buttons(view)
-        if self.force_runoff and not self.force_runoff_used and self.cog.state.day_number == 1:
+    def _mapping_for_normal_vote_day(
+        self,
+        *,
+        game_run_id: str,
+        day_generation: int,
+        voters: list[int],
+        candidates: list[int],
+        day_number: int,
+    ) -> dict[int, int]:
+        """同じ日の通常投票Viewすべてで共有する投票mappingを返す。"""
+        key = (game_run_id, day_generation)
+        if self._day_vote_mapping_key == key:
+            return self._day_vote_mapping
+
+        if self.force_runoff and not self.force_runoff_used and day_number == 1:
             mapping = self._forced_tie_mapping(voters, candidates)
             self.force_runoff_used = True
         else:
             mapping = self._random_vote_mapping(voters, candidates)
+        self._day_vote_mapping_key = key
+        self._day_vote_mapping = mapping
+        return mapping
+
+    async def _handle_vote_queue_view(
+        self, message: FakeMessage, view: VoteQueueView
+    ) -> None:
+        """投票待ちパネル: 生存者が番号順に「投票」を押して列へ並ぶ。
+
+        実際の卓では押した順がそのまま発言順になる。再現性のため
+        シミュレータでは番号順に押し、全員が必ず1度は並ぶようにする。
+        """
+        await asyncio.sleep(0)
+        state = self.cog.state
+        button = view.children[0]
+        for player in sorted(state.alive_players(), key=lambda p: p.number):
+            if player.user_id in state.vote_order:
+                continue
+            member = self.guild.get_member(player.user_id)
+            if member is None:
+                continue
+            await button.callback(
+                FakeInteraction(user=member, guild=self.guild, message=message)
+            )
+
+    async def _handle_vote_view(self, message: FakeMessage, view: VoteView) -> None:
+        await asyncio.sleep(0)
+        current_voters = list(view.voters)
+        candidates = self._candidate_ids_from_buttons(view)
+        state = self.cog.state
+        # 発言順は「投票」を押した順に伸びていくため、パネル掲示時点の
+        # vote_orderには後から並ぶ人がまだ入っていない。その日の投票先は
+        # 生存者全員ぶんを一度に決めておく。
+        day_voters = [
+            player.user_id
+            for player in sorted(state.alive_players(), key=lambda p: p.number)
+        ] or current_voters
+        # 旧式の同時VoteViewにも使えるよう、Viewにだけいる有権者は末尾へ補う。
+        day_voters.extend(
+            voter_id for voter_id in current_voters if voter_id not in day_voters
+        )
+        mapping = self._mapping_for_normal_vote_day(
+            game_run_id=str(getattr(state, "game_run_id", "")),
+            day_generation=int(getattr(state, "day_generation", state.day_number)),
+            voters=day_voters,
+            candidates=candidates,
+            day_number=state.day_number,
+        )
 
         buttons = self._candidate_buttons(view)
-        for voter_id in voters:
+        for voter_id in current_voters:
             interaction = FakeInteraction(
                 user=self.guild.get_member(voter_id),
                 guild=self.guild,
