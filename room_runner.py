@@ -1089,7 +1089,8 @@ class RoomRunner:
         # ここで操作可能なUIを出すと、復元前の参加/GM操作が進行中snapshotを
         # 空ロビーで上書きし得る。active時はrestore完了後だけ投稿する。
         if not active_snapshot:
-            await self._post_lobby_ui()
+            # 起動時は前回のパネルへ編集で当て、再起動しても未読・通知を出さない。
+            await self._post_lobby_ui(reuse_existing=True)
 
     @staticmethod
     def _resolve_nonactive_owned_mutes(
@@ -1302,13 +1303,61 @@ class RoomRunner:
                 log.warning(f"旧GMパネル削除失敗 ({state.room_name}): {e}")
         return True
 
-    async def _post_lobby_ui(self) -> None:
-        ch = self.state.lobby_channel
-        await self._purge_bot_messages(ch, "ロビー")
+    def _lobby_panel_meta_key(self) -> str:
+        return f"lobby_panel_message_id:{self.state.room_id}"
 
+    async def _post_lobby_ui(self, *, reuse_existing: bool = False) -> None:
+        """#参加受付 の常設パネルを掲示する。
+
+        reuse_existing=True は起動時だけ使う。削除→再投稿だと再起動のたびに
+        新着メッセージが増えて未読・通知が出るため、前回と同じメッセージへ
+        編集で当てて静かに戻す (#運営の運営パネルと同じ考え方)。
+        ゲーム終了後など運用中の再掲示は、末尾に出したいので従来どおり。
+        """
+        ch = self.state.lobby_channel
         view = LobbyView(self)
         embed = view._build_embed()
+        if reuse_existing:
+            message = await self._reuse_lobby_message(ch, embed=embed, view=view)
+            if message is not None:
+                self.state.lobby_message = message
+                return
+        await self._purge_bot_messages(ch, "ロビー")
+
         self.state.lobby_message = await ch.send(embed=embed, view=view)
+        await self._remember_lobby_message(self.state.lobby_message)
+
+    async def _reuse_lobby_message(
+        self, ch, *, embed: discord.Embed, view: discord.ui.View,
+    ) -> Optional[discord.Message]:
+        """保存済みのロビーパネルへ編集で当てる。無ければNone。"""
+        stored = await database.get_meta(ch.guild.id, self._lobby_panel_meta_key())
+        get_partial = getattr(ch, "get_partial_message", None)
+        if not stored or not str(stored).isdigit() or not callable(get_partial):
+            return None
+        try:
+            # fetchせず編集すればAPIは1回。消えていれば例外で分かる。
+            message = await get_partial(int(stored)).edit(embed=embed, view=view)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            log.info(
+                "ロビーパネルを再利用できないため投稿し直します (%s): %s",
+                self.state.room_name,
+                e,
+            )
+            return None
+        add_view = getattr(self.bot, "add_view", None)
+        if callable(add_view):
+            add_view(view, message_id=message.id)
+        return message
+
+    async def _remember_lobby_message(self, message) -> None:
+        message_id = getattr(message, "id", None)
+        guild = getattr(self.state.lobby_channel, "guild", None)
+        if message_id is None or guild is None:
+            return
+        await database.set_meta(
+            guild.id, self._lobby_panel_meta_key(), str(message_id),
+        )
 
     def _build_room_snapshot(self) -> dict:
         state = self.state

@@ -802,6 +802,7 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             "open_9_cross", variant_id="v9_cross", lobby_channel=channel,
         )
         self.manager._ensure_operations_channel = AsyncMock(return_value=None)
+        self.manager._ensure_operations_log_channel = AsyncMock(return_value=None)
         self.manager._upsert_panel = AsyncMock()
 
         await self.manager.setup(self.guild)

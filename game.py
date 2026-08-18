@@ -779,7 +779,6 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 label=f"チャンネル {GM_INFO_CATEGORY_NAME}/{CH_GM_INFO}",
             )
 
-        await self._purge_bot_messages(channel, "村作成")
         embed = discord.Embed(
             title="GM村と募集の作成",
             description=(
@@ -795,7 +794,13 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         )
         for attempt in range(3):
             try:
-                await channel.send(embed=embed, view=PrivateRoomInfoView(self))
+                await self._upsert_startup_panel(
+                    channel,
+                    "gm_hub_panel_message_id",
+                    embed=embed,
+                    view=PrivateRoomInfoView(self),
+                    label="村作成",
+                )
                 break
             except discord.HTTPException as e:
                 if attempt >= 2:
@@ -1158,18 +1163,63 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         except (discord.Forbidden, discord.HTTPException) as e:
             log.warning(f"{label}メッセージ削除失敗: {e}")
 
+    async def _upsert_startup_panel(
+        self,
+        channel: discord.TextChannel,
+        meta_key: str,
+        *,
+        embed: discord.Embed,
+        view: discord.ui.View,
+        label: str,
+    ) -> Optional[discord.Message]:
+        """常設パネルを前回と同じメッセージへ上書きする。
+
+        削除→再投稿だと起動のたびに新着メッセージが増え、そのチャンネルに
+        未読と通知が出る。保存したIDへ編集で当てればDiscordは通知を出さない
+        (#運営の運営パネルが起動しても静かなのはこの方式のため)。
+        IDが無い・消されている場合だけ、従来どおり掃除して投稿し直す。
+        """
+        stored = await database.get_meta(channel.guild.id, meta_key)
+        get_partial = getattr(channel, "get_partial_message", None)
+        if stored and str(stored).isdigit() and callable(get_partial):
+            try:
+                # fetchせず編集すればAPIは1回で済む。存在しなければ例外で分かる。
+                message = await get_partial(int(stored)).edit(embed=embed, view=view)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                log.info("%sパネルを再利用できないため投稿し直します: %s", label, e)
+            else:
+                self._register_panel_view(view, message)
+                return message
+        await self._purge_bot_messages(channel, label)
+        message = await channel.send(embed=embed, view=view)
+        await database.set_meta(channel.guild.id, meta_key, str(message.id))
+        self._register_panel_view(view, message)
+        return message
+
+    def _register_panel_view(self, view: discord.ui.View, message) -> None:
+        """再起動後も同じメッセージのボタンが効くようViewを結び直す。"""
+        add_view = getattr(self.bot, "add_view", None)
+        message_id = getattr(message, "id", None)
+        if callable(add_view) and message_id is not None:
+            add_view(view, message_id=message_id)
+
     async def _post_stats_ui(self) -> None:
         if self.stats_channel is None:
             return
 
-        await self._purge_bot_messages(self.stats_channel, "統計")
         view = StatsView(self)
         embed = discord.Embed(
             title="人狼ゲーム 統計",
             description="現在シーズンの統計、ランキング、前シーズン結果、最近の試合をここで確認できます。",
             color=discord.Color.blue(),
         )
-        await self.stats_channel.send(embed=embed, view=view)
+        await self._upsert_startup_panel(
+            self.stats_channel,
+            "stats_panel_message_id",
+            embed=embed,
+            view=view,
+            label="統計",
+        )
 
     async def _sync_all_rank_roles(
         self, guild: discord.Guild, *, paced: bool = False

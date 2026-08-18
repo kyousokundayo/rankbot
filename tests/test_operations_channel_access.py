@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import discord
 
 import recruitment as recruitment_lib
-from config import CH_OPERATIONS, OPERATIONS_CATEGORY_NAME
+from config import CH_OPERATIONS, CH_OPERATIONS_LOG, OPERATIONS_CATEGORY_NAME
 
 
 class _Target:
@@ -246,6 +246,35 @@ class OperationsMenuAuthorizationTest(unittest.TestCase):
 
         self.assertFalse(allowed)
 
+    def test_configured_staff_user_id_can_operate(self) -> None:
+        """ロールを持たない相手でも、ユーザー指定なら操作できる。"""
+        staff = self._member(15, administrator=False, role_names=("一般参加者",))
+
+        with patch.object(
+            recruitment_lib, "OPERATIONS_STAFF_ROLE_NAMES", frozenset()
+        ), patch.object(
+            recruitment_lib, "OPERATIONS_STAFF_USER_IDS", frozenset({15})
+        ):
+            allowed = recruitment_lib.OperationsView._is_admin(
+                self._interaction(staff)
+            )
+
+        self.assertTrue(allowed)
+
+    def test_unlisted_user_id_cannot_operate(self) -> None:
+        outsider = self._member(16, administrator=False)
+
+        with patch.object(
+            recruitment_lib, "OPERATIONS_STAFF_ROLE_NAMES", frozenset()
+        ), patch.object(
+            recruitment_lib, "OPERATIONS_STAFF_USER_IDS", frozenset({15})
+        ):
+            allowed = recruitment_lib.OperationsView._is_admin(
+                self._interaction(outsider)
+            )
+
+        self.assertFalse(allowed)
+
     def test_non_member_user_cannot_operate(self) -> None:
         """DMなどMemberでない相手は常に拒否する。"""
         with patch.object(
@@ -256,6 +285,144 @@ class OperationsMenuAuthorizationTest(unittest.TestCase):
             )
 
         self.assertFalse(allowed)
+
+
+class OperationsLogChannelTest(unittest.IsolatedAsyncioTestCase):
+    """同村拒否・報告を残す #運営記録 の用意と、記録先の切り替えを固定する。"""
+
+    def _manager(self) -> recruitment_lib.RecruitmentManager:
+        return recruitment_lib.RecruitmentManager(SimpleNamespace(), SimpleNamespace())
+
+    def _guild(self, *, text_channels: list, roles: list[_Target]):
+        category = SimpleNamespace(name=OPERATIONS_CATEGORY_NAME, id=50)
+        default_role = _Target(1, "@everyone")
+        bot_member = _Target(2, "bot")
+        guild = SimpleNamespace(
+            id=77,
+            categories=[category],
+            text_channels=text_channels,
+            roles=[default_role, *roles],
+            me=bot_member,
+            default_role=default_role,
+            get_channel=lambda _id: None,
+            create_text_channel=AsyncMock(
+                return_value=SimpleNamespace(id=900, name=CH_OPERATIONS_LOG)
+            ),
+        )
+        return guild, category, default_role, bot_member
+
+    def _meta_patch(self, stored: str | None = None):
+        return patch.multiple(
+            recruitment_lib.database,
+            get_meta=AsyncMock(return_value=stored),
+            set_meta=AsyncMock(),
+        )
+
+    async def test_created_channel_is_visible_only_to_configured_roles(self) -> None:
+        staff = _Target(3, "ねいと")
+        guild, category, default_role, bot_member = self._guild(
+            text_channels=[], roles=[staff],
+        )
+
+        with self._meta_patch(), patch.object(
+            recruitment_lib, "OPERATIONS_LOG_ROLE_NAMES", frozenset({"ねいと"})
+        ):
+            result = await self._manager()._ensure_operations_log_channel(guild)
+
+        self.assertIsNotNone(result)
+        kwargs = guild.create_text_channel.await_args.kwargs
+        self.assertEqual(guild.create_text_channel.await_args.args[0], CH_OPERATIONS_LOG)
+        self.assertIs(kwargs["category"], category)
+        overwrites = kwargs["overwrites"]
+        self.assertFalse(_view_allowed(overwrites[default_role]))
+        self.assertTrue(_view_allowed(overwrites[staff]))
+        # 記録の間に雑談が挟まらないよう、閲覧ロールにも書き込みは許可しない。
+        self.assertFalse(overwrites[staff].send_messages)
+        self.assertTrue(_view_allowed(overwrites[bot_member]))
+        self.assertTrue(overwrites[bot_member].send_messages)
+
+    async def test_channel_is_not_created_without_configured_roles(self) -> None:
+        guild, _category, _default, _bot = self._guild(
+            text_channels=[], roles=[_Target(3, "ねいと")],
+        )
+
+        with self._meta_patch(), patch.object(
+            recruitment_lib, "OPERATIONS_LOG_ROLE_NAMES", frozenset()
+        ):
+            result = await self._manager()._ensure_operations_log_channel(guild)
+
+        self.assertIsNone(result)
+        guild.create_text_channel.assert_not_awaited()
+
+    async def test_channel_is_not_created_when_role_name_is_ambiguous(self) -> None:
+        """同名ロールが複数あると、誰へ許可したか分からないので作らない。"""
+        guild, _category, _default, _bot = self._guild(
+            text_channels=[], roles=[_Target(3, "ねいと"), _Target(4, "ねいと")],
+        )
+
+        with self._meta_patch(), patch.object(
+            recruitment_lib, "OPERATIONS_LOG_ROLE_NAMES", frozenset({"ねいと"})
+        ):
+            result = await self._manager()._ensure_operations_log_channel(guild)
+
+        self.assertIsNone(result)
+        guild.create_text_channel.assert_not_awaited()
+
+    async def test_existing_channel_keeps_manual_overwrites(self) -> None:
+        staff = _Target(3, "ねいと")
+        outsider = _Target(4, "一般参加者")
+        category = SimpleNamespace(name=OPERATIONS_CATEGORY_NAME, id=50)
+        channel = _Channel(
+            CH_OPERATIONS_LOG,
+            category,
+            {
+                staff: discord.PermissionOverwrite(view_channel=True),
+                outsider: discord.PermissionOverwrite(view_channel=True),
+            },
+        )
+        channel.id = 901
+        default_role = _Target(1, "@everyone")
+        bot_member = _Target(2, "bot")
+        guild = SimpleNamespace(
+            id=77,
+            categories=[category],
+            text_channels=[channel],
+            roles=[default_role, staff, outsider],
+            me=bot_member,
+            default_role=default_role,
+            get_channel=lambda _id: None,
+            create_text_channel=AsyncMock(),
+        )
+
+        with self._meta_patch(), patch.object(
+            recruitment_lib, "OPERATIONS_LOG_ROLE_NAMES", frozenset({"ねいと"})
+        ):
+            result = await self._manager()._ensure_operations_log_channel(guild)
+
+        self.assertIs(result, channel)
+        guild.create_text_channel.assert_not_awaited()
+        self.assertTrue(_view_allowed(channel.overwrites[outsider]))
+        self.assertTrue(_view_allowed(channel.overwrites[bot_member]))
+        self.assertNotIn(default_role, channel.overwrites)
+
+    def test_record_target_prefers_log_channel(self) -> None:
+        manager = self._manager()
+        manager.operations_channel = SimpleNamespace(name=CH_OPERATIONS)
+        manager.operations_log_channel = SimpleNamespace(name=CH_OPERATIONS_LOG)
+
+        self.assertIs(
+            manager._operations_record_channel(), manager.operations_log_channel,
+        )
+
+    def test_record_target_falls_back_to_operations_channel(self) -> None:
+        """#運営記録を用意できない設定でも、記録そのものは失わない。"""
+        manager = self._manager()
+        manager.operations_channel = SimpleNamespace(name=CH_OPERATIONS)
+        manager.operations_log_channel = None
+
+        self.assertIs(
+            manager._operations_record_channel(), manager.operations_channel,
+        )
 
 
 if __name__ == "__main__":

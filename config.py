@@ -15,7 +15,7 @@ from room_config import (
 )
 
 # Botのバージョン (ヘルプに表示。ソース公開された派生でも識別できるように)
-BOT_VERSION = "v0.47"
+BOT_VERSION = "v0.48"
 
 # 新規導入先に同名カテゴリが既にある場合、無関係なDiscord構成をBot所有と
 # 誤認しない。既存運用は保存済みchannel IDで自動再利用できる。
@@ -361,6 +361,50 @@ OPERATIONS_CATEGORY_NAME = "開発"
 OPERATIONS_STAFF_ROLE_NAMES = frozenset(
     name.strip()
     for name in os.getenv("WEREWOLF_OPERATIONS_STAFF_ROLES", "").split(",")
+    if name.strip()
+)
+
+
+def _parse_user_id_set(env_name: str) -> frozenset[int]:
+    """カンマ区切りのDiscordユーザーIDを読む。
+
+    綴り間違いを黙って「権限なし」に落とすと、設定したつもりの人が
+    運営メニューを押せない理由に気づけない。起動時に止めて知らせる。
+    """
+    raw_values = [
+        value.strip()
+        for value in os.getenv(env_name, "").split(",")
+        if value.strip()
+    ]
+    invalid = [value for value in raw_values if not value.isdigit()]
+    if invalid:
+        raise RuntimeError(
+            f"{env_name} にDiscordユーザーIDでない値があります: "
+            + " / ".join(invalid)
+        )
+    return frozenset(int(value) for value in raw_values)
+
+
+# ロールを持たせずに、特定の人だけへ#運営メニューの操作を許すユーザーID。
+# ロール付与が使えない相手 (別アカウント運用など) を名指しで足すための枠で、
+# ロール指定 (WEREWOLF_OPERATIONS_STAFF_ROLES) と併用できる。
+# 閲覧権限はここでも変更せず、ボタン操作の認可だけに使う。
+# 例: WEREWOLF_OPERATIONS_STAFF_USER_IDS=268251382098690049
+OPERATIONS_STAFF_USER_IDS = _parse_user_id_set("WEREWOLF_OPERATIONS_STAFF_USER_IDS")
+
+# 同村拒否・報告を1件ずつ流す記録チャンネル。#運営はボタンだけの操作盤に保ち、
+# 読み返す記録はこちらへ分ける。開発カテゴリ内だけで探し、無ければ
+# OPERATIONS_LOG_ROLE_NAMES のロールだけが読める形で作る (書き込みはBotのみ)。
+CH_OPERATIONS_LOG = "運営記録"
+# #運営記録 を閲覧できるロール名 (カンマ区切り)。Botが新規作成するときの
+# 閲覧許可先で、公開コードへ個別サーバーのロール名を含めないため.envで渡す
+# (例: WEREWOLF_OPERATIONS_LOG_ROLES=ねいと)。未設定・同名ロールが複数ある
+# 場合は作成せず、記録は#運営へ流す従来どおりの動きに戻す。
+# 既にチャンネルがある場合はDiscord側の手動設定を正本とし、閲覧overwriteを
+# Botから追加・削除しない (#運営と同じ扱い)。
+OPERATIONS_LOG_ROLE_NAMES = frozenset(
+    name.strip()
+    for name in os.getenv("WEREWOLF_OPERATIONS_LOG_ROLES", "").split(",")
     if name.strip()
 )
 
