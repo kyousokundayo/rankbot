@@ -1427,11 +1427,23 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         log.info("チャンネルセットアップ開始")
         self._startup_in_progress = True
         try:
-            await self._setup_channels_body(guild)
+            await self._setup_channels_body(
+                guild, snapshots, quarantined_room_ids,
+            )
         finally:
             self._startup_in_progress = False
 
-    async def _setup_channels_body(self, guild: discord.Guild) -> None:
+    async def _setup_channels_body(
+        self,
+        guild: discord.Guild,
+        snapshots: dict,
+        quarantined_room_ids,
+    ) -> None:
+        """起動時のチャンネル・卓セットアップ本体。
+
+        `setup_channels` が起動中フラグを立てて呼ぶ。DBだけで済ませる事前確認
+        (snapshots / 隔離ID) は呼び出し側で済ませ、結果をここへ渡す。
+        """
         await self._recover_pending_settlements(guild)
         await self.load_pending_unmutes(guild)
         await self._ensure_gm_staff_roles(guild)
