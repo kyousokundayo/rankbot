@@ -135,5 +135,62 @@ class DisabledRoomStartupGuardTest(unittest.IsolatedAsyncioTestCase):
         manager._recover_pending_settlements.assert_not_awaited()
 
 
+class StartupBodyReachesRoomSetupTest(unittest.IsolatedAsyncioTestCase):
+    """事前確認を通ったあと、起動本体が最後まで到達できることを確認する。
+
+    setup_channels は事前確認 (DBだけ) と本体で関数が分かれている。
+    本体が前半のローカル変数を参照したままだと、テストでは前半で止まる
+    経路しか踏まないためNameErrorが起動時まで見つからない。
+    """
+
+    async def asyncSetUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="werewolf-startup-body-")
+        self._old_db_path = database.DB_PATH
+        database.DB_PATH = str(Path(self._tmp.name) / "startup.db")
+        await database.init_db()
+
+    async def asyncTearDown(self) -> None:
+        database.DB_PATH = self._old_db_path
+        self._tmp.cleanup()
+
+    class _Reached(RuntimeError):
+        """本体が卓セットアップ直前まで進んだことを表す番兵。"""
+
+    async def test_body_runs_past_snapshot_handling(self) -> None:
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        manager._recover_pending_settlements = AsyncMock()
+        manager.load_pending_unmutes = AsyncMock()
+        manager._ensure_gm_staff_roles = AsyncMock()
+        manager._cleanup_private_rooms_without_creator_role = AsyncMock(
+            side_effect=self._Reached("卓セットアップまで到達")
+        )
+
+        with self.assertRaises(self._Reached):
+            await manager.setup_channels(SimpleNamespace(id=1))
+
+        manager._recover_pending_settlements.assert_awaited_once()
+        manager._ensure_gm_staff_roles.assert_awaited_once()
+        # 例外で抜けても起動中フラグは残さない (以後の再掲示が編集固定になる)。
+        self.assertFalse(manager._startup_in_progress)
+
+    async def test_startup_flag_is_set_while_body_runs(self) -> None:
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        manager._recover_pending_settlements = AsyncMock()
+        manager.load_pending_unmutes = AsyncMock()
+        seen: list[bool] = []
+
+        async def _record(*_args, **_kwargs) -> None:
+            seen.append(manager._startup_in_progress)
+            raise self._Reached("記録のみ")
+
+        manager._ensure_gm_staff_roles = AsyncMock(side_effect=_record)
+
+        with self.assertRaises(self._Reached):
+            await manager.setup_channels(SimpleNamespace(id=1))
+
+        self.assertEqual(seen, [True])
+        self.assertFalse(manager._startup_in_progress)
+
+
 if __name__ == "__main__":
     unittest.main()

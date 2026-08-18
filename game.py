@@ -54,6 +54,11 @@ class GameCog(RoomPermissionMixin, commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.managed_guild_id: Optional[int] = getattr(bot, "managed_guild_id", None)
+        # 起動処理の最中だけTrue。この間の常設パネル再掲示は、削除→再投稿では
+        # なく前回と同じメッセージへの編集で済ませ、再起動のたびに未読・通知が
+        # 出ないようにする (復元・募集復旧など掲示の入口が複数あるため、
+        # 呼び出し口ごとの指定ではなくここで一括して切り替える)。
+        self._startup_in_progress = False
         self.stats_channel: Optional[discord.TextChannel] = None
         self.discord_api_sem = asyncio.Semaphore(5)
         self.rating_lock = asyncio.Lock()
@@ -1420,6 +1425,25 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         )
 
         log.info("チャンネルセットアップ開始")
+        self._startup_in_progress = True
+        try:
+            await self._setup_channels_body(
+                guild, snapshots, quarantined_room_ids,
+            )
+        finally:
+            self._startup_in_progress = False
+
+    async def _setup_channels_body(
+        self,
+        guild: discord.Guild,
+        snapshots: dict,
+        quarantined_room_ids,
+    ) -> None:
+        """起動時のチャンネル・卓セットアップ本体。
+
+        `setup_channels` が起動中フラグを立てて呼ぶ。DBだけで済ませる事前確認
+        (snapshots / 隔離ID) は呼び出し側で済ませ、結果をここへ渡す。
+        """
         await self._recover_pending_settlements(guild)
         await self.load_pending_unmutes(guild)
         await self._ensure_gm_staff_roles(guild)
