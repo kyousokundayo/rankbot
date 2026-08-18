@@ -22,6 +22,7 @@ from config import (
     RECRUITMENT_BACKUP_CAPACITY,
     RECRUITMENT_NOTIFICATION_WINDOW_MINUTES,
     RECRUITMENT_RANK_OPTIONS,
+    UNRATED_ROOM_IDS,
     VARIANT_DEFINITIONS,
     Phase,
     Role,
@@ -546,8 +547,10 @@ _CURRENT_SCHEMA_PRIMARY_KEYS = {
     "feedback_reports": ["report_id"],
 }
 _CURRENT_SCHEMA_UNIQUE_KEYS = {
+    # 村主あたりの村数はロール別上限で決めるため、(guild_id, owner_id) の
+    # 一意制約は持たない。旧DBに残る同制約は起動時に
+    # `_migrate_private_rooms_multi_owner` がテーブル再構築で外す。
     "private_rooms": {
-        ("guild_id", "owner_id"),
         ("guild_id", "room_name"),
     },
 }
@@ -613,6 +616,18 @@ async def _validate_current_schema(db: aiosqlite.Connection) -> None:
         missing = sorted(required_columns - existing)
         if missing:
             errors.append(f"{table_name}の不足列={','.join(missing)}")
+
+        # 現行のINSERTは必須列しか書かない。旧版が残した余分な列は
+        # nullableなら無視できるが、DEFAULTなしNOT NULLだと保存が
+        # 実行時に落ちるため、DDLを変える前に起動を止める。
+        for row in rows:
+            column_name = str(row[1])
+            if column_name in required_columns:
+                continue
+            if int(row[3] or 0) and row[4] is None:
+                errors.append(
+                    f"{table_name}.{column_name}がDEFAULTなしNOT NULLの余分な列"
+                )
 
         rows_by_name = {str(row[1]): row for row in rows}
         for column_name in sorted(required_columns):
@@ -707,12 +722,6 @@ async def _validate_current_schema(db: aiosqlite.Connection) -> None:
         if not pattern.search(table_sql):
             errors.append(f"{table_name}のCHECK制約不足={description}")
 
-    # 旧private roomのアクセスロール列がNOT NULLだと、現行の保存処理は
-    # その列を更新しないため、新規の個室保存が失敗する。DDLを変える前に拒否する。
-    for row in table_info["private_rooms"]:
-        if str(row[1]) == "role_name" and int(row[3] or 0):
-            errors.append("private_rooms.role_nameがNOT NULL")
-
     if errors:
         raise RuntimeError(
             "未移行のDBスキーマはサポートしていません。"
@@ -733,6 +742,100 @@ async def _validate_foreign_key_integrity(db: aiosqlite.Connection) -> None:
                 "DBの外部キー整合性が壊れています: "
                 f"{table_name} rowid={row_id} -> {parent_table}"
             )
+
+
+def _private_rooms_table_sql(table_name: str) -> str:
+    """現行のprivate_rooms定義。新規作成と移行の再構築で同じ形を使う。"""
+    return f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            guild_id INTEGER NOT NULL,
+            room_id TEXT NOT NULL,
+            owner_id INTEGER NOT NULL,
+            room_name TEXT NOT NULL,
+            variant_id TEXT NOT NULL DEFAULT 'v13_cross',
+            status TEXT NOT NULL DEFAULT 'active',
+            category_id INTEGER,
+            last_error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (guild_id, room_id),
+            UNIQUE (guild_id, room_name)
+        )
+    """
+
+
+async def _migrate_private_rooms_multi_owner(db: aiosqlite.Connection) -> None:
+    """1人1村時代の UNIQUE(guild_id, owner_id) を外す。
+
+    SQLiteはCREATE TABLE内のUNIQUEを後から削除できない (自動生成インデックスは
+    DROP INDEXできない) ため、新テーブルへ入れ替える。現行スキーマには制約が
+    無いので、この関数は再実行しても何もしない。
+    行数は最大でもサーバーの村数ぶんしかないため一括コピーで足りる。
+    """
+    legacy_unique = False
+    for index_row in await db.execute_fetchall("PRAGMA index_list(private_rooms)"):
+        # 条件付きUNIQUEは旧版が作った制約ではない。検証側も代用として
+        # 認めていないので、ここでもテーブル再構築の根拠にしない
+        # (手で足された索引を、移行のついでに黙って落とさないため)。
+        if not int(index_row[2] or 0) or int(index_row[4] or 0):
+            continue
+        columns = tuple(
+            str(row[0])
+            for row in await db.execute_fetchall(
+                "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+                (str(index_row[1]),),
+            )
+        )
+        if columns == ("guild_id", "owner_id"):
+            legacy_unique = True
+            break
+    if not legacy_unique:
+        return
+
+    # 入れ替えは現行定義でテーブルを作り直すため、放っておくと定義外の列を
+    # 黙って落とす。旧版が残した列は「保持したまま無視する」のがこのDBの方針
+    # なので、nullableな余分列は新テーブルへ引き継ぐ。
+    current_columns = _CURRENT_SCHEMA_REQUIRED_COLUMNS["private_rooms"]
+    extra_columns: list[str] = []
+    for row in await db.execute_fetchall("PRAGMA table_info(private_rooms)"):
+        name = str(row[1])
+        if name in current_columns:
+            continue
+        if int(row[3] or 0) and row[4] is None:
+            # DEFAULTなしNOT NULLの余分な列は移せない (INSERTが落ちる)。
+            # 黙って捨てるのも危険なので、DDLへ触れずに戻り、この後の
+            # スキーマ検証に「起動を止める」判断を任せる。
+            log.warning(
+                "private_rooms に移行できない余分な列があります: %s", name,
+            )
+            return
+        extra_columns.append(f'"{name}" {str(row[2] or "").strip() or "TEXT"}')
+
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        await db.execute("DROP TABLE IF EXISTS private_rooms_migrating")
+        await db.execute(_private_rooms_table_sql("private_rooms_migrating"))
+        for column_sql in extra_columns:
+            await db.execute(
+                f"ALTER TABLE private_rooms_migrating ADD COLUMN {column_sql}"
+            )
+        carried = ", ".join(
+            ["guild_id", "room_id", "owner_id", "room_name", "variant_id",
+             "status", "category_id", "last_error", "created_at"]
+            + [column_sql.split(" ")[0] for column_sql in extra_columns]
+        )
+        await db.execute(
+            f"INSERT INTO private_rooms_migrating ({carried}) "
+            f"SELECT {carried} FROM private_rooms"
+        )
+        await db.execute("DROP TABLE private_rooms")
+        await db.execute(
+            "ALTER TABLE private_rooms_migrating RENAME TO private_rooms"
+        )
+    except Exception:
+        await db.rollback()
+        raise
+    await db.commit()
+    log.info("private_rooms の1人1村制約を外しました (複数GM村へ移行)")
 
 
 async def _validate_check_integrity(db: aiosqlite.Connection) -> None:
@@ -950,6 +1053,12 @@ async def init_db() -> None:
         ))[0][0])
         if user_table_count:
             await _validate_current_schema(db)
+            # 検証を通ったDBだけを書き換える。検証は「不足している制約」しか
+            # 見ないので、旧版の UNIQUE(guild_id, owner_id) はここまで残る。
+            # 外さないと検証は通ったまま2村目のINSERTで失敗する。
+            # 未知・破損スキーマは上の検証で先に拒否されるため、
+            # 「古いスキーマは書き換えず拒否する」方針は保たれる。
+            await _migrate_private_rooms_multi_owner(db)
             await _validate_foreign_key_integrity(db)
             await _validate_check_integrity(db)
             await _validate_ladder_integrity(db)
@@ -1168,22 +1277,7 @@ async def init_db() -> None:
                 FOREIGN KEY (game_id) REFERENCES games(game_id)
             )
         """)
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS private_rooms (
-                guild_id INTEGER NOT NULL,
-                room_id TEXT NOT NULL,
-                owner_id INTEGER NOT NULL,
-                room_name TEXT NOT NULL,
-                variant_id TEXT NOT NULL DEFAULT 'v13_cross',
-                status TEXT NOT NULL DEFAULT 'active',
-                category_id INTEGER,
-                last_error TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (guild_id, room_id),
-                UNIQUE (guild_id, owner_id),
-                UNIQUE (guild_id, room_name)
-            )
-        """)
+        await db.execute(_private_rooms_table_sql("private_rooms"))
         await db.execute("""
             CREATE TABLE IF NOT EXISTS recruitments (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2585,39 +2679,7 @@ async def save_private_room(
         await db.commit()
 
 
-async def load_private_rooms(guild_id: int) -> list[dict]:
-    async with connect_db() as db:
-        rows = await db.execute_fetchall(
-            "SELECT room_id, owner_id, room_name, variant_id, status, category_id, "
-            "last_error "
-            "FROM private_rooms WHERE guild_id = ?",
-            (guild_id,),
-        )
-    return [
-        {
-            "room_id": row[0],
-            "owner_id": row[1],
-            "room_name": row[2],
-            "variant_id": row[3],
-            "status": row[4],
-            "category_id": row[5],
-            "last_error": row[6],
-        }
-        for row in rows
-    ]
-
-
-async def get_private_room_by_owner(guild_id: int, owner_id: int) -> Optional[dict]:
-    async with connect_db() as db:
-        rows = await db.execute_fetchall(
-            "SELECT room_id, owner_id, room_name, variant_id, status, category_id, "
-            "last_error "
-            "FROM private_rooms WHERE guild_id = ? AND owner_id = ?",
-            (guild_id, owner_id),
-        )
-    if not rows:
-        return None
-    row = rows[0]
+def _private_room_row_to_dict(row) -> dict:
     return {
         "room_id": row[0],
         "owner_id": row[1],
@@ -2627,6 +2689,52 @@ async def get_private_room_by_owner(guild_id: int, owner_id: int) -> Optional[di
         "category_id": row[5],
         "last_error": row[6],
     }
+
+
+async def load_private_rooms(guild_id: int) -> list[dict]:
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT room_id, owner_id, room_name, variant_id, status, category_id, "
+            "last_error "
+            "FROM private_rooms WHERE guild_id = ? ORDER BY created_at, room_id",
+            (guild_id,),
+        )
+    return [_private_room_row_to_dict(row) for row in rows]
+
+
+async def list_private_rooms_by_owner(guild_id: int, owner_id: int) -> list[dict]:
+    """村主の全GM村を作成順に返す。上限判定と削除UIの正本。"""
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT room_id, owner_id, room_name, variant_id, status, category_id, "
+            "last_error "
+            "FROM private_rooms WHERE guild_id = ? AND owner_id = ? "
+            "ORDER BY created_at, room_id",
+            (guild_id, owner_id),
+        )
+    return [_private_room_row_to_dict(row) for row in rows]
+
+
+async def get_private_room(guild_id: int, room_id: str) -> Optional[dict]:
+    """room_idで1村を引く。村主から一意に引けないため、以後はこちらを使う。"""
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT room_id, owner_id, room_name, variant_id, status, category_id, "
+            "last_error "
+            "FROM private_rooms WHERE guild_id = ? AND room_id = ?",
+            (guild_id, room_id),
+        )
+    return _private_room_row_to_dict(rows[0]) if rows else None
+
+
+async def count_private_rooms(guild_id: int) -> int:
+    """サーバー全体のGM村数。Discordのカテゴリ枠を守る上限判定に使う。"""
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT COUNT(*) FROM private_rooms WHERE guild_id = ?",
+            (guild_id,),
+        )
+    return int(rows[0][0]) if rows else 0
 
 
 async def get_private_room_by_name(guild_id: int, room_name: str) -> Optional[dict]:
@@ -2637,18 +2745,7 @@ async def get_private_room_by_name(guild_id: int, room_name: str) -> Optional[di
             "FROM private_rooms WHERE guild_id = ? AND room_name = ?",
             (guild_id, room_name),
         )
-    if not rows:
-        return None
-    row = rows[0]
-    return {
-        "room_id": row[0],
-        "owner_id": row[1],
-        "room_name": row[2],
-        "variant_id": row[3],
-        "status": row[4],
-        "category_id": row[5],
-        "last_error": row[6],
-    }
+    return _private_room_row_to_dict(rows[0]) if rows else None
 
 
 async def update_private_room_variant(
@@ -2773,6 +2870,22 @@ _GAME_SEQ_CTE = (
     " FROM games WHERE guild_id = ?"
     ") "
 )
+# 試合番号 (_GAME_SEQ_CTE) はログチャンネル名と揃える必要があるため、統計
+# 対象外の卓も含めて数える。除外するのは集計・一覧の側だけ。
+
+
+def _stats_room_filter(alias: str = "g") -> tuple[str, list[object]]:
+    """統計対象外の卓を除くWHERE断片とパラメータを返す。
+
+    レート対象外の卓 (身内の練習卓) は勝率・ランキング・試合一覧のどれにも
+    出さない。廃止した常設卓はここに含めない——卓を畳んでも、それまでに
+    積み上がった統計は消さないため (UNRATED_ROOM_IDSは有効卓だけを見る)。
+    """
+    room_ids = sorted(UNRATED_ROOM_IDS)
+    if not room_ids:
+        return "", []
+    placeholders = ",".join("?" * len(room_ids))
+    return f" AND {alias}.room_id NOT IN ({placeholders})", list(room_ids)
 
 
 async def get_game_sequence_number(guild_id: int, game_id: int) -> Optional[int]:
@@ -2796,14 +2909,16 @@ async def get_recent_games(
     variant_id: str = DEFAULT_VARIANT_ID,
 ) -> list[dict]:
     ladder_id = rating_lib.ladder_id_for_variant(variant_id)
+    room_filter, room_params = _stats_room_filter()
     async with connect_db() as db:
         rows = await db.execute_fetchall(
             _GAME_SEQ_CTE
             + "SELECT g.game_id, n.seq, g.room_name, g.winner_team, g.played_at "
             "FROM games g JOIN numbered n ON n.game_id = g.game_id "
-            "WHERE g.guild_id = ? AND g.variant_id = ? AND g.ladder_id = ? "
-            "ORDER BY g.game_id DESC LIMIT ?",
-            (guild_id, guild_id, variant_id, ladder_id, limit),
+            "WHERE g.guild_id = ? AND g.variant_id = ? AND g.ladder_id = ?"
+            + room_filter
+            + " ORDER BY g.game_id DESC LIMIT ?",
+            (guild_id, guild_id, variant_id, ladder_id, *room_params, limit),
         )
     return [
         {
@@ -2825,6 +2940,7 @@ async def get_player_recent_games(
     variant_id: str = DEFAULT_VARIANT_ID,
 ) -> list[dict]:
     ladder_id = rating_lib.ladder_id_for_variant(variant_id)
+    room_filter, room_params = _stats_room_filter()
     async with connect_db() as db:
         rows = await db.execute_fetchall(
             _GAME_SEQ_CTE
@@ -2839,9 +2955,13 @@ async def get_player_recent_games(
             "ON rh.game_id = g.game_id AND rh.player_id = gp.player_id AND rh.guild_id = g.guild_id "
             "AND rh.variant_id = g.variant_id AND rh.ladder_id = g.ladder_id "
             "WHERE gp.player_id = ? AND g.guild_id = ? "
-            "AND g.variant_id = ? AND g.ladder_id = ? "
-            "ORDER BY g.game_id DESC LIMIT ?",
-            (guild_id, player_id, guild_id, variant_id, ladder_id, limit),
+            "AND g.variant_id = ? AND g.ladder_id = ?"
+            + room_filter
+            + " ORDER BY g.game_id DESC LIMIT ?",
+            (
+                guild_id, player_id, guild_id, variant_id, ladder_id,
+                *room_params, limit,
+            ),
         )
     return [
         {
@@ -2887,6 +3007,9 @@ async def get_overall_game_stats(
     if room_id is not None:
         where += " AND g.room_id = ?"
         params.append(room_id)
+    room_filter, room_params = _stats_room_filter()
+    where += room_filter
+    params.extend(room_params)
 
     async with connect_db() as db:
         games = await db.execute_fetchall(
@@ -3009,13 +3132,16 @@ async def get_variant_balance_stats(
         return []
 
     placeholders = ", ".join("?" for _ in variant_ids)
+    room_filter, room_params = _stats_room_filter("games")
     async with connect_db() as db:
         rows = await db.execute_fetchall(
             "SELECT variant_id, COUNT(*), "
             "SUM(CASE WHEN winner_team = ? THEN 1 ELSE 0 END) "
             "FROM games WHERE guild_id = ? "
-            f"AND variant_id IN ({placeholders}) GROUP BY variant_id",
-            (Team.WOLF.value, guild_id, *variant_ids),
+            f"AND variant_id IN ({placeholders})"
+            + room_filter
+            + " GROUP BY variant_id",
+            (Team.WOLF.value, guild_id, *variant_ids, *room_params),
         )
     counts = {
         str(variant_id): (int(games), int(wolf_wins or 0))
@@ -3047,6 +3173,9 @@ async def get_rank_player_stats(
     if rank_name is not None:
         where += " AND gp.rank_at_game = ?"
         params.append(rank_name)
+    room_filter, room_params = _stats_room_filter()
+    where += room_filter
+    params.extend(room_params)
     async with connect_db() as db:
         rows = await db.execute_fetchall(
             "SELECT gp.role, gp.won, gp.died_on_day, gs.days, "
@@ -3059,9 +3188,11 @@ async def get_rank_player_stats(
         provisional_rows = await db.execute_fetchall(
             "SELECT COUNT(*) FROM game_players gp JOIN games g ON g.game_id = gp.game_id "
             "WHERE g.guild_id = ? AND g.variant_id = ? AND gp.rank_at_game IS NOT NULL "
-            "AND gp.rank_provisional = 1" + (" AND gp.rank_at_game = ?" if rank_name else ""),
-            (guild_id, variant_id, rank_name)
-            if rank_name else (guild_id, variant_id),
+            "AND gp.rank_provisional = 1"
+            + (" AND gp.rank_at_game = ?" if rank_name else "")
+            + room_filter,
+            (guild_id, variant_id, rank_name, *room_params)
+            if rank_name else (guild_id, variant_id, *room_params),
         )
 
     roles: dict[str, dict[str, int]] = {}
@@ -3124,9 +3255,15 @@ async def get_rank_player_stats(
 # 各SQLは (player_id, 分子, 分母, サンプル数) を返す。
 # サンプル数は指標ごとに母数が違う (村での試合数 / 狼勝利数 / 提出回数…) ため、
 # 全体の試合数ではなくこの値へ LEADERBOARD_MIN_SAMPLES を掛ける。
+# 統計対象外の卓の除外は base に畳み込む。各指標のSQLは base の後ろへ
+# 条件を足すだけなので、パラメータ順は guild_id → variant_id → 除外卓 →
+# 指標固有 (役職など) となり、SQL本文の並びと一致する。
+_LEADERBOARD_ROOM_FILTER, _LEADERBOARD_ROOM_PARAMS = _stats_room_filter()
 _LEADERBOARD_BASE = (
     "FROM game_players gp JOIN games g ON gp.game_id = g.game_id "
-    "WHERE g.guild_id = ? AND g.variant_id = ? "
+    "WHERE g.guild_id = ? AND g.variant_id = ?"
+    + _LEADERBOARD_ROOM_FILTER
+    + " "
 )
 
 LEADERBOARD_METRICS: dict[str, dict] = {
@@ -3176,7 +3313,9 @@ LEADERBOARD_METRICS: dict[str, dict] = {
             "LEFT JOIN rating_history rh ON rh.game_id = g.game_id "
             "AND rh.player_id = gp.player_id AND rh.guild_id = g.guild_id "
             "AND rh.variant_id = g.variant_id AND rh.ladder_id = g.ladder_id "
-            "WHERE g.guild_id = ? AND g.variant_id = ? GROUP BY gp.player_id"
+            "WHERE g.guild_id = ? AND g.variant_id = ?"
+            + _LEADERBOARD_ROOM_FILTER
+            + " GROUP BY gp.player_id"
         ),
     },
     "wolf_guess_accuracy": {
@@ -3213,7 +3352,7 @@ async def get_metric_leaderboard(
     if spec is None:
         raise ValueError(f"unknown metric: {metric}")
     rating_parameters = rating_lib.resolve_variant_rating_parameters(variant_id)
-    params: list = [guild_id, variant_id]
+    params: list = [guild_id, variant_id, *_LEADERBOARD_ROOM_PARAMS]
     if spec.get("needs_role"):
         if not role:
             raise ValueError("role is required for this metric")
@@ -3274,13 +3413,16 @@ async def get_player_stats(
     variant_id: str = DEFAULT_VARIANT_ID,
 ) -> Optional[dict]:
     rating_lib.ladder_id_for_variant(variant_id)
+    room_filter, room_params = _stats_room_filter()
+    base_params = (player_id, guild_id, variant_id, *room_params)
     async with connect_db() as db:
         row = await db.execute_fetchall(
             "SELECT COUNT(*), SUM(gp.won) "
             "FROM game_players gp "
             "JOIN games g ON gp.game_id = g.game_id "
-            "WHERE gp.player_id = ? AND g.guild_id = ? AND g.variant_id = ?",
-            (player_id, guild_id, variant_id)
+            "WHERE gp.player_id = ? AND g.guild_id = ? AND g.variant_id = ?"
+            + room_filter,
+            base_params,
         )
         total = row[0][0] or 0
         wins = row[0][1] or 0
@@ -3292,25 +3434,28 @@ async def get_player_stats(
             "SELECT gp.role, COUNT(*) as cnt, SUM(gp.won) as w "
             "FROM game_players gp "
             "JOIN games g ON gp.game_id = g.game_id "
-            "WHERE gp.player_id = ? AND g.guild_id = ? AND g.variant_id = ? "
-            "GROUP BY gp.role",
-            (player_id, guild_id, variant_id)
+            "WHERE gp.player_id = ? AND g.guild_id = ? AND g.variant_id = ?"
+            + room_filter
+            + " GROUP BY gp.role",
+            base_params,
         )
         # 陣営別統計
         teams = await db.execute_fetchall(
             "SELECT gp.team, COUNT(*) as cnt, SUM(gp.won) as w "
             "FROM game_players gp "
             "JOIN games g ON gp.game_id = g.game_id "
-            "WHERE gp.player_id = ? AND g.guild_id = ? AND g.variant_id = ? "
-            "GROUP BY gp.team",
-            (player_id, guild_id, variant_id)
+            "WHERE gp.player_id = ? AND g.guild_id = ? AND g.variant_id = ?"
+            + room_filter
+            + " GROUP BY gp.team",
+            base_params,
         )
         # 最終更新
         last = await db.execute_fetchall(
             "SELECT MAX(g.played_at) FROM game_players gp "
             "JOIN games g ON gp.game_id = g.game_id "
-            "WHERE gp.player_id = ? AND g.guild_id = ? AND g.variant_id = ?",
-            (player_id, guild_id, variant_id)
+            "WHERE gp.player_id = ? AND g.guild_id = ? AND g.variant_id = ?"
+            + room_filter,
+            base_params,
         )
 
         history = await db.execute_fetchall(
@@ -3318,18 +3463,21 @@ async def get_player_stats(
             "gs.days, gs.seer_checks, gs.seer_wolf_hits, gs.guard_successes "
             "FROM game_players gp JOIN games g ON gp.game_id = g.game_id "
             "LEFT JOIN game_stats gs ON gs.game_id = g.game_id "
-            "WHERE gp.player_id = ? AND g.guild_id = ? AND g.variant_id = ? "
-            "ORDER BY g.played_at, g.game_id",
-            (player_id, guild_id, variant_id),
+            "WHERE gp.player_id = ? AND g.guild_id = ? AND g.variant_id = ?"
+            + room_filter
+            + " ORDER BY g.played_at, g.game_id",
+            base_params,
         )
         reset_rows = await db.execute_fetchall(
             "SELECT reset_at FROM season_resets WHERE guild_id = ? ORDER BY reset_at, id",
             (guild_id,),
         )
         recommendation_rows = await db.execute_fetchall(
-            "SELECT COALESCE(SUM(recommendation_bonus), 0) FROM rating_history "
-            "WHERE player_id = ? AND guild_id = ? AND variant_id = ?",
-            (player_id, guild_id, variant_id),
+            "SELECT COALESCE(SUM(rh.recommendation_bonus), 0) "
+            "FROM rating_history rh JOIN games g ON g.game_id = rh.game_id "
+            "WHERE rh.player_id = ? AND rh.guild_id = ? AND rh.variant_id = ?"
+            + room_filter,
+            base_params,
         )
 
         max_win_streak = 0
@@ -4166,6 +4314,28 @@ async def list_player_blocks(guild_id: int, blocker_id: int) -> list[int]:
             "ORDER BY created_at, blocked_id", (guild_id, blocker_id)
         )
     return [int(r[0]) for r in rows]
+
+
+async def list_player_blocks_between(
+    guild_id: int, user_ids: Collection[int],
+) -> list[tuple[int, int]]:
+    """指定メンバー内で成立している同村拒否を (拒否した人, された人) で返す。
+
+    募集カードを通さずに卓へ入れる次村でも、同村拒否を素通りさせないため
+    に使う。1クエリで済ませ、参加人数ぶんの往復にしない。
+    """
+    ids = sorted({int(user_id) for user_id in user_ids})
+    if len(ids) < 2:
+        return []
+    placeholders = ",".join("?" * len(ids))
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT blocker_id, blocked_id FROM player_blocks "
+            f"WHERE guild_id = ? AND blocker_id IN ({placeholders}) "
+            f"AND blocked_id IN ({placeholders})",
+            (guild_id, *ids, *ids),
+        )
+    return [(int(row[0]), int(row[1])) for row in rows]
 
 
 async def get_dropout_counts(guild_id: int, *, limit: int = 25) -> list[dict]:

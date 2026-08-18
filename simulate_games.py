@@ -504,9 +504,13 @@ class FakeGuild:
         name: str,
         *,
         overwrites: Optional[dict[Any, discord.PermissionOverwrite]] = None,
+        position: Optional[int] = None,
     ) -> FakeCategory:
         category = FakeCategory(self, name, overwrites=overwrites)
-        self.categories.append(category)
+        if position is None:
+            self.categories.append(category)
+        else:
+            self.categories.insert(max(0, position), category)
         return category
 
     async def create_text_channel(self, name: str, *, category: Optional[FakeCategory] = None,
@@ -1181,30 +1185,32 @@ async def _simulate_selected_game_inner(
         candidates.sort(
             key=lambda room_def: (
                 room_def.room_id not in config.PUBLIC_ROOM_IDS,
-                room_def.room_id != "open",
                 room_def.room_id,
             )
         )
         if candidates:
             room_def = candidates[0]
         else:
-            # enabled=False の変種も本物のレート精算まで検証する。ライブ用の
-            # RATED_ROOM_IDS は無効卓を含めないため、ここだけ既存のレート卓ID
-            # を借りたシミュレーション専用定義を使う。
-            if "open" not in config.RATED_ROOM_IDS:
-                raise AssertionError("simulation requires an active rated room ID")
+            # 常設卓の全廃後、レート対象の固定卓が1つも残らない構成がある。
+            # is_rated_room() は卓定義そのもの (enabled かつ rated) を見るため、
+            # 検証専用の固定卓定義でレート精算まで通せる。名前村にはしない——
+            # LobbyViewから「参加」が消え、シミュレーションの参加導線ごと
+            # 無くなってしまうため。
             room_def = config.RoomDefinition(
-                "open",
+                f"simulation-rated-{variant_id}",
                 f"検証用-{variant.label}",
                 variant_id=variant_id,
             )
         cog = room_runner_module.RoomRunner(fake_bot, manager, room_def)
         manager.rooms[room_def.room_id] = cog
     else:
+        # is_rated_room() は卓定義のenabled/ratedで判定するため、IDだけでは
+        # 非レートにならない。明示的にrated=Falseを指定する。
         room_def = config.RoomDefinition(
             "simulation-unrated",
             "検証用非レート卓",
             variant_id=variant_id,
+            rated=False,
         )
         cog = room_runner_module.RoomRunner(fake_bot, manager, room_def)
         manager.rooms[room_def.room_id] = cog
@@ -1990,8 +1996,8 @@ def main() -> None:
         choices=("all", *tuple(config.VARIANT_DEFINITIONS)),
         default="all",
         help=(
-            "single mode defaults to every variant; population mode uses "
-            f"{config.DEFAULT_VARIANT_ID} when 'all' is selected"
+            "single mode defaults to every variant; population mode requires "
+            "one variant (ラダー別に母集団を作るため)"
         ),
     )
     parser.add_argument("--population-size", type=int, default=200, help="population size for population mode")
@@ -2024,11 +2030,15 @@ def main() -> None:
         )
         asyncio.run(run_simulations(args.runs, variant_ids=variant_ids))
     else:
-        population_variant = (
-            config.DEFAULT_VARIANT_ID
-            if args.variant == "all"
-            else args.variant
-        )
+        # population modeはラダー別に母集団を作る。'all'を13人村へ黙って
+        # 読み替えると、9人2ラダーの検証が気付かないまま漏れ続けるため、
+        # 対象を必ず選ばせる。まとめて回したい場合は変種ごとに実行する。
+        if args.variant == "all":
+            parser.error(
+                "population modeは --variant で対象を1つ指定してください: "
+                + ", ".join(config.VARIANT_DEFINITIONS)
+            )
+        population_variant = args.variant
         asyncio.run(
             run_population_simulation(
                 population_size=args.population_size,

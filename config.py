@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping
+from typing import Iterable, Mapping
 
 from room_config import (
     RoomDefinition,
@@ -15,7 +15,7 @@ from room_config import (
 )
 
 # Botのバージョン (ヘルプに表示。ソース公開された派生でも識別できるように)
-BOT_VERSION = "v0.41"
+BOT_VERSION = "v0.47"
 
 # 新規導入先に同名カテゴリが既にある場合、無関係なDiscord構成をBot所有と
 # 誤認しない。既存運用は保存済みchannel IDで自動再利用できる。
@@ -256,9 +256,6 @@ def get_variant_definition(variant_id: str) -> VariantDefinition:
 
 
 # 従来APIは13人クロストークのエイリアスとして残す。
-ROLE_DISTRIBUTION = dict(
-    VARIANT_DEFINITIONS[DEFAULT_VARIANT_ID].role_distribution
-)
 MAX_PLAYERS = VARIANT_DEFINITIONS[DEFAULT_VARIANT_ID].player_count
 
 # Discordの1メッセージあたりの文字数上限。超えると送信自体が
@@ -271,11 +268,6 @@ PREPARATION_TIME = 30
 # 役職確認後、1日目の議論より前に置く人狼の挨拶専用時間。
 # この間は人狼DMの自由文中継だけを開き、襲撃・占い・護衛は行わない。
 INITIAL_NIGHT_GREETING_TIME = 30
-# 13人クロストークの従来互換エイリアス。ゲーム進行は各変種の
-# ``crosstalk_discussion_seconds`` を使うため、新規の変種設定には使わない。
-DAY_DISCUSSION_BASE, DAY_DISCUSSION_DECREASE, DAY_DISCUSSION_MIN = (
-    CROSSTALK_DISCUSSION_SECONDS_13
-)
 NIGHT_BASE = 80                # 初日の夜は80秒
 NIGHT_DECREASE = 20            # 2日目以降は60秒固定 (80-20, 下限60)
 NIGHT_MIN = 60
@@ -341,10 +333,14 @@ RECRUITMENT_NOTIFICATION_ROLE_NAME = "通知"
 STATS_PARENT_CHANNEL_NAME = "総合"
 GM_INFO_CATEGORY_NAME = "GM"
 
-# 終了した #昼 / #霊界 を消さずに退避するログカテゴリ。
+# 終了した #昼 を消さずに退避するログカテゴリ。
 # 試合番号を先頭に付けて移す (Discordはカテゴリ内を名前順に並べるため、
 # 番号が前にあると自然に試合順になる)。読むだけで書き込みはできない。
 LOG_CATEGORY_VILLAGE = "ログ-昼"
+# #霊界 は退避せず従来どおり削除する。中身は入室通知と死亡者の雑談で
+# 読み返す価値が薄く、カテゴリ上限50本ぶんのチャンネル枠と試合ごとの
+# 退避APIに見合わない。名前だけは固定卓・名前村の予約語として残す
+# (サーバーに残る手動作成の同名カテゴリと衝突させないため)。
 LOG_CATEGORY_SPIRIT = "ログ-霊界"
 # Discordの上限がカテゴリあたり50チャンネル。上限に達したら
 # 古い順にまとめて減らす (毎回1つずつ消すより整理の頻度が下がる)。
@@ -414,7 +410,11 @@ _BUILTIN_ROOM_DEFINITIONS = [
         frozenset({"ダイヤ", "マスター", "グランドマスター"}),
         enabled=False,
     ),
-    RoomDefinition("open", "総合"),
+    # v0.47で常設卓を全廃し、村はGMの名前村だけにした。過去7試合ぶんの
+    # 統計・履歴が room_id="open" を参照するため、定義自体は残す
+    # (ROOM_DEFINITIONS は履歴用に全定義を保持する。落とすと過去試合の
+    # 卓名解決が壊れる)。Discord上のカテゴリ・受付・VCは作らない。
+    RoomDefinition("open", "総合", enabled=False),
     RoomDefinition(
         "open_13_turn", "総合-13ターン", variant_id="v13_turn", enabled=False,
     ),
@@ -449,6 +449,9 @@ _LOCAL_ROOM_REGISTRATIONS = parse_local_room_config(
     # このサーバーでDiscord側の静的権限を正本にする既存ローカル卓。
     # 他のローカル卓はsync_permissionsを省略すると従来どおり自動同期する。
     manual_static_room_names={"ねいとくん村"},
+    # 身内の練習卓。レートを動かさず、統計の集計・卓フィルタからも外す。
+    # .envで rated を明示した場合はそちらが優先される。
+    unrated_room_names={"ねいとくん村"},
 )
 
 ROOM_DEFINITIONS = [
@@ -484,10 +487,17 @@ _OPEN_ROOM_CANDIDATE_IDS = frozenset({
 })
 OPEN_ROOM_IDS = _OPEN_ROOM_CANDIDATE_IDS & ACTIVE_ROOM_IDS
 PUBLIC_ROOM_IDS = OPEN_ROOM_IDS
-# 正常終了した全村をレート対象にする。動的なGM名前村はこの静的集合へ
-# 列挙できないため、RoomRunner.is_rated_room() 側で追加判定する。
-# ローカル設定の旧 rated 値は設定互換のため読み込むが、対象外指定には使わない。
-RATED_ROOM_IDS = ACTIVE_ROOM_IDS
+# レート対象の固定卓。動的なGM名前村はこの静的集合へ列挙できないため、
+# RoomRunner.is_rated_room() 側で追加判定する。rated=False のローカル卓は
+# レートを動かさず、統計の集計・卓フィルタからも外す (UNRATED_ROOM_IDS)。
+RATED_ROOM_IDS = frozenset(
+    room.room_id for room in ACTIVE_ROOM_DEFINITIONS if room.rated
+)
+# 統計から除外する卓。無効卓は過去の試合を集計に残すため含めない
+# (常設卓を畳んでも、それまでの統計は消さない)。
+UNRATED_ROOM_IDS = frozenset(
+    room.room_id for room in ACTIVE_ROOM_DEFINITIONS if not room.rated
+)
 if not (OPEN_ROOM_IDS <= ACTIVE_ROOM_IDS):
     raise RuntimeError("OPEN_ROOM_IDS contains a disabled room")
 if not (PUBLIC_ROOM_IDS <= ACTIVE_ROOM_IDS):
@@ -501,6 +511,38 @@ GM_ROLE_NAME = "GM"
 TEMP_GM_ROLE_NAME = "仮GM"
 PRIVATE_ROOM_CREATOR_ROLE_NAMES = frozenset({GM_ROLE_NAME, TEMP_GM_ROLE_NAME})
 PRIVATE_ROOM_CREATOR_ROLE_LABEL = "GM または 仮GM"
+
+# 1人が同時に持てるGM村の数。募集と村が一体なので、同時に複数の受付を
+# 出したい人ほど多く要る。複数のロールを持つ場合は**最大値**を採用する
+# (仮GM＋GMなら3)。作成そのものの可否は PRIVATE_ROOM_CREATOR_ROLE_NAMES 側で
+# 判定するため、ここに無いロールだけの人は0村のままになる。
+PRIVATE_ROOM_LIMIT_BY_ROLE = {
+    TEMP_GM_ROLE_NAME: 1,
+    GM_ROLE_NAME: 3,
+}
+# 設定運営ロール (WEREWOLF_OPERATIONS_STAFF_ROLES) を併せ持つ運用担当の枠。
+PRIVATE_ROOM_LIMIT_STAFF = 7
+# サーバー全体で同時に持てるGM村の数。1村がカテゴリ1つと平常時2チャンネル
+# (ゲーム中は4) を占有し、Discordの上限は1サーバーあたりカテゴリ50・
+# チャンネル500。ログカテゴリ・GM・開発ぶんを残してここで頭打ちにする。
+PRIVATE_ROOM_GUILD_LIMIT = 12
+
+
+def private_room_limit_for_roles(role_names: Iterable[str]) -> int:
+    """保持ロール名から、その人が持てるGM村の上限を返す。
+
+    上限の決め方 (最大値を採る／運営ロールは別枠) を1か所に置くため、
+    ロールの取り出し方が違う呼出側からも同じこの関数を使う。
+    """
+    names = [str(name) for name in role_names]
+    limits = [
+        PRIVATE_ROOM_LIMIT_BY_ROLE[name]
+        for name in names
+        if name in PRIVATE_ROOM_LIMIT_BY_ROLE
+    ]
+    if any(name in OPERATIONS_STAFF_ROLE_NAMES for name in names):
+        limits.append(PRIVATE_ROOM_LIMIT_STAFF)
+    return max(limits, default=0)
 
 # ============================================================
 # レーティング設定

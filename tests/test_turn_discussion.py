@@ -11,7 +11,7 @@ import discord
 from config import Phase, Role, RoomDefinition, Team, get_variant_definition
 from models import GameState, Player
 from room_runner import RoomRunner, StateDurabilityError, turn_timer_should_update
-from views import TurnSpeechView, build_help_embeds, build_rule_embeds
+from views import TurnSpeechView, VoteView, build_help_embeds, build_rule_embeds
 
 
 class FakeManager:
@@ -945,6 +945,130 @@ class TurnDurabilityAndSafetyTest(unittest.IsolatedAsyncioTestCase):
                 "wolf_guess_slots": 2,
                 "final_day_threshold": 4,
             },
+        )
+
+
+class TurnSimultaneousVoteTest(unittest.IsolatedAsyncioTestCase):
+    """ターン制の通常投票は一斉投票。投票発言はクロストークだけ。"""
+
+    async def test_turn_variants_do_not_use_sequential_vote(self) -> None:
+        for variant_id in ("v9_turn", "v13_turn"):
+            with self.subTest(variant_id=variant_id):
+                self.assertFalse(make_runner(variant_id).uses_sequential_vote())
+        for variant_id in ("v9_cross", "v13_cross"):
+            with self.subTest(variant_id=variant_id):
+                self.assertTrue(make_runner(variant_id).uses_sequential_vote())
+
+    async def test_turn_vote_panel_has_no_queue_button(self) -> None:
+        """一斉投票には順番待ちの列がないので「投票」ボタンを置かない。"""
+        turn = make_runner("v9_turn")
+        players = add_players(turn, 9)
+        turn_view = VoteView(turn, candidates=players[1:], voters=players)
+        self.assertEqual(len(turn_view.children), len(players) - 1)
+
+        cross = make_runner("v9_cross")
+        cross_players = add_players(cross, 9)
+        cross_view = VoteView(
+            cross, candidates=cross_players[1:], voters=cross_players
+        )
+        self.assertEqual(len(cross_view.children), len(cross_players))
+
+    async def test_turn_vote_accepts_without_speech_slot(self) -> None:
+        """発言枠を持たないターン制でも、生存者はいつでも投票できる。"""
+        turn = make_runner("v9_turn")
+        players = add_players(turn, 9)
+        turn.state.phase = Phase.DAY_VOTE
+        view = VoteView(turn, candidates=players[1:], voters=players)
+        # vote_slot_active は投票発言専用。ターン制では立たないまま投票する。
+        self.assertFalse(turn.state.vote_slot_active)
+        self.assertIsNone(view._vote_error(players[0].user_id, players[1].user_id))
+
+    async def test_turn_vote_persists_current_day_generation(self) -> None:
+        """一斉投票中のsnapshotを、同じ日の投票として復元できる。"""
+        runner = make_runner("v9_turn")
+        add_players(runner, 9)
+        runner.state.day_generation = 3
+        runner.state.vote_day_generation = 2
+        runner._repost_gm_panel = AsyncMock()
+        runner._pausable_countdown = AsyncMock(return_value=True)
+        runner._resolve_day_vote = AsyncMock(return_value=None)
+
+        await runner._day_vote_simultaneous()
+
+        self.assertEqual(runner.state.phase, Phase.DAY_VOTE)
+        self.assertEqual(runner.state.vote_day_generation, 3)
+        runner._persist_room_state.assert_awaited()
+
+    async def test_closed_turn_vote_resumes_closed_without_losing_votes(self) -> None:
+        """GM締切後に再起動しても投票を再開せず、保存済み票を集計する。"""
+        runner = make_runner("v9_turn")
+        players = add_players(runner, 9)
+        runner.state.day_generation = 4
+        runner.state.vote_day_generation = 4
+        runner.state.vote_closed = True
+        runner.state.votes = {players[0].user_id: players[1].user_id}
+        runner._repost_gm_panel = AsyncMock()
+        runner._pausable_countdown = AsyncMock(return_value=True)
+        runner._resolve_day_vote = AsyncMock(return_value=None)
+
+        await runner._day_vote_simultaneous()
+
+        self.assertTrue(runner.state.vote_closed)
+        self.assertTrue(runner.state.vote_complete_event.is_set())
+        self.assertEqual(
+            runner.state.votes,
+            {players[0].user_id: players[1].user_id},
+        )
+
+    async def test_closed_turn_vote_rejects_late_vote(self) -> None:
+        runner = make_runner("v9_turn")
+        players = add_players(runner, 9)
+        runner.state.phase = Phase.DAY_VOTE
+        runner.state.vote_closed = True
+        view = VoteView(runner, candidates=players[1:], voters=players)
+
+        self.assertEqual(
+            view._vote_error(players[0].user_id, players[1].user_id),
+            "投票受付は終了しました。",
+        )
+
+    async def test_gm_skip_closes_simultaneous_vote_for_real(self) -> None:
+        """ターン制のスキップは vote_complete_event を立てて実際に締め切る。
+
+        逐次投票用の締切分岐は vote_order が空のターン制でも条件が揃うため、
+        締め切ったと表示しながら時間切れまで続く不具合があった。
+        """
+        runner = make_runner("v9_turn")
+        players = add_players(runner, 9)
+        runner.state.gm_id = players[0].user_id
+        runner.state.phase = Phase.DAY_VOTE
+        runner.state.vote_complete_event.clear()
+
+        result = await runner.force_skip_wait(players[0].member)
+
+        self.assertIn("締め切", result)
+        self.assertTrue(runner.state.vote_complete_event.is_set())
+        self.assertTrue(runner.state.vote_closed)
+        runner._persist_room_state.assert_awaited()
+
+    async def test_gm_skip_on_turn_vote_is_idempotent(self) -> None:
+        runner = make_runner("v9_turn")
+        players = add_players(runner, 9)
+        runner.state.gm_id = players[0].user_id
+        runner.state.phase = Phase.DAY_VOTE
+        runner.state.vote_complete_event.set()
+
+        result = await runner.force_skip_wait(players[0].member)
+        self.assertIn("スキップできる時間待ちはありません", result)
+
+    async def test_crosstalk_still_requires_speech_slot(self) -> None:
+        cross = make_runner("v9_cross")
+        players = add_players(cross, 9)
+        cross.state.phase = Phase.DAY_VOTE
+        view = VoteView(cross, candidates=players[1:], voters=players)
+        self.assertEqual(
+            view._vote_error(players[0].user_id, players[1].user_id),
+            "自分の番になってから投票できます。",
         )
 
 

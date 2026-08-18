@@ -6,13 +6,23 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
+import config as config_lib
 import database
 import rating as rating_lib
-from config import LOG_CATEGORY_SPIRIT, LOG_CATEGORY_VILLAGE, RoomDefinition, Team
+from config import (
+    GM_INFO_CATEGORY_NAME,
+    LOG_CATEGORY_SPIRIT,
+    LOG_CATEGORY_VILLAGE,
+    Phase,
+    RoomDefinition,
+    Team,
+)
 from game import GameCog
 from permissions import RoomPermissionMixin, RoomVisibilityError
+from views import DangerConfirmView
 
 
 class _PermissionTarget:
@@ -100,10 +110,51 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("role_id", {row[1] for row in columns})
 
         await database.save_private_room(1, "private_10", 10, "十村")
-        row = await database.get_private_room_by_owner(1, 10)
+        row = await database.get_private_room(1, "private_10")
         assert row is not None
         self.assertNotIn("role_name", row)
         self.assertNotIn("role_id", row)
+
+    async def test_init_db_rejects_extra_not_null_column_without_default(self) -> None:
+        """現行のINSERTは必須列しか書かない。DEFAULTなしNOT NULLの余分な列が
+        残っていると保存が実行時に落ちるため、起動前に止める。"""
+        async with database.connect_db() as db:
+            await db.execute("PRAGMA foreign_keys = OFF")
+            await db.execute("ALTER TABLE private_rooms RENAME TO private_rooms_old")
+            await db.execute("""
+                CREATE TABLE private_rooms (
+                    guild_id INTEGER NOT NULL,
+                    room_id TEXT NOT NULL,
+                    owner_id INTEGER NOT NULL,
+                    room_name TEXT NOT NULL,
+                    role_name TEXT NOT NULL,
+                    variant_id TEXT NOT NULL DEFAULT 'v13_cross',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    category_id INTEGER,
+                    last_error TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (guild_id, room_id),
+                    UNIQUE (guild_id, owner_id),
+                    UNIQUE (guild_id, room_name)
+                )
+            """)
+            await db.execute("DROP TABLE private_rooms_old")
+            await db.commit()
+            table_sql_before = (await db.execute_fetchall(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='private_rooms'"
+            ))[0][0]
+
+        with self.assertRaisesRegex(
+            RuntimeError, "private_rooms.role_nameがDEFAULTなしNOT NULLの余分な列"
+        ):
+            await database.init_db()
+
+        # 拒否するだけで、DDLは書き換えない
+        async with database.connect_db() as db:
+            table_sql_after = (await db.execute_fetchall(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='private_rooms'"
+            ))[0][0]
+        self.assertEqual(table_sql_after, table_sql_before)
 
     async def test_existing_private_room_legacy_columns_are_retained_but_ignored(self) -> None:
         async with database.connect_db() as db:
@@ -117,7 +168,7 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue({"role_name", "role_id"}.issubset({row[1] for row in columns}))
 
         await database.save_private_room(1, "private_10", 10, "十村")
-        row = await database.get_private_room_by_owner(1, 10)
+        row = await database.get_private_room(1, "private_10")
         assert row is not None
         self.assertNotIn("role_name", row)
         self.assertNotIn("role_id", row)
@@ -147,39 +198,6 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
                 "SELECT COUNT(*) FROM private_room_members"
             ))[0][0]
         self.assertEqual(count, 1)
-
-    async def test_init_db_rejects_not_null_legacy_private_room_role_without_changes(self) -> None:
-        async with database.connect_db() as db:
-            await db.execute(
-                "ALTER TABLE private_rooms ADD COLUMN role_name TEXT NOT NULL"
-            )
-            await db.commit()
-            schema_version_before = (await db.execute_fetchall(
-                "PRAGMA schema_version"
-            ))[0][0]
-            journal_mode_before = (await db.execute_fetchall(
-                "PRAGMA journal_mode"
-            ))[0][0]
-            table_sql_before = (await db.execute_fetchall(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='private_rooms'"
-            ))[0][0]
-
-        with self.assertRaisesRegex(RuntimeError, "private_rooms.role_nameがNOT NULL"):
-            await database.init_db()
-
-        async with database.connect_db() as db:
-            schema_version_after = (await db.execute_fetchall(
-                "PRAGMA schema_version"
-            ))[0][0]
-            journal_mode_after = (await db.execute_fetchall(
-                "PRAGMA journal_mode"
-            ))[0][0]
-            table_sql_after = (await db.execute_fetchall(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='private_rooms'"
-            ))[0][0]
-        self.assertEqual(schema_version_after, schema_version_before)
-        self.assertEqual(journal_mode_after, journal_mode_before)
-        self.assertEqual(table_sql_after, table_sql_before)
 
     async def test_init_db_rejects_partial_private_room_unique_keys(self) -> None:
         async with database.connect_db() as db:
@@ -867,11 +885,21 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_private_room_owner_and_name_queries(self) -> None:
         await database.save_private_room(1, "private_10", 10, "十村")
-        by_owner = await database.get_private_room_by_owner(1, 10)
+        await database.save_private_room(1, "private_10_2", 10, "十村の2つ目")
+        # 1人が複数の村を持てるため、村主からは一覧で引く (作成順)
+        by_owner = await database.list_private_rooms_by_owner(1, 10)
+        self.assertEqual(
+            [row["room_id"] for row in by_owner],
+            ["private_10", "private_10_2"],
+        )
+        self.assertEqual(by_owner[0]["status"], "creating")
+
         by_name = await database.get_private_room_by_name(1, "十村")
-        self.assertEqual(by_owner["room_id"], "private_10")
         self.assertEqual(by_name["owner_id"], 10)
-        self.assertEqual(by_owner["status"], "creating")
+        by_room_id = await database.get_private_room(1, "private_10_2")
+        self.assertEqual(by_room_id["room_name"], "十村の2つ目")
+        self.assertIsNone(await database.get_private_room(1, "private_missing"))
+        self.assertEqual(await database.count_private_rooms(1), 2)
 
     async def test_feedback_report_keeps_game_context(self) -> None:
         report_id = await database.save_feedback_report(
@@ -1484,6 +1512,345 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
             len([r for r in rows if r["user_id"] == 100]), FEEDBACK_MAX_PER_DAY
         )
         self.assertEqual(len([r for r in rows if r["user_id"] == 200]), 1)
+
+
+class PrivateRoomLimitTest(unittest.IsolatedAsyncioTestCase):
+    """1人が持てるGM村の数と、サーバー全体の上限を固定する。"""
+
+    async def asyncSetUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="werewolf-private-room-test-")
+        self._original_db_path = database.DB_PATH
+        database.DB_PATH = str(Path(self._tmp.name) / "test.db")
+        await database.init_db()
+
+    async def asyncTearDown(self) -> None:
+        database.DB_PATH = self._original_db_path
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _member(member_id: int, *role_names: str):
+        member = MagicMock(spec=discord.Member)
+        member.id = member_id
+        member.guild = SimpleNamespace(id=1)
+        member.roles = [SimpleNamespace(name=name) for name in role_names]
+        return member
+
+    def test_limit_takes_the_largest_of_held_roles(self) -> None:
+        from config import (
+            GM_ROLE_NAME, TEMP_GM_ROLE_NAME, private_room_limit_for_roles,
+        )
+
+        with patch.object(config_lib, "OPERATIONS_STAFF_ROLE_NAMES", frozenset({"ねいと"})):
+            self.assertEqual(private_room_limit_for_roles([TEMP_GM_ROLE_NAME]), 1)
+            self.assertEqual(private_room_limit_for_roles([GM_ROLE_NAME]), 3)
+            self.assertEqual(
+                private_room_limit_for_roles(["ねいと", GM_ROLE_NAME]), 7
+            )
+            # 合算せず最大値。仮GMを併せ持っても下がらない
+            self.assertEqual(
+                private_room_limit_for_roles([TEMP_GM_ROLE_NAME, GM_ROLE_NAME]), 3
+            )
+            self.assertEqual(private_room_limit_for_roles(["一般参加者"]), 0)
+
+    async def test_room_ids_are_sequential_per_owner(self) -> None:
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        self.assertEqual(manager._next_private_room_id(10, set()), "private_10")
+        self.assertEqual(
+            manager._next_private_room_id(10, {"private_10"}), "private_10_2"
+        )
+        self.assertEqual(
+            manager._next_private_room_id(10, {"private_10", "private_10_2"}),
+            "private_10_3",
+        )
+
+    async def test_creation_is_refused_at_the_personal_limit(self) -> None:
+        from config import TEMP_GM_ROLE_NAME
+
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        guild = SimpleNamespace(id=1, categories=[], text_channels=[], roles=[])
+        owner = self._member(10, TEMP_GM_ROLE_NAME)
+        await database.save_private_room(1, "private_10", 10, "十村")
+
+        with self.assertRaisesRegex(RuntimeError, "作成できるGM村は1個までです"):
+            await manager.ensure_gm_village_for_recruitment(
+                guild, owner, room_name="十村の2つ目", variant_id="v13_cross",
+            )
+
+    async def test_creation_is_refused_at_the_guild_limit(self) -> None:
+        from config import GM_ROLE_NAME, PRIVATE_ROOM_GUILD_LIMIT
+
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        guild = SimpleNamespace(id=1, categories=[], text_channels=[], roles=[])
+        owner = self._member(10, GM_ROLE_NAME)
+        for index in range(PRIVATE_ROOM_GUILD_LIMIT):
+            await database.save_private_room(
+                1, f"private_{100 + index}", 100 + index, f"村{index}",
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "サーバー全体のGM村が上限"):
+            await manager.ensure_gm_village_for_recruitment(
+                guild, owner, room_name="新しい村", variant_id="v13_cross",
+            )
+
+    async def test_existing_room_is_reused_when_the_name_matches(self) -> None:
+        """同じ村名なら、その村で次の募集を受け付ける (新規作成しない)。"""
+        from config import GM_ROLE_NAME
+
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        guild = SimpleNamespace(id=1, categories=[], text_channels=[], roles=[])
+        owner = self._member(10, GM_ROLE_NAME)
+        await database.save_private_room(1, "private_10", 10, "十村")
+        await database.save_private_room(1, "private_10_2", 10, "十村2")
+        room = SimpleNamespace(
+            state=SimpleNamespace(phase=Phase.LOBBY, players=[], room_id="private_10_2"),
+        )
+        manager.rooms["private_10_2"] = room
+
+        reused, created = await manager.ensure_gm_village_for_recruitment(
+            guild, owner, room_name="十村2", variant_id="v13_cross",
+        )
+
+        self.assertIs(reused, room)
+        self.assertFalse(created)
+
+    async def test_blank_name_with_multiple_rooms_asks_which_village(self) -> None:
+        from config import GM_ROLE_NAME
+
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        guild = SimpleNamespace(id=1, categories=[], text_channels=[], roles=[])
+        owner = self._member(10, GM_ROLE_NAME)
+        await database.save_private_room(1, "private_10", 10, "十村")
+        await database.save_private_room(1, "private_10_2", 10, "十村2")
+
+        with self.assertRaisesRegex(RuntimeError, "GM村が複数あります"):
+            await manager.ensure_gm_village_for_recruitment(
+                guild, owner, room_name="", variant_id="v13_cross",
+            )
+
+    def test_owner_can_run_only_one_village_at_a_time(self) -> None:
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        manager.rooms = {
+            "private_10": SimpleNamespace(
+                room_def=SimpleNamespace(private_owner_id=10),
+                state=SimpleNamespace(
+                    room_id="private_10", room_name="十村", phase=Phase.NIGHT,
+                ),
+            ),
+            "private_10_2": SimpleNamespace(
+                room_def=SimpleNamespace(private_owner_id=10),
+                state=SimpleNamespace(
+                    room_id="private_10_2", room_name="十村2", phase=Phase.LOBBY,
+                ),
+            ),
+            "private_11": SimpleNamespace(
+                room_def=SimpleNamespace(private_owner_id=11),
+                state=SimpleNamespace(
+                    room_id="private_11", room_name="十一村", phase=Phase.LOBBY,
+                ),
+            ),
+        }
+
+        self.assertEqual(
+            manager.running_room_name_for_owner(10, exclude_room_id="private_10_2"),
+            "十村",
+        )
+        # 進行中の村自身からは開始判定に引っかからない
+        self.assertIsNone(
+            manager.running_room_name_for_owner(10, exclude_room_id="private_10")
+        )
+        self.assertIsNone(
+            manager.running_room_name_for_owner(11, exclude_room_id="private_11")
+        )
+
+    async def test_operations_button_delegates_village_deletion(self) -> None:
+        """#運営の村削除も、選択と最終確認は本人削除と同じ入口を通る。"""
+        import recruitment as recruitment_lib
+
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        manager.prompt_private_room_force_delete = AsyncMock()
+        view = recruitment_lib.OperationsView(manager.recruitment_manager)
+        button = next(
+            item for item in view.children if item.label == "村の強制削除"
+        )
+        member = self._member(10)
+        member.guild_permissions = SimpleNamespace(administrator=True)
+        interaction = SimpleNamespace(
+            user=member,
+            guild=SimpleNamespace(id=1, owner_id=999),
+            response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+        )
+
+        with patch.object(
+            recruitment_lib, "OPERATIONS_STAFF_ROLE_NAMES", frozenset()
+        ):
+            await button.callback(interaction)
+
+        manager.prompt_private_room_force_delete.assert_awaited_once_with(interaction)
+
+    async def test_legacy_one_room_per_owner_constraint_is_migrated_away(self) -> None:
+        """旧DBの UNIQUE(guild_id, owner_id) は起動時に外れて2村目が作れる。"""
+        async with database.connect_db() as db:
+            await db.execute("PRAGMA foreign_keys = OFF")
+            await db.execute("ALTER TABLE private_rooms RENAME TO private_rooms_old")
+            await db.execute("""
+                CREATE TABLE private_rooms (
+                    guild_id INTEGER NOT NULL,
+                    room_id TEXT NOT NULL,
+                    owner_id INTEGER NOT NULL,
+                    room_name TEXT NOT NULL,
+                    variant_id TEXT NOT NULL DEFAULT 'v13_cross',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    category_id INTEGER,
+                    last_error TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (guild_id, room_id),
+                    UNIQUE (guild_id, owner_id),
+                    UNIQUE (guild_id, room_name)
+                )
+            """)
+            await db.execute(
+                "INSERT INTO private_rooms (guild_id, room_id, owner_id, room_name) "
+                "VALUES (1, 'private_10', 10, '十村')"
+            )
+            await db.execute("DROP TABLE private_rooms_old")
+            await db.commit()
+
+        await database.init_db()
+        await database.save_private_room(1, "private_10_2", 10, "十村2")
+
+        rooms = await database.list_private_rooms_by_owner(1, 10)
+        self.assertEqual([row["room_name"] for row in rooms], ["十村", "十村2"])
+        # 村名の一意制約は残す
+        with self.assertRaises(Exception):
+            await database.save_private_room(1, "private_11", 11, "十村")
+
+
+class SeasonResetConfirmationTest(unittest.IsolatedAsyncioTestCase):
+    """全員のレートを書き換える操作なので、押し間違いを最終確認で止める。"""
+
+    @staticmethod
+    def _member(member_id: int = 10, *, manage_guild: bool = True):
+        member = MagicMock(spec=discord.Member)
+        member.id = member_id
+        member.guild_permissions = SimpleNamespace(
+            manage_guild=manage_guild, administrator=manage_guild,
+        )
+        member.roles = []
+        return member
+
+    @staticmethod
+    def _interaction(member):
+        return SimpleNamespace(
+            user=member,
+            guild=SimpleNamespace(id=1, owner_id=999),
+            response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+        )
+
+    async def test_confirmation_is_required_before_reset(self) -> None:
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        manager._execute_season_reset = AsyncMock()
+        interaction = self._interaction(self._member())
+
+        with patch.object(
+            database, "get_season_start", AsyncMock(return_value="2026-01-01 00:00:00"),
+        ):
+            await manager.prompt_season_reset(interaction, note="移行")
+
+        manager._execute_season_reset.assert_not_awaited()
+        kwargs = interaction.response.send_message.await_args.kwargs
+        self.assertTrue(kwargs["ephemeral"])
+        view = kwargs["view"]
+        self.assertIsInstance(view, DangerConfirmView)
+
+        confirm = next(
+            item for item in view.children if item.label == "シーズンリセットを実行"
+        )
+        await confirm.callback(interaction)
+
+        call = manager._execute_season_reset.await_args
+        self.assertEqual(call.kwargs["note"], "移行")
+        # 確認を出した時点のシーズン開始時刻をCASへ渡す (確認中の別リセットを検出)
+        self.assertEqual(call.kwargs["expected_start"], "2026-01-01 00:00:00")
+
+    async def test_reset_is_refused_without_manage_guild(self) -> None:
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        manager._execute_season_reset = AsyncMock()
+        interaction = self._interaction(self._member(manage_guild=False))
+
+        with patch.object(database, "get_season_start", AsyncMock()) as get_start:
+            await manager.prompt_season_reset(interaction)
+
+        get_start.assert_not_awaited()
+        manager._execute_season_reset.assert_not_awaited()
+        self.assertIsNone(
+            interaction.response.send_message.await_args.kwargs.get("view")
+        )
+
+    async def test_operations_button_uses_the_same_entry(self) -> None:
+        """#運営のボタンでも権限判定と最終確認を共通入口へ通す。"""
+        import recruitment as recruitment_lib
+
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        manager.prompt_season_reset = AsyncMock()
+        view = recruitment_lib.OperationsView(manager.recruitment_manager)
+        button = next(
+            item for item in view.children if item.label == "シーズンリセット"
+        )
+        interaction = self._interaction(self._member())
+
+        with patch.object(
+            recruitment_lib, "OPERATIONS_STAFF_ROLE_NAMES", frozenset()
+        ):
+            await button.callback(interaction)
+
+        manager.prompt_season_reset.assert_awaited_once_with(interaction)
+
+
+class PrivateRoomCategoryPositionTest(unittest.IsolatedAsyncioTestCase):
+    """GM名前村はGMカテゴリのすぐ下へ作る (最下部だと作成者が探せない)。"""
+
+    @staticmethod
+    def _runner(room_def: RoomDefinition):
+        from room_runner import RoomRunner
+
+        return RoomRunner(None, SimpleNamespace(), room_def)
+
+    @staticmethod
+    def _guild(categories: list[object]):
+        return SimpleNamespace(
+            id=1,
+            categories=categories,
+            get_channel=lambda _channel_id: None,
+        )
+
+    def _private_room(self) -> RoomDefinition:
+        return RoomDefinition("private", "GM名前村", private_owner_id=10)
+
+    async def test_new_private_room_goes_right_below_the_gm_category(self) -> None:
+        gm_category = SimpleNamespace(name=GM_INFO_CATEGORY_NAME, id=50, position=2)
+        guild = self._guild([gm_category])
+        runner = self._runner(self._private_room())
+
+        with patch.object(database, "get_meta", AsyncMock(return_value=None)):
+            position = await runner._new_category_position(guild)
+
+        # 既存の村を動かさず、新しい村ほどGMカテゴリの直下に積まれる
+        self.assertEqual(position, 3)
+
+    async def test_fixed_rooms_and_missing_gm_category_keep_appending(self) -> None:
+        gm_category = SimpleNamespace(name=GM_INFO_CATEGORY_NAME, id=50, position=2)
+        cases = {
+            "固定卓": (RoomDefinition("open", "総合"), [gm_category]),
+            "GMカテゴリなし": (self._private_room(), []),
+        }
+        for label, (room_def, categories) in cases.items():
+            with self.subTest(label):
+                runner = self._runner(room_def)
+                with patch.object(database, "get_meta", AsyncMock(return_value=None)):
+                    position = await runner._new_category_position(
+                        self._guild(categories)
+                    )
+                self.assertIsNone(position)
 
 
 class ParseSelectIdTest(unittest.TestCase):

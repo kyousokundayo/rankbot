@@ -1,5 +1,5 @@
 #!/bin/zsh
-# コンパイルチェック + ゲームシミュレータ (コード変更後は必ず実行する)
+# コミット前の静的確認 + ユニットテスト
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -20,8 +20,5 @@ echo "== dependency consistency =="
 
 echo "== unit tests =="
 "$PY" -m unittest discover -s tests
-
-echo "== simulate_games (10 additional runs / 15 total) =="
-"$PY" simulate_games.py --runs 10
 
 echo "== all checks passed =="

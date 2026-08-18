@@ -78,6 +78,14 @@ class UsabilityViewLayoutTest(unittest.TestCase):
             ["start_game", "rematch_game", "lobby_gm_menu", "rule_btn", "help_btn"],
         )
 
+        # GM村は参加・GM登録だけを募集カードへ寄せる。連戦のたびに募集を
+        # 作り直させないため、次村はロビーに残す。
+        private_view = LobbyView(self._lobby_cog(private=True))
+        private_ids = [item.custom_id for item in private_view.children]
+        self.assertIn("rematch_game", private_ids)
+        self.assertNotIn("join_game", private_ids)
+        self.assertNotIn("get_gm", private_ids)
+
     def test_stats_panel_stays_within_three_rows(self) -> None:
         view = StatsView(SimpleNamespace())
 

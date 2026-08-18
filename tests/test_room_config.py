@@ -52,13 +52,26 @@ class LocalRoomConfigTest(unittest.TestCase):
             frozenset({"コミュニティ参加者"}),
         )
         self.assertTrue(registration.room.sync_permissions)
+        self.assertTrue(registration.room.rated)
 
         manual = parse_local_room_config(
             self._json(), manual_static_room_names={"コミュニティ村"}
         )[0]
         self.assertFalse(manual.room.sync_permissions)
 
-    def test_legacy_rating_and_recruitment_keys_are_accepted(self) -> None:
+        unrated = parse_local_room_config(
+            self._json(), unrated_room_names={"コミュニティ村"}
+        )[0]
+        self.assertFalse(unrated.room.rated)
+
+    def test_rated_setting_overrides_the_unrated_default(self) -> None:
+        """.envの明示指定は、コード側の既定 (身内卓リスト) より優先する。"""
+        registration = parse_local_room_config(
+            self._json(rated=True), unrated_room_names={"コミュニティ村"}
+        )[0]
+        self.assertTrue(registration.room.rated)
+
+    def test_legacy_recruitment_key_is_accepted(self) -> None:
         registration = parse_local_room_config(
             self._json(
                 rated=False,
@@ -67,6 +80,7 @@ class LocalRoomConfigTest(unittest.TestCase):
             )
         )[0]
         self.assertTrue(registration.room.sync_permissions)
+        self.assertFalse(registration.room.rated)
 
     def test_reserved_or_duplicate_id_is_rejected(self) -> None:
         with self.assertRaises(LocalRoomConfigError):
@@ -154,8 +168,8 @@ class LocalRoomConfigTest(unittest.TestCase):
             timeout=10,
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        # `rated` は旧設定互換として読み込むが、稼働中の全村をレート対象にする。
-        self.assertEqual(completed.stdout.strip(), "コミュニティ村 True True")
+        # `rated: false` の卓はレートを動かさず、統計の集計からも外れる。
+        self.assertEqual(completed.stdout.strip(), "コミュニティ村 False False")
 
     def test_invalid_environment_fails_before_runtime_initialization(self) -> None:
         env = os.environ.copy()

@@ -33,6 +33,7 @@ from config import (
     VARIANT_DEFINITIONS,
     USER_VISIBLE_VARIANT_IDS,
     Phase,
+    private_room_limit_for_roles,
 )
 from models import Player, parse_select_id
 
@@ -274,17 +275,32 @@ class RecruitmentManager:
                 "ロール保持者だけです。",
                 ephemeral=True,
             )
-        existing = await database.get_private_room_by_owner(
+        own_rooms = await database.list_private_rooms_by_owner(
             interaction.guild.id, interaction.user.id
         )
-        if existing is not None:
-            open_row = await database.get_open_recruitment_for_room(
-                interaction.guild.id, existing["room_id"]
+        if own_rooms:
+            # 受付中の募集を持つ村は次の募集を出せない。全部が受付中で、かつ
+            # 村の上限にも達しているときだけ、フォームを開く前に止める
+            # (残りの判定は ensure_gm_village_for_recruitment が行う)。
+            busy_room_ids = {
+                str(row["room_id"])
+                for row in await database.list_active_recruitments_for_room_ids(
+                    interaction.guild.id, [row["room_id"] for row in own_rooms],
+                )
+            }
+            free_rooms = [
+                row for row in own_rooms
+                if str(row["room_id"]) not in busy_room_ids
+            ]
+            limit = private_room_limit_for_roles(
+                role.name for role in getattr(interaction.user, "roles", ())
             )
-            if open_row is not None:
+            if not free_rooms and len(own_rooms) >= limit:
+                names = "、".join(row["room_name"] for row in own_rooms)
                 return await interaction.response.send_message(
-                    f"GM村 **{existing['room_name']}** では既に募集を受け付けています。"
-                    "その村の #参加受付 から内容を変更してください。",
+                    f"作成できるGM村{limit}個すべてで募集を受け付けています（{names}）。"
+                    "新しく作るには、どれかの村を削除するか、"
+                    "その村の #参加受付 から募集を締め切ってください。",
                     ephemeral=True,
                 )
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -1239,6 +1255,50 @@ class RecruitmentManager:
             f"{discord.utils.format_dt(scheduled_at, style='F')}"
         )
 
+    async def remove_entry_with_promotion(
+        self,
+        guild: discord.Guild,
+        recruitment_id: int,
+        user_id: int,
+    ) -> str:
+        """登録を1件外し、補欠繰り上げと開催前DMまで面倒を見る。
+
+        本人の「参加取消」と主催者の「参加者を除外」で共通に使う。補欠繰り上げと
+        開催前通知は、卓への開催反映と同じlock内で完了させる——次回巡回を待つと、
+        繰り上げ直後に開催済みとなった人だけ通知が漏れる。
+        """
+        async with self.lock:
+            entries = await database.list_recruitment_entries(recruitment_id)
+            current_entry = next(
+                (entry for entry in entries if entry["user_id"] == user_id),
+                None,
+            )
+            if current_entry is None:
+                raise database.RecruitmentConflict("この募集には登録されていません。")
+            kind, promoted = await database.remove_recruitment_entry(
+                recruitment_id, user_id,
+            )
+            if promoted is not None:
+                member = guild.get_member(promoted)
+                if member is not None:
+                    try:
+                        await member.send("補欠から参加者へ繰り上がりました。")
+                    except (discord.Forbidden, discord.HTTPException) as exc:
+                        log.warning("補欠繰り上げDM失敗 (%s): %s", promoted, exc)
+                    try:
+                        await self.notify_participant_if_due(
+                            guild, recruitment_id, promoted,
+                        )
+                    except Exception:
+                        # 取消・繰上げはDBへcommit済み。通知台帳の障害で取消
+                        # 自体を失敗表示にせず、定期巡回の再試行へ残す。
+                        log.exception(
+                            "補欠繰上げ直後の開催前DM補完に失敗 (%s/%s)",
+                            recruitment_id,
+                            promoted,
+                        )
+        return str(kind)
+
     async def notify_participant_if_due(
         self,
         guild: discord.Guild,
@@ -1691,8 +1751,8 @@ class RecruitmentOptionsView(discord.ui.View):
 
 class RecruitmentCreateModal(discord.ui.Modal, title="募集内容"):
     village_name = discord.ui.TextInput(
-        label="村名（既存の自分の村がある場合は空欄）",
-        placeholder="例: Aくん村",
+        label="村名（新しい村を作るときは新しい名前）",
+        placeholder="既存の村で募集するならその村名／村が1つなら空欄",
         required=False,
         max_length=90,
     )
@@ -1870,20 +1930,54 @@ class RecruitmentCardView(discord.ui.View):
         super().__init__(timeout=None)
         self.manager, self.recruitment_id = manager, recruitment_id
         buttons = [
-            ("参加", discord.ButtonStyle.success, "join", self.join),
-            ("参加取消", discord.ButtonStyle.danger, "leave", self.leave),
-            ("ゲーム開始", discord.ButtonStyle.success, "transfer", self.transfer),
-            ("主催者メニュー", discord.ButtonStyle.secondary, "host", self.host_menu),
-            ("通知", discord.ButtonStyle.primary, "notify", self.notification),
+            ("参加", discord.ButtonStyle.success, "join", self.join, 0),
+            ("参加取消", discord.ButtonStyle.danger, "leave", self.leave, 0),
+            ("ゲーム開始", discord.ButtonStyle.success, "transfer", self.transfer, 0),
+            ("主催者メニュー", discord.ButtonStyle.secondary, "host", self.host_menu, 0),
+            ("通知", discord.ButtonStyle.primary, "notify", self.notification, 0),
+            # 受付中のGM村で唯一出ている常設パネルがこのカード。ルール・ヘルプを
+            # 載せないと、参加前に規定を読む導線が村の中に無くなる (旧・総合卓は
+            # 参加受付のLobbyViewに常時出ていた)。読むだけの操作なので、受付が
+            # 閉じたカードでも押せるままにする。
+            ("ルール", discord.ButtonStyle.secondary, "rule", self.rule, 1),
+            ("ヘルプ", discord.ButtonStyle.secondary, "help", self.help, 1),
         ]
-        for label, style, suffix, callback in buttons:
+        for label, style, suffix, callback, row in buttons:
             button = discord.ui.Button(
-                label=label, style=style,
+                label=label, style=style, row=row,
                 emoji="🔔" if suffix == "notify" else None,
-                custom_id=f"recruitment:{recruitment_id}:{suffix}", disabled=not active,
+                custom_id=f"recruitment:{recruitment_id}:{suffix}",
+                disabled=not active and suffix not in ("rule", "help"),
             )
             button.callback = callback
             self.add_item(button)
+
+    async def _variant_for_card(self) -> Optional[object]:
+        """カードの現在の形式を返す。取得できなければ既定表示へ委ねる。"""
+        try:
+            row = await database.get_recruitment(self.recruitment_id)
+        except Exception:
+            log.exception("募集カードの形式取得に失敗 (%s)", self.recruitment_id)
+            return None
+        if row is None:
+            return None
+        return VARIANT_DEFINITIONS.get(str(row["variant_id"]))
+
+    async def rule(self, interaction: discord.Interaction) -> None:
+        from views import build_rule_embeds
+
+        variant = await self._variant_for_card()
+        await interaction.response.send_message(
+            embeds=build_rule_embeds(variant), ephemeral=True,
+        )
+
+    async def help(self, interaction: discord.Interaction) -> None:
+        from views import build_help_embeds
+
+        variant = await self._variant_for_card()
+        await interaction.response.send_message(
+            embeds=build_help_embeds(variant), ephemeral=True,
+        )
 
     async def notification(self, interaction: discord.Interaction) -> None:
         await self.manager.toggle_notification_role(interaction)
@@ -1966,47 +2060,9 @@ class RecruitmentCardView(discord.ui.View):
         if access_error:
             return await interaction.followup.send(access_error, ephemeral=True)
         try:
-            # 補欠繰り上げと開催前通知を、卓への開催反映と同じlock内で完了する。
-            # 次回巡回を待たず、繰り上げ直後に開催済みとなる場合も漏らさない。
-            async with self.manager.lock:
-                entries = await database.list_recruitment_entries(
-                    self.recruitment_id
-                )
-                current_entry = next(
-                    (
-                        entry for entry in entries
-                        if entry["user_id"] == interaction.user.id
-                    ),
-                    None,
-                )
-                if current_entry is None:
-                    raise database.RecruitmentConflict(
-                        "この募集には登録されていません。"
-                    )
-                _kind, promoted = await database.remove_recruitment_entry(
-                    self.recruitment_id, interaction.user.id,
-                )
-                if promoted is not None:
-                    member = interaction.guild.get_member(promoted)
-                    if member is not None:
-                        try:
-                            await member.send("補欠から参加者へ繰り上がりました。")
-                        except (discord.Forbidden, discord.HTTPException) as exc:
-                            log.warning("補欠繰り上げDM失敗 (%s): %s", promoted, exc)
-                        try:
-                            await self.manager.notify_participant_if_due(
-                                interaction.guild,
-                                self.recruitment_id,
-                                promoted,
-                            )
-                        except Exception:
-                            # 取消・繰上げはDBへcommit済み。通知台帳の障害で取消
-                            # 自体を失敗表示にせず、定期巡回の再試行へ残す。
-                            log.exception(
-                                "補欠繰上げ直後の開催前DM補完に失敗 (%s/%s)",
-                                self.recruitment_id,
-                                promoted,
-                            )
+            await self.manager.remove_entry_with_promotion(
+                interaction.guild, self.recruitment_id, interaction.user.id,
+            )
         except database.RecruitmentConflict as exc:
             return await interaction.followup.send(str(exc), ephemeral=True)
         embed = await self.manager.build_embed(interaction.guild, self.recruitment_id)
@@ -2136,6 +2192,37 @@ class RecruitmentHostView(discord.ui.View):
             return await interaction.response.send_message(error, ephemeral=True)
         await interaction.response.send_modal(RecruitmentContactModal(self.manager, self.recruitment_id, self.host_id))
 
+    @discord.ui.button(label="参加者を除外", style=discord.ButtonStyle.secondary)
+    async def remove_entry(
+        self, interaction: discord.Interaction, button: discord.ui.Button,
+    ) -> None:
+        row, error = await self._authorized_row(interaction, action="参加者の除外")
+        if error:
+            return await interaction.response.send_message(error, ephemeral=True)
+        entries = await database.list_recruitment_entries(self.recruitment_id)
+        # 主催者本人は「募集を廃止」で畳む。ここで自分を外せると、GM不在の
+        # 募集だけが残って誰も開始できなくなる。
+        options = [
+            discord.SelectOption(
+                label=_display_name(interaction.guild, int(entry["user_id"])),
+                description=str(entry["kind"]),
+                value=str(entry["user_id"]),
+            )
+            for entry in entries
+            if int(entry["user_id"]) != self.host_id
+        ][:25]
+        if not options:
+            return await interaction.response.send_message(
+                "除外できる参加者がいません。", ephemeral=True
+            )
+        await interaction.response.send_message(
+            "除外する参加者を選んでください。選択後に確認が出ます。",
+            view=RecruitmentRemoveEntryView(
+                self.manager, self.recruitment_id, self.host_id, options,
+            ),
+            ephemeral=True,
+        )
+
     @discord.ui.button(label="募集を廃止", style=discord.ButtonStyle.danger)
     async def archive(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         _row, error = await self._authorized_row(interaction, action="募集の廃止")
@@ -2147,6 +2234,73 @@ class RecruitmentHostView(discord.ui.View):
         )
         await interaction.followup.send(
             "募集をアーカイブしました。" if changed else "募集は既に終了しています。",
+            ephemeral=True,
+        )
+
+
+class RecruitmentRemoveEntryView(discord.ui.View):
+    """主催者が受付中の登録を1件外す。ロビーの「参加者を除外」に相当する。"""
+
+    def __init__(
+        self,
+        manager: RecruitmentManager,
+        recruitment_id: int,
+        host_id: int,
+        options: list[discord.SelectOption],
+    ) -> None:
+        super().__init__(timeout=180)
+        self.manager = manager
+        self.recruitment_id = recruitment_id
+        self.host_id = host_id
+        select = discord.ui.Select(
+            placeholder="除外する参加者を選択",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+        select.callback = self._selected
+        self.add_item(select)
+
+    async def _selected(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.host_id or interaction.guild is None:
+            return await interaction.response.send_message(
+                "主催者だけ操作できます。", ephemeral=True
+            )
+        user_id = parse_select_id(interaction.data["values"][0])
+        if user_id is None:
+            return await interaction.response.send_message(
+                "❌ 不正な選択です。", ephemeral=True
+            )
+        if user_id == self.host_id:
+            return await interaction.response.send_message(
+                "主催者自身は除外できません。募集ごと畳む場合は「募集を廃止」を使ってください。",
+                ephemeral=True,
+            )
+        row = await database.get_recruitment(self.recruitment_id)
+        if row is None or row["host_id"] != self.host_id:
+            return await interaction.response.send_message(
+                "募集が見つかりません。", ephemeral=True
+            )
+        access_error = self.manager.validate_existing_card_action(
+            interaction.guild, row, interaction.user, action="参加者の除外",
+        )
+        if access_error:
+            return await interaction.response.send_message(
+                access_error, ephemeral=True
+            )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            kind = await self.manager.remove_entry_with_promotion(
+                interaction.guild, self.recruitment_id, user_id,
+            )
+        except database.RecruitmentConflict as exc:
+            return await interaction.followup.send(str(exc), ephemeral=True)
+        await self.manager.refresh_message(self.recruitment_id)
+        # 除外しても再登録は塞がない。繰り返す相手は同村拒否で扱う方が、
+        # 主催者ごとの一時的な判断を恒久ルールにせずに済む。
+        await interaction.followup.send(
+            f"{_display_name(interaction.guild, user_id)} を除外しました ({kind})。\n"
+            "本人はもう一度「参加」を押せます。繰り返す場合は同村拒否をご利用ください。",
             ephemeral=True,
         )
 
@@ -2727,6 +2881,22 @@ class OperationsView(discord.ui.View):
             "強制アーカイブする募集を選んでください。",
             view=OperationsRecruitmentArchiveView(self.manager, rows[:25]), ephemeral=True,
         )
+
+    @discord.ui.button(label="村の強制削除", style=discord.ButtonStyle.danger, custom_id="operations:delete_private_room", row=1)
+    async def delete_private_room(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        # 村主が対応できない村の救済。選択と最終確認は本人削除と同じ入口に任せる。
+        if not self._is_admin(interaction) or interaction.guild is None:
+            return await interaction.response.send_message("運営のみ操作できます。", ephemeral=True)
+        await self.manager.game_cog.prompt_private_room_force_delete(interaction)
+
+    @discord.ui.button(label="シーズンリセット", style=discord.ButtonStyle.danger, custom_id="operations:season_reset", row=2)
+    async def season_reset(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        # メニュー表示の運営権限だけでは足りない。全員のレートを書き換える
+        # 操作なので、`/season_reset` と同じ「サーバー管理」権限と最終確認を
+        # 共通入口へ委ね、権限判定を二重に定義しない。
+        if not self._is_admin(interaction) or interaction.guild is None:
+            return await interaction.response.send_message("運営のみ操作できます。", ephemeral=True)
+        await self.manager.game_cog.prompt_season_reset(interaction)
 
 
 class OperationsGMReleaseView(discord.ui.View):

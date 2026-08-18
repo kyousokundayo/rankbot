@@ -55,6 +55,9 @@ class RoomDefinition:
     # Falseならカテゴリ・参加受付・VCの平常時overwriteをDiscordの手動設定へ
     # 委ねる。#昼/#霊界とゲーム中VCの一時制御は秘密保持のため引き続きBot管理。
     sync_permissions: bool = True
+    # Falseの卓はレートを動かさず、統計の集計・卓フィルタからも除外する
+    # (身内の練習卓を想定)。試合記録自体はログと試合番号のために残す。
+    rated: bool = True
 
 
 @dataclass(frozen=True)
@@ -160,6 +163,7 @@ def parse_local_room_config(
     reserved_room_ids: Collection[str] = (),
     reserved_room_names: Collection[str] = (),
     manual_static_room_names: Collection[str] = (),
+    unrated_room_names: Collection[str] = (),
 ) -> tuple[LocalRoomRegistration, ...]:
     """JSON設定を厳格に検証し、固定卓定義へ変換する。
 
@@ -182,6 +186,7 @@ def parse_local_room_config(
     used_ids = set(reserved_room_ids)
     used_names = set(reserved_room_names)
     manual_static_names = set(manual_static_room_names)
+    unrated_names = set(unrated_room_names)
     registrations: list[LocalRoomRegistration] = []
     for index, item in enumerate(decoded):
         if not isinstance(item, dict):
@@ -211,10 +216,8 @@ def parse_local_room_config(
         if name in used_names:
             raise LocalRoomConfigError(f"卓の表示名が重複しています: {name}")
 
-        # v0.40では全村がレート対象で、募集はGM名前村の参加受付へ統合した。
-        # 既存.envを壊さないため旧キーは受理・型検証のみ行う。
-        if "rated" in item:
-            _boolean(item, "rated", index=index, default=True)
+        # 募集はGM名前村の参加受付へ統合済み。既存.envを壊さないため
+        # 旧キーは受理・型検証のみ行う。
         if "recruitment_enabled" in item:
             _boolean(item, "recruitment_enabled", index=index, default=True)
 
@@ -238,6 +241,14 @@ def parse_local_room_config(
                         "sync_permissions",
                         index=index,
                         default=name not in manual_static_names,
+                    ),
+                    # 指定された身内卓は、.envを書き換えなくてもレート・統計から
+                    # 外す。設定で明示された rated が常に優先される。
+                    rated=_boolean(
+                        item,
+                        "rated",
+                        index=index,
+                        default=name not in unrated_names,
                     ),
                 ),
             )
