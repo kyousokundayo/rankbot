@@ -274,6 +274,9 @@ class SimulationFakeMessageTest(unittest.IsolatedAsyncioTestCase):
         vote_cog = SimpleNamespace(
             state=vote_state,
             register_game_view=lambda _view: None,
+            # 投票発言(クロストーク)側のパネルを再現する。ターン制は
+            # 一斉投票で「投票」列ボタンを置かない。
+            uses_sequential_vote=lambda: True,
         )
         first_view = simulate_games.VoteView(vote_cog, [], [])
         second_view = simulate_games.VoteView(vote_cog, [], [])

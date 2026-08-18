@@ -11,6 +11,7 @@ import discord
 import database
 from config import (
     LOG_CATEGORY_LIMIT,
+    LOG_CATEGORY_SPIRIT,
     LOG_CATEGORY_TRIM_TO,
     Phase,
     Role,
@@ -158,10 +159,12 @@ def permission_text_channel(
 
 
 def make_runner(variant_id: str = "v13_cross") -> RoomRunner:
+    # 進行そのものを見る共通ランナーはレート対象外にする。レート精算の
+    # 経路を通したいテストは名前村 (private_owner_id) を自前で作る。
     runner = RoomRunner(
         None,
         FakeManager(),
-        RoomDefinition("test", "テスト村", variant_id=variant_id),
+        RoomDefinition("test", "テスト村", variant_id=variant_id, rated=False),
     )
     runner.state.game_run_id = "run-1"
     runner.state.phase = Phase.NIGHT
@@ -688,10 +691,79 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(runner.state.vc_gm_speak_captured)
         self.assertEqual(runner._persist_room_state.await_count, 2)
 
-    async def test_active_fixed_and_gm_rooms_are_rated_and_wait_for_postgame(self) -> None:
-        fixed = RoomRunner(
-            None, FakeManager(), RoomDefinition("open", "総合")
+    async def test_rematch_skips_members_blocked_by_the_current_lobby(self) -> None:
+        """次村は募集カードを通らないので、同村拒否を自前で見る。"""
+        runner = make_runner()
+        runner.state.phase = Phase.LOBBY
+        gm = FakeMember(1, "GM")
+        wanted = FakeMember(2, "参加OK")
+        blocked = FakeMember(3, "拒否された人")
+        members = {member.id: member for member in (gm, wanted, blocked)}
+        runner.state.guild = SimpleNamespace(
+            id=1, get_member=members.get, owner_id=999,
         )
+        runner.state.lobby_channel = SimpleNamespace(send=AsyncMock())
+        runner.last_game_gm = gm.id
+        runner.last_game_roster = [gm.id, wanted.id, blocked.id]
+        runner.validate_gm_claim = AsyncMock(return_value=None)
+        runner.validate_join = AsyncMock(return_value=None)
+
+        with patch.object(
+            database,
+            "list_player_blocks_between",
+            AsyncMock(return_value=[(wanted.id, blocked.id)]),
+        ):
+            result = await runner.rematch(gm)
+
+        self.assertEqual(set(runner.state.players), {gm.id, wanted.id})
+        # 誰が誰を拒否したかは出さず、スキップした事実だけを返す
+        self.assertIn(blocked.display_name, result)
+        blocked.send.assert_not_awaited()
+
+    async def test_rematch_waits_for_shared_join_lock(self) -> None:
+        """次村も通常参加と同じ全卓共通ロックの内側で登録する。"""
+        runner = make_runner()
+        member = FakeMember(1, "GM")
+        runner._rematch_locked = AsyncMock(return_value="ok")
+
+        async with runner.manager.join_lock:
+            task = asyncio.create_task(runner.rematch(member))
+            await asyncio.sleep(0)
+            runner._rematch_locked.assert_not_awaited()
+
+        self.assertEqual(await task, "ok")
+        runner._rematch_locked.assert_awaited_once_with(member)
+
+    async def test_rematch_reconsiders_blocked_member_after_dm_failure(self) -> None:
+        """先行候補がDM不可なら、その人との拒否だけで後続を除外しない。"""
+        runner = make_runner()
+        runner.state.phase = Phase.LOBBY
+        gm = FakeMember(1, "GM")
+        dm_failed = FakeMember(2, "DM不可")
+        recovered = FakeMember(3, "参加可能")
+        dm_failed.send.side_effect = discord.Forbidden(Mock(status=403), "denied")
+        members = {member.id: member for member in (gm, dm_failed, recovered)}
+        runner.state.guild = SimpleNamespace(
+            id=1, get_member=members.get, owner_id=999,
+        )
+        runner.state.lobby_channel = SimpleNamespace(send=AsyncMock())
+        runner.last_game_gm = gm.id
+        runner.last_game_roster = [gm.id, dm_failed.id, recovered.id]
+        runner.validate_gm_claim = AsyncMock(return_value=None)
+        runner.validate_join = AsyncMock(return_value=None)
+
+        with patch.object(
+            database,
+            "list_player_blocks_between",
+            AsyncMock(return_value=[(dm_failed.id, recovered.id)]),
+        ):
+            result = await runner.rematch(gm)
+
+        self.assertEqual(set(runner.state.players), {gm.id, recovered.id})
+        self.assertIn("DM不可", result)
+        recovered.send.assert_awaited_once()
+
+    async def test_gm_rooms_are_rated_and_wait_for_postgame(self) -> None:
         gm_room = RoomRunner(
             None,
             FakeManager(),
@@ -702,20 +774,25 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
                 variant_id="v9_turn",
             ),
         )
-        inactive = RoomRunner(
-            None, FakeManager(), RoomDefinition("retired", "廃止卓", enabled=False)
+        # 常設卓の廃止後、レート対象は名前村と rated なローカル固定卓だけ。
+        # 「総合」は履歴用に定義だけ残った無効卓なので対象外になる。
+        retired_open = RoomRunner(
+            None, FakeManager(), RoomDefinition("open", "総合", enabled=False)
+        )
+        unrated_local = RoomRunner(
+            None, FakeManager(), RoomDefinition("nate", "ローカル卓", rated=False)
         )
 
-        self.assertTrue(fixed.is_rated_room())
         self.assertTrue(gm_room.is_rated_room())
-        self.assertFalse(inactive.is_rated_room())
+        self.assertFalse(retired_open.is_rated_room())
+        self.assertFalse(unrated_local.is_rated_room())
 
-        fixed._postgame_vote_pending = True
+        gm_room._postgame_vote_pending = True
         interaction = SimpleNamespace(
             guild=SimpleNamespace(),
             followup=SimpleNamespace(send=AsyncMock()),
         )
-        await fixed._start_game_locked(interaction)
+        await gm_room._start_game_locked(interaction)
         self.assertIn(
             "終了後投票を集計中",
             interaction.followup.send.await_args.args[0],
@@ -1931,6 +2008,28 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result)
         category.edit.assert_not_awaited()
         manual.edit.assert_not_awaited()
+
+    async def test_spirit_log_category_is_not_managed_anymore(self) -> None:
+        """#霊界 は退避しない。過去の「ログ-霊界」もBotは触らない。"""
+        runner = make_runner()
+        self.assertFalse(
+            runner._is_managed_log_channel_name(LOG_CATEGORY_SPIRIT, "04-霊界")
+        )
+
+        default = FakeRole(1, "@everyone", default=True)
+        old_log = FakeLogChannel("04-霊界", 100)
+        category = FakeLogCategory(LOG_CATEGORY_SPIRIT, channels=[old_log])
+        runner.state.guild = SimpleNamespace(
+            id=1, default_role=default,
+            categories=[category], create_category=AsyncMock(),
+        )
+
+        result = await runner._ensure_log_category(LOG_CATEGORY_SPIRIT)
+
+        self.assertIsNone(result)
+        category.edit.assert_not_awaited()
+        old_log.edit.assert_not_awaited()
+        old_log.delete.assert_not_awaited()
 
     async def test_archive_uses_safe_overwrites_without_waiting_for_gateway_cache(self) -> None:
         """カテゴリPATCH後も旧キャッシュからunsafe権限をコピーしない。"""

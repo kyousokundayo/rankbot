@@ -16,7 +16,7 @@ from config import (
     RUNOFF_SPEECH_TIME, LAST_WILL_TIME, VOTE_TIMEOUT,
     NIGHT_BASE, NIGHT_MIN,
     CH_LOBBY, CH_STATS, CH_VILLAGE, CH_SPIRIT,
-    LOG_CATEGORY_VILLAGE, LOG_CATEGORY_SPIRIT, LOG_CATEGORY_LIMIT,
+    LOG_CATEGORY_VILLAGE, LOG_CATEGORY_LIMIT,
     SEASON_RANK_MIN_GAMES, GRANDMASTER_PERCENTAGE,
     RANK_SPECS, SEASON_RANK_PERCENTAGES,
     RATING_FLOOR, INITIAL_RATING, WIN_PARTICIPATION_BONUS,
@@ -86,8 +86,11 @@ class DangerConfirmView(discord.ui.View):
         action: Callable[[discord.Interaction], Awaitable[None]],
         *,
         confirm_label: str = "実行する",
+        timeout: float = 30,
     ) -> None:
-        super().__init__(timeout=30)
+        # 既定は30秒。読ませたい警告文が長い操作 (シーズンリセット等) だけ
+        # 呼び出し側で延ばす。時間切れは「何も起きない」= 安全側に倒れる。
+        super().__init__(timeout=timeout)
         self.actor_id = actor_id
         self.action = action
         self.confirm_btn.label = confirm_label
@@ -176,24 +179,106 @@ class PrivateRoomInfoView(discord.ui.View):
         super().__init__(timeout=None)
         self.manager = manager
 
-    @discord.ui.button(label="村・募集を作成", style=discord.ButtonStyle.success, custom_id="mayor_room_create")
+    @discord.ui.button(label="村・募集を作成", style=discord.ButtonStyle.success, custom_id="gm_room_create")
     async def create_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.manager.recruitment_manager.start_village_creation(interaction)
 
-    @discord.ui.button(label="村名変更", style=discord.ButtonStyle.secondary, custom_id="mayor_room_rename")
+    @discord.ui.button(label="村名変更", style=discord.ButtonStyle.secondary, custom_id="gm_room_rename")
     async def rename_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-            return await interaction.response.send_message("サーバー内でのみ使用できます。", ephemeral=True)
-        if not self.manager._has_private_room_creator_role(interaction.user):
-            return await interaction.response.send_message(
-                f"村名を変更できるのは **{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロール保持者だけです。",
-                ephemeral=True,
-            )
-        await interaction.response.send_modal(PrivateRoomRenameModal(self.manager))
+        await self.manager.prompt_private_room_rename(interaction)
 
-    @discord.ui.button(label="村を削除", style=discord.ButtonStyle.danger, custom_id="mayor_room_delete")
+    @discord.ui.button(label="村を削除", style=discord.ButtonStyle.danger, custom_id="gm_room_delete")
     async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.manager.delete_private_room_for_member(interaction)
+
+
+def _private_room_options(
+    rows: list[dict],
+    *,
+    guild: Optional[discord.Guild] = None,
+) -> list[discord.SelectOption]:
+    """GM村セレクトの選択肢。村主名は運営向け表示のときだけ添える。"""
+    options: list[discord.SelectOption] = []
+    for row in rows[:25]:
+        description = None
+        if guild is not None:
+            owner = guild.get_member(int(row["owner_id"]))
+            description = f"村主: {owner.display_name if owner else row['owner_id']}"
+        options.append(
+            discord.SelectOption(
+                label=str(row["room_name"])[:100],
+                value=str(row["room_id"]),
+                description=description,
+            )
+        )
+    return options
+
+
+class PrivateRoomDeleteSelectView(discord.ui.View):
+    """削除するGM村を選ぶ。選んだ後にもう一度確認を挟む。"""
+
+    def __init__(
+        self,
+        manager: GameCog,
+        actor_id: int,
+        rows: list[dict],
+        *,
+        force: bool = False,
+        guild: Optional[discord.Guild] = None,
+    ) -> None:
+        super().__init__(timeout=180)
+        self.manager = manager
+        self.actor_id = actor_id
+        self.force = force
+        self.rows = {str(row["room_id"]): row for row in rows}
+        select = discord.ui.Select(
+            placeholder="削除するGM村",
+            # 運営向けは同名の村が並ばないよう村主を添える
+            options=_private_room_options(rows, guild=guild),
+        )
+        self.add_item(select)
+        self._select = select
+        select.callback = self.selected
+
+    async def selected(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.actor_id:
+            return await interaction.response.send_message(
+                "この操作を開始した本人だけが選べます。", ephemeral=True,
+            )
+        row = self.rows.get(self._select.values[0])
+        if row is None:
+            return await interaction.response.send_message(
+                "対象のGM村が見つかりません。", ephemeral=True,
+            )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self.manager._send_private_room_delete_confirm(
+            interaction, row, force=self.force,
+        )
+
+
+class PrivateRoomRenameSelectView(discord.ui.View):
+    """改名するGM村を選び、そのまま入力フォームを開く。"""
+
+    def __init__(self, manager: GameCog, actor_id: int, rows: list[dict]) -> None:
+        super().__init__(timeout=180)
+        self.manager = manager
+        self.actor_id = actor_id
+        select = discord.ui.Select(
+            placeholder="村名を変更するGM村",
+            options=_private_room_options(rows),
+        )
+        self.add_item(select)
+        self._select = select
+        select.callback = self.selected
+
+    async def selected(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.actor_id:
+            return await interaction.response.send_message(
+                "この操作を開始した本人だけが選べます。", ephemeral=True,
+            )
+        await interaction.response.send_modal(
+            PrivateRoomRenameModal(self.manager, self._select.values[0])
+        )
 
 
 class PrivateRoomRenameModal(discord.ui.Modal, title="GM村名変更"):
@@ -204,12 +289,15 @@ class PrivateRoomRenameModal(discord.ui.Modal, title="GM村名変更"):
         max_length=90,
     )
 
-    def __init__(self, manager: GameCog) -> None:
+    def __init__(self, manager: GameCog, room_id: str) -> None:
         super().__init__()
         self.manager = manager
+        self.room_id = room_id
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        await self.manager.rename_private_room_for_member(interaction, str(self.new_name.value))
+        await self.manager.rename_private_room_for_member(
+            interaction, str(self.new_name.value), self.room_id,
+        )
 
 
 # ============================================================
@@ -219,12 +307,14 @@ class PrivateRoomRenameModal(discord.ui.Modal, title="GM村名変更"):
 class LobbyView(discord.ui.View):
     """参加受付画面のUI"""
 
+    # GM村は参加・GM登録を募集カードだけで受ける。次村はここに含めない——
+    # 常設卓を全廃した後、連戦のたびに募集を作り直して全員に押し直させる
+    # のは現実的でないため、終了後のロビーから前回メンバーを組み直せる。
     _GM_VILLAGE_RECRUITMENT_ONLY_CONTROLS = frozenset({
         "join_game",
         "leave_game",
         "get_gm",
         "release_gm",
-        "rematch_game",
     })
 
     def __init__(self, cog: RoomRunner) -> None:
@@ -289,6 +379,7 @@ class LobbyView(discord.ui.View):
         if self.cog.is_private_room():
             description = (
                 "参加者とGMの登録は、公開中の募集カードから行います。\n"
+                "直前と同じメンバーで続ける場合は、GMが「次村」を押してください。\n"
                 f"参加条件: **{room_note}**"
             )
         else:
@@ -479,16 +570,11 @@ class LobbyView(discord.ui.View):
 
     @discord.ui.button(label="次村", style=discord.ButtonStyle.primary, custom_id="rematch_game", row=1)
     async def rematch_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if self.cog.is_private_room():
-            return await interaction.response.send_message(
-                "GM村の次回参加は、新しい募集カードから受け付けます。",
-                ephemeral=True,
-            )
         await interaction.response.defer(ephemeral=True, thinking=True)
-        async with self.cog.action_lock:
-            result = await self.cog.rematch(interaction.user)
-            await self._update(interaction)
-            await interaction.followup.send(result, ephemeral=True)
+        # rematch側が全卓共通join_lock → 卓action_lockの順で取得する。
+        result = await self.cog.rematch(interaction.user)
+        await self._update(interaction)
+        await interaction.followup.send(result, ephemeral=True)
 
     @discord.ui.button(label="GM管理", style=discord.ButtonStyle.secondary, custom_id="lobby_gm_menu", row=1)
     async def gm_menu_button(
@@ -1303,7 +1389,7 @@ class _VoteQueueButton(discord.ui.Button):
     def __init__(self, cog: RoomRunner) -> None:
         # custom_idは候補ボタン (vote_<id>) と前方一致しない名前にする。
         super().__init__(
-            label="🗳️ 投票", style=discord.ButtonStyle.success, custom_id="join_vote"
+            label="投票", style=discord.ButtonStyle.success, custom_id="join_vote"
         )
         self.cog = cog
         self.game_run_id = cog.state.game_run_id
@@ -1355,24 +1441,15 @@ class _BaseVoteView(discord.ui.View):
         cog: RoomRunner,
         candidates: list,
         voters: list,
-        *,
-        provisional: bool = False,
     ) -> None:
-        """通常投票・決戦投票の候補パネルを作る。
-
-        provisionalは旧snapshot/UIを安全に拒否する互換引数として残すが、
-        現行進行では議論中の仮投票パネルを生成しない。
-        """
+        """通常投票・決戦投票の候補パネルを作る。"""
         super().__init__(timeout=None)
         self.cog = cog
         self.game_run_id = cog.state.game_run_id
         self.day_generation = cog.state.day_generation
         cog.register_game_view(self)
         self.voters = {v.user_id for v in voters}
-        self.provisional = provisional
         self.vote_slot_token = int(getattr(cog.state, "vote_slot_token", 0))
-        # 仮投票は議論フェーズ、確定は本来のフェーズでだけ受け付ける
-        self.accept_phase = Phase.DAY_DISCUSSION if provisional else self.expected_phase
 
         # 13人なら5・5・3の3段。確認ボタンはephemeralなので公開行を増やさない。
         for player in candidates:
@@ -1383,23 +1460,28 @@ class _BaseVoteView(discord.ui.View):
             )
             btn.callback = self._make_callback(player.user_id)
             self.add_item(btn)
-        if self.with_queue_button:
+        # 「投票」(列へ並ぶ) は投票発言のときだけ。ターン制の一斉投票には
+        # 順番待ちの列がないため置かない。
+        if self.with_queue_button and cog.uses_sequential_vote():
             self.add_item(_VoteQueueButton(cog))
 
     def _vote_error(self, voter_id: int, target_id: int) -> Optional[str]:
         state = self.cog.state
         if (
             not self.cog.is_current_day_view(self.game_run_id, self.day_generation)
-            or state.phase != self.accept_phase
+            or state.phase != self.expected_phase
         ):
             return "⏳ 現在この操作はできません。"
         if voter_id not in self.voters:
             return "投票権がありません。"
-        # 通常投票は列の先頭1人だけ受け付ける。slot tokenも照合し、
+        if self.expected_phase == Phase.DAY_VOTE and state.vote_closed:
+            return "投票受付は終了しました。"
+        # 投票発言の通常投票は列の先頭1人だけ受け付ける。slot tokenも照合し、
         # 1つ前の投票者に残った古いボタンが次の人の枠へ作用しないようにする。
+        # ターン制の一斉投票には発言枠がないため、この照合は行わない。
         if (
-            not self.provisional
-            and self.expected_phase == Phase.DAY_VOTE
+            self.expected_phase == Phase.DAY_VOTE
+            and self.cog.uses_sequential_vote()
             and (
                 not state.vote_slot_active
                 or state.current_speaker_id != voter_id
@@ -1407,8 +1489,7 @@ class _BaseVoteView(discord.ui.View):
             )
         ):
             return "自分の番になってから投票できます。"
-        # 仮投票は入れ替え自由。確定後 (投票フェーズ) だけ二重投票を弾く
-        if voter_id in state.votes and not self.provisional:
+        if voter_id in state.votes:
             return "投票済みです。"
         if voter_id == target_id:
             return "自分には投票できません。"
@@ -1429,13 +1510,7 @@ class _BaseVoteView(discord.ui.View):
                 target_name = target.display_name if target is not None else "選択した相手"
             if error:
                 return await interaction.followup.send(error, ephemeral=True)
-            if self.provisional:
-                prompt = (
-                    f"**{target_name}** に投票します。よろしいですか？\n"
-                    "投票フェーズに入るまでは、別の人を押せば入れ替えられます。"
-                )
-            else:
-                prompt = f"**{target_name}** に投票しますか？確定後は変更できません。"
+            prompt = f"**{target_name}** に投票しますか？確定後は変更できません。"
             await interaction.followup.send(
                 prompt,
                 view=VoteConfirmView(self, interaction.user.id, target_id),
@@ -1486,7 +1561,7 @@ class _BaseVoteView(discord.ui.View):
                     False,
                 )
 
-            if not self.provisional and self.expected_phase == Phase.DAY_VOTE:
+            if self.expected_phase == Phase.DAY_VOTE and self.cog.uses_sequential_vote():
                 # 保存した票を同じ公開パネルへ反映してから、現在の20秒枠を
                 # 終了する。次の人へ進んだ後で表示すると、発言順と公開票の
                 # 対応が一瞬ずれるため、この順序は崩さない。
@@ -1505,12 +1580,6 @@ class _BaseVoteView(discord.ui.View):
                 }
                 if alive_voters <= state.votes.keys():
                     state.vote_complete_event.set()
-        if self.provisional:
-            return (
-                f"✅ **{target_name}** に投票しました。\n"
-                "投票フェーズに入るまでは入れ替えられます。",
-                True,
-            )
         return f"✅ **{target_name}** に投票しました。", True
 
 
@@ -2685,7 +2754,7 @@ class PostgameVotePanelView(discord.ui.View):
         except (discord.NotFound, discord.HTTPException):
             pass
 
-    @discord.ui.button(label="🗳️ 投票する", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="投票する", style=discord.ButtonStyle.primary)
     async def vote_btn(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
@@ -3114,8 +3183,9 @@ class OverallRoomStatsSelect(discord.ui.Select):
                 value=room.room_id,
                 default=owner.room_id == room.room_id,
             )
+            # 統計対象外の卓 (rated=False) は選択肢に出さない。
             for room in ACTIVE_ROOM_DEFINITIONS
-            if room.variant_id == owner.variant_id
+            if room.variant_id == owner.variant_id and room.rated
         )
         super().__init__(
             placeholder="試合指標を表示する卓",
@@ -3182,7 +3252,7 @@ class OverallStatsFilterView(discord.ui.View):
         valid_rooms = {
             room.room_id
             for room in ACTIVE_ROOM_DEFINITIONS
-            if room.variant_id == self.variant_id
+            if room.variant_id == self.variant_id and room.rated
         }
         if self.room_id not in valid_rooms:
             self.room_id = None
@@ -4218,7 +4288,7 @@ def build_rule_embeds(
             "COは初日2巡目と2日目以降に名前のみ公開。詳細はVCで話します。"
             f"本人はパス可、割り込みは村全体で1日 **{variant.turn_interrupts_per_day}回**（各30秒）。\n"
             "**仮投票はありません。** 規定の発言後に投票します。\n"
-            "通常投票 **1人20秒**（「投票」を押した順・確定ごとに公開） ／ "
+            f"通常投票 **{VOTE_TIMEOUT}秒の一斉投票**（全員そろえば即開示） ／ "
             f"弁明 **{RUNOFF_SPEECH_TIME}秒** ／ 遺言 **{LAST_WILL_TIME}秒**（本人かGMが短縮可）\n"
             f"夜 **初日{NIGHT_BASE}秒 / 以降{NIGHT_MIN}秒**（目安。朝は全員の宣言で明ける）"
         )
@@ -4264,14 +4334,25 @@ def build_rule_embeds(
         value=discussion_rule,
         inline=False,
     )
-    embed.add_field(
-        name="投票と処刑",
-        value=(
-            "「🗳️ 投票」を押した順に1人20秒。自分の番に名前を押して確定すると"
+    if variant.discussion_mode == "turn":
+        vote_rule = (
+            f"規定の発言を終えたら、**{VOTE_TIMEOUT}秒の一斉投票**です。"
+            "名前を押して確定すると投票が入り、全員そろえばその場で開示されます"
+            "（時間切れは棄権）。\n"
+            "棄権ボタンはなく、自分には投票できません。\n"
+        )
+    else:
+        vote_rule = (
+            "「投票」を押した順に1人20秒。自分の番に名前を押して確定すると"
             "投票がすぐ公開され、次の人へ進みます（時間切れは棄権）。\n"
             "ボタンはいつでも押せます。押した人がいなくなると全員ミュートで待機するので、"
             "必ず押してください（棄権ボタンはなく、自分には投票できません）。\n"
-            f"同票なら候補者が順番に弁明し、候補者以外が一斉に**{VOTE_TIMEOUT}秒**で決戦投票します。"
+        )
+    embed.add_field(
+        name="投票と処刑",
+        value=(
+            vote_rule
+            + f"同票なら候補者が順番に弁明し、候補者以外が一斉に**{VOTE_TIMEOUT}秒**で決戦投票します。"
             "**再び同票ならランダム**で処刑します。\n"
             "1票もなければ処刑なし。処刑が確定した人には遺言時間があります。"
             "**処刑・襲撃された人の役職は非公開**です。"
@@ -4346,8 +4427,9 @@ def build_help_embeds(
         name=f"{BOT_VERSION}の変更",
         value=(
             "**0日目初夜30秒**（人狼の挨拶のみ）を追加しました。\n"
-            "通常投票は「🗳️ 投票」を押した順に**1人20秒**で発言・確定する方式になり、"
-            "決戦は弁明30秒→候補者以外の一斉投票になりました。\n"
+            "クロストークの通常投票は「投票」を押した順に**1人20秒**で発言・確定する"
+            "方式になりました（ターン制は従来どおり一斉投票）。"
+            "決戦は弁明30秒→候補者以外の一斉投票です。\n"
             "「朝を迎える」は夜の時間が終わってから **0/生存人数** で出ます（取消不可）。\n"
             "GMメニューに**スキップ**、人狼のDMに**サレンダー**を追加。"
             "人狼予想は陣営に関係なくDMだけで受け付けます。"
@@ -4400,8 +4482,8 @@ def build_help_embeds(
     embed3.add_field(
         name="終わった試合を読み返す",
         value=(
-            f"全村で `#{CH_VILLAGE}` / `#{CH_SPIRIT}` を"
-            f"**{LOG_CATEGORY_VILLAGE}** / **{LOG_CATEGORY_SPIRIT}** へ保存します。\n"
+            f"全村で `#{CH_VILLAGE}` を **{LOG_CATEGORY_VILLAGE}** へ保存します"
+            f"（`#{CH_SPIRIT}` は保存せず削除します）。\n"
             f"終了後は全員が読み返せますが書き込みはできません。\n"
             f"試合番号で `#統計` と照合できます（直近{LOG_CATEGORY_LIMIT}試合）。"
         ),
@@ -4558,7 +4640,7 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
     rate.add_field(
         name="対象",
         value=(
-            "正常終了した**すべての村**で、レート・ランク・統計・ランキングが更新されます。\n"
+            "正常終了した**レート対象卓**で、レート・ランク・統計・ランキングが更新されます。\n"
             "各試合は変種に対応するラダーだけを更新します。シーズン境界は3ラダー共通ですが、"
             "順位・レート・履歴は混ぜません。"
         ),
@@ -4602,7 +4684,8 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
     rank.add_field(
         name="シーズン（管理者向け）",
         value=(
-            "`/season_reset` でレートをハーフリセットし、前シーズンの結果を保存します。\n"
+            "`/season_reset` または `#運営` の「シーズンリセット」で、レートを"
+            "`1500 + (現レート - 1500) ÷ 2` へ戻し、前シーズンの結果を保存します。\n"
             "必要な権限: チャンネル管理 / ロール管理 / ニックネーム変更 / "
             "メンバーをミュート / DM送信。"
         ),

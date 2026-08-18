@@ -516,6 +516,41 @@ class GameStatsDatabaseTest(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
+    async def test_player_recommendations_exclude_unrated_rooms(self) -> None:
+        """個人統計の推薦票も、ほかの集計と同じく非レート卓を除く。"""
+        async with database.connect_db() as db:
+            game_ids: dict[str, int] = {}
+            for room_id in ("rated", "nate"):
+                cursor = await db.execute(
+                    "INSERT INTO games "
+                    "(guild_id, variant_id, ladder_id, room_id, room_name, winner_team) "
+                    "VALUES (1, 'v13_cross', 'l13', ?, ?, ?)",
+                    (room_id, room_id, Team.VILLAGE.value),
+                )
+                game_id = int(cursor.lastrowid)
+                game_ids[room_id] = game_id
+                await db.execute(
+                    "INSERT INTO game_players "
+                    "(game_id, player_id, role, team, won) VALUES (?, 42, ?, ?, 1)",
+                    (game_id, Role.VILLAGER.value, Team.VILLAGE.value),
+                )
+            for room_id, bonus in (("rated", 2), ("nate", 7)):
+                await db.execute(
+                    "INSERT INTO rating_history "
+                    "(player_id, guild_id, game_id, variant_id, ladder_id, "
+                    "rating_before, rating_after, elo_delta, recommendation_bonus) "
+                    "VALUES (42, 1, ?, 'v13_cross', 'l13', 1500, 1500, 0, ?)",
+                    (game_ids[room_id], bonus),
+                )
+            await db.commit()
+
+        with patch.object(database, "UNRATED_ROOM_IDS", frozenset({"nate"})):
+            stats = await database.get_player_stats(42, 1)
+
+        assert stats is not None
+        self.assertEqual(stats["total"], 1)
+        self.assertEqual(stats["recommendations_received"], 2)
+
     async def test_stats_write_failure_does_not_rollback_core_settlement(self) -> None:
         await database.stage_game_settlement(
             1, "open", "run-stats-fail", room_name="総合", rated=False,

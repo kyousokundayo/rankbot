@@ -97,6 +97,61 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
             await database.set_recruitment_gm(recruitment_id, gm_id)
         return recruitment_id
 
+    async def test_host_can_remove_an_entry_and_backup_is_promoted(self) -> None:
+        """主催者の「参加者を除外」は、本人の参加取消と同じ繰り上げを通る。"""
+        recruitment_id = await self._full_recruitment(gm_id=1)
+        # 13人の定員を超えて登録し、補欠を1人作る
+        await database.add_recruitment_entry(recruitment_id, 113)
+        self.members[113] = SimpleNamespace(
+            id=113, nick=None, display_name="user-113", send=AsyncMock(),
+        )
+
+        host_view = recruitment_lib.RecruitmentHostView(
+            self.manager, recruitment_id, 1,
+        )
+        interaction = SimpleNamespace(
+            user=self.members[100],
+            guild=self.guild,
+            response=SimpleNamespace(
+                send_message=AsyncMock(), defer=AsyncMock(),
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+            data={"values": ["100"]},
+        )
+        remove_button = discord.utils.get(
+            host_view.children, label="参加者を除外",
+        )
+        # 主催者以外は開けない
+        await remove_button.callback(interaction)
+        self.assertIn(
+            "主催者だけ", interaction.response.send_message.await_args.args[0],
+        )
+
+        host_interaction = SimpleNamespace(
+            user=self.members[1],
+            guild=self.guild,
+            response=SimpleNamespace(
+                send_message=AsyncMock(), defer=AsyncMock(),
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+            data={"values": ["100"]},
+        )
+        await remove_button.callback(host_interaction)
+        select_view = host_interaction.response.send_message.await_args.kwargs["view"]
+        # 主催者自身は選択肢に出さない (GM不在の募集が残ってしまうため)
+        self.assertNotIn(
+            "1", {option.value for option in select_view.children[0].options},
+        )
+
+        await select_view._selected(host_interaction)
+
+        entries = await database.list_recruitment_entries(recruitment_id)
+        by_user = {int(e["user_id"]): e["kind"] for e in entries}
+        self.assertNotIn(100, by_user)
+        # 空いた参加枠へ補欠が繰り上がり、本人へDMが飛ぶ
+        self.assertEqual(by_user[113], "参加")
+        self.members[113].send.assert_awaited()
+
     async def test_player_block_view_pages_all_candidates_and_registered_users(self) -> None:
         members = [
             SimpleNamespace(
@@ -955,7 +1010,17 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
                 "recruitment:42:join", "recruitment:42:leave",
                 "recruitment:42:transfer", "recruitment:42:host",
                 "recruitment:42:notify",
+                # 受付中のGM村で規定を読める唯一の導線
+                "recruitment:42:rule", "recruitment:42:help",
             },
+        )
+        # 受付が閉じても、読むだけのルール・ヘルプは押せるままにする
+        closed = RecruitmentCardView(self.manager, 42, active=False)
+        enabled = {
+            item.custom_id for item in closed.children if not item.disabled
+        }
+        self.assertEqual(
+            enabled, {"recruitment:42:rule", "recruitment:42:help"},
         )
         base = {
             "date": "2026-08-03", "hour": "20", "minute": "0",

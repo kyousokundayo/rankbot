@@ -18,7 +18,7 @@ from config import (
     DISCORD_MESSAGE_LIMIT,
     PREPARATION_TIME, INITIAL_NIGHT_GREETING_TIME,
     CHANNEL_DELETE_DELAY, VOTE_TIMEOUT, VOTE_SPEECH_TIME,
-    LOG_CATEGORY_VILLAGE, LOG_CATEGORY_SPIRIT,
+    LOG_CATEGORY_VILLAGE,
     LOG_CATEGORY_LIMIT, LOG_CATEGORY_TRIM_TO,
     CH_VILLAGE, CH_SPIRIT, CH_LOBBY, VC_GAME,
     RUNOFF_SPEECH_TIME, LAST_WILL_TIME, DISCUSSION_GRACE_TIME,
@@ -27,9 +27,10 @@ from config import (
     WOLF_GUESS_TIMEOUT, BONUS_WOLF_GUESS_DEATH_CAUSES,
     SE_ENABLED,
     ADOPT_EXISTING_LAYOUT,
+    GM_INFO_CATEGORY_NAME,
     PRIVATE_ROOM_CREATOR_ROLE_NAMES, PRIVATE_ROOM_CREATOR_ROLE_LABEL,
     RECRUITMENT_UNRANKED_LABEL,
-    RATED_ROOM_IDS, RoomDefinition, VariantDefinition, get_variant_definition,
+    RoomDefinition, VariantDefinition, get_variant_definition,
     USER_VISIBLE_VARIANT_IDS,
 )
 from models import Player, GameState, by_number
@@ -395,6 +396,16 @@ class RoomRunner:
     def is_turn_discussion_mode(self) -> bool:
         return self.variant.discussion_mode == "turn"
 
+    def uses_sequential_vote(self) -> bool:
+        """通常投票を「投票発言」(1人ずつ) で行う変種か。
+
+        クロストークは議論の流れをそのまま投票へ繋げるため1人ずつ発言して
+        確定する。ターン制は発言順そのものが進行の骨格で、投票まで順番に
+        すると1日が長くなりすぎるため、規定の発言を終えてから一斉に投票する。
+        決戦投票はどちらも一斉、決戦弁明はどちらも1人30秒で共通。
+        """
+        return not self.is_turn_discussion_mode()
+
     async def change_lobby_variant(self, actor_id: int, variant_id: str) -> str:
         """GM村の開始前形式を、募集カードと同じtransactionで変更する。"""
         if not self.is_private_room():
@@ -526,9 +537,13 @@ class RoomRunner:
         return f"✅ ゲーム形式を **{new_variant.label}** へ変更しました。"
 
     def is_rated_room(self) -> bool:
-        # 正常終了した全村を対象にする。固定・ローカル卓は静的集合、
-        # 作成時にIDが決まるGM名前村はprivate属性で判定する。
-        return self.room_def.room_id in RATED_ROOM_IDS or self.is_private_room()
+        # 正常終了した全村を対象にする。作成時にIDが決まるGM名前村は
+        # private属性、固定・ローカル卓は**自分が持つ定義**で判定する。
+        # IDでグローバル集合を引くと、同じroom_idの別定義 (環境ごとに
+        # rated が違うローカル卓など) を取り違える。
+        return self.is_private_room() or (
+            self.room_def.enabled and self.room_def.rated
+        )
 
     def turn_actions_open(self) -> bool:
         """現在の発言枠がターン用ボタンを受け付けるか。"""
@@ -731,6 +746,40 @@ class RoomRunner:
             self.manager._build_room_overwrites(guild, self.room_def),
         )
 
+    async def _new_category_position(
+        self, guild: discord.Guild,
+    ) -> Optional[int]:
+        """GM名前村を GM カテゴリのすぐ下へ作るための position を返す。
+
+        position を渡さないとDiscordはサーバー最下部へ足すため、作った本人が
+        一番下まで辿らないと自分の村を見つけられない。**新しい村ほど上** と
+        なる作成順に積むのは、開始時刻順にすると募集の時刻変更や試合ごとに
+        既存カテゴリの並べ替えPATCHが増えるため。作成時の1パラメータで済み、
+        既にある村のpositionを一切触らないこの方式を採る。
+
+        固定卓と、GMカテゴリを特定できない場合は従来どおり最下部へ作る。
+        """
+        if not self.is_private_room():
+            return None
+        anchor = None
+        try:
+            stored_id = await database.get_meta(guild.id, "gm_hub_category_id")
+        except Exception as e:
+            log.warning(f"GMカテゴリIDを取得できません: {e}")
+            stored_id = None
+        if stored_id and str(stored_id).isdigit():
+            candidate = guild.get_channel(int(stored_id))
+            if isinstance(candidate, discord.CategoryChannel):
+                anchor = candidate
+        if anchor is None:
+            anchor = discord.utils.get(
+                guild.categories, name=GM_INFO_CATEGORY_NAME,
+            )
+        position = getattr(anchor, "position", None)
+        if not isinstance(position, int):
+            return None
+        return position + 1
+
     async def setup_channels(
         self,
         guild: discord.Guild,
@@ -797,9 +846,14 @@ class RoomRunner:
             # 作成後に閲覧拒否を付けると、Discord API応答間だけ
             # 新規カテゴリが公開になる。作成リクエスト自体に完成形の
             # overwriteを含め、最初からfail-closedにする。
+            create_options: dict[str, object] = {
+                "overwrites": self.manager._build_room_overwrites(guild, self.room_def),
+            }
+            position = await self._new_category_position(guild)
+            if position is not None:
+                create_options["position"] = position
             category = await guild.create_category(
-                self.room_def.name,
-                overwrites=self.manager._build_room_overwrites(guild, self.room_def),
+                self.room_def.name, **create_options,
             )
         self.state.category = category
         if preserve_snapshot_access_boundary:
@@ -2330,6 +2384,14 @@ class RoomRunner:
     # ============================================================
 
     async def rematch(self, user: discord.Member) -> str:
+        """全卓共通の所属ロックを取って、直前のメンバーを再登録する。"""
+        # 通常参加・GM取得と同じ join_lock → action_lock の順に固定する。
+        # DM確認のawait中に別卓の参加/次村が割り込むと、同じ人を複数卓へ
+        # 登録できてしまうため、判定からstate更新までを全卓で直列化する。
+        async with self.manager.join_lock, self.action_lock:
+            return await self._rematch_locked(user)
+
+    async def _rematch_locked(self, user: discord.Member) -> str:
         """直前のゲームの参加者とGMをロビーへ一括再登録する (次村)。
 
         押せるのは直前のゲームのGMのみ (進行の主導権をGMに一本化する)。
@@ -2361,13 +2423,27 @@ class RoomRunner:
             else:
                 skipped.append(f"前回GM: {gm_member.display_name}")
 
-        # 参加条件を満たす候補を先に絞る
+        # 同村拒否は募集カードのDB制約側にしかないため、カードを通さない
+        # 次村では自前で見る。試合直後は「今の卓のあの人とはもう組みたくない」
+        # を登録する典型的なタイミングなので、素通りさせない。
+        blocked_pairs = await database.list_player_blocks_between(
+            guild.id, [*state.players, *self.last_game_roster],
+        )
+        blockers_of: dict[int, set[int]] = {}
+        for blocker_id, blocked_id in blocked_pairs:
+            blockers_of.setdefault(blocked_id, set()).add(blocker_id)
+            blockers_of.setdefault(blocker_id, set()).add(blocked_id)
+
+        # 前回の並び順で1人ずつ、参加条件 → 同村拒否 → DMの順に確定する。
+        # DM確認は全卓共有のAPIペーシングで元から直列化される。先に候補全員を
+        # 仮登録扱いにすると、先行候補のDM失敗後も、その候補との拒否関係だけで
+        # 後続まで余計に除外してしまうため、成功した人だけregisteredへ足す。
         # (GMを兼ねている人も参加者として登録する: 同じ卓での兼任は許可されている)
-        candidates: list[discord.Member] = []
+        registered_ids = set(state.players)
         for uid in self.last_game_roster:
             if uid in state.players:
                 continue
-            if len(state.players) + len(candidates) >= self.variant.player_count:
+            if len(state.players) >= self.variant.player_count:
                 skipped.append("(定員に達したため以降を打ち切り)")
                 break
             member = guild.get_member(uid)
@@ -2377,25 +2453,17 @@ class RoomRunner:
             if await self.validate_join(member) is not None:
                 skipped.append(member.display_name)
                 continue
-            candidates.append(member)
-
-        # DM開放チェック (通常の「参加」と同じ条件。ここで弾かないと
-        # ゲーム開始時の役職DM送信で失敗して中断になる)
-        dm_failed: set[int] = set()
-
-        async def dm_check(member: discord.Member) -> None:
+            # 募集と同じく「先に入っている人」を優先し、前回の並び順で
+            # 決まる安定した結果にする。理由は本人にも卓にも出さない
+            # (誰が誰を拒否したかが分かってしまうため)。
+            if blockers_of.get(uid, set()) & registered_ids:
+                skipped.append(member.display_name)
+                continue
             try:
                 await self._discord_api_call(
                     member.send, "人狼ゲームへの次村参加を受け付けました。"
                 )
             except (discord.Forbidden, discord.HTTPException):
-                dm_failed.add(member.id)
-
-        if candidates:
-            await asyncio.gather(*(dm_check(m) for m in candidates))
-
-        for member in candidates:
-            if member.id in dm_failed:
                 skipped.append(f"{member.display_name} (DM不可)")
                 continue
             state.players[member.id] = Player(
@@ -2403,6 +2471,7 @@ class RoomRunner:
                 member=member,
                 original_nickname=member.nick,
             )
+            registered_ids.add(member.id)
             added.append(member.display_name)
 
         await self._persist_room_state()
@@ -2500,6 +2569,22 @@ class RoomRunner:
             except (discord.NotFound, discord.HTTPException):
                 pass
             return
+        owner_id = self.room_def.private_owner_id
+        if owner_id is not None:
+            running = self.manager.running_room_name_for_owner(
+                owner_id, exclude_room_id=state.room_id,
+            )
+            if running is not None:
+                try:
+                    await interaction.followup.send(
+                        f"同じ村主の **{running}** が進行中です。"
+                        "1人が同時に進行できる村は1つまでなので、"
+                        "先にそちらを終了してください。",
+                        ephemeral=True,
+                    )
+                except (discord.NotFound, discord.HTTPException):
+                    pass
+                return
         if (
             state.vc_default_permissions_captured
             or state.vc_gm_speak_captured
@@ -3415,7 +3500,28 @@ class RoomRunner:
             await self._safe_village_send("⏭️ **GMの操作で0日目の初夜をスキップします。**")
             return "⏭️ 0日目の初夜をスキップしました。"
         if (
+            # 一斉投票には発言枠も待機列もない。逐次投票用の締切分岐は
+            # vote_order が空のターン制でも条件が揃ってしまい、締め切った
+            # と表示しながら実際は時間切れまで続く。先にここで捌く。
             phase == Phase.DAY_VOTE
+            and not self.uses_sequential_vote()
+            and not state.vote_complete_event.is_set()
+        ):
+            state.vote_closed = True
+            try:
+                await self._persist_room_state()
+            except Exception as error:
+                state.vote_closed = False
+                log.exception(f"一斉投票締切の保存に失敗: {error}")
+                return "❌ 保存できませんでした。もう一度押してください。"
+            state.vote_complete_event.set()
+            await self._safe_village_send(
+                "⏭️ **GMの操作で投票を締め切ります。**（未投票は棄権）"
+            )
+            return "⏭️ 投票を締め切りました。"
+        if (
+            phase == Phase.DAY_VOTE
+            and self.uses_sequential_vote()
             and state.vote_slot_active
             and not state.speech_done_event.is_set()
         ):
@@ -3424,6 +3530,7 @@ class RoomRunner:
             return "⏭️ 現在の投票発言をスキップしました。"
         if (
             phase == Phase.DAY_VOTE
+            and self.uses_sequential_vote()
             and not state.vote_slot_active
             # 列に未処理が残っている間は締め切らない。1枠の終了処理は
             # 「vote_slot_activeを下ろす → ミュート戻し(API) → cursor更新(DB)」
@@ -4519,6 +4626,65 @@ class RoomRunner:
         await self._persist_vote_checkpoint("通常投票発言枠の完了")
 
     async def _day_vote(self) -> Optional[int]:
+        if not self.uses_sequential_vote():
+            return await self._day_vote_simultaneous()
+        return await self._day_vote_sequential()
+
+    async def _day_vote_simultaneous(self) -> Optional[int]:
+        """ターン制の通常投票。規定の発言を終えてから全員が一斉に投票する。"""
+        state = self.state
+        await state.pause_event.wait()
+        state.phase = Phase.DAY_VOTE
+        # 新規開始時だけ当日へ進める。復元時は同じ世代なので、保存済みの票を
+        # 消さずに再開する。DAY_VOTE snapshotは世代一致を必須にしているため、
+        # persistより先に更新しないと投票中の再起動で復元できなくなる。
+        if state.vote_day_generation != state.day_generation:
+            state.votes.clear()
+            state.vote_day_generation = state.day_generation
+            state.vote_closed = False
+        state.vote_complete_event.clear()
+        await self._persist_room_state()
+
+        alive = state.alive_players()
+        view = VoteView(self, candidates=by_number(alive), voters=alive)
+        alive_voter_ids = {p.user_id for p in alive}
+        if state.vote_closed or (
+            alive_voter_ids and alive_voter_ids <= state.votes.keys()
+        ):
+            state.vote_complete_event.set()
+        # 投票開始のSEは鳴らさない。直前の議論終了SEと数秒差で連続し、
+        # 合図として区別できないため (議論終了SEに一本化)
+
+        def vote_content(remaining: float) -> str:
+            return (
+                "🗳️ **投票フェーズ** — 処刑する人を選んでください。\n"
+                + self._timer_line(remaining, "制限時間")
+            )
+
+        timer_msg = await self._safe_village_send(vote_content(VOTE_TIMEOUT), view=view)
+        await self._repost_gm_panel()
+
+        # 全員投票完了 or タイムアウト (pause対応)
+        completed = await self._pausable_countdown(
+            timer_msg, vote_content, VOTE_TIMEOUT, state.vote_complete_event
+        )
+        if not completed:
+            not_voted = [
+                state.get_player(uid) for uid in view.voters if uid not in state.votes
+            ]
+            # フェーズ中に退出/除外で死亡した人は未投票者に載せない
+            not_voted = [p for p in not_voted if p and p.alive]
+            not_voted.sort(key=lambda p: p.number)
+            names = ", ".join(p.display_name for p in not_voted)
+            await self._safe_village_send(
+                f"⏰ **投票時間切れ** — 未投票者: {names}\n既投票分で集計します。"
+            )
+
+        # 翌日の投票フェーズで古いボタンが反応しないよう停止する
+        view.stop()
+        return await self._resolve_day_vote()
+
+    async def _day_vote_sequential(self) -> Optional[int]:
         state = self.state
         await state.pause_event.wait()
         initialized = await self._initialize_sequential_vote()
@@ -4612,6 +4778,11 @@ class RoomRunner:
                 None,
             )
 
+        return await self._resolve_day_vote()
+
+    async def _resolve_day_vote(self) -> Optional[int]:
+        """集計〜決戦。投票の集め方 (一斉/投票発言) によらず共通。"""
+        state = self.state
         if not state.votes:
             await self._safe_village_send("⚠️ 投票が1票もなかったため、処刑なしとなります。")
             return None
@@ -5040,9 +5211,10 @@ class RoomRunner:
     @staticmethod
     def _is_managed_log_channel_name(category_name: str, channel_name: str) -> bool:
         """同名の手動カテゴリや専用村をログとして誤採用しない。"""
+        # 退避先は #昼 だけ。過去に作られた「ログ-霊界」はBotの管理対象外とし、
+        # 権限同期もtrimも行わない (運営が手動で消す)。
         expected = {
             LOG_CATEGORY_VILLAGE: CH_VILLAGE,
-            LOG_CATEGORY_SPIRIT: CH_SPIRIT,
         }.get(category_name)
         sequence, separator, suffix = channel_name.partition("-")
         return bool(expected and separator and sequence.isdecimal() and suffix == expected)
@@ -6821,10 +6993,11 @@ class RoomRunner:
             "✅ **ゲーム終了処理が完了しました。**\nニックネームとVC設定を復元しました。",
         )
 
-        # ログカテゴリへ退避 (#昼 / #霊界)。移せなければ従来どおり削除する。
+        # ログカテゴリへ退避するのは #昼 だけ。移せなければ従来どおり削除する。
+        # #霊界 は退避せず常に削除する (Noneのカテゴリ名で削除側へ倒す)。
         game_channels = [
             (state.village_channel, LOG_CATEGORY_VILLAGE),
-            (state.spirit_channel, LOG_CATEGORY_SPIRIT),
+            (state.spirit_channel, None),
         ]
         game_channels = [(ch, cat) for ch, cat in game_channels if ch]
         seq = None
@@ -6851,7 +7024,8 @@ class RoomRunner:
             await asyncio.sleep(CHANNEL_DELETE_DELAY)
             for ch, category_name in game_channels:
                 if (
-                    archive_to_public_log
+                    category_name is not None
+                    and archive_to_public_log
                     and seq is not None
                     and await self._archive_game_channel(
                         ch,

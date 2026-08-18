@@ -20,6 +20,8 @@ from config import (
     LOG_CATEGORY_VILLAGE, LOG_CATEGORY_SPIRIT,
     GM_ROLE_NAME, TEMP_GM_ROLE_NAME,
     PRIVATE_ROOM_CREATOR_ROLE_NAMES, PRIVATE_ROOM_CREATOR_ROLE_LABEL,
+    PRIVATE_ROOM_GUILD_LIMIT, PRIVATE_ROOM_LIMIT_BY_ROLE,
+    private_room_limit_for_roles,
     RECRUITMENT_NOTIFICATION_ROLE_NAME,
     BULK_DISCORD_API_INTERVAL,
     DEFAULT_LADDER_ID, LADDER_DEFINITIONS,
@@ -33,8 +35,15 @@ from room_runner import (
     RoomRunner,
     member_roles_for_edit,
 )
-from views import DangerConfirmView, PrivateRoomInfoView, StatsView
-from recruitment import RecruitmentManager
+from views import (
+    DangerConfirmView,
+    PrivateRoomDeleteSelectView,
+    PrivateRoomInfoView,
+    PrivateRoomRenameModal,
+    PrivateRoomRenameSelectView,
+    StatsView,
+)
+from recruitment import OperationsView, RecruitmentManager
 import database
 import rating as rating_lib
 import sounds
@@ -489,6 +498,23 @@ class GameCog(RoomPermissionMixin, commands.Cog):
     async def _season_reminder_wait_ready(self) -> None:
         await self.bot.wait_until_ready()
 
+    def running_room_name_for_owner(
+        self, owner_id: int, *, exclude_room_id: str,
+    ) -> Optional[str]:
+        """同じ村主の別の村が進行中なら、その村名を返す。
+
+        村は複数持てるが、村主は同時に2卓を進行できない。募集の受付
+        (参加ボタン) は複数開いたままで構わないので、開始時だけ弾く。
+        """
+        for room in self.rooms.values():
+            if room.state.room_id == exclude_room_id:
+                continue
+            if room.room_def.private_owner_id != owner_id:
+                continue
+            if room.state.phase not in (Phase.LOBBY, Phase.GAME_OVER):
+                return room.state.room_name
+        return None
+
     def has_active_rated_games(self) -> bool:
         return any(
             room.is_rated_room()
@@ -758,7 +784,12 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             title="GM村と募集の作成",
             description=(
                 "GMは自分の村を作成し、参加者を募集できます。\n"
-                "村は1人1つまで作成できます。"
+                f"作成できる村数は 仮GM {PRIVATE_ROOM_LIMIT_BY_ROLE[TEMP_GM_ROLE_NAME]}個 / "
+                f"GM {PRIVATE_ROOM_LIMIT_BY_ROLE[GM_ROLE_NAME]}個 です"
+                f"（サーバー全体で{PRIVATE_ROOM_GUILD_LIMIT}個まで）。\n"
+                "新しい村を作るときは村名を入力し、既存の村で募集するときは"
+                "その村名を入力してください（村が1つだけなら空欄で構いません）。\n"
+                "同時にゲームを進行できるのは1人1村までです。"
             ),
             color=discord.Color.dark_gold(),
         )
@@ -1037,35 +1068,48 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         await database.delete_private_room(guild.id, row["room_id"])
         return True
 
-    async def _delete_private_room_for_owner_safely(
+    async def _delete_private_rooms_for_owner_safely(
         self,
         guild: discord.Guild,
         owner_id: int,
         *,
         reason: str,
-    ) -> bool:
-        """ライブ中の自動削除を manager→action→private で直列化する。"""
+    ) -> int:
+        """村主の全GM村を消し、削除できた数を返す。
+
+        ロール剥奪・サーバー退出で呼ぶため、1人が複数村を持っていれば
+        すべてが対象になる。ライブ中の自動削除は
+        manager→action→private の順で直列化する。
+        """
+        deleted = 0
         async with self.recruitment_manager.lock:
-            row = await database.get_private_room_by_owner(guild.id, owner_id)
-            if row is None:
-                return False
-            room = self.rooms.get(row["room_id"])
-            if room is None:
-                async with self.private_room_lock:
-                    latest = await database.get_private_room_by_owner(guild.id, owner_id)
-                    if latest is None:
-                        return False
-                    return await self._delete_private_room_by_row(
-                        guild, latest, reason=reason,
-                    )
-            async with room.action_lock:
-                async with self.private_room_lock:
-                    latest = await database.get_private_room_by_owner(guild.id, owner_id)
-                    if latest is None or latest["room_id"] != room.state.room_id:
-                        return False
-                    return await self._delete_private_room_by_row(
-                        guild, latest, reason=reason,
-                    )
+            rows = await database.list_private_rooms_by_owner(guild.id, owner_id)
+            for row in rows:
+                room = self.rooms.get(row["room_id"])
+                if room is None:
+                    async with self.private_room_lock:
+                        latest = await database.get_private_room(
+                            guild.id, row["room_id"]
+                        )
+                        if latest is None:
+                            continue
+                        if await self._delete_private_room_by_row(
+                            guild, latest, reason=reason,
+                        ):
+                            deleted += 1
+                    continue
+                async with room.action_lock:
+                    async with self.private_room_lock:
+                        latest = await database.get_private_room(
+                            guild.id, row["room_id"]
+                        )
+                        if latest is None:
+                            continue
+                        if await self._delete_private_room_by_row(
+                            guild, latest, reason=reason,
+                        ):
+                            deleted += 1
+        return deleted
 
     async def _cleanup_private_rooms_without_creator_role(
         self,
@@ -1778,7 +1822,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 await self.recruitment_manager.refresh_message(recruitment_id)
         except Exception as exc:
             log.exception("退出主催者の募集アーカイブ失敗: %s", exc)
-        await self._delete_private_room_for_owner_safely(
+        await self._delete_private_rooms_for_owner_safely(
             member.guild,
             member.id,
             reason=f"{PRIVATE_ROOM_CREATOR_ROLE_LABEL}がサーバーから退出したため専用村削除",
@@ -1792,7 +1836,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         has_creator_role = self._has_private_room_creator_role(after)
         if not had_creator_role or has_creator_role:
             return
-        await self._delete_private_room_for_owner_safely(
+        await self._delete_private_rooms_for_owner_safely(
             after.guild,
             after.id,
             reason=f"{PRIVATE_ROOM_CREATOR_ROLE_LABEL}ロールが外れたため専用村削除",
@@ -1813,8 +1857,37 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             for role in getattr(member, "roles", ())
         )
 
-    def _private_room_id_for(self, owner_id: int) -> str:
-        return f"private_{owner_id}"
+    def _private_room_limit_for(self, member: discord.Member) -> int:
+        """その人が同時に持てるGM村の数。複数ロールなら最大値を採る。
+
+        設定運営ロールの枠は作成者ロール (GM／仮GM) と併用する前提で、
+        単独では村を作れない (作成可否は `_has_private_room_creator_role`)。
+        """
+        return private_room_limit_for_roles(
+            role.name for role in getattr(member, "roles", ())
+        )
+
+    def _next_private_room_id(self, owner_id: int, taken: set[str]) -> str:
+        """未使用のroom_idを返す。1つ目は旧来の `private_<user>` を保つ。"""
+        base = f"private_{owner_id}"
+        if base not in taken:
+            return base
+        index = 2
+        while f"{base}_{index}" in taken:
+            index += 1
+        return f"{base}_{index}"
+
+    def _private_room_list_text(self, rows: list[dict]) -> str:
+        """エラー文へ載せる自分の村一覧。どれを消すか判断できるようにする。"""
+        lines = []
+        for row in rows:
+            room = self.rooms.get(row["room_id"])
+            phase = getattr(getattr(room, "state", None), "phase", None)
+            if phase is not None and phase not in (Phase.LOBBY, Phase.GAME_OVER):
+                lines.append(f"・{row['room_name']} (ゲーム中)")
+            else:
+                lines.append(f"・{row['room_name']}")
+        return "\n".join(lines)
 
     def _normalize_private_room_name(self, raw_name: Optional[str], owner: discord.Member) -> str:
         base = (raw_name or f"{owner.display_name}村").strip()
@@ -1880,7 +1953,26 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             raise RuntimeError("公開されていないゲーム形式は選択できません。")
 
         async with self.private_room_lock:
-            existing = await database.get_private_room_by_owner(guild.id, owner.id)
+            own_rooms = await database.list_private_rooms_by_owner(guild.id, owner.id)
+            requested_name = (room_name or "").strip()
+            # どの村で募集するかは村名で決める。空欄は「既存の村で募集」の
+            # 従来動作で、村が複数あるときだけどれか分からないので入力させる。
+            if requested_name:
+                existing = next(
+                    (row for row in own_rooms if row["room_name"] == requested_name),
+                    None,
+                )
+            elif len(own_rooms) == 1:
+                existing = own_rooms[0]
+            elif own_rooms:
+                raise RuntimeError(
+                    "GM村が複数あります。募集を出す村名を入力するか、"
+                    "新しい村名を入力してください。\n"
+                    + self._private_room_list_text(own_rooms)
+                )
+            else:
+                existing = None
+
             if existing is not None:
                 if existing.get("status") not in {"active", "creating"}:
                     raise RuntimeError(
@@ -1891,7 +1983,10 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                     room_def = self._private_room_definition_from_row(existing)
                     room = await self._setup_private_room_from_definition(guild, room_def)
                 if room.state.phase not in (Phase.LOBBY, Phase.GAME_OVER):
-                    raise RuntimeError("ゲーム中は次の募集を作成できません。")
+                    raise RuntimeError(
+                        f"GM村 {existing['room_name']} はゲーム中のため、"
+                        "次の募集を作成できません。"
+                    )
                 if room.state.players:
                     raise RuntimeError(
                         "参加受付に参加者が残っているため募集を作成できません。"
@@ -1902,7 +1997,22 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 # 失敗した際に、受付のない設定変更が残ってしまう。
                 return room, False
 
-            normalized_name = self._normalize_private_room_name(room_name, owner)
+            limit = self._private_room_limit_for(owner)
+            if len(own_rooms) >= limit:
+                raise RuntimeError(
+                    f"作成できるGM村は{limit}個までです"
+                    f"（現在{len(own_rooms)}個）。"
+                    "新しく作るには、先にどれかを削除してください。\n"
+                    + self._private_room_list_text(own_rooms)
+                )
+            if await database.count_private_rooms(guild.id) >= PRIVATE_ROOM_GUILD_LIMIT:
+                raise RuntimeError(
+                    f"サーバー全体のGM村が上限{PRIVATE_ROOM_GUILD_LIMIT}個に"
+                    "達しているため作成できません。"
+                    "どれかの村が削除されてから作成してください。"
+                )
+
+            normalized_name = self._normalize_private_room_name(requested_name or None, owner)
             name_owner = await database.get_private_room_by_name(guild.id, normalized_name)
             if name_owner is not None:
                 raise RuntimeError("その村名は既に使われています。別の村名にしてください。")
@@ -1910,7 +2020,10 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             if name_error is not None:
                 raise RuntimeError(name_error)
 
-            room_id = self._private_room_id_for(owner.id)
+            all_rooms = await database.load_private_rooms(guild.id)
+            room_id = self._next_private_room_id(
+                owner.id, {row["room_id"] for row in all_rooms}
+            )
             room_def = RoomDefinition(
                 room_id=room_id,
                 name=normalized_name,
@@ -1931,7 +2044,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 await room._persist_room_state()
                 return room, True
             except Exception:
-                row = await database.get_private_room_by_owner(guild.id, owner.id)
+                row = await database.get_private_room(guild.id, room_id)
                 if row is not None:
                     await self._delete_private_room_by_row(
                         guild, row, reason="村・募集の一体作成失敗を回収"
@@ -1943,13 +2056,8 @@ class GameCog(RoomPermissionMixin, commands.Cog):
     ) -> None:
         """今回新規作成した村を、募集作成失敗時だけ回収する。"""
         async with self.private_room_lock:
-            row = await database.get_private_room_by_owner(
-                guild.id,
-                int(room_id.removeprefix("private_"))
-                if room_id.startswith("private_") and room_id[8:].isdigit()
-                else 0,
-            )
-            if row is None or row["room_id"] != room_id:
+            row = await database.get_private_room(guild.id, room_id)
+            if row is None:
                 return
             # 同じGMが作成フォームを並行送信した場合、別送信が先に募集を
             # 成功させている可能性がある。その募集ごと村を消さない。
@@ -1963,10 +2071,44 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 guild, row, reason="募集作成失敗に伴う新規GM村の回収"
             )
 
+    async def prompt_private_room_rename(
+        self, interaction: discord.Interaction,
+    ) -> None:
+        """改名する村を選ばせる。1つだけならそのまま入力フォームを出す。
+
+        Modalは他の応答と同時に返せないため、村が1つのときだけ直接開く。
+        """
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message(
+                "サーバー内でのみ使用できます。", ephemeral=True,
+            )
+        if not self._has_private_room_creator_role(interaction.user):
+            return await interaction.response.send_message(
+                f"村名を変更できるのは **{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロール保持者だけです。",
+                ephemeral=True,
+            )
+        rows = await database.list_private_rooms_by_owner(
+            interaction.guild.id, interaction.user.id
+        )
+        if not rows:
+            return await interaction.response.send_message(
+                "変更できるGM村がありません。", ephemeral=True,
+            )
+        if len(rows) == 1:
+            return await interaction.response.send_modal(
+                PrivateRoomRenameModal(self, str(rows[0]["room_id"]))
+            )
+        await interaction.response.send_message(
+            "村名を変更するGM村を選んでください。",
+            view=PrivateRoomRenameSelectView(self, interaction.user.id, rows),
+            ephemeral=True,
+        )
+
     async def rename_private_room_for_member(
         self,
         interaction: discord.Interaction,
         new_name: str,
+        room_id: str,
     ) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await self._private_reply(interaction, "この操作はサーバー内でのみ使用できます。")
@@ -1983,12 +2125,13 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         if not interaction.response.is_done():
             await interaction.response.defer(ephemeral=True, thinking=True)
         async with self.private_room_lock:
-            await self._rename_private_room_locked(interaction, new_name)
+            await self._rename_private_room_locked(interaction, new_name, room_id)
 
     async def _rename_private_room_locked(
         self,
         interaction: discord.Interaction,
         new_name: str,
+        room_id: str,
     ) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await self._private_reply(interaction, "この操作はサーバー内でのみ使用できます。")
@@ -2004,9 +2147,9 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             return
 
         guild = interaction.guild
-        row = await database.get_private_room_by_owner(guild.id, interaction.user.id)
-        if row is None:
-            await self._private_reply(interaction, "変更できるGM村がありません。")
+        row = await database.get_private_room(guild.id, room_id)
+        if row is None or int(row["owner_id"]) != interaction.user.id:
+            await self._private_reply(interaction, "変更できるGM村が見つかりません。")
             return
 
         normalized_name = self._normalize_private_room_name(new_name, interaction.user)
@@ -2133,45 +2276,130 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         await interaction.followup.send(f"GM村名を **{normalized_name}** に変更しました。", ephemeral=True)
 
     async def delete_private_room_for_member(self, interaction: discord.Interaction) -> None:
+        """自分のGM村を選んで削除する。1つだけなら選択を挟まない。"""
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await self._private_reply(interaction, "この操作はサーバー内でのみ使用できます。")
             return
         if not self._is_managed_guild(interaction.guild):
             await self._private_reply(interaction, "このBotの管理対象外サーバーでは操作できません。")
             return
-        if not interaction.response.is_done():
-            await interaction.response.defer(ephemeral=True, thinking=True)
-        row = await database.get_private_room_by_owner(
-            interaction.guild.id, interaction.user.id
-        )
-        if row is None:
-            await interaction.followup.send(
-                "削除できるGM村がありません。", ephemeral=True
-            )
-            return
         if (
             not self._has_private_room_creator_role(interaction.user)
             and not interaction.user.guild_permissions.manage_guild
         ):
-            await interaction.followup.send(
+            await self._private_reply(
+                interaction,
                 f"GM村を削除できるのは村主本人の **{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** "
                 "ロール保持者、またはサーバー管理者だけです。",
-                ephemeral=True,
             )
             return
-        room = self.rooms.get(row["room_id"])
-        if room is not None and room.state.phase not in (Phase.LOBBY, Phase.GAME_OVER):
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        rows = await database.list_private_rooms_by_owner(
+            interaction.guild.id, interaction.user.id
+        )
+        if not rows:
+            await interaction.followup.send(
+                "削除できるGM村がありません。", ephemeral=True
+            )
+            return
+        await self._send_private_room_delete_picker(
+            interaction, rows, force=False,
+        )
+
+    async def prompt_private_room_force_delete(
+        self, interaction: discord.Interaction,
+    ) -> None:
+        """#運営メニューから、村主を問わずGM村を選んで削除する。"""
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            await self._private_reply(interaction, "この操作はサーバー内でのみ使用できます。")
+            return
+        if not self._is_managed_guild(interaction.guild):
+            await self._private_reply(interaction, "このBotの管理対象外サーバーでは操作できません。")
+            return
+        if not OperationsView._is_admin(interaction):
+            await self._private_reply(interaction, "運営のみ操作できます。")
+            return
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        rows = await database.load_private_rooms(interaction.guild.id)
+        if not rows:
+            await interaction.followup.send("GM村がありません。", ephemeral=True)
+            return
+        await self._send_private_room_delete_picker(interaction, rows, force=True)
+
+    async def _send_private_room_delete_picker(
+        self,
+        interaction: discord.Interaction,
+        rows: list[dict],
+        *,
+        force: bool,
+    ) -> None:
+        """削除対象の選択UIを出す。ゲーム中の村は選ばせない。"""
+        guild = interaction.guild
+        if guild is None:
+            return
+        deletable = [
+            row for row in rows
+            if not self._private_room_phase_blocks_delete(row)
+        ]
+        busy = [
+            row for row in rows
+            if self._private_room_phase_blocks_delete(row)
+        ]
+        busy_note = (
+            "\nゲーム中のため選べません: "
+            + "、".join(row["room_name"] for row in busy)
+            if busy else ""
+        )
+        if not deletable:
             await interaction.followup.send(
                 "ゲーム中のGM村は削除できません。先にゲームを終了してください。",
                 ephemeral=True,
             )
             return
+        if len(deletable) == 1:
+            await self._send_private_room_delete_confirm(
+                interaction, deletable[0], force=force, extra_note=busy_note,
+            )
+            return
+        await interaction.followup.send(
+            "削除するGM村を選んでください。" + busy_note,
+            view=PrivateRoomDeleteSelectView(
+                self, interaction.user.id, deletable, force=force,
+                guild=guild if force else None,
+            ),
+            ephemeral=True,
+        )
+
+    def _private_room_phase_blocks_delete(self, row: dict) -> bool:
+        room = self.rooms.get(row["room_id"])
+        phase = getattr(getattr(room, "state", None), "phase", None)
+        return phase is not None and phase not in (Phase.LOBBY, Phase.GAME_OVER)
+
+    async def _send_private_room_delete_confirm(
+        self,
+        interaction: discord.Interaction,
+        row: dict,
+        *,
+        force: bool,
+        extra_note: str = "",
+    ) -> None:
+        room_id = str(row["room_id"])
 
         async def execute(confirm_interaction: discord.Interaction) -> None:
-            await self._delete_private_room_confirmed(confirm_interaction)
+            await self._delete_private_room_confirmed(
+                confirm_interaction, room_id, force=force,
+            )
 
+        owner_label = ""
+        if force:
+            owner = interaction.guild.get_member(int(row["owner_id"])) if interaction.guild else None
+            owner_label = f"（村主: {owner.display_name if owner else row['owner_id']}）"
         await interaction.followup.send(
-            f"⚠️ GM村 **{row['room_name']}** のカテゴリ・チャンネルを削除します。実行しますか？",
+            f"⚠️ GM村 **{row['room_name']}**{owner_label} のカテゴリ・チャンネルを"
+            "削除します。受付中の募集も一緒に締め切られます。実行しますか？"
+            + extra_note,
             view=DangerConfirmView(
                 interaction.user.id,
                 execute,
@@ -2181,7 +2409,11 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         )
 
     async def _delete_private_room_confirmed(
-        self, interaction: discord.Interaction
+        self,
+        interaction: discord.Interaction,
+        room_id: str,
+        *,
+        force: bool = False,
     ) -> None:
         """確認操作の直後に状態を再検査し、GM村を削除する。"""
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
@@ -2189,20 +2421,27 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             return
         # 参加・形式変更・開催と同じ manager→action→private の順で固定する。
         async with self.recruitment_manager.lock:
-            row = await database.get_private_room_by_owner(
-                interaction.guild.id, interaction.user.id,
-            )
-            room = self.rooms.get(row["room_id"]) if row is not None else None
+            room = self.rooms.get(room_id)
             if room is None:
                 async with self.private_room_lock:
-                    await self._delete_private_room_locked(interaction)
+                    await self._delete_private_room_locked(
+                        interaction, room_id, force=force,
+                    )
                 return
             # 確認画面を開いた後にtransfer/startが始まっても、LOBBY再検査と
             # runner除外を一体にする。
             async with room.action_lock, self.private_room_lock:
-                await self._delete_private_room_locked(interaction)
+                await self._delete_private_room_locked(
+                    interaction, room_id, force=force,
+                )
 
-    async def _delete_private_room_locked(self, interaction: discord.Interaction) -> None:
+    async def _delete_private_room_locked(
+        self,
+        interaction: discord.Interaction,
+        room_id: str,
+        *,
+        force: bool = False,
+    ) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await self._private_reply(interaction, "この操作はサーバー内でのみ使用できます。")
             return
@@ -2211,19 +2450,31 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             return
 
         guild = interaction.guild
-        row = await database.get_private_room_by_owner(guild.id, interaction.user.id)
+        row = await database.get_private_room(guild.id, room_id)
         if row is None:
             await self._private_reply(interaction, "削除できるGM村がありません。")
             return
-        if not self._has_private_room_creator_role(interaction.user) and not interaction.user.guild_permissions.manage_guild:
-            await self._private_reply(
-                interaction,
-                f"GM村を削除できるのは村主本人の **{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロール保持者、またはサーバー管理者だけです。",
-            )
-            return
+        if force:
+            if not OperationsView._is_admin(interaction):
+                await self._private_reply(interaction, "運営のみ操作できます。")
+                return
+        else:
+            if int(row["owner_id"]) != interaction.user.id:
+                await self._private_reply(
+                    interaction, "自分が村主のGM村だけ削除できます。",
+                )
+                return
+            if (
+                not self._has_private_room_creator_role(interaction.user)
+                and not interaction.user.guild_permissions.manage_guild
+            ):
+                await self._private_reply(
+                    interaction,
+                    f"GM村を削除できるのは村主本人の **{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** ロール保持者、またはサーバー管理者だけです。",
+                )
+                return
 
-        room = self.rooms.get(row["room_id"])
-        if room is not None and room.state.phase not in (Phase.LOBBY, Phase.GAME_OVER):
+        if self._private_room_phase_blocks_delete(row):
             await self._private_reply(
                 interaction,
                 "ゲーム中のGM村は削除できません。先にゲームを終了してください。",
@@ -2273,7 +2524,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
 
     @app_commands.command(
         name="season_reset",
-        description="全プレイヤーのレートをハーフリセット（管理者専用）",
+        description="全プレイヤーのレートをシーズンリセット（管理者専用）",
     )
     @app_commands.describe(note="リセット理由 (任意)")
     @app_commands.default_permissions(manage_guild=True)
@@ -2282,16 +2533,31 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         interaction: discord.Interaction,
         note: Optional[str] = None,
     ) -> None:
+        await self.prompt_season_reset(interaction, note=note)
+
+    async def prompt_season_reset(
+        self,
+        interaction: discord.Interaction,
+        *,
+        note: Optional[str] = None,
+    ) -> None:
+        """シーズンリセットの最終確認を出す。`/season_reset` と #運営 の共通入口。
+
+        全員のレートを書き換える取り消し不能な操作なので、押し間違いを
+        防ぐために必ずここで本人だけの確認を挟む。確認表示より前に
+        権限・管理対象・進行中卓を弾き、実行の可否は
+        `_execute_season_reset` 側で改めて検査する。
+        """
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             await interaction.response.send_message(
-                "❌ このコマンドはサーバー内でのみ使用できます。",
+                "❌ この操作はサーバー内でのみ使用できます。",
                 ephemeral=True,
             )
             return
 
         if not interaction.user.guild_permissions.manage_guild:
             await interaction.response.send_message(
-                "❌ このコマンドは「サーバー管理」権限が必要です。",
+                "❌ この操作は「サーバー管理」権限が必要です。",
                 ephemeral=True,
             )
             return
@@ -2302,24 +2568,56 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             )
             return
 
-        await interaction.response.defer(ephemeral=False, thinking=True)
-        # SQLite busy waitより先にinteractionをackする。同時要求はCASと
-        # season_games=0検査の双方で二重実行を拒否する。
+        if self.has_active_rated_games():
+            await interaction.response.send_message(
+                "ランク対象卓が進行中のため、シーズンリセットは実行できません。"
+                "全卓終了後に実行してください。",
+                ephemeral=True,
+            )
+            return
+
         try:
             expected_start = await database.get_season_start(interaction.guild.id)
         except Exception as e:
             log.exception("シーズン開始情報の取得に失敗: %s", e)
-            await interaction.followup.send(
-                "❌ データベースからシーズン情報を取得できないため、中止しました。"
+            await interaction.response.send_message(
+                "❌ データベースからシーズン情報を取得できないため、中止しました。",
+                ephemeral=True,
             )
             return
-        async with self.season_reset_lock:
-            # start_gameと同じlockを保持してからactiveを再確認する。
-            # これにより確認後〜reset完了まで新規ゲームが割り込まない
-            async with self.start_lock:
-                await self._execute_season_reset(
-                    interaction, note=note, expected_start=expected_start
-                )
+
+        async def execute(confirm_interaction: discord.Interaction) -> None:
+            # 確認を出した時点のシーズン開始時刻をそのままCASへ渡す。
+            # 確認中に別の運営がリセットしていれば SeasonResetConflict で止まる。
+            async with self.season_reset_lock:
+                # start_gameと同じlockを保持してからactiveを再確認する。
+                # これにより確認後〜reset完了まで新規ゲームが割り込まない
+                async with self.start_lock:
+                    await self._execute_season_reset(
+                        confirm_interaction, note=note, expected_start=expected_start
+                    )
+
+        lines = [
+            "⚠️ **シーズンリセットを実行しようとしています。取り消せません。**",
+            f"・全ラダーのレートを `{INITIAL_RATING} + (現レート - {INITIAL_RATING}) ÷ 2` へ再計算",
+            "・今シーズンの試合数/勝利数を0に (通算戦績と過去最高レートは残る)",
+            "・直前のランク・順位をスナップショットへ保存し、ランクロールを再同期",
+            "・実行直前にDBを自動バックアップ (失敗した場合はリセットを中止)",
+            f"・現シーズン開始: {expected_start or '記録なし'}",
+        ]
+        if note:
+            lines.append(f"・メモ: {discord.utils.escape_markdown(note[:200])}")
+        lines.append("よろしければ「シーズンリセットを実行」を押してください。")
+        await interaction.response.send_message(
+            "\n".join(lines),
+            view=DangerConfirmView(
+                interaction.user.id,
+                execute,
+                confirm_label="シーズンリセットを実行",
+                timeout=60,
+            ),
+            ephemeral=True,
+        )
 
     async def _execute_season_reset(
         self,
@@ -2390,7 +2688,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
 
         self.spawn_bg_task(self._resync_roles_after_reset(guild))
         embed = discord.Embed(
-            title="🔄 シーズンハーフリセット完了",
+            title="🔄 シーズンリセット完了",
             description=(
                 f"全プレイヤーのレートを\n"
                 f"`新レート = {INITIAL_RATING} + (現レート - {INITIAL_RATING}) ÷ 2`\n"
