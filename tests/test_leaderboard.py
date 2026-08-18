@@ -442,6 +442,7 @@ class TestFeedbackOperationsNotice(unittest.IsolatedAsyncioTestCase):
             self.recruitment.RecruitmentManager
         )
         manager.operations_channel = FakeChannel()
+        manager.operations_log_channel = None
         await manager.notify_feedback_report(FakeGuild(), {
             "report_id": 7,
             "user_id": 12345,
@@ -463,4 +464,5 @@ class TestFeedbackOperationsNotice(unittest.IsolatedAsyncioTestCase):
             self.recruitment.RecruitmentManager
         )
         manager.operations_channel = None
+        manager.operations_log_channel = None
         await manager.notify_feedback_report(object(), {"report_id": 1})

@@ -17,8 +17,11 @@ import rating as rating_lib
 from config import (
     CH_LOBBY,
     CH_OPERATIONS,
+    CH_OPERATIONS_LOG,
     OPERATIONS_CATEGORY_NAME,
+    OPERATIONS_LOG_ROLE_NAMES,
     OPERATIONS_STAFF_ROLE_NAMES,
+    OPERATIONS_STAFF_USER_IDS,
     PLAYER_BLOCK_LIMIT,
     PRIVATE_ROOM_CREATOR_ROLE_LABEL,
     PRIVATE_ROOM_CREATOR_ROLE_NAMES,
@@ -243,6 +246,7 @@ class RecruitmentManager:
         self.game_cog = game_cog
         self.channel: Optional[discord.TextChannel] = None
         self.operations_channel: Optional[discord.TextChannel] = None
+        self.operations_log_channel: Optional[discord.TextChannel] = None
         self.lock = asyncio.Lock()
         # 定期巡回と、通知後に参加・補欠繰上げとなった人への即時補完が
         # 同じ利用者へ並行送信しないよう直列化する。
@@ -540,6 +544,62 @@ class RecruitmentManager:
             return
         self._role_pinged_recruitment_ids.add(recruitment_id)
 
+    async def _adopt_operations_channel(
+        self,
+        channel: discord.TextChannel,
+        bot_member: discord.Member,
+        *,
+        label: str,
+    ) -> Optional[discord.TextChannel]:
+        """既存チャンネルの手動設定を保ったままBot必須権限だけを補う。
+
+        #運営 と #運営記録 のどちらも「Discordで手動設定した閲覧範囲が正本」で
+        扱いが同じなので、判定と1回のPATCHをここへ集約する。
+        """
+        mapping = getattr(channel, "overwrites", None)
+        if not isinstance(mapping, Mapping):
+            log.error("#%sの権限上書きを確認できないため採用しません", label)
+            return None
+
+        # @everyoneを含む既存のロール・メンバー個別overwriteは、Discord上で
+        # 運営者が手動で決めた閲覧範囲としてそのまま保持する。Botが変更する
+        # のはBot自身の必要権限だけ。
+        desired_overwrites: dict[object, discord.PermissionOverwrite] = dict(mapping)
+        for target, overwrite in list(mapping.items()):
+            target_id = getattr(target, "id", None)
+            if target_id is None or not isinstance(overwrite, discord.PermissionOverwrite):
+                log.error(
+                    "#%sの権限上書きを解釈できないため採用しません: %s",
+                    label,
+                    target_id,
+                )
+                return None
+
+        existing_bot = mapping.get(bot_member)
+        if isinstance(existing_bot, discord.PermissionOverwrite):
+            bot_overwrite = discord.PermissionOverwrite.from_pair(*existing_bot.pair())
+        else:
+            bot_overwrite = discord.PermissionOverwrite()
+        bot_overwrite.view_channel = True
+        bot_overwrite.read_messages = True
+        bot_overwrite.read_message_history = True
+        bot_overwrite.send_messages = True
+        desired_overwrites[bot_member] = bot_overwrite
+
+        # 変更が無ければDiscord APIを呼ばない。変更時は全overwriteを1回の
+        # PATCHで置換し、逐次更新の途中状態を運営通知先として採用しない。
+        if dict(mapping) == desired_overwrites:
+            return channel
+        try:
+            updated_channel = await channel.edit(
+                overwrites=desired_overwrites,
+                reason="運営チャンネルの必須権限だけを補完",
+            )
+        except (discord.Forbidden, discord.HTTPException, TypeError, ValueError) as exc:
+            log.error("既存#%sのBot必須権限を補完できません: %s", label, exc)
+            return None
+        return updated_channel or channel
+
     async def _ensure_operations_channel(
         self, guild: discord.Guild,
     ) -> Optional[discord.TextChannel]:
@@ -553,61 +613,139 @@ class RecruitmentManager:
         if bot_member is None:
             log.error("Botメンバーを確認できないため#運営を採用しません")
             return None
-        allow_bot = discord.PermissionOverwrite(
-            view_channel=True,
-            read_messages=True,
-            read_message_history=True,
-            send_messages=True,
-        )
         channel = discord.utils.get(guild.text_channels, name=CH_OPERATIONS, category=category)
         if channel is None:
             log.warning(
                 "既存の開発/#運営が見つからないため、運営UIと通知を無効化します"
             )
             return None
+        return await self._adopt_operations_channel(
+            channel, bot_member, label=CH_OPERATIONS,
+        )
 
-        mapping = getattr(channel, "overwrites", None)
-        if not isinstance(mapping, Mapping):
-            log.error("#運営の権限上書きを確認できないため採用しません")
+    def _resolve_operations_log_roles(
+        self, guild: discord.Guild,
+    ) -> Optional[list[discord.Role]]:
+        """#運営記録を新規作成するときの閲覧ロールを一意に解決する。
+
+        同名ロールがあると誰へ許可したのか設定者が判別できないため、
+        欠損・重複はどちらも「作らない」で止める (記録は#運営へ残る)。
+        """
+        if not OPERATIONS_LOG_ROLE_NAMES:
+            return None
+        matches: dict[str, list[discord.Role]] = {
+            name: [] for name in OPERATIONS_LOG_ROLE_NAMES
+        }
+        for role in getattr(guild, "roles", ()):
+            if getattr(role, "name", None) in matches:
+                matches[role.name].append(role)
+        missing = sorted(name for name, found in matches.items() if not found)
+        duplicated = sorted(name for name, found in matches.items() if len(found) > 1)
+        if missing or duplicated:
+            log.warning(
+                "#%sの閲覧ロールを確認できません (見つかりません: %s / 同名複数: %s)",
+                CH_OPERATIONS_LOG,
+                " ".join(missing) or "なし",
+                " ".join(duplicated) or "なし",
+            )
+            return None
+        return [found[0] for found in matches.values()]
+
+    async def _ensure_operations_log_channel(
+        self, guild: discord.Guild,
+    ) -> Optional[discord.TextChannel]:
+        """同村拒否・報告を流す #運営記録 を用意する。
+
+        既にあればDiscord側の手動設定を正本として扱い、無ければ
+        OPERATIONS_LOG_ROLE_NAMES のロールだけが読める形で開発カテゴリへ作る。
+        用意できない場合はNoneを返し、記録は従来どおり#運営へ流す
+        (設定漏れで同村拒否の記録そのものが消えるのを避けるため)。
+        """
+        category = discord.utils.get(guild.categories, name=OPERATIONS_CATEGORY_NAME)
+        if category is None:
+            return None
+        bot_member = guild.me
+        if bot_member is None:
             return None
 
-        # @everyoneを含む既存のロール・メンバー個別overwriteは、Discord上で
-        # 運営者が手動で決めた閲覧範囲としてそのまま保持する。Botが変更する
-        # のはBot自身の必要権限だけ。
-        desired_overwrites: dict[object, discord.PermissionOverwrite] = dict(mapping)
-        for target, overwrite in list(mapping.items()):
-            target_id = getattr(target, "id", None)
-            if target_id is None or not isinstance(overwrite, discord.PermissionOverwrite):
-                log.error(
-                    "#運営の権限上書きを解釈できないため採用しません: %s",
-                    target_id,
+        channel = None
+        stored_channel_id = await database.get_meta(guild.id, "operations_log_channel_id")
+        if stored_channel_id and str(stored_channel_id).isdigit():
+            candidate = guild.get_channel(int(stored_channel_id))
+            if (
+                isinstance(candidate, discord.TextChannel)
+                and getattr(candidate.category, "id", None) == category.id
+            ):
+                # 手動で改名されていてもIDで拾い、同じ役目の空チャンネルを
+                # 増やさない。
+                channel = candidate
+        if channel is None:
+            channel = discord.utils.get(
+                guild.text_channels, name=CH_OPERATIONS_LOG, category=category,
+            )
+        if channel is not None:
+            adopted = await self._adopt_operations_channel(
+                channel, bot_member, label=CH_OPERATIONS_LOG,
+            )
+            if adopted is not None:
+                await database.set_meta(
+                    guild.id, "operations_log_channel_id", str(adopted.id),
                 )
-                return None
+            return adopted
 
-        existing_bot = mapping.get(bot_member)
-        if isinstance(existing_bot, discord.PermissionOverwrite):
-            bot_overwrite = discord.PermissionOverwrite.from_pair(*existing_bot.pair())
-            bot_overwrite.view_channel = True
-            bot_overwrite.read_messages = True
-            bot_overwrite.read_message_history = True
-            bot_overwrite.send_messages = True
-        else:
-            bot_overwrite = allow_bot
-        desired_overwrites[bot_member] = bot_overwrite
-
-        # 変更が無ければDiscord APIを呼ばない。変更時は全overwriteを1回の
-        # PATCHで置換し、逐次更新の途中状態を運営通知先として採用しない。
-        if dict(mapping) == desired_overwrites:
-            return channel
+        roles = self._resolve_operations_log_roles(guild)
+        if not roles:
+            log.warning(
+                "#%sを作成できないため、同村拒否・報告は#%sへ流します",
+                CH_OPERATIONS_LOG,
+                CH_OPERATIONS,
+            )
+            return None
+        overwrites: dict[object, discord.PermissionOverwrite] = {
+            guild.default_role: discord.PermissionOverwrite(
+                view_channel=False, read_messages=False, send_messages=False,
+            ),
+            bot_member: discord.PermissionOverwrite(
+                view_channel=True,
+                read_messages=True,
+                read_message_history=True,
+                send_messages=True,
+            ),
+        }
+        for role in roles:
+            # 読むための場所なので、閲覧ロールにも書き込みは許可しない
+            # (記録の間に雑談が挟まると後から追いにくい)。
+            overwrites[role] = discord.PermissionOverwrite(
+                view_channel=True,
+                read_messages=True,
+                read_message_history=True,
+                send_messages=False,
+            )
         try:
-            updated_channel = await channel.edit(
-                overwrites=desired_overwrites,
-                reason="運営チャンネルの必須権限だけを補完",
+            created = await guild.create_text_channel(
+                CH_OPERATIONS_LOG,
+                category=category,
+                overwrites=overwrites,
+                topic="同村拒否と報告の記録 (書き込みはBotのみ)",
+                reason="運営記録チャンネルの作成",
             )
         except (discord.Forbidden, discord.HTTPException, TypeError, ValueError) as exc:
-            log.error("既存#運営のBot必須権限を補完できません: %s", exc)
+            log.error(
+                "#%sを作成できません (記録は#%sへ流します): %s",
+                CH_OPERATIONS_LOG,
+                CH_OPERATIONS,
+                exc,
+            )
             return None
-        return updated_channel or channel
+        await database.set_meta(
+            guild.id, "operations_log_channel_id", str(created.id),
+        )
+        log.info("#%sを作成しました", CH_OPERATIONS_LOG)
+        return created
+
+    def _operations_record_channel(self) -> Optional[discord.TextChannel]:
+        """同村拒否・報告の記録先。#運営記録が無ければ#運営へ戻す。"""
+        return self.operations_log_channel or self.operations_channel
 
     async def _upsert_panel(
         self, channel: discord.TextChannel, meta_key: str, *, content: str, view,
@@ -633,6 +771,7 @@ class RecruitmentManager:
         """GM村の参加受付へ募集カードを復元する。"""
         self.channel = None
         self.operations_channel = await self._ensure_operations_channel(guild)
+        self.operations_log_channel = await self._ensure_operations_log_channel(guild)
         if self.operations_channel is not None:
             await self._upsert_panel(
                 self.operations_channel, "operations_home_message_id",
@@ -809,6 +948,11 @@ class RecruitmentManager:
         else:
             await message.edit(embed=embed, view=view)
         room.state.lobby_message = message
+        # 起動時にこのカードへ編集で戻れるよう、#参加受付の常設メッセージIDを
+        # 更新しておく (再起動のたびに新着を出さないため)。
+        remember = getattr(room, "_remember_lobby_message", None)
+        if callable(remember):
+            await remember(message)
         room.state.recruitment_id = int(row["id"])
         await room._persist_room_state()
         add_view = getattr(self.bot, "add_view", None)
@@ -1457,11 +1601,11 @@ class RecruitmentManager:
     async def notify_feedback_report(
         self, guild: discord.Guild, report: dict,
     ) -> None:
-        """不具合・改善の報告を #運営 へ流す。
+        """不具合・改善の報告を #運営記録 (無ければ #運営) へ流す。
 
-        本文は一般公開しないが、`#運営` はDiscordで手動許可された閲覧者に
-        限られるため中身まで載せる。設定運営ロールはメニュー操作の認可だけで、
-        チャンネル閲覧権限はBotから追加しない。
+        本文は一般公開しないが、記録先はDiscordで許可された閲覧者に限られる
+        ため中身まで載せる。設定運営ロール・運営ユーザーはメニュー操作の認可
+        だけで、#運営の閲覧権限はBotから追加しない。
         (毎回「報告の一覧」を開かないと読めない形だと見落とされるため)。
 
         **メンションは抑制しない。** 到達範囲はチャンネルの可視性で閉じるので、
@@ -1469,7 +1613,7 @@ class RecruitmentManager:
         報告者の表示にメンションを使わないのは、通知を出さないためではなく
         退出済みでもIDから追えるようにするため (`_plain_identity`)。
         """
-        channel = self.operations_channel
+        channel = self._operations_record_channel()
         if channel is None:
             return
         lines = [
@@ -1496,7 +1640,7 @@ class RecruitmentManager:
     async def notify_block_added(
         self, guild: discord.Guild, blocker_id: int, blocked_id: int, count: int,
     ) -> None:
-        channel = self.operations_channel
+        channel = self._operations_record_channel()
         if channel is None:
             return
         try:
@@ -1933,8 +2077,10 @@ class RecruitmentCardView(discord.ui.View):
             ("参加", discord.ButtonStyle.success, "join", self.join, 0),
             ("参加取消", discord.ButtonStyle.danger, "leave", self.leave, 0),
             ("ゲーム開始", discord.ButtonStyle.success, "transfer", self.transfer, 0),
-            ("主催者メニュー", discord.ButtonStyle.secondary, "host", self.host_menu, 0),
             ("通知", discord.ButtonStyle.primary, "notify", self.notification, 0),
+            # 主催者メニューは2段目の先頭に置く。1段目は参加者が使うボタンだけに
+            # 揃えたほうが、押す人と押さない人の境目が見た目で分かる。
+            ("主催者メニュー", discord.ButtonStyle.secondary, "host", self.host_menu, 1),
             # 受付中のGM村で唯一出ている常設パネルがこのカード。ルール・ヘルプを
             # 載せないと、参加前に規定を読む導線が村の中に無くなる (旧・総合卓は
             # 参加受付のLobbyViewに常時出ていた)。読むだけの操作なので、受付が
@@ -2761,6 +2907,7 @@ class OperationsView(discord.ui.View):
         含まれるが、所有者を弾く実装へ後から変えられないよう明示的に許可する。
         OPERATIONS_STAFF_ROLE_NAMESはAdministratorを付けずに運営を任せるための
         設定で、#運営の閲覧と同じ範囲を操作にも認める。
+        OPERATIONS_STAFF_USER_IDSはロールを使わず名指しで足すための枠。
         """
         member = interaction.user
         if not isinstance(member, discord.Member):
@@ -2770,6 +2917,8 @@ class OperationsView(discord.ui.View):
         if owner_id is not None and owner_id == member.id:
             return True
         if getattr(member.guild_permissions, "administrator", False):
+            return True
+        if member.id in OPERATIONS_STAFF_USER_IDS:
             return True
         return any(
             role.name in OPERATIONS_STAFF_ROLE_NAMES
