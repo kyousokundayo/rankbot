@@ -143,6 +143,7 @@ class LobbyPanelReuseTest(unittest.IsolatedAsyncioTestCase):
     def _runner(self, channel) -> RoomRunner:
         runner = RoomRunner.__new__(RoomRunner)
         runner.bot = SimpleNamespace()
+        runner.manager = SimpleNamespace(_startup_in_progress=False)
         runner.state = SimpleNamespace(
             room_id="nate",
             room_name="ねいとくん村",
@@ -193,6 +194,32 @@ class LobbyPanelReuseTest(unittest.IsolatedAsyncioTestCase):
         runner._purge_bot_messages.assert_awaited_once()
         self.assertEqual(len(channel.sent), 1)
         set_meta.assert_awaited_once_with(1, "lobby_panel_message_id:nate", "4242")
+
+    async def test_startup_flag_covers_restore_and_recruitment_reposts(self) -> None:
+        """起動中は、復元・募集復旧からの再掲示も編集で済ませる。
+
+        ロビーの掲示は setup_channels だけでなく restore_from_snapshot や
+        募集カードの復旧からも走る。呼び出し口の指定漏れで新着が出ないよう、
+        起動中フラグだけで再利用に入ることを固定する。
+        """
+        partial = _PartialMessage(777)
+        channel = self._channel(partial=partial)
+        runner = self._runner(channel)
+        runner.manager = SimpleNamespace(_startup_in_progress=True)
+
+        with patch.object(
+            database, "get_meta", AsyncMock(return_value="777")
+        ), patch.object(database, "set_meta", AsyncMock()), patch(
+            "room_runner.LobbyView"
+        ) as lobby_view:
+            lobby_view.return_value = SimpleNamespace(
+                _build_embed=lambda: discord.Embed(title="参加受付")
+            )
+            await runner._post_lobby_ui()
+
+        self.assertEqual(runner.state.lobby_message.id, 777)
+        self.assertEqual(channel.sent, [])
+        runner._purge_bot_messages.assert_not_awaited()
 
     async def test_runtime_repost_still_posts_at_the_bottom(self) -> None:
         """ゲーム終了後などの再掲示は、末尾に出す従来動作のまま。"""

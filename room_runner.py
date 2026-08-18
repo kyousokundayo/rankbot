@@ -1309,15 +1309,18 @@ class RoomRunner:
     async def _post_lobby_ui(self, *, reuse_existing: bool = False) -> None:
         """#参加受付 の常設パネルを掲示する。
 
-        reuse_existing=True は起動時だけ使う。削除→再投稿だと再起動のたびに
-        新着メッセージが増えて未読・通知が出るため、前回と同じメッセージへ
-        編集で当てて静かに戻す (#運営の運営パネルと同じ考え方)。
+        削除→再投稿だと再起動のたびに新着メッセージが増えて未読・通知が出る。
+        起動中 (`manager._startup_in_progress`) と reuse_existing=True では、
+        前回と同じメッセージへ編集で当てて静かに戻す (#運営の運営パネルと
+        同じ考え方)。起動時の掲示はここだけでなく、snapshotからのロビー復帰・
+        進行中ゲームの復元・募集カードの復旧からも走るため、呼び出し口ごとの
+        指定ではなく起動中フラグでまとめて切り替える。
         ゲーム終了後など運用中の再掲示は、末尾に出したいので従来どおり。
         """
         ch = self.state.lobby_channel
         view = LobbyView(self)
         embed = view._build_embed()
-        if reuse_existing:
+        if reuse_existing or getattr(self.manager, "_startup_in_progress", False):
             message = await self._reuse_lobby_message(ch, embed=embed, view=view)
             if message is not None:
                 self.state.lobby_message = message
