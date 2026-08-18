@@ -1884,3 +1884,34 @@ class ParseSelectIdTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RankRoleSweepAfterRatingResetTest(unittest.IsolatedAsyncioTestCase):
+    """レート行が消えても、付与済みランクロールを剥がし残さない。"""
+
+    async def test_members_holding_rank_roles_are_swept_without_rating_rows(self) -> None:
+        from game import GameCog
+
+        role_name = rating_lib.get_rank_role_name("ゴールド")
+        stale_member = SimpleNamespace(
+            id=42,
+            display_name="前シーズンのゴールド",
+            roles=[SimpleNamespace(name=role_name)],
+        )
+        guild = SimpleNamespace(id=1, members=[stale_member], get_member=lambda uid: stale_member if uid == 42 else None)
+
+        cog = GameCog.__new__(GameCog)
+        cog._ensure_rank_roles = AsyncMock(return_value={})
+        synced_ids: list[int] = []
+
+        async def fake_sync(member, **_kwargs):
+            synced_ids.append(member.id)
+            return "updated"
+
+        cog._sync_rank_role = fake_sync
+
+        # player_ratings が空 = 一括削除直後の状態
+        with patch.object(database, "get_all_player_ratings", AsyncMock(return_value=[])):
+            await cog._sync_all_rank_roles(guild)
+
+        self.assertEqual(synced_ids, [42])

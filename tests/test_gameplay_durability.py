@@ -203,7 +203,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
                 add_player(runner, 4, Role.VILLAGER)
                 add_player(runner, 5, Role.VILLAGER)
 
-                self.assertTrue(runner._should_hold_spirit(victim, "処刑"))
+                self.assertTrue(runner._should_hold_spirit("処刑"))
 
     async def test_wolf_guess_skips_death_that_decides_winner(self) -> None:
         runner = make_runner()
@@ -214,7 +214,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         add_player(runner, 3, Role.VILLAGER)
 
         self.assertEqual(runner.state.check_win(), Team.VILLAGE)
-        self.assertFalse(runner._should_hold_spirit(last_wolf, "処刑"))
+        self.assertFalse(runner._should_hold_spirit("処刑"))
 
     async def test_wolf_guess_dm_is_bound_to_run_player_and_death_event(self) -> None:
         runner = make_runner()
@@ -449,7 +449,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         wolf = add_player(runner, 1, Role.WEREWOLF)
         target = add_player(runner, 2)
         permanent = WolfSurrenderView(runner)
-        night = WolfVoteView(runner, [target], wolf)
+        night = WolfVoteView(runner, [target])
         runner.state.game_run_id = "run-2"
 
         for view, button in (
@@ -1427,7 +1427,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.refresh_wolf_dm_displays = AsyncMock()
         runner._relay_to_wolves = AsyncMock()
 
-        view = WolfVoteView(runner, [victim], wolf)
+        view = WolfVoteView(runner, [victim])
         select = next(
             item for item in view.children if isinstance(item, discord.ui.Select)
         )
@@ -1621,7 +1621,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         wolf_runner = make_runner()
         wolf = add_player(wolf_runner, 1, Role.WEREWOLF)
         victim = add_player(wolf_runner, 2, Role.VILLAGER)
-        wolf_view = WolfVoteView(wolf_runner, [victim], wolf)
+        wolf_view = WolfVoteView(wolf_runner, [victim])
         wolf_runner._persist_room_state = AsyncMock(side_effect=RuntimeError("DB down"))
         interaction = SimpleNamespace(
             user=wolf.member,

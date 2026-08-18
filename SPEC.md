@@ -403,7 +403,7 @@ GM/                       ← GMまたは仮GMロール保持者だけに表示
   - 「人狼で勝った試合の生存率」は `role = '人狼'` で判定する。**狂人は含まない** (襲撃されない以上、生存率の意味が変わるため)
   - 「終了後投票の獲得票」は `rating_history.recommendation_bonus` の合計 ÷ 参加試合数。推薦票と勝利陣営票の両方を含む
 - 詳細統計は導入後の試合だけが対象。既存試合を推測で補完せず、詳細値がない過去試合と明確に分ける
-- **プレシーズンの一括削除**: シーズン1を1試合目から始めるための一回きりの運用スクリプトとして `scripts/purge_preseason_stats.py` を置く。`/season_reset` はレートを圧縮するだけで試合記録を残すため、記録ごと消すにはこちらを使う。既定はdry-runで、`--execute` 指定時だけBot本体と同じロックを取得し、自動バックアップを取って削除する。Botが稼働中または停止状態を安全に確認できない場合は削除を開始しない。`--reset-ratings` でレート・シーズン履歴も白紙にできる (0戦なのにレートだけ残る状態を避ける)。同村拒否・募集・GM村・不具合報告には触れない。**試合番号は1から振り直しになる**ので、Discordのログカテゴリも運営が手で消す前提 (Botは触らない)
+- **プレシーズンの一括削除**: シーズン1を1試合目から始めるための一回きりの運用スクリプトとして `scripts/purge_preseason_stats.py` を置く。`/season_reset` はレートを圧縮するだけで試合記録を残すため、記録ごと消すにはこちらを使う。既定はdry-runで、`--execute --confirm-season1 ERASE-PRESEASON` がそろった場合だけBot本体と同じロックを取得する。自動バックアップを作成し、`integrity_check=ok`、対象テーブルの`foreign_key_check`違反なし、対象テーブルの行数が元DBと一致したことを確認してから削除する。Botが稼働中、停止状態を安全に確認できない、バックアップを検証できない、のいずれかなら削除を開始しない。`--reset-ratings` でレート・シーズン履歴も白紙にできる (0戦なのにレートだけ残る状態を避ける)。同村拒否・募集・GM村・不具合報告には触れない。**試合番号は1から振り直しになる**ので、Discordのログカテゴリも運営が手で消す前提 (Botは触らない)
 
 ## 10. コマンド・UI一覧
 
@@ -458,7 +458,7 @@ bot/
 ├── CHANGELOG.md        プレイヤー向けの変更履歴 (そのままDiscordへ貼れる粒度)
 ├── scripts/            run_bot.sh / stop_bot.sh / setup_venv.sh /
 │                       start_bot_detached.py / verify_runtime.py /
-│                       check_se_playback.py / purge_preseason_stats.py /
+│                       check_se_playback.py / purge_preseason_stats.py (一度限り) /
 │                       *.applescript / run_checks.sh
 ├── data/               werewolf_stats.db + backups/ + lib/ (同梱libopus。
 │                       いずれもgitignore対象。
@@ -478,7 +478,7 @@ bot/
 - **状態永続化**: フェーズ遷移に加え、0日目初夜の完了、夜の行動、朝待機の受付開始・宣言、サレンダー同意・成立・村勝利意図、死亡・ミュート所有・開始処理の進捗を卓スナップショットへ保存する。勝敗境界に使うboolやID配列は型を強制変換せず検証し、不整合は安全側へ停止する。payloadは現行schema version 1を必須とし、欠損・旧version・破損した卓だけを自動変換せず隔離して、他卓の復元を継続する
 - **外部副作用の再実行**: 死亡通知・権限変更はoutbox、名前村作成/改名/削除は進捗journalとして保存し、Discord APIとDBの間で停止しても再調停する。通知は欠落防止を優先するため障害窓では重複する場合がある
 - **レート整合性**: 勝敗結果と活躍ボーナスの材料 (`bonus_payload`) を先に未精算キューへ保存し、ゲーム履歴とレート更新を同一トランザクションで冪等精算する。終了後投票も1試合・1投票者・1種別 (`kind`) の一意制約と集計済み状態を同一トランザクションで更新し、二重加算を防ぐ。レート計算・投票集計・シーズンリセットは `rating_lock` で直列化する
-- **移行**: 旧版の `private_rooms` にある `UNIQUE (guild_id, owner_id)`（1人1村）は、**現行必須スキーマの検証を通した直後**にテーブル再構築で外す。検証は必要な制約の不足だけを拒否し、この旧UNIQUEは追加制約として許容するため、旧DBを壊さず移行対象として判定できる。外さないままだと2村目のINSERTで落ちる。村名の一意制約は維持する。移行が対象にするのは旧版が作った**通常のUNIQUEだけ**で、条件付きUNIQUEは検証側と同じく制約の代用と認めず、再構築の根拠にもしない (手で足された索引を移行のついでに落とさないため)。再構築は現行定義でテーブルを作り直すため、旧版が残した**nullableな余分列は新テーブルへ引き継ぐ**。DEFAULTなしNOT NULLの余分列があるときはDDLへ触れずに戻り、再検証に起動停止を任せる (黙って列を捨てない)。
+- **移行**: 旧版の `private_rooms` にある `UNIQUE (guild_id, owner_id)`（1人1村）は、**現行必須スキーマの検証を通した直後**にテーブル再構築で外す。検証は必要な制約の不足だけを拒否し、この旧UNIQUEは追加制約として許容するため、旧DBを壊さず移行対象として判定できる。外さないままだと2村目のINSERTで落ちる。村名の一意制約は維持する。移行が対象にするのは旧版が作った**通常のUNIQUEだけ**で、条件付きUNIQUEは検証側と同じく制約の代用と認めず、再構築の根拠にもしない (手で足された索引を移行のついでに落とさないため)。再構築は現行定義でテーブルを作り直すため、旧版が残した**nullableな余分列は新テーブルへ引き継ぐ**。DEFAULTなしNOT NULLの余分列があるときはDDLへ触れずに戻り、再検証に起動停止を任せる (黙って列を捨てない)。この処理を削除できるのは、本番DBだけでなく今後復旧対象にする全バックアップでも旧UNIQUEがないことを確認し、v0.46以前のDBを直接復元しない運用へ移行した後に限る。
 - **DBスキーマ**: games / game_players / **game_stats** / player_ratings / rating_history / game_recommendations / season_resets / rating_snapshots / room_states / room_state_quarantine / game_settlements / pending_unmutes / private_rooms / **recruitments** / **recruitment_entries** / **recruitment_notification_deliveries** / **player_blocks** / **feedback_reports** / **bot_meta**
   - **試合番号の表示**: `games.game_id` はAUTOINCREMENTで欠番が出るため、UIには出さず**サーバー内の通し番号 (古い順に1から)** を `ROW_NUMBER()` で振って表示する (`database._GAME_SEQ_CTE`)。欠番の原因は開発中の検証で消費したぶん (本番DBへの書き込みガードは `34c77e5` で後から導入)。**廃村 (`force_end`) は精算しないので `games` に入らず、番号も消費しない**。精算がロールバックされた場合も、SQLiteは採番カウンタを巻き戻すので消費しない
     - 復元は**`-wal` / `-shm` を先に削除してから**本体を差し替える。残したままだとSQLiteが古いWALを再生し、エラーを出さずに移行後のデータが復活する

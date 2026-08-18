@@ -171,7 +171,6 @@ class FakeResponse:
         # エフェメラルの確認UI (占い・護衛の実行確認) を呼び出し側から辿れるようにする
         self._done = True
         self.interaction.sent_view = kwargs.get("view")
-        self.interaction.original_content = kwargs.get("content")
         return None
 
     async def defer(self, *_args, **_kwargs) -> None:
@@ -192,10 +191,6 @@ class FakeFollowup:
         # defer後にfollowupで返される投票確認UIも辿れるようにする。
         if "view" in kwargs:
             self.interaction.sent_view = kwargs["view"]
-        if _args:
-            self.interaction.original_content = _args[0]
-        elif "content" in kwargs:
-            self.interaction.original_content = kwargs["content"]
         return None
 
 
@@ -216,12 +211,9 @@ class FakeInteraction:
         self.followup = FakeFollowup(self)
         # response.send_message(view=...) で返された確認UI
         self.sent_view: Optional[discord.ui.View] = None
-        self.original_content: Optional[str] = None
 
     async def edit_original_response(self, **kwargs) -> Optional[FakeMessage]:
         """公開メッセージとephemeral応答の両方を最小限再現する。"""
-        if "content" in kwargs:
-            self.original_content = kwargs["content"]
         if "view" in kwargs:
             self.sent_view = kwargs["view"]
         if self.message is not None:

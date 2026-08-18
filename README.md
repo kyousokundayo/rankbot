@@ -122,11 +122,14 @@ v0.40へ移行済みのバックアップまたは新規DBを使用してくだ�
 稼働中は24時間ごとのバックアップとシーズンリセット前バックアップを保持します。
 v0.47のGM村複数化にあわせて、旧DBに残る `private_rooms` の1人1村制約は起動時に
 テーブル再構築で外します（村名の一意制約は維持し、旧版が残したnullableな余分列も
-引き継ぎます）。
+引き継ぎます）。この移行は、本番DBと復旧対象にする旧バックアップの両方で制約解除を
+確認できるまでは削除しません。
 
 シーズン1を1試合目から始めるためのプレシーズン一括削除は
 `scripts/purge_preseason_stats.py` にあります。既定は削除件数を表示するだけで、
-`--execute` を付けたときだけ自動バックアップを取ってから消します
+`--execute --confirm-season1 ERASE-PRESEASON` をそろえたときだけ、自動バックアップを
+作成し、`integrity_check`・対象テーブルの`foreign_key_check`・対象件数の一致を
+確認してから消します
 （`--reset-ratings` でレート・シーズン履歴も白紙化）。**試合番号が1から振り直しに
 なる**ため、Discord側のログカテゴリも運営が手で削除する前提です。Botは停止してから
 実行してください。`--execute` はBot本体と同じロックを取得できない場合、安全のため
@@ -163,7 +166,8 @@ AppleScriptの実行環境へ明示的に渡した場合だけ最優先され、
 .venv/bin/python -c 'import sounds; sounds.require_voice_ready()'
 ```
 
-実際のDiscord VCへ接続して朝SEを1回鳴らす場合（BotがVCへ接続・再生・切断します）:
+実際のDiscord VCへ接続して朝SEを1回鳴らす場合（BotがVCへ接続・再生・切断します）。
+通常チェックでは実行せず、実Discordでの再生確認を明示的に行うときだけ使用します:
 
 ```sh
 .venv/bin/python scripts/check_se_playback.py --scene morning

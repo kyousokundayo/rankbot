@@ -1202,6 +1202,14 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             for rows in rows_by_ladder.values()
             for row in rows
         }
+        # レート行が消えた人 (シーズン1開始時の一括削除など) も対象に含める。
+        # player_ratings だけを見ると、行が消えた瞬間にその人は走査から外れ、
+        # 付与済みのランクロールがDiscord上へ残り続ける。ロール保持者を足せば
+        # _sync_rank_role が「望ましいロール=なし」として剥がしてくれる。
+        rank_role_names = set(rating_lib.all_rank_role_names())
+        for member in getattr(guild, "members", ()):
+            if any(role.name in rank_role_names for role in getattr(member, "roles", ())):
+                player_ids.add(int(member.id))
         synced = 0
         skipped = 0
         failed = 0
