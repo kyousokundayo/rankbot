@@ -4070,14 +4070,14 @@ class RoomRunner:
                 return message, None
             await self._grant_turn_speaker(speaker)
             if not speaker.alive or state.turn_done_event.is_set():
-                await self._clear_speaker(speaker.member)
+                await self._clear_speaker()
                 state.turn_window_open = False
                 return message, None
             # grantとGM停止が競合した場合、停止側が全員muteを完了するまで
             # パネル受付・タイマーを開かない。再開後に話者だけを再度grantする。
             if not state.paused:
                 break
-            await self._clear_speaker(speaker.member)
+            await self._clear_speaker()
             await state.pause_event.wait()
         view = TurnSpeechView(
             self,
@@ -4147,7 +4147,7 @@ class RoomRunner:
             state.turn_window_open = False
             state.turn_slot_active = False
             view.stop()
-            await self._clear_speaker(interrupter.member)
+            await self._clear_speaker()
 
         state.current_speaker_id = None
         state.turn_original_speaker_id = None
@@ -4184,7 +4184,7 @@ class RoomRunner:
                 self.state.turn_window_open = False
                 self.state.turn_slot_active = False
                 view.stop()
-                await self._clear_speaker(speaker.member)
+                await self._clear_speaker()
 
             if outcome != "interrupt":
                 break
@@ -4746,7 +4746,7 @@ class RoomRunner:
             )
             view.stop()
             state.vote_slot_active = False
-            await self._clear_speaker(voter.member)
+            await self._clear_speaker()
             if not completed and voter.user_id not in state.votes:
                 await self._safe_village_send(
                     f"⏰ **{voter.display_name}** は時間切れのため無投票です。"
@@ -4916,7 +4916,7 @@ class RoomRunner:
 
             view.stop()
             state.current_speaker_id = None
-            await self._clear_speaker(candidate.member)
+            await self._clear_speaker()
             state.runoff_speech_index += 1
             await self._persist_vote_checkpoint("決戦弁明枠の完了")
             # 弁明ごとの「終了」告知は出さない。次の弁明パネルへ切り替われば
@@ -5058,7 +5058,7 @@ class RoomRunner:
 
         view.stop()
         state.current_speaker_id = None
-        await self._clear_speaker(player.member)
+        await self._clear_speaker()
 
     async def _checkpoint_pending_execution(self, player_id: int) -> None:
         """投票集計済みの処刑対象を遺言より前にdurableにする。"""
@@ -5505,7 +5505,7 @@ class RoomRunner:
             )
         # 陣営に関係なく同じ条件で人狼予想DMを送り、受付を締めるまで
         # 霊界を開けない。陣営で挙動を変えると死亡者の正体が漏れる。
-        held_for_guess = self._should_hold_spirit(player, method)
+        held_for_guess = self._should_hold_spirit(method)
         if held_for_guess:
             death_event_id = str(effect.get("event_id") or "")
             self._hold_spirit_for_guess(player.user_id, death_event_id)
@@ -5630,7 +5630,7 @@ class RoomRunner:
         state.wolf_dm_messages.clear()
 
         async def send_wolf_dm(wolf: Player) -> None:
-            wolf_view = WolfVoteView(self, non_wolves_alive, wolf)
+            wolf_view = WolfVoteView(self, non_wolves_alive)
             self.register_game_view(wolf_view, night=True)
             try:
                 msg = await self._discord_api_call(
@@ -6022,7 +6022,7 @@ class RoomRunner:
         required = self._morning_required_ids()
         return len(required & self.state.morning_ready_ids), len(required)
 
-    def _morning_panel_content(self, *, reveal_count: bool = True) -> str:
+    def _morning_panel_content(self) -> str:
         """夜時間終了後だけ掲示し、押下ごとに人数を更新する本文。"""
         ready, required = self._morning_ready_count()
         return (
@@ -6030,7 +6030,7 @@ class RoomRunner:
             f"現在 **{ready} / {required}人** — 生存者全員が押すと朝になります"
         )
 
-    def _morning_feedback_text(self, *, declared: bool = True) -> str:
+    def _morning_feedback_text(self) -> str:
         """押した本人へ、冪等な宣言結果と現在人数を返す。"""
         ready, required = self._morning_ready_count()
         if required and ready >= required:
@@ -6207,7 +6207,7 @@ class RoomRunner:
         # snapshot保存後に公開表示を更新する。編集失敗でも宣言自体は成立済みで、
         # 次の押下または復元再掲示で最新人数へ追いつく。
         await self._reveal_morning_count()
-        return self._morning_feedback_text(declared=True), None
+        return self._morning_feedback_text(), None
 
     async def force_morning(self, member: discord.Member) -> tuple[str, Optional[str]]:
         """GMによる強制的な夜明け (AFKで止まったままにならないための逃げ道)"""
@@ -8778,8 +8778,13 @@ class RoomRunner:
             "ターン話者がミュート中のため持ち時間を開始できません"
         )
 
-    async def _clear_speaker(self, member: discord.Member) -> None:
-        """弁明終了: 弁明者を再びミュートする"""
+    async def _clear_speaker(self) -> None:
+        """発言枠の終了: 全員を再びミュートへ戻す。
+
+        誰が話していたかに関係なく「生存者全員ミュート」へ収束させるだけなので、
+        話者のMemberは受け取らない (渡しても使い道が無く、呼び出し側に
+        speaker.member を持たせる制約だけが残るため)。
+        """
         changed = await self._sync_server_mutes(set())
         await self._wait_for_mute_sync_or_pause(
             changed, set(), "発言者の再ミュート"
@@ -9156,7 +9161,7 @@ class RoomRunner:
     # 人狼予想 (霊界を開ける前の数分だけDMで受け付ける)
     # ============================================================
 
-    def _should_hold_spirit(self, player: Player, method: str) -> bool:
+    def _should_hold_spirit(self, method: str) -> bool:
         """人狼予想のために #霊界 の解放を待つべき死亡かどうか。
 
         処刑死・襲撃死は陣営に関係なく同じ挙動にする。除外、復元をまたいだ

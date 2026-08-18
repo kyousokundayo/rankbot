@@ -188,13 +188,17 @@ class HelpAndRuleEmbedTest(unittest.TestCase):
                     f"{embed.title}/{field.name}",
                 )
 
-    def test_help_shows_current_release_and_all_room_log_policy(self) -> None:
+    def test_help_omits_release_notes_and_keeps_gm_and_log_policy(self) -> None:
+        """ヘルプはリリースノートを持たない。
+
+        見出しへ BOT_VERSION を埋めた「変更点」フィールドは、版を上げるだけで
+        中身が古いまま見出しだけ新しくなる (実際にv0.41の内容がv0.47として
+        表示されていた)。変更履歴はCHANGELOG.mdに一本化する。
+        """
         help_embed = build_help_embeds()[0]
         fields = {field.name: field.value for field in help_embed.fields}
-        self.assertIn(f"{BOT_VERSION}の変更", fields)
-        self.assertIn("0日目初夜", fields[f"{BOT_VERSION}の変更"])
-        self.assertIn("押した順", fields[f"{BOT_VERSION}の変更"])
-        self.assertIn("サレンダー", fields[f"{BOT_VERSION}の変更"])
+        self.assertNotIn(f"{BOT_VERSION}の変更", fields)
+        self.assertFalse([name for name in fields if "の変更" in name])
         self.assertIn("役職確認を締切", fields["GMの操作"])
         self.assertIn("スキップ", fields["GMの操作"])
         self.assertIn("全村", fields["終わった試合を読み返す"])

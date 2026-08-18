@@ -25,7 +25,7 @@ from config import (
     BONUS_WOLF_EXECUTION_VOTE, BONUS_FINAL_DAY_WOLF,
     BONUS_WOLF_GUESS_HIT, BONUS_WOLF_GUESS_EARLY_MULTIPLIER,
     BONUS_WOLF_GUESS_EARLY_MAX_DAY, BONUS_GUARD_SUCCESS, BONUS_NIGHT1_SEER_KILL,
-    PRIVATE_ROOM_CREATOR_ROLE_LABEL, BOT_VERSION,
+    BOT_VERSION,
     ACTIVE_ROOM_DEFINITIONS, STATS_MIN_SAMPLES,
     SLOW_INTERACTION_SECONDS,
     DEFAULT_VARIANT_ID, VariantDefinition, get_variant_definition,
@@ -1634,7 +1634,7 @@ class WolfVoteView(discord.ui.View):
     選択のたびに他の生存人狼へ通知される。
     """
 
-    def __init__(self, cog: RoomRunner, targets: list, wolf_player) -> None:
+    def __init__(self, cog: RoomRunner, targets: list) -> None:
         super().__init__(timeout=None)
         self.cog = cog
         self.game_run_id = cog.state.game_run_id
@@ -4288,7 +4288,7 @@ def build_rule_embeds(
             "COは初日2巡目と2日目以降に名前のみ公開。詳細はVCで話します。"
             f"本人はパス可、割り込みは村全体で1日 **{variant.turn_interrupts_per_day}回**（各30秒）。\n"
             "**仮投票はありません。** 規定の発言後に投票します。\n"
-            f"通常投票 **{VOTE_TIMEOUT}秒の一斉投票**（全員そろえば即開示） ／ "
+            f"通常投票 **{VOTE_TIMEOUT}秒の一斉投票** ／ "
             f"弁明 **{RUNOFF_SPEECH_TIME}秒** ／ 遺言 **{LAST_WILL_TIME}秒**（本人かGMが短縮可）\n"
             f"夜 **初日{NIGHT_BASE}秒 / 以降{NIGHT_MIN}秒**（目安。朝は全員の宣言で明ける）"
         )
@@ -4305,7 +4305,7 @@ def build_rule_embeds(
             "朝の結果発表 → 議論 → 投票 →（同票なら弁明と決戦投票）→ 遺言 → 処刑 → 夜\n"
             "**議論中の仮投票はありません。** 議論後に「投票」を押した順で発言します。\n"
             f"議論 **初日{day_base_min}分 / 毎日{day_drop_min}分短縮 / 最低{day_min_min}分**"
-            " ／ 通常投票 **1人20秒**（確定ごとに公開）\n"
+            " ／ 通常投票 **1人20秒**\n"
             f"弁明 **{RUNOFF_SPEECH_TIME}秒** ／ 遺言 **{LAST_WILL_TIME}秒**（本人かGMが短縮可）\n"
             f"夜 **初日{NIGHT_BASE}秒 / 以降{NIGHT_MIN}秒**（目安。朝は全員の宣言で明ける）"
         )
@@ -4406,7 +4406,7 @@ def build_help_embeds(
         speech_help = (
             "ターン制は**現在の話者だけ**発言できます。本人はパス、ほかの生存者は村全体で"
             f"1日{variant.turn_interrupts_per_day}回まで30秒割り込みができます。\n"
-            "COは初日2巡目と2日目以降の「COを宣言」で名前のみ公開し、詳細はVCで話します。\n"
+            "COは「COを宣言」で名前のみ公開できます（タイミングはルール参照）。\n"
             "投票・弁明・遺言は発言中の本人だけ。夜と一時停止中は全員ミュート。\n"
             "死亡者・観戦者は終了まで発言できません（GMのミュートだけは手動）。"
         )
@@ -4423,19 +4423,6 @@ def build_help_embeds(
         color=discord.Color.dark_gold(),
     )
     embed3.set_footer(text=BOT_VERSION)
-    embed3.add_field(
-        name=f"{BOT_VERSION}の変更",
-        value=(
-            "**0日目初夜30秒**（人狼の挨拶のみ）を追加しました。\n"
-            "クロストークの通常投票は「投票」を押した順に**1人20秒**で発言・確定する"
-            "方式になりました（ターン制は従来どおり一斉投票）。"
-            "決戦は弁明30秒→候補者以外の一斉投票です。\n"
-            "「朝を迎える」は夜の時間が終わってから **0/生存人数** で出ます（取消不可）。\n"
-            "GMメニューに**スキップ**、人狼のDMに**サレンダー**を追加。"
-            "人狼予想は陣営に関係なくDMだけで受け付けます。"
-        ),
-        inline=False,
-    )
     embed3.add_field(
         name="DMに届くもの",
         value=(
@@ -4493,8 +4480,7 @@ def build_help_embeds(
         name="不具合・改善の報告",
         value=(
             f"`#{CH_STATS}` の **「不具合・改善を報告」** から送れます"
-            "（不具合 / 分かりにくい / 改善要望 / その他）。\n"
-            "報告内容はバージョンと一緒に保存され、改善の参考にします。"
+            "（不具合 / 分かりにくい / 改善要望 / その他）。"
         ),
         inline=False,
     )
@@ -4559,8 +4545,7 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
             f"初期値 **{INITIAL_RATING}**、下限 **{RATING_FLOOR}**（これ以上は下がりません）。\n"
             "試合成績は変種別です。レート・順位も、13人村／9人クロストーク／"
             "9人ターン制の3ラダーで分けます。\n"
-            f"下の変動値は勝った陣営へのボーナス +{WIN_PARTICIPATION_BONUS} を含み、"
-            "端数は決まったルールで分配します。"
+            f"下の変動値は勝った陣営へのボーナス +{WIN_PARTICIPATION_BONUS} を含みます。"
         ),
         inline=False,
     )
@@ -4614,26 +4599,21 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
     rate.add_field(
         name="人狼予想",
         value=(
-            "処刑・襲撃で亡くなり、まだ勝敗が決まっていなければ、陣営に関係なくDMで"
-            "**人狼だと思う人数を変種ごとの枠数で**提出できます。\n"
-            f"受付は**死亡から{WOLF_GUESS_TIMEOUT // 60}分**で、"
-            "**提出するか時間切れになるまで霊界へ入れません**"
-            "（霊界で答えを聞けてしまわないようにするためです）。\n"
-            "選ぶ相手は既に亡くなった人でも構いません。狂人は正解に含みません。"
-            "実際の人狼本人は提出できますが、採点対象外です。"
+            "提出方法は「ルール」を参照してください。\n"
+            "**狂人は正解に含みません。** 実際の人狼本人も提出できますが、"
+            "**採点対象外**です。"
         ),
         inline=False,
     )
     rate.add_field(
         name="終了後の投票",
         value=(
-            f"レート対象卓の終了後、`#{CH_VILLAGE}` にパネルが1枚出ます"
+            f"終了後に `#{CH_VILLAGE}` のパネルで投票します"
             f"（受付 **{POSTGAME_RECOMMENDATION_TIMEOUT // 60}分**・"
             f"1票につき **+{BONUS_POSTGAME_VOTE}**）。\n"
-            "・**勝利陣営**は、手強かった**敗北陣営**の1人へ1票\n"
-            "・**霊媒師 / 初日の処刑者 / 初夜の襲撃死者**は、参加者の1人へ1票\n"
-            "両方に当てはまる人は2票持ちます。初夜が平和なら襲撃死者枠はありません。\n"
-            "GMもプレイヤー参加していれば対象です。**投票者名は公開されません。**"
+            "・**勝利陣営** → 手強かった**敗北陣営**の1人\n"
+            "・**霊媒師 / 初日の処刑者 / 初夜の襲撃死者** → 参加者の1人\n"
+            "両方に当てはまる人は2票。**投票者名は公開されません。**"
         ),
         inline=False,
     )
@@ -4641,8 +4621,7 @@ def build_rank_spec_embeds() -> list[discord.Embed]:
         name="対象",
         value=(
             "正常終了した**レート対象卓**で、レート・ランク・統計・ランキングが更新されます。\n"
-            "各試合は変種に対応するラダーだけを更新します。シーズン境界は3ラダー共通ですが、"
-            "順位・レート・履歴は混ぜません。"
+            "シーズン境界は3ラダー共通です。"
         ),
         inline=False,
     )
