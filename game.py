@@ -1193,8 +1193,6 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
                 log.info("%sパネルを再利用できないため投稿し直します: %s", label, e)
             else:
-                # 再起動が静かに済んだことを後から確認できるようにする。
-                log.info("%sパネルを再利用しました (ID: %s)", label, message.id)
                 self._register_panel_view(view, message)
                 return message
         await self._purge_bot_messages(channel, label)

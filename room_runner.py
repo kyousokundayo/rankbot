@@ -1348,11 +1348,6 @@ class RoomRunner:
                 e,
             )
             return None
-        log.info(
-            "ロビーパネルを再利用しました (%s / ID: %s)",
-            self.state.room_name,
-            message.id,
-        )
         add_view = getattr(self.bot, "add_view", None)
         if callable(add_view):
             add_view(view, message_id=message.id)
