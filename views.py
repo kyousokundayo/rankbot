@@ -338,8 +338,17 @@ class LobbyView(discord.ui.View):
             # GM村は募集カードでのみ参加者・GMを受け付ける。
             # 開始直前に一時的に戻すLobbyViewでは「ゲーム開始」を
             # 残し、募集を通さない参加や次村だけを閉じる。
+            # 「次村」は募集カードを作らず前回メンバーを直接戻すため、
+            # そのロビーだけは参加者本人の「参加取消」を残す。
+            rematch_lobby = bool(
+                self.cog.state.players
+                and getattr(self.cog.state, "recruitment_id", None) is None
+            )
+            hidden_controls = set(self._GM_VILLAGE_RECRUITMENT_ONLY_CONTROLS)
+            if rematch_lobby:
+                hidden_controls.discard("leave_game")
             for item in tuple(self.children):
-                if getattr(item, "custom_id", None) in self._GM_VILLAGE_RECRUITMENT_ONLY_CONTROLS:
+                if getattr(item, "custom_id", None) in hidden_controls:
                     self.remove_item(item)
             reopen_button = discord.ui.Button(
                 label="前回設定で参加受付を再開",
@@ -374,6 +383,7 @@ class LobbyView(discord.ui.View):
                 state.phase == Phase.LOBBY
                 and len(state.players) == self.player_count
                 and state.gm_id is not None
+                and not getattr(self.cog, "_postgame_vote_pending", False)
             )
 
     def _build_embed(self) -> discord.Embed:
@@ -405,10 +415,21 @@ class LobbyView(discord.ui.View):
                 "直前と同じメンバーで続ける場合は、GMが「次村」を押してください。\n"
                 f"参加条件: **{room_note}**"
             )
+            if state.players and getattr(state, "recruitment_id", None) is None:
+                description = (
+                    "直前のメンバーで次村を受付中です。抜ける人は「参加取消」を押してください。\n"
+                    "新しく参加者を募る場合は、村主が前回設定の受付を再開してください。\n"
+                    f"参加条件: **{room_note}**"
+                )
         else:
             description = (
                 f"参加者が{self.player_count}人揃ったらGMが「ゲーム開始」を押してください。\n"
                 f"参加条件: **{room_note}**"
+            )
+        if getattr(self.cog, "_postgame_vote_pending", False):
+            description = (
+                "⏳ **終了後投票を受付中です。終了するとゲーム開始ボタンが有効になります。**\n"
+                + description
             )
 
         embed = discord.Embed(
@@ -488,22 +509,38 @@ class LobbyView(discord.ui.View):
 
     @discord.ui.button(label="参加取消", style=discord.ButtonStyle.danger, custom_id="leave_game", row=0)
     async def leave_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if self.cog.is_private_room():
+        if (
+            self.cog.is_private_room()
+            and getattr(self.cog.state, "recruitment_id", None) is not None
+        ):
             return await interaction.response.send_message(
                 "GM村の参加取消は、公開中の募集カードから行ってください。",
                 ephemeral=True,
             )
+        await interaction.response.defer(ephemeral=True, thinking=True)
         async with self.cog.action_lock:
             state = self.cog.state
             if state.phase != Phase.LOBBY:
-                return await interaction.response.send_message("ゲーム中は取り消せません。", ephemeral=True)
+                return await interaction.followup.send("ゲーム中は取り消せません。", ephemeral=True)
             if interaction.user.id not in state.players:
-                return await interaction.response.send_message("参加していません。", ephemeral=True)
+                return await interaction.followup.send("参加していません。", ephemeral=True)
 
+            previous_players = dict(state.players)
             del state.players[interaction.user.id]
-            await interaction.response.defer()
+            try:
+                await self.cog._persist_room_state()
+            except Exception as error:
+                # DB保存失敗時にメモリ上だけ参加取消にすると、
+                # 開始判定と再起動後の参加者が食い違う。元の順序ごと戻す。
+                state.players.clear()
+                state.players.update(previous_players)
+                log.exception("参加取消の保存に失敗: %s", error)
+                return await interaction.followup.send(
+                    "参加取消を保存できませんでした。もう一度お試しください。",
+                    ephemeral=True,
+                )
             await self._update(interaction)
-            await self.cog._persist_room_state()
+        await interaction.followup.send("参加を取り消しました。", ephemeral=True)
 
     @discord.ui.button(label="GM取得", style=discord.ButtonStyle.success, custom_id="get_gm", row=0)
     async def gm_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -726,10 +763,24 @@ class LobbyGMMenuView(discord.ui.View):
                 )
                 return
             result = await self.cog.reset_game()
+            if result.startswith("🔄") and self.cog.is_private_room():
+                manager = getattr(self.cog.manager, "recruitment_manager", None)
+                if manager is None:
+                    reopen_result = "⚠️ 参加受付機能を利用できないため、募集カードを再開できませんでした。"
+                else:
+                    reopen_result = await manager.reopen_previous_recruitment(
+                        confirm_interaction, self.cog,
+                    )
+                result = f"{result}\n{reopen_result}"
             await confirm_interaction.followup.send(result, ephemeral=True)
 
+        reset_description = (
+            "⚠️ 参加者とGMを全員解除し、前回設定で空の募集カードを作り直します。実行しますか？"
+            if self.cog.is_private_room()
+            else "⚠️ 参加者とGMを全員解除して、参加受付を作り直します。実行しますか？"
+        )
         await interaction.response.send_message(
-            "⚠️ 参加者とGMを全員解除して、参加受付を作り直します。実行しますか？",
+            reset_description,
             view=DangerConfirmView(
                 interaction.user.id,
                 execute,
@@ -1061,9 +1112,26 @@ class GMControlView(discord.ui.View):
             return await interaction.response.send_message("GMのみ操作可能です。", ephemeral=True)
         if self._settlement_locked():
             return await interaction.response.send_message("結果保存・精算中です。一時停止はできません。", ephemeral=True)
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        result = await self.cog.pause_game()
-        await interaction.followup.send(result, ephemeral=True)
+        # thinking付きephemeralを新たに出すと、元のGMパネルが停止前の
+        # disabled状態のまま残る。コンポーネント応答として先にACKして、
+        # 完了後は同じパネルを最新stateのViewへ差し替える。
+        await interaction.response.defer()
+        try:
+            result = await self.cog.pause_game()
+        except Exception as error:
+            log.exception("GMによる一時停止に失敗: %s", error)
+            result = "⚠️ 一時停止を完了できませんでした。最新の状態を確認してください。"
+        refreshed_view = GMControlView(self.cog)
+        try:
+            await interaction.edit_original_response(
+                content=result,
+                embed=build_gm_status_embed(self.cog),
+                view=refreshed_view,
+            )
+        except (discord.NotFound, discord.HTTPException):
+            pass
+        else:
+            self.stop()
 
     @discord.ui.button(label="再開", style=discord.ButtonStyle.success, custom_id="gm_resume", row=0)
     async def resume_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -1071,9 +1139,25 @@ class GMControlView(discord.ui.View):
             return await interaction.response.send_message("⏳ このゲームの操作パネルは終了しています。", ephemeral=True)
         if interaction.user.id != self.cog.state.gm_id:
             return await interaction.response.send_message("GMのみ操作可能です。", ephemeral=True)
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        result = await self.cog.resume_game()
-        await interaction.followup.send(result, ephemeral=True)
+        # 一時停止と同じephemeralパネルを更新し、再開直後に再度一時停止を
+        # 押せるようにする。
+        await interaction.response.defer()
+        try:
+            result = await self.cog.resume_game()
+        except Exception as error:
+            log.exception("GMによる再開に失敗: %s", error)
+            result = "⚠️ 再開を完了できませんでした。最新の状態を確認してください。"
+        refreshed_view = GMControlView(self.cog)
+        try:
+            await interaction.edit_original_response(
+                content=result,
+                embed=build_gm_status_embed(self.cog),
+                view=refreshed_view,
+            )
+        except (discord.NotFound, discord.HTTPException):
+            pass
+        else:
+            self.stop()
 
     @discord.ui.button(label="朝", style=discord.ButtonStyle.primary, custom_id="gm_force_morning", row=0)
     async def force_morning_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -1481,12 +1565,12 @@ class VoteConfirmView(discord.ui.View):
 
 
 class _VoteQueueButton(discord.ui.Button):
-    """「投票」= 投票発言の列へ並ぶ。誰かの発言中でも先に並べる。"""
+    """「投票参加」= 投票発言の列へ並ぶ。誰かの発言中でも先に並べる。"""
 
     def __init__(self, cog: RoomRunner) -> None:
         # custom_idは候補ボタン (vote_<id>) と前方一致しない名前にする。
         super().__init__(
-            label="投票", style=discord.ButtonStyle.success, custom_id="join_vote"
+            label="投票参加", style=discord.ButtonStyle.success, custom_id="join_vote"
         )
         self.cog = cog
         self.game_run_id = cog.state.game_run_id
@@ -1528,7 +1612,7 @@ class SequentialVoteSpeechView(discord.ui.View):
     """クロストーク通常投票の発言中パネル。
 
     候補ボタンは発言終了後に初めて出す。他の生存者は発言中でも
-    次以降の列へ並べるため、共通の「投票」ボタンだけ併置する。
+    次以降の列へ並べるため、共通の「投票参加」ボタンだけ併置する。
     """
 
     def __init__(self, cog: RoomRunner, speaker_id: int) -> None:
@@ -1581,7 +1665,7 @@ class _BaseVoteView(discord.ui.View):
     vote_kind: str  # database.record_vote_event の vote_kind ('本投票'|'決選投票')
     round_index: int  # 決選の回数。本投票は常に0
     # 通常投票のパネルだけ、発言中の人の候補ボタンと並べて
-    # 「投票」(列へ並ぶ) を置く。決戦は一斉投票なので置かない。
+    # 「投票参加」(列へ並ぶ) を置く。決戦は一斉投票なので置かない。
     with_queue_button: bool = False
 
     def __init__(
@@ -1608,7 +1692,7 @@ class _BaseVoteView(discord.ui.View):
             )
             btn.callback = self._make_callback(player.user_id)
             self.add_item(btn)
-        # 「投票」(列へ並ぶ) は投票発言のときだけ。ターン制の一斉投票には
+        # 「投票参加」(列へ並ぶ) は投票発言のときだけ。ターン制の一斉投票には
         # 順番待ちの列がないため置かない。
         if self.with_queue_button and cog.uses_sequential_vote():
             self.add_item(_VoteQueueButton(cog))
@@ -2747,27 +2831,49 @@ class VillageWolfGuessView(discord.ui.View):
 
             for child in self.children:
                 child.disabled = True
-            accepted = await self.cog.submit_wolf_guess(
-                self.user_id,
-                self.selected,
-                game_run_id=self.game_run_id,
-                death_event_id=self.death_event_id,
-            )
+            # 保存・霊界開放にはDB/Discord APIが続く。最後の選択だけは
+            # 3秒の応答期限より先にACKし、元のephemeralメッセージを結果へ
+            # 書き換える。これで提出自体は通ったのにUIだけ失敗表示になる
+            # 事故を防ぐ。
+            await interaction.response.defer()
+            try:
+                accepted = await self.cog.submit_wolf_guess(
+                    self.user_id,
+                    self.selected,
+                    game_run_id=self.game_run_id,
+                    death_event_id=self.death_event_id,
+                )
+            except Exception as error:
+                log.exception("人狼予想の提出に失敗: %s", error)
+                accepted = False
+                failure_message = (
+                    "⚠️ 人狼予想の提出処理を確認できませんでした。"
+                    "GMに状況を確認してください。"
+                )
+            else:
+                failure_message = (
+                    "⏳ この人狼予想の受付は終了しているか、既に提出済みです。"
+                )
             self.stop()
             if not accepted:
-                await interaction.response.edit_message(
-                    content="⏳ この人狼予想の受付は終了しているか、既に提出済みです。",
+                try:
+                    await interaction.edit_original_response(
+                        content=failure_message, view=None,
+                    )
+                except (discord.NotFound, discord.HTTPException):
+                    pass
+                return
+            try:
+                await interaction.edit_original_response(
+                    content=(
+                        f"✅ **{self._selected_names()}** で提出しました。\n"
+                        "実際の人狼本人を除き、的中数が試合終了後のレート変動に反映されます。"
+                        "霊界へどうぞ。"
+                    ),
                     view=None,
                 )
-                return
-            await interaction.response.edit_message(
-                content=(
-                    f"✅ **{self._selected_names()}** で提出しました。\n"
-                    "実際の人狼本人を除き、的中数が試合終了後のレート変動に反映されます。"
-                    "霊界へどうぞ。"
-                ),
-                view=None,
-            )
+            except (discord.NotFound, discord.HTTPException):
+                pass
         return callback
 
 
@@ -5138,7 +5244,7 @@ def build_rule_embeds(
             "朝の結果発表 → 議論 → 投票 →（同票なら弁明と決戦投票）→ 遺言 → 処刑 → 夜\n"
             "**議論中の仮投票はありません。**\n"
             f"議論 **初日{day_base_min}分 / 毎日{day_drop_min}分短縮 / 最低{day_min_min}分**"
-            " ／ 通常投票 **1人20秒**\n"
+            " ／ 通常投票 **1人30秒の投票発言**\n"
             f"弁明 **{RUNOFF_SPEECH_TIME}秒** ／ 遺言 **{LAST_WILL_TIME}秒**（本人かGMが短縮可）\n"
             f"夜 **初日{NIGHT_BASE}秒 / 以降{NIGHT_MIN}秒**（目安。朝は全員の宣言で明ける）"
         )
@@ -5176,10 +5282,12 @@ def build_rule_embeds(
         )
     else:
         vote_rule = (
-            "「投票」を押した順に1人20秒。自分の番に名前を押すとすぐ公開され、"
-            "次の人へ進みます（時間切れは棄権）。\n"
-            "ボタンはいつでも押せますが、押した人がいなくなると全員ミュートで待機するので"
-            "必ず押してください（棄権ボタンはなく、自分には投票できません）。\n"
+            "「投票参加」を押した順に1人30秒発言します。本人の「発言終了」または"
+            "時間経過で発言を終え、**発言終了SEと約2秒の切替後**に候補を選びます。\n"
+            "候補を選んだ後は本人専用の確認で確定し、票をその場で公開します。"
+            "**候補選択に時間制限はなく、自動棄権はしません。**\n"
+            "「投票参加」はいつでも押せます。列が空なら全員ミュートで待機し、"
+            "進行が詰まった場合だけGMが明示的に締め切れます。自分には投票できません。\n"
         )
     embed.add_field(
         name="投票と処刑",
@@ -5245,14 +5353,14 @@ def build_help_embeds(
             f"1日{variant.turn_interrupts_per_day}回まで30秒割り込みができます。\n"
             "COは村パネルの[CO]で役職を宣言できます（タイミングはルール参照）。\n"
             "投票・弁明・遺言は発言中の本人だけ。夜と一時停止中は全員ミュート。\n"
-            "死亡者・観戦者は終了まで発言できません（GMのミュートだけは手動）。"
+            "死亡者・観戦者は終了まで発言できません（専任GMのミュートだけは手動）。"
         )
         gm_turn_help = " / 次の発言へ"
     else:
         speech_help = (
             "議論中は生存者のみ、投票・弁明・遺言は発言中の本人のみ発言できます。\n"
             "夜と一時停止中は全員ミュート。死亡者・観戦者は終了まで発言できません"
-            "（GMのミュートだけは手動）。"
+            "（専任GMのミュートだけは手動）。"
         )
         gm_turn_help = ""
     embed3 = discord.Embed(

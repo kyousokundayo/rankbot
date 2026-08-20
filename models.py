@@ -185,7 +185,7 @@ class GameState:
         self.runoff_candidates: list[int] = []
         self.runoff_speech_index: int = 0
 
-        # 通常投票のdurableな発言順とcursor。順番は「投票」ボタンを押した順で、
+        # 通常投票のdurableな発言順とcursor。順番は「投票参加」ボタンを押した順で、
         # 押した人から1人ずつ30秒発言し、発言終了後は時間制限なしで確定投票を待つ。
         # 列が空になったら次に押した人が来るまで待つ。進行中に落ちた場合は
         # 発言中なら満額でやり直し、投票待ちならミュートのまま再開する。
@@ -210,13 +210,19 @@ class GameState:
         # 通常投票の公開パネルを再利用するためのメッセージID。
         self.vote_panel_message_id: Optional[int] = None
         # 現在枠の残り時間は表示更新用のプロセス内状態。復元時は同じ投票者の
-        # 20秒を満額でやり直すためsnapshotへは保存しない。
+        # 30秒を満額でやり直すためsnapshotへは保存しない。
         self.vote_remaining_seconds: float = 0.0
 
         # 決戦弁明・遺言・ターン制議論の現在話者。
         # ターン制では turn_slot_token も併用し、同じ人が2巡目に回ったときに
         # 1巡目の古いボタンが現在の発言を終了させないようにする。
         self.current_speaker_id: Optional[int] = None
+        # 決戦弁明・遺言の終了パネル。再起動後に同じメッセージの古い
+        # 終了ボタンを表示上も外すため、IDだけを保存する。
+        self.speech_panel_message_id: Optional[int] = None
+        # 空LOBBYへ戻った後も、Discord API一時失敗で残った
+        # DM/#昼パネルを試合ごとに再掃除できるよう持ち越す。
+        self.pending_ui_cleanup_batches: list[dict] = []
 
         # ターン制議論のdurable cursor。完了したslotだけをcheckpointし、
         # 再起動時は進行中だったslotだけを満額でやり直す。
@@ -354,6 +360,12 @@ class GameState:
 
         # 各人狼のDM襲撃UIメッセージ (現在の襲撃先を全狼へ反映するため。非永続)
         self.wolf_dm_messages: dict[int, discord.Message] = {}
+        # 人狼DMの襲撃UI。プロセスをまたぐとViewを復元できないため、再起動・
+        # 夜終了時に古いコンポーネントを取り外せるようメッセージIDだけを保存する。
+        self.wolf_dm_message_ids: dict[int, list[int]] = {}
+        # 役職DM/復元時DMに付けるサレンダー操作も同様。DMは再送され得るので、
+        # 人狼ごとに複数のメッセージIDを保持する。
+        self.surrender_dm_message_ids: dict[int, list[int]] = {}
         # 現在の夜の制限時間 (人狼DM本文の再生成に使う。非永続)
         self.night_duration: float = 0.0
         # 人狼DMの中継を受け付ける窓が開いているか (非永続)。
@@ -370,6 +382,9 @@ class GameState:
 
         # 「役職を確認した」パネル (役職確認タイム中 #昼 に掲示。非永続)
         self.prep_panel_message: Optional[discord.Message] = None
+        # 掲示中の役職確認パネルのメッセージID (永続)。再起動後の古い
+        # ボタンを、新しいパネルの投稿前または終了時に削除/無効化する。
+        self.prep_panel_message_id: Optional[int] = None
 
         # 公開CO宣言 (昼パネル)。1人1役職まで。撤回すると削除され、
         # 別役職を宣言し直せる。試合を通じて保持し、日ごとにクリアしない

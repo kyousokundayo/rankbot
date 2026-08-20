@@ -116,8 +116,8 @@ class MuteSyncLoggingTest(unittest.IsolatedAsyncioTestCase):
         changed_ids = {m.id for m, _ in changed}
         self.assertEqual(changed_ids, {victim.user_id})
 
-    async def test_thirteen_player_empty_cache_mutes_all_except_gm(self) -> None:
-        """13人村でvc.membersが空でも12人を取りこぼさず、GMは除外する。"""
+    async def test_thirteen_player_empty_cache_mutes_participant_gm_too(self) -> None:
+        """13人村でvc.membersが空でも、参加者兼GMを含む全員をmuteする。"""
         runner = make_runner()
         players = add_players(runner, 13)
         voice_channel = SimpleNamespace(id=50, members=[])
@@ -147,10 +147,9 @@ class MuteSyncLoggingTest(unittest.IsolatedAsyncioTestCase):
 
         changed = await runner._sync_server_mutes(set())
 
-        self.assertEqual(len(changed), 12)
-        self.assertTrue(all(player.member.voice.mute for player in players[:-1]))
-        self.assertFalse(players[-1].member.voice.mute)
-        players[-1].member.edit.assert_not_awaited()
+        self.assertEqual(len(changed), 13)
+        self.assertTrue(all(player.member.voice.mute for player in players))
+        players[-1].member.edit.assert_awaited_once()
 
     async def test_retry_exhaustion_logs_final_failed_members(self) -> None:
         runner = make_runner()
@@ -182,7 +181,7 @@ class MuteSyncLoggingTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn(victim.member.display_name, final_lines[0])
         self.assertIn("mute=True", final_lines[0])
 
-    async def test_gm_is_never_muted_even_when_not_speaking(self) -> None:
+    async def test_participant_gm_is_muted_when_not_speaking(self) -> None:
         runner = make_runner()
         (gm,) = add_players(runner, 1)
         voice_channel = SimpleNamespace(id=50, members=[gm.member])
@@ -191,6 +190,31 @@ class MuteSyncLoggingTest(unittest.IsolatedAsyncioTestCase):
 
         gm.member.bot = False
         gm.member.voice = SimpleNamespace(channel=voice_channel, mute=False, suppress=False)
+        async def edit_member(*, mute=None, **_kwargs):
+            if mute is not None:
+                gm.member.voice.mute = mute
+            return gm.member
+
+        gm.member.edit = AsyncMock(side_effect=edit_member)
+
+        changed = await runner._sync_server_mutes(set())
+
+        self.assertEqual({member.id for member, _ in changed}, {gm.user_id})
+        self.assertTrue(gm.member.voice.mute)
+        gm.member.edit.assert_awaited_once()
+
+    async def test_dedicated_gm_is_not_muted(self) -> None:
+        runner = make_runner()
+        (gm,) = add_players(runner, 1)
+        runner.state.players.pop(gm.user_id)
+        voice_channel = SimpleNamespace(id=50, members=[gm.member])
+        runner.state.voice_channel = voice_channel
+        runner.state.gm_id = gm.user_id
+
+        gm.member.bot = False
+        gm.member.voice = SimpleNamespace(
+            channel=voice_channel, mute=False, suppress=False,
+        )
         gm.member.edit = AsyncMock()
 
         changed = await runner._sync_server_mutes(set())

@@ -402,6 +402,84 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("13人とGM", result)
         self.assertNotIn(999, self.state.players)
 
+    async def test_card_transfer_confirms_only_after_game_start_succeeds(self) -> None:
+        """開始前ではなく、LOBBY離脱とゲームループ設定後だけ成功を返す。"""
+        recruitment_id = await self._full_recruitment()
+        card = RecruitmentCardView(self.manager, recruitment_id)
+        interaction = SimpleNamespace(
+            user=self.members[1],
+            guild=self.guild,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        async def start_game(_interaction) -> None:
+            self.state.phase = Phase.PREPARATION
+            self.state.game_task = object()
+
+        self.room.start_game = AsyncMock(side_effect=start_game)
+
+        await card.transfer(interaction)
+
+        self.room.start_game.assert_awaited_once_with(interaction)
+        interaction.followup.send.assert_awaited_once_with(
+            "✅ ゲーム開始処理へ進みました。", ephemeral=True,
+        )
+
+    async def test_card_transfer_leaves_start_rejection_to_room_runner(self) -> None:
+        recruitment_id = await self._full_recruitment()
+        card = RecruitmentCardView(self.manager, recruitment_id)
+        interaction = SimpleNamespace(
+            user=self.members[1],
+            guild=self.guild,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        async def reject_start(start_interaction) -> None:
+            await start_interaction.followup.send(
+                "村の状態が変わったためゲームを開始しませんでした。",
+                ephemeral=True,
+            )
+
+        self.room.start_game = AsyncMock(side_effect=reject_start)
+
+        await card.transfer(interaction)
+
+        self.room.start_game.assert_awaited_once_with(interaction)
+        interaction.followup.send.assert_awaited_once_with(
+            "村の状態が変わったためゲームを開始しませんでした。",
+            ephemeral=True,
+        )
+
+    async def test_reset_confirmation_starts_game_after_transfer(self) -> None:
+        """受付リセット確認も通常の開催反映後と同じ開始経路へ進む。"""
+        recruitment_id = await self._full_recruitment()
+        self.state.players[999] = object()
+        view = recruitment_lib.RecruitmentLobbyResetConfirmView(
+            self.manager, recruitment_id, self.members[1].id,
+        )
+        interaction = SimpleNamespace(
+            user=self.members[1],
+            guild=self.guild,
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        async def start_game(_interaction) -> None:
+            self.state.phase = Phase.PREPARATION
+            self.state.game_task = object()
+
+        self.room.start_game = AsyncMock(side_effect=start_game)
+        confirm = discord.utils.get(view.children, label="受付をリセットして開催")
+
+        await confirm.callback(interaction)
+
+        self.assertNotIn(999, self.state.players)
+        self.room.start_game.assert_awaited_once_with(interaction)
+        interaction.followup.send.assert_awaited_once_with(
+            "✅ ゲーム開始処理へ進みました。", ephemeral=True,
+        )
+
     async def test_fly_in_lobby_entry_during_validation_is_not_silently_cleared(self) -> None:
         recruitment_id = await self._full_recruitment()
         injected = False
@@ -651,6 +729,134 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         self.manager.notify_participant_if_due.assert_awaited_once_with(
             self.guild, recruitment_id, 100
         )
+
+    async def test_join_succeeds_when_stale_card_was_deleted_after_db_update(self) -> None:
+        recruitment_id = await database.create_recruitment(
+            1,
+            1,
+            title="削除済みカードへの参加",
+            scheduled_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+            room_id=self.room_id,
+            variant_id="v13_cross",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        missing = discord.NotFound(
+            SimpleNamespace(status=404, reason="Not Found", headers={}), "missing",
+        )
+        card = RecruitmentCardView(self.manager, recruitment_id)
+        interaction = SimpleNamespace(
+            user=self.members[100],
+            guild=self.guild,
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+            message=SimpleNamespace(edit=AsyncMock(side_effect=missing)),
+        )
+        self.manager.build_embed = AsyncMock(return_value=discord.Embed())
+        self.manager.notify_ready_if_needed = AsyncMock()
+
+        with patch.object(recruitment_lib.discord, "Member", SimpleNamespace):
+            await card.join(interaction)
+
+        self.assertEqual(
+            [entry["user_id"] for entry in await database.list_recruitment_entries(recruitment_id)],
+            [100],
+        )
+        self.assertIn("参加として登録しました", interaction.followup.send.await_args.args[0])
+
+    async def test_leave_succeeds_when_stale_card_was_deleted_after_db_update(self) -> None:
+        recruitment_id = await database.create_recruitment(
+            1,
+            1,
+            title="削除済みカードからの取消",
+            scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            room_id=self.room_id,
+            variant_id="v13_cross",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        await database.add_recruitment_entry(recruitment_id, 100)
+        missing = discord.NotFound(
+            SimpleNamespace(status=404, reason="Not Found", headers={}), "missing",
+        )
+        card = RecruitmentCardView(self.manager, recruitment_id)
+        interaction = SimpleNamespace(
+            user=self.members[100],
+            guild=self.guild,
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+            message=SimpleNamespace(edit=AsyncMock(side_effect=missing)),
+        )
+        self.manager.build_embed = AsyncMock(return_value=discord.Embed())
+
+        await card.leave(interaction)
+
+        self.assertEqual(await database.list_recruitment_entries(recruitment_id), [])
+        self.assertIn("参加を取り消しました", interaction.followup.send.await_args.args[0])
+
+    async def test_entry_change_succeeds_when_card_refresh_is_unavailable(self) -> None:
+        """削除済み以外のDiscord API失敗でも、DB確定済みの応答を優先する。"""
+        refresh_failures = (
+            (
+                "join",
+                discord.Forbidden(
+                    SimpleNamespace(status=403, reason="Forbidden", headers={}),
+                    "denied",
+                ),
+                "参加として登録しました",
+            ),
+            (
+                "leave",
+                discord.HTTPException(
+                    SimpleNamespace(status=503, reason="Unavailable", headers={}),
+                    "retry",
+                ),
+                "参加を取り消しました",
+            ),
+        )
+        for action, refresh_error, success_text in refresh_failures:
+            with self.subTest(action=action):
+                recruitment_id = await database.create_recruitment(
+                    1,
+                    1,
+                    title=f"カード更新失敗 {action}",
+                    scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
+                    room_id=self.room_id,
+                    variant_id="v13_cross",
+                    streaming=False,
+                    allowed_ranks=None,
+                )
+                if action == "leave":
+                    await database.add_recruitment_entry(recruitment_id, 100)
+                card = RecruitmentCardView(self.manager, recruitment_id)
+                interaction = SimpleNamespace(
+                    user=self.members[100],
+                    guild=self.guild,
+                    response=SimpleNamespace(
+                        defer=AsyncMock(), send_message=AsyncMock(),
+                    ),
+                    followup=SimpleNamespace(send=AsyncMock()),
+                    message=SimpleNamespace(
+                        edit=AsyncMock(side_effect=refresh_error),
+                    ),
+                )
+                self.manager.build_embed = AsyncMock(return_value=discord.Embed())
+                self.manager.notify_ready_if_needed = AsyncMock()
+
+                if action == "join":
+                    with patch.object(recruitment_lib.discord, "Member", SimpleNamespace):
+                        await card.join(interaction)
+                    entries = await database.list_recruitment_entries(recruitment_id)
+                    self.assertEqual([entry["user_id"] for entry in entries], [100])
+                else:
+                    await card.leave(interaction)
+                    self.assertEqual(
+                        await database.list_recruitment_entries(recruitment_id), [],
+                    )
+                self.assertIn(success_text, interaction.followup.send.await_args.args[0])
+                self.assertTrue(await database.set_recruitment_status(
+                    recruitment_id, database.RECRUITMENT_ARCHIVED,
+                ))
 
     async def test_join_revalidates_current_conditions_inside_manager_lock(self) -> None:
         recruitment_id = await database.create_recruitment(

@@ -795,9 +795,10 @@ class TurnDurabilityAndSafetyTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await state.game_task
 
-    async def test_manual_server_mute_stops_before_turn_timer(self) -> None:
+    async def test_participant_gm_manual_mute_stops_before_turn_timer(self) -> None:
         runner = make_runner()
         speaker = add_players(runner, 1)[0]
+        runner.state.gm_id = speaker.user_id
         voice_channel = SimpleNamespace(id=50)
         runner.state.voice_channel = voice_channel
         speaker.member.voice = SimpleNamespace(
