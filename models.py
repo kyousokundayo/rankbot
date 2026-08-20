@@ -142,6 +142,12 @@ class GameState:
         self.pending_winner: Optional[Team] = None
         # 終了処理開始後の古いView/除外/一時停止との競合を防ぐ。
         self.ending: bool = False
+        # GMが議論を打ち切った day_generation。クロストークは残り時間を捨て、
+        # ターン制は残りの巡を飛ばして投票へ進む。世代で持つので日が変われば
+        # 自然に無効化され、再起動をまたいでもスキップ指示を失わない。
+        self.day_discussion_skip_generation: Optional[int] = None
+        # 上を進行中のカウントダウンへ伝えるだけの揮発イベント。
+        self.day_discussion_skip_event: asyncio.Event = asyncio.Event()
         # GAME_OVER checkpoint後に再起動しても、終了種別ごとのLOBBY復帰を
         # 失わない。empty=全解除 / gm=GMのみ / roster=参加者とGMを保持。
         self.lobby_return_mode: str = "empty"
