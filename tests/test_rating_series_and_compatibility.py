@@ -159,10 +159,13 @@ class RatingSeriesTest(_SeededDatabaseTest):
 
 class CompatibilityTest(_SeededDatabaseTest):
     async def _seed_pair(self) -> None:
-        """自分(1)の陣営別勝率を 村0.5 / 狼1.0 にし、相手(2)を全試合へ入れる。
+        """自分(1)の対戦相手を2人(2・3)にし、期待値が leave-one-out で計算されることを検証する。
 
-        同陣営: g1(村・勝) と g5(狼・勝) → 実測1.00 / 期待0.75
-        敵対  : g2(村・負) と g6(狼・勝) → 実測0.50 / 期待0.75
+        相手2はg1-g6(自分の村4戦・狼2戦すべてに登場)、相手3はg7-g8
+        (村1戦・狼1戦)にのみ登場する。相手2を評価する期待値は「相手2との
+        共戦を除いた」村0.5戦0.5戦・狼0.5戦の勝率、つまりg7/g8だけから
+        計算されるべきで、逆に相手3を評価する期待値はg1-g6だけから
+        計算されるべき (test_leave_one_out_excludes_the_opponent_own_games で検証)。
         """
         village = Team.VILLAGE.value
         wolf = Team.WOLF.value
@@ -173,33 +176,157 @@ class CompatibilityTest(_SeededDatabaseTest):
             (4, "2026-06-04 12:00:00", [(1, village, 0), (2, wolf, 1)]),
             (5, "2026-06-05 12:00:00", [(1, wolf, 1), (2, wolf, 1)]),
             (6, "2026-06-06 12:00:00", [(1, wolf, 1), (2, village, 0)]),
+            (7, "2026-06-07 12:00:00", [(1, village, 1), (3, village, 0)]),
+            (8, "2026-06-08 12:00:00", [(1, wolf, 0), (3, village, 1)]),
         ]
         for game_id, played_at, players in layout:
             await self._add_game(game_id, played_at=played_at, players=players)
 
-    async def test_expected_value_is_taken_from_own_team_win_rates(self) -> None:
+    async def test_leave_one_out_excludes_the_opponent_own_games(self) -> None:
+        """期待値は「その相手との共戦を除いた」自分の陣営別勝率から計算される。
+
+        修正前は自分の陣営別勝率(相手の分を含む)をそのまま期待値にしていたため、
+        相手2のように自分の試合の大半(6/8)を占める相手ほど期待値が実測へ
+        漸近して diff が潰れていた。leave-one-out ならその歪みが起きない。
+        """
         await self._seed_pair()
         data = await database.get_player_compatibility(1, 1, min_games=1)
 
-        self.assertAlmostEqual(data["win_rate"], 4 / 6)
-        self.assertAlmostEqual(data["team_win_rates"][Team.VILLAGE.value], 0.5)
-        self.assertAlmostEqual(data["team_win_rates"][Team.WOLF.value], 1.0)
+        self.assertAlmostEqual(data["win_rate"], 5 / 8)
+        # team_win_rates は「相手を除かない」自分の陣営別勝率 (参考値として表示に使う)。
+        self.assertAlmostEqual(data["team_win_rates"][Team.VILLAGE.value], 0.6)
+        self.assertAlmostEqual(
+            data["team_win_rates"][Team.WOLF.value], 2 / 3,
+        )
 
-        same = {row["player_id"]: row for row in data["same"]}[2]
-        self.assertEqual((same["games"], same["wins"]), (2, 2))
-        self.assertAlmostEqual(same["expected"], 0.75)
-        self.assertAlmostEqual(same["diff"], 0.25)
+        same = {row["player_id"]: row for row in data["same"]}
+        # 相手2: g1(村)+g5(狼) 2戦2勝。期待値はg7/g8(相手2を除いた分)から。
+        self.assertEqual((same[2]["games"], same[2]["wins"]), (2, 2))
+        self.assertAlmostEqual(same[2]["expected"], 0.5)
+        self.assertAlmostEqual(same[2]["diff"], 0.5)
+        # 相手3: g7(村) 1戦1勝。期待値はg1-g6(相手3を除いた分)から。
+        self.assertEqual((same[3]["games"], same[3]["wins"]), (1, 1))
+        self.assertAlmostEqual(same[3]["expected"], 0.5)
+        self.assertAlmostEqual(same[3]["diff"], 0.5)
 
-        opposite = {row["player_id"]: row for row in data["opposite"]}[2]
-        self.assertEqual((opposite["games"], opposite["wins"]), (4, 2))
-        self.assertAlmostEqual(opposite["rate"], 0.5)
-        self.assertAlmostEqual(opposite["expected"], 0.625)  # 村3戦+狼1戦の加重
+        opposite = {row["player_id"]: row for row in data["opposite"]}
+        self.assertEqual((opposite[2]["games"], opposite[2]["wins"]), (4, 2))
+        self.assertAlmostEqual(opposite[2]["expected"], 0.75)
+        self.assertAlmostEqual(opposite[2]["diff"], -0.25)
+        self.assertEqual((opposite[3]["games"], opposite[3]["wins"]), (1, 0))
+        self.assertAlmostEqual(opposite[3]["expected"], 1.0)
+        self.assertAlmostEqual(opposite[3]["diff"], -1.0)
 
     async def test_no_games_returns_empty_shape(self) -> None:
         data = await database.get_player_compatibility(999, 1)
         self.assertEqual(data["games"], 0)
         self.assertEqual(data["same"], [])
         self.assertEqual(data["opposite"], [])
+
+    async def test_full_coplay_no_longer_collapses_diff_to_zero(self) -> None:
+        """自己参照バイアスの再現ケース: 相手Aと村で100%共戦(10戦9勝)。
+
+        修正前は baseline[村] が相手Aの分だけで出来ていたため、
+        expected == rate == 0.9 で diff が 0.0 に潰れていた
+        (実勝率90%なのに「差なし」と出る)。修正後は村タイプの共戦が
+        Aで全部埋まっている場合、陣営を問わない leave-one-out
+        (自分の狼試合だけ) にフォールバックするため、期待値が実測へ
+        機械的に一致しなくなる。
+        """
+        village = Team.VILLAGE.value
+        wolf = Team.WOLF.value
+        layout = [
+            (1, "2026-06-01 12:00:00", [(1, village, 1), (2, village, 1)]),
+            (2, "2026-06-02 12:00:00", [(1, village, 1), (2, village, 1)]),
+            (3, "2026-06-03 12:00:00", [(1, village, 1), (2, village, 1)]),
+            (4, "2026-06-04 12:00:00", [(1, village, 1), (2, village, 1)]),
+            (5, "2026-06-05 12:00:00", [(1, village, 1), (2, village, 1)]),
+            (6, "2026-06-06 12:00:00", [(1, village, 1), (2, village, 1)]),
+            (7, "2026-06-07 12:00:00", [(1, village, 1), (2, village, 1)]),
+            (8, "2026-06-08 12:00:00", [(1, village, 1), (2, village, 1)]),
+            (9, "2026-06-09 12:00:00", [(1, village, 1), (2, village, 1)]),
+            (10, "2026-06-10 12:00:00", [(1, village, 0), (2, village, 0)]),
+            # 別陣営(狼)での共戦。村の比較基準には使わない。
+            (11, "2026-06-11 12:00:00", [(1, wolf, 0), (3, wolf, 1)]),
+            (12, "2026-06-12 12:00:00", [(1, wolf, 0), (3, wolf, 1)]),
+            (13, "2026-06-13 12:00:00", [(1, wolf, 0), (3, wolf, 1)]),
+            (14, "2026-06-14 12:00:00", [(1, wolf, 0), (3, wolf, 1)]),
+            (15, "2026-06-15 12:00:00", [(1, wolf, 1), (3, wolf, 1)]),
+        ]
+        for game_id, played_at, players in layout:
+            await self._add_game(game_id, played_at=played_at, players=players)
+
+        data = await database.get_player_compatibility(1, 1, min_games=1)
+        same = {row["player_id"]: row for row in data["same"]}
+        # 村の10戦が全て相手Aとの共戦なので、Aを除くと同じ陣営の比較材料が
+        # 残らない。修正前は expected=0.9 で diff=0.0 に潰れていたが、
+        # 陣営を跨いで狼の勝率を基準にすると相性とは無関係な差が出るため、
+        # 判定できない行として出さないのが正しい。
+        self.assertNotIn(2, same)
+        # 狼の5戦も全て相手Cとの共戦なので、同じ理由でCも判定できない。
+        # この編成では「比較材料が1つも無い」ため、どの行も出さないのが正しい。
+        shown = {row["player_id"] for row in (*data["same"], *data["opposite"])}
+        self.assertEqual(shown, set())
+        # 判定できる相手がいる場合に diff が出ることは
+        # test_leave_one_out_excludes_the_opponent_own_games 側で担保する。
+
+    async def test_diff_magnitude_reflects_the_real_gap_not_the_share_of_games(
+        self,
+    ) -> None:
+        """主戦相手(共戦が多い)ほど diff が過小評価されない、少数相手ほど
+        誇張されない、という修正前のバイアスが直っていることを検証する。
+
+        相手2: 40戦36勝(90%)、相手3: 10戦1勝(10%)。すべて村の同陣営。
+        修正前はそれぞれ diff +0.16 / -0.64 と、主戦相手(実態90%)の方が
+        弱く出て少数相手(実態10%)の方が誇張されていた。
+        leave-one-outでは互いの相手を除いた分がもう一方の相手の実測其のもの
+        になるため、diffの絶対値は両者で揃い、実態の差(90%対10%)を
+        どちらも過小評価しない。
+        """
+        village = Team.VILLAGE.value
+        game_id = 0
+        layout: list[tuple[int, str, list[tuple[int, str, int]]]] = []
+
+        def add(opponent_id: int, me_won: bool) -> None:
+            nonlocal game_id
+            game_id += 1
+            layout.append(
+                (
+                    game_id,
+                    f"2026-07-{(game_id % 28) + 1:02d} 12:00:00",
+                    [
+                        (1, village, int(me_won)),
+                        (opponent_id, village, int(me_won)),
+                    ],
+                )
+            )
+
+        for _ in range(36):
+            add(2, True)
+        for _ in range(4):
+            add(2, False)
+        for _ in range(1):
+            add(3, True)
+        for _ in range(9):
+            add(3, False)
+
+        for gid, played_at, players in layout:
+            await self._add_game(gid, played_at=played_at, players=players)
+
+        data = await database.get_player_compatibility(1, 1, min_games=1)
+        same = {row["player_id"]: row for row in data["same"]}
+
+        self.assertAlmostEqual(same[2]["rate"], 0.9)
+        self.assertAlmostEqual(same[3]["rate"], 0.1)
+        # 相手を除いた分がもう一方の相手そのものになるので、期待値は
+        # 「相手を除いた実測」と一致する。
+        self.assertAlmostEqual(same[2]["expected"], 0.1)
+        self.assertAlmostEqual(same[3]["expected"], 0.9)
+        self.assertAlmostEqual(same[2]["diff"], 0.8)
+        self.assertAlmostEqual(same[3]["diff"], -0.8)
+        # 主戦相手(共戦が多い)の diff の絶対値が、少数相手より小さく
+        # 評価されてはいけない (修正前バグの再現条件)。
+        self.assertGreaterEqual(abs(same[2]["diff"]), abs(same[3]["diff"]))
 
 
 class NightActionRecordsTest(_SeededDatabaseTest):

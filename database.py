@@ -5763,6 +5763,15 @@ async def get_player_compatibility(
     陣営別勝率 (村のときの勝率／狼のときの勝率) から、その相手との
     共戦の陣営構成で期待される勝率を出し、実測との差 (diff) を返す。
     表示する/しないの足切りは呼び出し側が min_games で行う。
+
+    期待勝率は leave-one-out (相手Oとの共戦分を除いた自分の陣営別勝率) で
+    算出する。単純に「自分の陣営別勝率全体」を期待値にすると、その相手との
+    共戦が自分の試合の大半を占めるほど期待値が実測へ漸近して diff がゼロへ
+    潰れてしまい (自己参照バイアス)、逆に共戦が少ない相手の diff だけが
+    誇張される。相手Oを除いた分で期待値を作ればこの漸近が起きない。
+    除外後の陣営別試合数が0の相手には、陣営を問わない除外後の全体勝率へ
+    フォールバックし、それも0 (=その相手以外に試合が無い) なら期待値が
+    定義できないため、誤った断定を避けてその行自体を出力しない。
     """
     rating_lib.ladder_id_for_variant(variant_id)
     room_filter, room_params = _stats_room_filter()
@@ -5790,7 +5799,9 @@ async def get_player_compatibility(
             base_params,
         )
 
-    baseline: dict[str, float] = {}
+    # team -> (games, wins)。「自分がその陣営を引いた全試合」の集計で、
+    # 期待値計算では相手ごとに共戦分を差し引いた leave-one-out で使う。
+    baseline: dict[str, tuple[int, int]] = {}
     total_games = 0
     total_wins = 0
     for team, count, wins in team_rows:
@@ -5799,7 +5810,7 @@ async def get_player_compatibility(
         total_games += count
         total_wins += wins
         if count:
-            baseline[str(team)] = wins / count
+            baseline[str(team)] = (count, wins)
     if total_games == 0:
         return {
             "variant_id": variant_id, "min_games": min_games,
@@ -5808,16 +5819,49 @@ async def get_player_compatibility(
         }
     overall_rate = total_wins / total_games
 
+    # 表示用バケット (opponent_id, same_team) と、leave-one-out用に
+    # 相手ごと・陣営ごとの共戦試合数/勝数を別途集計する。
     buckets: dict[tuple[int, int], dict] = {}
+    opponent_team_totals: dict[int, dict[str, tuple[int, int]]] = {}
     for opponent_id, same_team, my_team, count, wins in pair_rows:
-        key = (int(opponent_id), int(same_team))
-        entry = buckets.setdefault(
-            key, {"player_id": int(opponent_id), "games": 0, "wins": 0, "expected_wins": 0.0}
-        )
+        opponent_id = int(opponent_id)
+        my_team = str(my_team)
         count = int(count or 0)
+        wins = int(wins or 0)
+
+        key = (opponent_id, int(same_team))
+        entry = buckets.setdefault(
+            key,
+            {"player_id": opponent_id, "games": 0, "wins": 0, "team_counts": {}},
+        )
         entry["games"] += count
-        entry["wins"] += int(wins or 0)
-        entry["expected_wins"] += count * baseline.get(str(my_team), overall_rate)
+        entry["wins"] += wins
+        tc_count, tc_wins = entry["team_counts"].get(my_team, (0, 0))
+        entry["team_counts"][my_team] = (tc_count + count, tc_wins + wins)
+
+        team_totals = opponent_team_totals.setdefault(opponent_id, {})
+        oc, ow = team_totals.get(my_team, (0, 0))
+        team_totals[my_team] = (oc + count, ow + wins)
+
+    def _excluded_rate(opponent_id: int, my_team: str) -> Optional[float]:
+        """相手Oとの共戦分を除いた、自分の「同じ陣営での」勝率。
+
+        期待値の基準に相手Oとの試合を混ぜると、Oが自分の試合の大半を占めるほど
+        期待値が実測へ漸近して差がゼロへ潰れる (自己参照バイアス)。そのため
+        Oとの共戦分を必ず除く。
+
+        除外すると同じ陣営の試合が残らない場合、陣営を問わない全体勝率へ
+        落とすことはしない。村と狼では勝率の水準が構造的に違うので、村の実測を
+        狼込みの基準と比べると相性とは無関係な大きな差が出てしまう。
+        判定できないときは None を返し、呼び出し元で行ごと表示しない
+        (誤った断定をするより出さないほうがよい)。
+        """
+        base_count, base_wins = baseline.get(my_team, (0, 0))
+        opp_count, opp_wins = opponent_team_totals.get(opponent_id, {}).get(my_team, (0, 0))
+        excl_count = base_count - opp_count
+        if excl_count > 0:
+            return (base_wins - opp_wins) / excl_count
+        return None
 
     same: list[dict] = []
     opposite: list[dict] = []
@@ -5826,7 +5870,17 @@ async def get_player_compatibility(
         if games <= 0:
             continue
         rate = entry["wins"] / games
-        expected = entry["expected_wins"] / games
+        expected_wins = 0.0
+        unresolved = False
+        for my_team, (count, _wins) in entry["team_counts"].items():
+            excl_rate = _excluded_rate(opponent_id, my_team)
+            if excl_rate is None:
+                unresolved = True
+                break
+            expected_wins += count * excl_rate
+        if unresolved:
+            continue
+        expected = expected_wins / games
         row = {
             "player_id": opponent_id,
             "games": games,
@@ -5844,7 +5898,9 @@ async def get_player_compatibility(
         "min_games": min_games,
         "games": total_games,
         "win_rate": overall_rate,
-        "team_win_rates": baseline,
+        "team_win_rates": {
+            team: wins / count for team, (count, wins) in baseline.items()
+        },
         "partners": len({opponent_id for opponent_id, _ in buckets}),
         "same": same,
         "opposite": opposite,
@@ -6308,8 +6364,14 @@ async def get_ops_rating_health(
             "WHERE guild_id = ? AND ladder_id = ?",
             (guild_id, ladder_id),
         )
+        # games.played_at は SQLite の CURRENT_TIMESTAMP = tz無しUTC で保存される。
+        # 他の運営指標 (_jst_date 経由) と同じくJST基準で月を切るため、
+        # ここでは strftime に渡す前に SQL側で +9時間してJSTへ寄せる。
+        # Python側で全行を _jst_date に通してもよいが、この関数は元々
+        # SQLの GROUP BY で月別集計まで済ませる作りなので、それに合わせて
+        # SQL側で時差補正するほうが変更が小さく済む。
         monthly_rows = await db.execute_fetchall(
-            "SELECT strftime('%Y-%m', g.played_at) AS month, "
+            "SELECT strftime('%Y-%m', g.played_at, '+9 hours') AS month, "
             "  COUNT(*), AVG(rh.rating_after), AVG(rh.elo_delta + rh.bonus "
             "  + rh.play_bonus + rh.recommendation_bonus) "
             "FROM rating_history rh JOIN games g ON g.game_id = rh.game_id "
