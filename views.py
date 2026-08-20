@@ -3996,15 +3996,23 @@ def _compatibility_lines(
     *,
     best: bool,
 ) -> list[str]:
-    """相性の上位/下位を「期待値との差」つきで整形する。"""
-    ordered = rows if best else list(reversed(rows))
+    """相性の上位/下位を「いる時 − いない時」の差つきで整形する。
+
+    差の符号で振り分けてから並べる。単に上位N件/下位N件を取ると、相手が
+    少ないうちは同じ人が「勝ちやすい」と「勝ちにくい」の両方へ出てしまう。
+    差0の相手はどちらにも出さない (勝ちやすくも勝ちにくくもないため)。
+    """
+    if best:
+        ordered = [row for row in rows if row["diff"] > 0]
+    else:
+        ordered = list(reversed([row for row in rows if row["diff"] < 0]))
     lines = []
     for row in ordered[:COMPATIBILITY_TOP_N]:
         low, high = _wilson_interval(int(row["wins"]), int(row["games"]))
         lines.append(
             f"{_player_label(guild, int(row['player_id']))}: "
             f"{row['diff'] * 100:+.1f}pt"
-            f"（勝率{row['rate'] * 100:.0f}% / 期待{row['expected'] * 100:.0f}% ・"
+            f"（いる時{row['rate'] * 100:.0f}% / いない時{row['expected'] * 100:.0f}% ・"
             f"{row['wins']}勝{int(row['games']) - int(row['wins'])}敗 ・"
             f"95%CI {low * 100:.0f}–{high * 100:.0f}%）"
         )
@@ -4016,9 +4024,11 @@ def build_compatibility_embed(
 ) -> discord.Embed:
     """同陣営／敵対それぞれの相性を本人向けに表示する。
 
-    素の勝率ではなく「自分の陣営別勝率から期待される勝率との差」を主役に
-    据える。13人卓では引いた陣営で勝率が大きく動くため、素の勝率を並べると
-    “村を多く引いた相手”が全員相性◎に見えてしまう。
+    主役は素の勝率ではなく「その相手がいる試合の勝率 − いない試合の勝率」。
+    13人卓では引いた陣営で勝率が大きく動くため、素の勝率を並べると
+    “村を多く引いた相手”が全員相性◎に見えてしまう。比較は同じ陣営どうしで
+    行い、基準側からはその相手との共戦を必ず除く (database.get_player_
+    compatibility の leave-one-out。混ぜると差がゼロへ潰れる)。
     """
     variant = _stats_variant(str(data.get("variant_id") or DEFAULT_VARIANT_ID))
     min_games = int(data.get("min_games") or COMPATIBILITY_MIN_GAMES)
@@ -4026,8 +4036,9 @@ def build_compatibility_embed(
         title=f"{user.display_name} の相性 — {variant.label}",
         description=(
             f"共戦**{min_games}戦以上**の相手だけを表示します。\n"
-            "「差」は自分の陣営別勝率から計算した期待勝率との差で、"
-            "プラスほどその相手と一緒（または対面）のときに勝てているという意味です。"
+            "「差」は **その相手がいる試合の勝率 − いない試合の勝率**。"
+            "同じ陣営どうしで比べています。プラスほど、その相手と一緒"
+            "（または対面）だと勝てているという意味です。"
         ),
         color=discord.Color.blurple(),
     )
@@ -4049,11 +4060,17 @@ def build_compatibility_embed(
             continue
         best_lines = _compatibility_lines(rows, guild, best=True)
         worst_lines = _compatibility_lines(rows, guild, best=False)
+        # 符号で振り分けるため片側が空になり得る。Discordは値が空の
+        # フィールドを拒否するので、必ず何か入れる。
         embed.add_field(
-            name=f"{title}・勝ちやすい", value="\n".join(best_lines), inline=False,
+            name=f"{title}・勝ちやすい",
+            value="\n".join(best_lines) or "該当なし。",
+            inline=False,
         )
         embed.add_field(
-            name=f"{title}・勝ちにくい", value="\n".join(worst_lines), inline=False,
+            name=f"{title}・勝ちにくい",
+            value="\n".join(worst_lines) or "該当なし。",
+            inline=False,
         )
 
     embed.set_footer(
