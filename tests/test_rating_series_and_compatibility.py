@@ -365,3 +365,54 @@ class NightActionRecordsTest(_SeededDatabaseTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CompatibilityEmbedTest(unittest.TestCase):
+    """相性embedの振り分け。同じ相手が両方の欄へ出ないこと。"""
+
+    def _data(self, same: list[dict]) -> dict:
+        return {
+            "variant_id": "v13_cross", "min_games": 10, "games": 30,
+            "win_rate": 0.53, "partners": len(same), "same": same, "opposite": [],
+        }
+
+    def _fields(self, same: list[dict]) -> dict[str, str]:
+        import views
+        from types import SimpleNamespace
+        embed = views.build_compatibility_embed(
+            self._data(same), None, user=SimpleNamespace(display_name="u"),
+        )
+        return {field.name: str(field.value) for field in embed.fields}
+
+    def test_same_partner_is_never_in_both_columns(self) -> None:
+        # 相手が少ないと、単純な上位N/下位Nでは同じ人が両方へ出てしまう。
+        fields = self._fields([
+            {"player_id": 2, "games": 10, "wins": 9, "rate": 0.9,
+             "expected": 0.35, "diff": 0.55},
+            {"player_id": 3, "games": 10, "wins": 2, "rate": 0.2,
+             "expected": 0.70, "diff": -0.50},
+        ])
+        best = next(v for k, v in fields.items() if "勝ちやすい" in k)
+        worst = next(v for k, v in fields.items() if "勝ちにくい" in k)
+        self.assertIn("ID:2", best)
+        self.assertNotIn("ID:2", worst)
+        self.assertIn("ID:3", worst)
+        self.assertNotIn("ID:3", best)
+
+    def test_empty_side_still_renders(self) -> None:
+        # 符号で振り分けると片側が空になり得る。Discordは空の値を拒否する。
+        fields = self._fields([
+            {"player_id": 2, "games": 10, "wins": 9, "rate": 0.9,
+             "expected": 0.35, "diff": 0.55},
+        ])
+        for name, value in fields.items():
+            self.assertTrue(value.strip(), f"{name} の値が空になっている")
+
+    def test_zero_diff_is_listed_in_neither_column(self) -> None:
+        fields = self._fields([
+            {"player_id": 9, "games": 10, "wins": 5, "rate": 0.5,
+             "expected": 0.5, "diff": 0.0},
+        ])
+        for name, value in fields.items():
+            if "同じ陣営" in name:
+                self.assertNotIn("ID:9", value)
