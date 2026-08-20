@@ -83,6 +83,7 @@ def make_interaction(member: FakeMember) -> SimpleNamespace:
             send_message=AsyncMock(), edit_message=AsyncMock(), defer=AsyncMock(),
         ),
         followup=SimpleNamespace(send=AsyncMock()),
+        edit_original_response=AsyncMock(),
     )
 
 
@@ -229,7 +230,11 @@ class WolfGuessButtonTest(unittest.IsolatedAsyncioTestCase):
             "room_runner.database.record_night_action", new=AsyncMock(),
         ) as record:
             await second_btn.callback(interaction2)
-        interaction2.response.edit_message.assert_awaited_once()
+        # 最後の選択は霊界開放まで待つ前にACKし、同じephemeralメッセージを
+        # 書き換えて結果を残す。
+        interaction2.response.defer.assert_awaited_once_with()
+        interaction2.response.edit_message.assert_not_awaited()
+        interaction2.edit_original_response.assert_awaited_once()
 
         # 予想の中身は1人1行で記録する (正解数だけでは後から傾向を追えない)。
         self.assertEqual(record.await_count, 2)
@@ -241,8 +246,30 @@ class WolfGuessButtonTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(guess_view.selected), [2, 3])
         self.assertEqual(runner.state.wolf_guesses[1], sorted(guess_view.selected))
         self.assertNotIn(1, runner.state.spirit_hold_ids)
-        content = interaction2.response.edit_message.await_args.kwargs["content"]
+        content = interaction2.edit_original_response.await_args.kwargs["content"]
         self.assertIn("提出しました", content)
+
+    async def test_final_selection_rewrites_same_message_when_submission_is_rejected(self) -> None:
+        runner = make_runner()
+        dead = add_player(runner, 1, Role.VILLAGER, alive=False)
+        add_player(runner, 2, Role.VILLAGER)
+        add_player(runner, 3, Role.VILLAGER)
+        runner.state.spirit_hold_ids.add(1)
+        runner.state.spirit_hold_events[1] = "run-role:処刑:1:1"
+        runner.submit_wolf_guess = AsyncMock(return_value=False)
+        guess_view = VillageWolfGuessView(runner, 1, "run-role:処刑:1:1")
+        first_btn, second_btn = guess_view.children
+
+        await first_btn.callback(make_interaction(dead.member))
+        final_interaction = make_interaction(dead.member)
+        await second_btn.callback(final_interaction)
+
+        final_interaction.response.defer.assert_awaited_once_with()
+        final_interaction.edit_original_response.assert_awaited_once()
+        kwargs = final_interaction.edit_original_response.await_args.kwargs
+        self.assertIn("受付は終了", kwargs["content"])
+        self.assertIsNone(kwargs["view"])
+        self.assertTrue(guess_view.is_finished())
 
 
 class SeerButtonTest(unittest.IsolatedAsyncioTestCase):

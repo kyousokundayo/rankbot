@@ -16,6 +16,7 @@ from views import (
     GMControlView,
     GMPanelEntryView,
     InteractionTimer,
+    LobbyGMMenuView,
     LobbyView,
     StatsView,
     build_help_embeds,
@@ -43,6 +44,7 @@ class UsabilityViewLayoutTest(unittest.TestCase):
             players={},
             gm_id=None,
             room_id="private_1" if private else "beginner",
+            recruitment_id=None,
         )
         return SimpleNamespace(state=state, is_private_room=lambda: private)
 
@@ -87,7 +89,43 @@ class UsabilityViewLayoutTest(unittest.TestCase):
         private_ids = [item.custom_id for item in private_view.children]
         self.assertIn("rematch_game", private_ids)
         self.assertNotIn("join_game", private_ids)
+        self.assertNotIn("leave_game", private_ids)
         self.assertNotIn("get_gm", private_ids)
+
+    def test_private_rematch_keeps_leave_and_postgame_wait_disables_start(self) -> None:
+        player = SimpleNamespace(member=SimpleNamespace(display_name="参加者"))
+        state = SimpleNamespace(
+            phase=Phase.LOBBY,
+            players={1: player},
+            gm_id=99,
+            room_id="private_1",
+            recruitment_id=None,
+            guild=SimpleNamespace(
+                get_member=lambda user_id: (
+                    SimpleNamespace(display_name="GM") if user_id == 99 else None
+                ),
+            ),
+            room_name="GM村",
+        )
+        cog = SimpleNamespace(
+            state=state,
+            variant=SimpleNamespace(player_count=1, label="1人テスト"),
+            room_def=SimpleNamespace(
+                allowed_ranks=None,
+                allowed_gm_user_ids=None,
+                owner_only_gm=False,
+            ),
+            is_private_room=lambda: True,
+            _postgame_vote_pending=True,
+        )
+
+        view = LobbyView(cog)
+        ids = [item.custom_id for item in view.children]
+        start = next(item for item in view.children if item.custom_id == "start_game")
+
+        self.assertIn("leave_game", ids)
+        self.assertTrue(start.disabled)
+        self.assertIn("終了後投票を受付中", view._build_embed().description)
 
     def test_stats_panel_stays_within_three_rows(self) -> None:
         view = StatsView(SimpleNamespace())
@@ -260,6 +298,146 @@ class LobbyInteractionExpiryTest(unittest.IsolatedAsyncioTestCase):
         cog.start_game.assert_awaited_once_with(interaction)
 
 
+class PrivateLobbyRecoveryTest(unittest.IsolatedAsyncioTestCase):
+    async def test_rematch_player_can_cancel_from_private_lobby(self) -> None:
+        state = SimpleNamespace(
+            phase=Phase.LOBBY,
+            players={
+                1: SimpleNamespace(member=SimpleNamespace(display_name="参加者")),
+            },
+            gm_id=99,
+            room_id="private_1",
+            recruitment_id=None,
+            guild=SimpleNamespace(
+                get_member=lambda user_id: (
+                    SimpleNamespace(display_name="GM") if user_id == 99 else None
+                ),
+            ),
+            room_name="GM村",
+        )
+        cog = SimpleNamespace(
+            state=state,
+            action_lock=asyncio.Lock(),
+            variant=SimpleNamespace(player_count=1, label="1人テスト"),
+            room_def=SimpleNamespace(
+                allowed_ranks=None,
+                allowed_gm_user_ids=None,
+                owner_only_gm=False,
+            ),
+            is_private_room=lambda: True,
+            _postgame_vote_pending=False,
+            _persist_room_state=AsyncMock(),
+        )
+        view = LobbyView(cog)
+        leave = next(item for item in view.children if item.custom_id == "leave_game")
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=1),
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+            message=SimpleNamespace(edit=AsyncMock()),
+        )
+
+        await leave.callback(interaction)
+
+        interaction.response.defer.assert_awaited_once_with(
+            ephemeral=True, thinking=True,
+        )
+        self.assertNotIn(1, state.players)
+        cog._persist_room_state.assert_awaited_once()
+        interaction.followup.send.assert_awaited_once_with(
+            "参加を取り消しました。", ephemeral=True,
+        )
+
+    async def test_rematch_cancel_rolls_back_when_snapshot_save_fails(self) -> None:
+        player = SimpleNamespace(member=SimpleNamespace(display_name="参加者"))
+        state = SimpleNamespace(
+            phase=Phase.LOBBY,
+            players={1: player},
+            gm_id=99,
+            room_id="private_1",
+            recruitment_id=None,
+            guild=SimpleNamespace(get_member=lambda _user_id: None),
+            room_name="GM村",
+        )
+        cog = SimpleNamespace(
+            state=state,
+            action_lock=asyncio.Lock(),
+            variant=SimpleNamespace(player_count=1, label="1人テスト"),
+            room_def=SimpleNamespace(
+                allowed_ranks=None,
+                allowed_gm_user_ids=None,
+                owner_only_gm=False,
+            ),
+            is_private_room=lambda: True,
+            _postgame_vote_pending=False,
+            _persist_room_state=AsyncMock(side_effect=RuntimeError("DB down")),
+        )
+        view = LobbyView(cog)
+        leave = next(item for item in view.children if item.custom_id == "leave_game")
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=1),
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+            message=SimpleNamespace(edit=AsyncMock()),
+        )
+
+        await leave.callback(interaction)
+
+        self.assertIs(state.players[1], player)
+        interaction.message.edit.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once_with(
+            "参加取消を保存できませんでした。もう一度お試しください。",
+            ephemeral=True,
+        )
+
+    async def test_private_reset_reopens_previous_recruitment(self) -> None:
+        recruitment_manager = SimpleNamespace(
+            reopen_previous_recruitment=AsyncMock(
+                return_value="✅ 前回設定で参加受付を再開しました。",
+            ),
+        )
+        state = SimpleNamespace(
+            phase=Phase.LOBBY,
+            players={1: object()},
+            gm_id=99,
+            room_id="private_1",
+        )
+        cog = SimpleNamespace(
+            state=state,
+            manager=SimpleNamespace(recruitment_manager=recruitment_manager),
+            is_private_room=lambda: True,
+            reset_game=AsyncMock(return_value="🔄 参加受付をリセットしました。"),
+        )
+        view = LobbyGMMenuView(cog)
+        reset = next(item for item in view.children if item.label == "受付をリセット")
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=99),
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+        await reset.callback(interaction)
+
+        sent = interaction.response.send_message.await_args
+        self.assertIn("空の募集カード", sent.args[0])
+        confirm_view = sent.kwargs["view"]
+        confirm = next(item for item in confirm_view.children if item.label == "受付をリセット")
+        confirm_interaction = SimpleNamespace(
+            user=SimpleNamespace(id=99),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        await confirm.callback(confirm_interaction)
+
+        cog.reset_game.assert_awaited_once()
+        recruitment_manager.reopen_previous_recruitment.assert_awaited_once_with(
+            confirm_interaction, cog,
+        )
+        result = confirm_interaction.followup.send.await_args.args[0]
+        self.assertIn("参加受付をリセット", result)
+        self.assertIn("前回設定で参加受付を再開", result)
+
+
 class DangerConfirmationTest(unittest.IsolatedAsyncioTestCase):
     async def test_action_runs_only_after_same_user_confirms(self) -> None:
         action = AsyncMock()
@@ -331,6 +509,8 @@ class HelpAndRuleEmbedTest(unittest.TestCase):
         self.assertIn("スキップ", fields["GMの操作"])
         self.assertIn("全村", fields["終わった試合を読み返す"])
         self.assertIn("書き込みはできません", fields["終わった試合を読み返す"])
+        self.assertIn("専任GMのミュートだけは手動", fields["発言とミュート"])
+        self.assertNotIn("（GMのミュートだけは手動）", fields["発言とミュート"])
 
     def test_release_version_is_consistent_across_current_documents(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -342,17 +522,96 @@ class HelpAndRuleEmbedTest(unittest.TestCase):
         self.assertIn(f"対応Bot: **{BOT_VERSION}**", spec)
         self.assertIn(f"## {BOT_VERSION}", changelog)
 
-    def test_vote_help_explains_sequential_timeout_and_public_result(self) -> None:
+    def test_vote_help_explains_current_crosstalk_vote_flow(self) -> None:
         rule_embed = build_rule_embeds()[0]
         fields = {field.name: field.value for field in rule_embed.fields}
         vote_help = fields["投票と処刑"]
-        self.assertIn("棄権ボタン", vote_help)
-        self.assertIn("押した順", vote_help)
-        self.assertIn("1人20秒", vote_help)
-        self.assertIn("すぐ公開", vote_help)
+        daily_flow = fields["1日の流れ"]
+        self.assertIn("投票参加", vote_help)
+        self.assertIn("1人30秒", vote_help)
+        self.assertIn("発言終了", vote_help)
+        self.assertIn("発言終了SEと約2秒", vote_help)
+        self.assertIn("本人専用の確認", vote_help)
+        self.assertIn("候補選択に時間制限はなく", vote_help)
+        self.assertIn("自動棄権はしません", vote_help)
+        self.assertIn("1人30秒の投票発言", daily_flow)
         self.assertIn("1票もなければ処刑なし", vote_help)
         self.assertIn("候補者以外が一斉", vote_help)
-        self.assertNotIn("棄権もできません", vote_help)
+        self.assertNotIn("1人20秒", vote_help)
+        self.assertNotIn("時間切れは棄権", vote_help)
+
+
+class GMControlRefreshTest(unittest.IsolatedAsyncioTestCase):
+    """停止/再開後も同じGMパネルで逆操作を続けられること。"""
+
+    @staticmethod
+    def _button(view, custom_id: str):
+        return next(item for item in view.children if item.custom_id == custom_id)
+
+    async def test_pause_and_resume_replace_the_same_ephemeral_panel(self) -> None:
+        state = SimpleNamespace(
+            game_run_id="run-1",
+            gm_id=99,
+            phase=Phase.DAY_DISCUSSION,
+            phase_before_pause=None,
+            paused=False,
+            ending=False,
+            pending_winner=None,
+            initial_night_completed=False,
+            vote_slot_active=False,
+            vote_slot_token=0,
+            turn_slot_token=0,
+            current_speaker_id=None,
+            morning_ready_open=False,
+        )
+
+        async def pause_game() -> str:
+            state.paused = True
+            state.phase_before_pause = state.phase
+            state.phase = Phase.PAUSED
+            return "⏸️ 一時停止しました。"
+
+        async def resume_game() -> str:
+            state.paused = False
+            state.phase = state.phase_before_pause
+            state.phase_before_pause = None
+            return "▶️ 再開しました。"
+
+        cog = SimpleNamespace(
+            state=state,
+            pause_game=AsyncMock(side_effect=pause_game),
+            resume_game=AsyncMock(side_effect=resume_game),
+        )
+        original = GMControlView(cog)
+        pause_interaction = SimpleNamespace(
+            user=SimpleNamespace(id=99),
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            edit_original_response=AsyncMock(),
+        )
+
+        with patch.object(views, "build_gm_status_embed", return_value=object()):
+            await self._button(original, "gm_pause").callback(pause_interaction)
+
+            pause_interaction.response.defer.assert_awaited_once_with()
+            pause_interaction.edit_original_response.assert_awaited_once()
+            self.assertTrue(original.is_finished())
+            paused_view = pause_interaction.edit_original_response.await_args.kwargs["view"]
+            self.assertTrue(self._button(paused_view, "gm_pause").disabled)
+            self.assertFalse(self._button(paused_view, "gm_resume").disabled)
+
+            resume_interaction = SimpleNamespace(
+                user=SimpleNamespace(id=99),
+                response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+                edit_original_response=AsyncMock(),
+            )
+            await self._button(paused_view, "gm_resume").callback(resume_interaction)
+
+        resume_interaction.response.defer.assert_awaited_once_with()
+        resume_interaction.edit_original_response.assert_awaited_once()
+        self.assertTrue(paused_view.is_finished())
+        resumed_view = resume_interaction.edit_original_response.await_args.kwargs["view"]
+        self.assertFalse(self._button(resumed_view, "gm_pause").disabled)
+        self.assertTrue(self._button(resumed_view, "gm_resume").disabled)
 
 
 class InteractionTimerTest(unittest.TestCase):

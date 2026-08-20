@@ -407,11 +407,181 @@ class RoomRunner:
         target.vc_gm_speak_user_id = source.vc_gm_speak_user_id
         target.vc_gm_speak_before_game = source.vc_gm_speak_before_game
 
+    _PENDING_CHANNEL_UI_FIELDS = (
+        "morning_panel_message_id",
+        "prep_panel_message_id",
+        "speech_panel_message_id",
+        "turn_panel_message_id",
+        "vote_panel_message_id",
+        "village_panel_message_id",
+    )
+    _PENDING_CHANNEL_UI_DELETE_FIELDS = frozenset({
+        "morning_panel_message_id",
+        "prep_panel_message_id",
+        "village_panel_message_id",
+    })
+
+    def _ui_cleanup_channel(self):
+        """現行ゲームの#昼だけを返す。旧ゲームの掃除先とは混ぜない。"""
+        return self.state.village_channel
+
+    @staticmethod
+    def _copy_dm_cleanup_ids(mapping: object) -> dict[int, list[int]]:
+        """保留掃除用DM IDを、参照共有せず正整数だけ複製する。"""
+        if not isinstance(mapping, dict):
+            return {}
+        copied: dict[int, list[int]] = {}
+        for user_id, message_ids in mapping.items():
+            if (
+                isinstance(user_id, bool)
+                or not isinstance(user_id, int)
+                or user_id <= 0
+                or not isinstance(message_ids, list)
+            ):
+                continue
+            valid_ids = [
+                message_id
+                for message_id in message_ids
+                if isinstance(message_id, int)
+                and not isinstance(message_id, bool)
+                and message_id > 0
+            ]
+            if valid_ids:
+                copied[user_id] = list(dict.fromkeys(valid_ids))
+        return copied
+
+    @classmethod
+    def _append_pending_ui_cleanup_batch(
+        cls,
+        batches: list[dict],
+        batch: dict,
+    ) -> None:
+        """同じ試合・チャンネルの互換バッチを安全に統合して二重登録を防ぐ。"""
+        game_run_id = batch.get("game_run_id")
+        if not isinstance(game_run_id, str) or not game_run_id:
+            game_run_id = None
+        channel_id = batch.get("channel_id")
+        if (
+            isinstance(channel_id, bool)
+            or not isinstance(channel_id, int)
+            or channel_id <= 0
+        ):
+            channel_id = None
+        raw_channel_ids = batch.get("channel_message_ids", {})
+        channel_message_ids = {
+            field_name: message_id
+            for field_name, message_id in (
+                raw_channel_ids.items()
+                if isinstance(raw_channel_ids, dict)
+                else ()
+            )
+            if field_name in cls._PENDING_CHANNEL_UI_FIELDS
+            and isinstance(message_id, int)
+            and not isinstance(message_id, bool)
+            and message_id > 0
+        }
+        wolf_ids = cls._copy_dm_cleanup_ids(
+            batch.get("wolf_dm_message_ids", {})
+        )
+        surrender_ids = cls._copy_dm_cleanup_ids(
+            batch.get("surrender_dm_message_ids", {})
+        )
+        if not (channel_message_ids or wolf_ids or surrender_ids):
+            return
+
+        for existing in batches:
+            if (
+                existing.get("game_run_id") != game_run_id
+                or existing.get("channel_id") != channel_id
+            ):
+                continue
+            existing_channel_ids = existing["channel_message_ids"]
+            if any(
+                field_name in existing_channel_ids
+                and existing_channel_ids[field_name] != message_id
+                for field_name, message_id in channel_message_ids.items()
+            ):
+                # 同じ種類の別メッセージは両方掃除する必要があるため、
+                # 1値のmapへ潰さず別バッチのまま残す。
+                continue
+            existing_channel_ids.update(channel_message_ids)
+            for key, incoming in (
+                ("wolf_dm_message_ids", wolf_ids),
+                ("surrender_dm_message_ids", surrender_ids),
+            ):
+                target_mapping = existing[key]
+                for user_id, message_ids in incoming.items():
+                    target_mapping[user_id] = list(dict.fromkeys(
+                        target_mapping.get(user_id, []) + message_ids
+                    ))
+            return
+
+        batches.append({
+            "game_run_id": game_run_id,
+            "channel_id": channel_id,
+            "channel_message_ids": channel_message_ids,
+            "wolf_dm_message_ids": wolf_ids,
+            "surrender_dm_message_ids": surrender_ids,
+        })
+
+    def _carry_pending_ui_cleanup(
+        self,
+        source: GameState,
+        target: GameState,
+        *,
+        channel_id_override: Optional[int] = None,
+    ) -> None:
+        """旧ゲームの掃除失敗を、現在UIと独立したバッチで引き継ぐ。"""
+        target.pending_ui_cleanup_batches = []
+        for batch in getattr(source, "pending_ui_cleanup_batches", []):
+            if not isinstance(batch, dict):
+                continue
+            self._append_pending_ui_cleanup_batch(
+                target.pending_ui_cleanup_batches,
+                batch,
+            )
+
+        current_channel_ids = {
+            field_name: message_id
+            for field_name in self._PENDING_CHANNEL_UI_FIELDS
+            if isinstance((message_id := getattr(source, field_name, None)), int)
+            and not isinstance(message_id, bool)
+            and message_id > 0
+        }
+        current_wolf_ids = self._copy_dm_cleanup_ids(source.wolf_dm_message_ids)
+        current_surrender_ids = self._copy_dm_cleanup_ids(
+            source.surrender_dm_message_ids
+        )
+        if current_channel_ids or current_wolf_ids or current_surrender_ids:
+            channel_id = channel_id_override or getattr(
+                source.village_channel, "id", None
+            )
+            if (
+                isinstance(channel_id, bool)
+                or not isinstance(channel_id, int)
+                or channel_id <= 0
+            ):
+                channel_id = None
+            self._append_pending_ui_cleanup_batch(
+                target.pending_ui_cleanup_batches,
+                {
+                    "game_run_id": source.game_run_id or None,
+                    "channel_id": channel_id,
+                    "channel_message_ids": current_channel_ids,
+                    "wolf_dm_message_ids": current_wolf_ids,
+                    "surrender_dm_message_ids": current_surrender_ids,
+                },
+            )
+
+    def _has_pending_ui_cleanup(self) -> bool:
+        return bool(getattr(self.state, "pending_ui_cleanup_batches", []))
+
     def _make_empty_lobby_state(
         self,
         source: GameState,
         *,
         nickname_failures: Optional[dict[int, Optional[str]]] = None,
+        cleanup_channel_id: Optional[int] = None,
     ) -> GameState:
         """終了済みstateから、外部復元待ちだけを持つ空LOBBYを作る。"""
         target = GameState()
@@ -426,6 +596,11 @@ class RoomRunner:
         target.lobby_message = source.lobby_message
         target.original_nicknames = dict(nickname_failures or {})
         self._carry_pending_vc_restore(source, target)
+        self._carry_pending_ui_cleanup(
+            source,
+            target,
+            channel_id_override=cleanup_channel_id,
+        )
         target.managed_game_channel_ids = set(source.managed_game_channel_ids)
         return target
 
@@ -443,6 +618,7 @@ class RoomRunner:
         source: GameState,
         *,
         nickname_failures: Optional[dict[int, Optional[str]]] = None,
+        cleanup_channel_id: Optional[int] = None,
         log_label: str,
     ) -> bool:
         """募集終了と空LOBBY保存を原子的に確定してからstateを差し替える。"""
@@ -452,6 +628,7 @@ class RoomRunner:
         target = self._make_empty_lobby_state(
             source,
             nickname_failures=nickname_failures,
+            cleanup_channel_id=cleanup_channel_id,
         )
         payload = self._build_snapshot_for_state(target)
         recruitment_id = source.recruitment_id
@@ -483,6 +660,10 @@ class RoomRunner:
                 )
         if not transitioned:
             return False
+
+        # 空LOBBY snapshotへ引き継いだ後始末IDですぐ再試行する。
+        # 一時失敗が続いてもIDはLOBBYに残り、再起動時にまた試せる。
+        await self._retry_pending_ui_cleanup()
 
         panel_ready = False
         for attempt, delay in enumerate((0, 1, 2), start=1):
@@ -694,6 +875,277 @@ class RoomRunner:
             self._game_views.append(view)
         if night and view not in self._night_views:
             self._night_views.append(view)
+
+    @staticmethod
+    def _remember_dm_view_message(
+        message_ids_by_user: dict[int, list[int]], user_id: int, message,
+    ) -> bool:
+        """DM Viewを後で表示上も閉じられるよう、メッセージIDを控える。"""
+        message_id = getattr(message, "id", None)
+        if (
+            isinstance(message_id, bool)
+            or not isinstance(message_id, int)
+            or message_id <= 0
+        ):
+            return False
+        ids = message_ids_by_user.setdefault(user_id, [])
+        if message_id in ids:
+            return False
+        ids.append(message_id)
+        return True
+
+    async def _disable_persisted_dm_views(
+        self, message_ids_by_user: dict[int, list[int]], *, label: str,
+    ) -> None:
+        """再起動をまたいだDMコンポーネントを、可能な範囲で取り外す。
+
+        DiscordはDMメッセージのViewだけを直接無効化できないため、対象メッセージを
+        ``view=None`` で編集してボタン自体を消す。DM作成/取得・編集のどこかが
+        失敗してもゲーム進行は止めず、次の終了・復元で再試行できるようIDは残す。
+        """
+        state = self.state
+
+        async def disable_one(user_id: int, message_id: int) -> tuple[int, int, bool]:
+            player = state.get_player(user_id)
+            guild = state.guild
+            member = getattr(player, "member", None)
+            if member is None and guild is not None:
+                get_member = getattr(guild, "get_member", None)
+                if callable(get_member):
+                    member = get_member(user_id)
+            if member is None:
+                bot = getattr(self.manager, "bot", None)
+                get_user = getattr(bot, "get_user", None)
+                if callable(get_user):
+                    member = get_user(user_id)
+                if member is None:
+                    fetch_user = getattr(bot, "fetch_user", None)
+                    if callable(fetch_user):
+                        try:
+                            member = await self._discord_api_call(fetch_user, user_id)
+                        except discord.NotFound:
+                            # ユーザー自体が存在しなければ、そのDM操作口も残らない。
+                            return user_id, message_id, True
+                        except (discord.Forbidden, discord.HTTPException) as error:
+                            log.warning(
+                                "%s DMユーザーの取得に失敗 (ID:%s): %s",
+                                label, user_id, error,
+                            )
+                            return user_id, message_id, False
+            if member is None:
+                return user_id, message_id, False
+            display_name = (
+                getattr(player, "display_name", None)
+                or getattr(member, "display_name", None)
+                or f"ID:{user_id}"
+            )
+            channel = getattr(member, "dm_channel", None)
+            if channel is None:
+                create_dm = getattr(member, "create_dm", None)
+                if not callable(create_dm):
+                    return user_id, message_id, False
+                try:
+                    channel = await self._discord_api_call(create_dm)
+                except (discord.Forbidden, discord.HTTPException) as error:
+                    log.warning(
+                        "%s DMチャンネルの取得に失敗 (%s): %s",
+                        label, display_name, error,
+                    )
+                    return user_id, message_id, False
+            get_partial = getattr(channel, "get_partial_message", None)
+            if not callable(get_partial):
+                return user_id, message_id, False
+            try:
+                await self._discord_api_call(get_partial(message_id).edit, view=None)
+            except discord.NotFound:
+                return user_id, message_id, True
+            except (discord.Forbidden, discord.HTTPException) as error:
+                log.warning(
+                    "%s DM操作の無効化に失敗 (%s): %s",
+                    label, display_name, error,
+                )
+                return user_id, message_id, False
+            return user_id, message_id, True
+
+        targets = [
+            (user_id, message_id)
+            for user_id, message_ids in message_ids_by_user.items()
+            for message_id in message_ids
+        ]
+        if not targets:
+            return
+        results = await asyncio.gather(
+            *(disable_one(user_id, message_id) for user_id, message_id in targets)
+        )
+        completed = {
+            (user_id, message_id)
+            for user_id, message_id, success in results if success
+        }
+        if not completed:
+            return
+        for user_id, message_ids in list(message_ids_by_user.items()):
+            remaining = [
+                message_id for message_id in message_ids
+                if (user_id, message_id) not in completed
+            ]
+            if remaining:
+                message_ids_by_user[user_id] = remaining
+            else:
+                message_ids_by_user.pop(user_id, None)
+
+    async def _disable_live_wolf_vote_dms(self) -> None:
+        """このプロセスで配った襲撃DMから、夜終了前にViewを取り外す。"""
+        state = self.state
+        messages = list(state.wolf_dm_messages.items())
+        if not messages:
+            return
+
+        async def disable_one(user_id: int, message) -> tuple[int, Optional[int], bool]:
+            message_id = getattr(message, "id", None)
+            try:
+                await self._discord_api_call(message.edit, view=None)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+                log.warning("人狼襲撃DM操作の無効化に失敗 (ID:%s): %s", user_id, error)
+                return user_id, message_id, False
+            return user_id, message_id, True
+
+        results = await asyncio.gather(
+            *(disable_one(user_id, message) for user_id, message in messages)
+        )
+        for user_id, message_id, success in results:
+            if not success or not isinstance(message_id, int):
+                continue
+            ids = state.wolf_dm_message_ids.get(user_id, [])
+            state.wolf_dm_message_ids[user_id] = [
+                recorded_id for recorded_id in ids if recorded_id != message_id
+            ]
+            if not state.wolf_dm_message_ids[user_id]:
+                state.wolf_dm_message_ids.pop(user_id, None)
+        state.wolf_dm_messages.clear()
+
+    async def _close_game_views_for_shutdown(self) -> None:
+        """通常終了・強制終了・GAME_OVER復旧で、古い操作口を表示から外す。"""
+        state = self.state
+        await self._disable_live_wolf_vote_dms()
+        await self._disable_persisted_dm_views(
+            state.wolf_dm_message_ids, label="人狼襲撃",
+        )
+        await self._disable_persisted_dm_views(
+            state.surrender_dm_message_ids, label="サレンダー",
+        )
+        await self._close_morning_panel()
+        await self._close_prep_panel()
+        await self._disable_recovered_speech_panel()
+        await self._disable_recovered_turn_panel(clear_on_success=True)
+        await self._disable_recovered_vote_panel()
+        await self.close_village_panel()
+        self._stop_all_game_views()
+
+    async def _retry_pending_ui_cleanup(self) -> None:
+        """旧ゲームごとのDM/パネルを再掃除し、失敗分だけ保存する。"""
+        state = self.state
+        if not self._has_pending_ui_cleanup():
+            return
+
+        remaining_batches: list[dict] = []
+        guild = state.guild
+        for raw_batch in list(getattr(state, "pending_ui_cleanup_batches", [])):
+            if not isinstance(raw_batch, dict):
+                continue
+            game_run_id = raw_batch.get("game_run_id")
+            if not isinstance(game_run_id, str) or not game_run_id:
+                game_run_id = None
+            channel_id = raw_batch.get("channel_id")
+            channel_message_ids = {
+                field_name: message_id
+                for field_name, message_id in (
+                    raw_batch.get("channel_message_ids", {}).items()
+                    if isinstance(raw_batch.get("channel_message_ids"), dict)
+                    else ()
+                )
+                if field_name in self._PENDING_CHANNEL_UI_FIELDS
+                and isinstance(message_id, int)
+                and not isinstance(message_id, bool)
+                and message_id > 0
+            }
+            wolf_ids = self._copy_dm_cleanup_ids(
+                raw_batch.get("wolf_dm_message_ids", {})
+            )
+            surrender_ids = self._copy_dm_cleanup_ids(
+                raw_batch.get("surrender_dm_message_ids", {})
+            )
+
+            channel = None
+            channel_lookup_available = False
+            valid_channel_id = (
+                isinstance(channel_id, int)
+                and not isinstance(channel_id, bool)
+                and channel_id > 0
+            )
+            if guild is not None:
+                get_channel = getattr(guild, "get_channel", None)
+                if callable(get_channel):
+                    channel_lookup_available = True
+                    if valid_channel_id:
+                        channel = get_channel(channel_id)
+            if (
+                channel_message_ids
+                and valid_channel_id
+                and channel_lookup_available
+                and channel is None
+            ):
+                # 保存した#昼が既に削除済みなら、中のボタンも存在しない。
+                channel_message_ids.clear()
+            elif channel_message_ids and channel is not None:
+                get_partial_message = getattr(channel, "get_partial_message", None)
+                if callable(get_partial_message):
+                    for field_name, message_id in list(channel_message_ids.items()):
+                        message = get_partial_message(message_id)
+                        try:
+                            if field_name in self._PENDING_CHANNEL_UI_DELETE_FIELDS:
+                                await self._discord_api_call(message.delete)
+                            else:
+                                await self._discord_api_call(message.edit, view=None)
+                        except discord.NotFound:
+                            channel_message_ids.pop(field_name, None)
+                        except (discord.Forbidden, discord.HTTPException) as error:
+                            log.warning(
+                                "旧ゲームUIの後始末に失敗 (%s, %s, %s): %s",
+                                state.room_name,
+                                channel_id,
+                                field_name,
+                                error,
+                            )
+                        else:
+                            channel_message_ids.pop(field_name, None)
+
+            await self._disable_persisted_dm_views(
+                wolf_ids, label="旧ゲーム人狼襲撃",
+            )
+            await self._disable_persisted_dm_views(
+                surrender_ids, label="旧ゲームサレンダー",
+            )
+            if channel_message_ids or wolf_ids or surrender_ids:
+                self._append_pending_ui_cleanup_batch(remaining_batches, {
+                    "game_run_id": game_run_id,
+                    "channel_id": (
+                        channel_id
+                        if isinstance(channel_id, int)
+                        and not isinstance(channel_id, bool)
+                        and channel_id > 0
+                        else None
+                    ),
+                    "channel_message_ids": channel_message_ids,
+                    "wolf_dm_message_ids": wolf_ids,
+                    "surrender_dm_message_ids": surrender_ids,
+                })
+
+        state.pending_ui_cleanup_batches = remaining_batches
+        try:
+            await self._persist_room_state()
+        except Exception as error:
+            # 掃除は完了していても、保存失敗時は次回も再実行するだけで安全。
+            log.warning("UI後始末の再試行結果を保存できません (%s): %s", state.room_name, error)
 
     def _stop_night_views(self) -> None:
         # 夜UIを畳むときは中継窓も必ず閉じる (異常終了で開いたまま残さない)
@@ -1623,6 +2075,14 @@ class RoomRunner:
                 {"user_id": user_id, "target_id": target_id}
                 for user_id, target_id in state.wolf_voters.items()
             ],
+            "wolf_dm_message_ids": [
+                {"user_id": user_id, "message_ids": list(message_ids)}
+                for user_id, message_ids in state.wolf_dm_message_ids.items()
+            ],
+            "surrender_dm_message_ids": [
+                {"user_id": user_id, "message_ids": list(message_ids)}
+                for user_id, message_ids in state.surrender_dm_message_ids.items()
+            ],
             "seer_target": state.seer_target,
             "guard_target": state.guard_target,
             "action_log": state.action_log,
@@ -1637,6 +2097,13 @@ class RoomRunner:
             "morning_panel_message_id": state.morning_panel_message_id,
             "prep_ready_ids": list(state.prep_ready_ids),
             "prep_confirmed": state.prep_confirmed,
+            "prep_panel_message_id": state.prep_panel_message_id,
+            "speech_panel_message_id": state.speech_panel_message_id,
+            "pending_ui_cleanup_batches": (
+                self._serialize_pending_ui_cleanup_batches(
+                    getattr(state, "pending_ui_cleanup_batches", [])
+                )
+            ),
             "disconnected_players": list(state.disconnected_players),
             "bot_muted_ids": list(state.bot_muted_ids),
             "bot_mute_intent_ids": list(state.bot_mute_intent_ids),
@@ -1858,7 +2325,7 @@ class RoomRunner:
             raise StateDurabilityError("進行中の通常投票の日世代が一致しません")
         if slot_index > len(raw_order):
             raise StateDurabilityError("投票順snapshotのcursorが順序の範囲外です")
-        # 発言順は「投票」を押した人だけの部分列なので、生存者が全員
+        # 発言順は「投票参加」を押した人だけの部分列なので、生存者が全員
         # 入っている必要はない。まだ押していない人は復元後に押して並ぶ。
         for key in (
             "vote_closed", "vote_slot_active", "vote_speech_finished",
@@ -1980,6 +2447,154 @@ class RoomRunner:
             raise StateDurabilityError("morning_ready_idsに重複があります")
         if raw_ready_ids and not payload.get("morning_ready_open", False):
             raise StateDurabilityError("朝待機開始前の宣言が保存されています")
+
+    @staticmethod
+    def _restore_dm_view_message_ids(payload: dict, key: str) -> dict[int, list[int]]:
+        """UI掃除用DMメッセージIDを、旧snapshot互換で読み戻す。
+
+        この情報はゲーム進行に影響しないベストエフォートの後始末用なので、
+        新フィールドを持たない旧snapshotや壊れた行を理由に復元全体を止めない。
+        """
+        restored: dict[int, list[int]] = {}
+        rows = payload.get(key, [])
+        if not isinstance(rows, list):
+            return restored
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            user_id = row.get("user_id")
+            message_ids = row.get("message_ids")
+            if (
+                isinstance(user_id, bool)
+                or not isinstance(user_id, int)
+                or user_id <= 0
+                or not isinstance(message_ids, list)
+            ):
+                continue
+            valid_ids = [
+                message_id
+                for message_id in message_ids
+                if isinstance(message_id, int)
+                and not isinstance(message_id, bool)
+                and message_id > 0
+            ]
+            if valid_ids:
+                restored[user_id] = list(dict.fromkeys(valid_ids))
+        return restored
+
+    @staticmethod
+    def _restore_optional_message_id(payload: dict, key: str) -> Optional[int]:
+        """旧snapshotの欠損をNoneとして扱う、UI用IDの安全な読込。"""
+        value = payload.get(key)
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+        return None
+
+    @classmethod
+    def _serialize_pending_ui_cleanup_batches(
+        cls,
+        batches: object,
+    ) -> list[dict]:
+        """旧ゲームUIの掃除待ちをJSON安全な形へ変換する。"""
+        if not isinstance(batches, list):
+            return []
+
+        def serialize_dm(mapping: object) -> list[dict]:
+            normalized = cls._copy_dm_cleanup_ids(mapping)
+            return [
+                {"user_id": user_id, "message_ids": list(message_ids)}
+                for user_id, message_ids in sorted(normalized.items())
+            ]
+
+        serialized: list[dict] = []
+        for batch in batches:
+            if not isinstance(batch, dict):
+                continue
+            channel_id = batch.get("channel_id")
+            if (
+                isinstance(channel_id, bool)
+                or not isinstance(channel_id, int)
+                or channel_id <= 0
+            ):
+                channel_id = None
+            raw_channel_ids = batch.get("channel_message_ids", {})
+            channel_rows = []
+            if isinstance(raw_channel_ids, dict):
+                for field_name in cls._PENDING_CHANNEL_UI_FIELDS:
+                    message_id = raw_channel_ids.get(field_name)
+                    if (
+                        isinstance(message_id, int)
+                        and not isinstance(message_id, bool)
+                        and message_id > 0
+                    ):
+                        channel_rows.append({
+                            "kind": field_name,
+                            "message_id": message_id,
+                        })
+            wolf_rows = serialize_dm(batch.get("wolf_dm_message_ids", {}))
+            surrender_rows = serialize_dm(
+                batch.get("surrender_dm_message_ids", {})
+            )
+            if channel_rows or wolf_rows or surrender_rows:
+                game_run_id = batch.get("game_run_id")
+                if not isinstance(game_run_id, str) or not game_run_id:
+                    game_run_id = None
+                serialized.append({
+                    "game_run_id": game_run_id,
+                    "channel_id": channel_id,
+                    "channel_message_ids": channel_rows,
+                    "wolf_dm_message_ids": wolf_rows,
+                    "surrender_dm_message_ids": surrender_rows,
+                })
+        return serialized
+
+    @classmethod
+    def _restore_pending_ui_cleanup_batches(cls, payload: dict) -> list[dict]:
+        """掃除待ちをベストエフォートで復元し、不正な行だけ捨てる。"""
+        rows = payload.get("pending_ui_cleanup_batches", [])
+        if not isinstance(rows, list):
+            return []
+        restored: list[dict] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            channel_id = row.get("channel_id")
+            if (
+                isinstance(channel_id, bool)
+                or not isinstance(channel_id, int)
+                or channel_id <= 0
+            ):
+                channel_id = None
+            channel_message_ids: dict[str, int] = {}
+            raw_channel_rows = row.get("channel_message_ids", [])
+            if isinstance(raw_channel_rows, list):
+                for channel_row in raw_channel_rows:
+                    if not isinstance(channel_row, dict):
+                        continue
+                    field_name = channel_row.get("kind")
+                    message_id = channel_row.get("message_id")
+                    if (
+                        field_name in cls._PENDING_CHANNEL_UI_FIELDS
+                        and isinstance(message_id, int)
+                        and not isinstance(message_id, bool)
+                        and message_id > 0
+                    ):
+                        channel_message_ids[field_name] = message_id
+            wolf_ids = cls._restore_dm_view_message_ids(
+                {"rows": row.get("wolf_dm_message_ids", [])}, "rows"
+            )
+            surrender_ids = cls._restore_dm_view_message_ids(
+                {"rows": row.get("surrender_dm_message_ids", [])}, "rows"
+            )
+            if channel_message_ids or wolf_ids or surrender_ids:
+                cls._append_pending_ui_cleanup_batch(restored, {
+                    "game_run_id": row.get("game_run_id"),
+                    "channel_id": channel_id,
+                    "channel_message_ids": channel_message_ids,
+                    "wolf_dm_message_ids": wolf_ids,
+                    "surrender_dm_message_ids": surrender_ids,
+                })
+        return restored
 
     async def _persist_room_state(self) -> None:
         async with self.state_persist_lock:
@@ -2145,8 +2760,16 @@ class RoomRunner:
             state.players[player.user_id] = player
 
         channel_ids = payload.get("channel_ids", {})
+        saved_village_channel_id = (
+            channel_ids.get("village")
+            if isinstance(channel_ids, dict)
+            and isinstance(channel_ids.get("village"), int)
+            and not isinstance(channel_ids.get("village"), bool)
+            and channel_ids.get("village") > 0
+            else None
+        )
         if state.guild:
-            village_id = channel_ids.get("village")
+            village_id = saved_village_channel_id
             if village_id:
                 village = state.guild.get_channel(village_id)
                 if isinstance(village, discord.TextChannel):
@@ -2163,6 +2786,35 @@ class RoomRunner:
             saved_phase_name = recovery_phase_name
         saved_phase = Phase[saved_phase_name]
         self._validate_night_surrender_snapshot(payload)
+        # GAME_OVERはこの直後に空LOBBYへ回収するため、通常の
+        # 進行状態復元より先にUI掃除用IDだけを読み戻す。
+        state.wolf_dm_message_ids = self._restore_dm_view_message_ids(
+            payload, "wolf_dm_message_ids"
+        )
+        state.surrender_dm_message_ids = self._restore_dm_view_message_ids(
+            payload, "surrender_dm_message_ids"
+        )
+        state.morning_panel_message_id = self._restore_optional_message_id(
+            payload, "morning_panel_message_id"
+        )
+        state.prep_panel_message_id = self._restore_optional_message_id(
+            payload, "prep_panel_message_id"
+        )
+        state.speech_panel_message_id = self._restore_optional_message_id(
+            payload, "speech_panel_message_id"
+        )
+        state.turn_panel_message_id = self._restore_optional_message_id(
+            payload, "turn_panel_message_id"
+        )
+        state.vote_panel_message_id = self._restore_optional_message_id(
+            payload, "vote_panel_message_id"
+        )
+        state.village_panel_message_id = self._restore_optional_message_id(
+            payload, "village_panel_message_id"
+        )
+        state.pending_ui_cleanup_batches = (
+            self._restore_pending_ui_cleanup_batches(payload)
+        )
         if saved_phase == Phase.GAME_OVER:
             # 終了checkpoint後〜空LOBBYの原子保存前に停止した窓を回収する。
             # 旧実装のように参加者・GM・募集IDを残したままLOBBY扱いにすると、
@@ -2173,11 +2825,13 @@ class RoomRunner:
             if had_entries:
                 self.last_game_roster = list(state.players)
                 self.last_game_gm = state.gm_id
+            await self._close_game_views_for_shutdown()
             nickname_failures = await self._restore_nicknames(state)
             await self._teardown_game_roles_and_perms()
             if not await self._transition_to_empty_lobby(
                 state,
                 nickname_failures=nickname_failures,
+                cleanup_channel_id=saved_village_channel_id,
                 log_label="再起動時の終了処理回収",
             ):
                 log.error(
@@ -2189,6 +2843,7 @@ class RoomRunner:
             state.phase = Phase.LOBBY
             state.recovery_phase = None
             state.recovered_from_restart = False
+            await self._retry_pending_ui_cleanup()
             # ロビー復帰時は前ゲームの一時ロールを掃除
             await self._delete_alive_role()
             await self._post_lobby_ui()
@@ -2392,6 +3047,12 @@ class RoomRunner:
             for row in payload.get("wolf_voters", [])
             if row.get("user_id") is not None and row.get("target_id") is not None
         }
+        state.wolf_dm_message_ids = self._restore_dm_view_message_ids(
+            payload, "wolf_dm_message_ids"
+        )
+        state.surrender_dm_message_ids = self._restore_dm_view_message_ids(
+            payload, "surrender_dm_message_ids"
+        )
         state.seer_target = payload.get("seer_target")
         state.guard_target = payload.get("guard_target")
         state.action_log = list(payload.get("action_log", []))
@@ -2408,9 +3069,17 @@ class RoomRunner:
         state.morning_ready_ids = set(payload.get("morning_ready_ids", []))
         state.morning_warned_ids = set(payload.get("morning_warned_ids", []))
         state.morning_confirmed = bool(payload.get("morning_confirmed", False))
-        state.morning_panel_message_id = payload.get("morning_panel_message_id")
+        state.morning_panel_message_id = self._restore_optional_message_id(
+            payload, "morning_panel_message_id"
+        )
         state.prep_ready_ids = set(payload.get("prep_ready_ids", []))
         state.prep_confirmed = bool(payload.get("prep_confirmed", False))
+        state.prep_panel_message_id = self._restore_optional_message_id(
+            payload, "prep_panel_message_id"
+        )
+        state.speech_panel_message_id = self._restore_optional_message_id(
+            payload, "speech_panel_message_id"
+        )
         state.disconnected_players = set(payload.get("disconnected_players", []))
         state.bot_muted_ids = set(payload.get("bot_muted_ids", []))
         state.bot_mute_intent_ids = set(payload.get("bot_mute_intent_ids", []))
@@ -2512,6 +3181,10 @@ class RoomRunner:
         await self._enable_mute_markers()
         await self._reconcile_mute_marker_ownership()
         await self._reconcile_mute_intents()
+        if self._has_pending_ui_cleanup():
+            # 進行中ゲームの復元でも、さらに次の終了まで古い操作口を
+            # 放置せず、現在UIとは独立したバッチだけをすぐ再掃除する。
+            await self._retry_pending_ui_cleanup()
         if state.morning_confirmed:
             state.morning_ready_event.set()
         if state.prep_confirmed:
@@ -2540,6 +3213,13 @@ class RoomRunner:
 
         await self._disable_recovered_turn_panel()
         await self._disable_recovered_village_panel()
+        # これらは永続View化していないため、再起動後に古いボタンだけが
+        # 見えても正常には受け付けられない。GMの再開を待つ間に表示から外す。
+        await self._delete_stale_prep_panel()
+        await self._disable_recovered_speech_panel()
+        await self._disable_persisted_dm_views(
+            state.wolf_dm_message_ids, label="人狼襲撃",
+        )
 
         await self._reconcile_pending_death_effects()
 
@@ -2945,6 +3625,8 @@ class RoomRunner:
             except (discord.NotFound, discord.HTTPException):
                 pass
             return
+        if self._has_pending_ui_cleanup():
+            await self._retry_pending_ui_cleanup()
         participant_ids = set(state.players)
         if state.gm_id is not None:
             participant_ids.add(state.gm_id)
@@ -3058,6 +3740,36 @@ class RoomRunner:
             except (discord.NotFound, discord.HTTPException):
                 pass
             return
+
+        # 音声人狼は全参加者が同じVCにいることを開始条件にする。
+        # 開始後に初めて不在が分かると、その人だけ役職確認・発言・投票を
+        # 音声なしで進められてしまうため、役職配布より前にまとめて止める。
+        game_vc = state.voice_channel
+        game_vc_id = getattr(game_vc, "id", None)
+        missing_vc_players: list[str] = []
+        for player in state.players.values():
+            member = (
+                guild.get_member(player.user_id)
+                if guild is not None
+                else None
+            ) or player.member
+            voice = getattr(member, "voice", None)
+            joined_channel_id = getattr(
+                getattr(voice, "channel", None), "id", None,
+            )
+            if game_vc_id is None or joined_channel_id != game_vc_id:
+                missing_vc_players.append(player.display_name)
+        if missing_vc_players:
+            try:
+                await interaction.followup.send(
+                    "ゲームVCに接続していない参加者がいるため、開始しませんでした: "
+                    + ", ".join(missing_vc_players)
+                    + "\n全員がゲームVCへ入ってから、もう一度開始してください。",
+                    ephemeral=True,
+                )
+            except (discord.NotFound, discord.HTTPException):
+                pass
+            return
         state.guild = guild
         state.game_run_id = secrets.token_hex(16)
         state.started_at = datetime.now(timezone.utc)
@@ -3088,6 +3800,9 @@ class RoomRunner:
         state.surrender_announced = False
         self._surrender_control_sent_ids.clear()
         self._surrender_finish_task = None
+        state.wolf_dm_messages.clear()
+        state.wolf_dm_message_ids.clear()
+        state.surrender_dm_message_ids.clear()
         state.morning_ready_open = False
         state.morning_ready_ids.clear()
         state.morning_warned_ids.clear()
@@ -3096,6 +3811,9 @@ class RoomRunner:
         state.prep_ready_ids.clear()
         state.prep_confirmed = False
         state.prep_ready_event.clear()
+        state.prep_panel_message = None
+        state.prep_panel_message_id = None
+        state.speech_panel_message_id = None
         state.phase = Phase.PREPARATION
         state.recovery_phase = None
         state.recovered_from_restart = False
@@ -3184,8 +3902,9 @@ class RoomRunner:
         vc_member_ids = {m.id for m in vc.members} if vc else set()
 
         def should_initial_mute(member: discord.Member) -> bool:
-            # GMはミュート自動制御の対象外 (参加者を兼ねていても)
-            if member.id == state.gm_id:
+            # 参加者を兼ねない専任GMだけは進行役として自動制御から外す。
+            # 参加者兼GMは役職・夜情報を持つため、他の参加者と同じ扱い。
+            if self._is_dedicated_gm(member.id):
                 return False
             if member.id not in vc_member_ids:
                 return False
@@ -3237,7 +3956,7 @@ class RoomRunner:
         # 現在Botが新たにmuteする意図の相手を先に所有記録する。
         # 既にmuteの相手は手動muteとして所有しない。
         for member in vc_members:
-            if member.bot or member.id == state.gm_id:
+            if member.bot or self._is_dedicated_gm(member.id):
                 continue
             vs = getattr(member, "voice", None)
             if vs is not None and not vs.mute:
@@ -3594,13 +4313,16 @@ class RoomRunner:
                     if player.role == Role.WEREWOLF
                     else None
                 )
-                await self._discord_api_call(
+                sent_message = await self._discord_api_call(
                     player.member.send,
                     msg,
                     **({"view": surrender_view} if surrender_view is not None else {}),
                 )
                 if surrender_view is not None:
                     self._surrender_control_sent_ids.add(player.user_id)
+                    self._remember_dm_view_message(
+                        state.surrender_dm_message_ids, player.user_id, sent_message,
+                    )
                 state.preparation_dm_sent_ids.add(player.user_id)
             except (discord.Forbidden, discord.HTTPException) as e:
                 log.warning(f"DM送信失敗: {player.member.display_name} ({e})")
@@ -3657,19 +4379,30 @@ class RoomRunner:
 
     async def _send_surrender_controls(self) -> None:
         """復元後も使える、試合中常設のサレンダー操作を実人狼へ補完する。"""
-        if self.state.surrender_confirmed:
+        state = self.state
+        if state.surrender_confirmed:
             return
-        for wolf in self.state.alive_wolves():
+        # 再起動前のViewはコールバックを復元できない。新しいrun照合付きViewを
+        # 送る前に、残っている操作を見た目から外す。
+        if not self._surrender_control_sent_ids:
+            await self._disable_persisted_dm_views(
+                state.surrender_dm_message_ids, label="サレンダー",
+            )
+        remembered = False
+        for wolf in state.alive_wolves():
             if wolf.user_id in self._surrender_control_sent_ids:
                 continue
             view = WolfSurrenderView(self)
             try:
-                await self._discord_api_call(
+                sent_message = await self._discord_api_call(
                     wolf.member.send,
                     "🏳️ **サレンダー** — 生存中の人狼全員が同意すると村陣営の勝利で終了します。",
                     view=view,
                 )
                 self._surrender_control_sent_ids.add(wolf.user_id)
+                remembered = self._remember_dm_view_message(
+                    state.surrender_dm_message_ids, wolf.user_id, sent_message,
+                ) or remembered
             except (discord.Forbidden, discord.HTTPException) as error:
                 view.stop()
                 log.warning(
@@ -3677,6 +4410,13 @@ class RoomRunner:
                     wolf.display_name,
                     error,
                 )
+        if remembered:
+            try:
+                await self._persist_room_state()
+            except Exception as error:
+                # 操作自体はrun_idで保護済み。UI掃除用のID保存失敗だけで
+                # 進行を止めず、次の送信/終了で改めて回収する。
+                log.warning("サレンダーDM操作IDの保存に失敗 (%s): %s", state.room_name, error)
 
     # ============================================================
     # 人狼DM中継
@@ -3869,13 +4609,28 @@ class RoomRunner:
             return
 
         state = self.state
-        # 夜の制限時間内のみ中継
-        if not self.wolf_relay_open():
-            return
-
         # 送信者が生存中の人狼か確認
         sender = state.get_player(message.author.id)
         if not sender or not sender.is_wolf or not sender.alive:
+            return
+
+        # 役職DMは役職確認パネルより先に届く。パネル掲示前にすぐ挨拶を
+        # 送ると中継窓がまだ開いておらず、従来は黙って消えていた。
+        # 中継済みと誤解させないよう、この狭い開始前だけ再送を案内する。
+        if not self.wolf_relay_open():
+            if (
+                self._effective_phase() == Phase.PREPARATION
+                and not state.initial_night_completed
+            ):
+                try:
+                    await self._discord_api_call(
+                        sender.member.send,
+                        "⏳ このメッセージは人狼へ中継されませんでした。"
+                        "#昼の役職確認パネルが表示された後、"
+                        "初日内通の受付中にもう一度送ってください。",
+                    )
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
             return
 
         # 他の人狼に中継。Discordの2000字上限は「送信するメッセージ全体」に
@@ -4081,7 +4836,7 @@ class RoomRunner:
             and not state.vote_closed
         ):
             # 通常は締切時間を設けない。GMが明示的に締めた場合だけ、
-            # まだ「投票」を押していない生存者を棄権として閉じる。
+            # まだ「投票参加」を押していない生存者を棄権として閉じる。
             not_pressed = self._vote_queue_waiting()
             state.vote_closed = True
             if not await self._record_vote_abstentions(not_pressed, "本投票", 0):
@@ -4301,11 +5056,11 @@ class RoomRunner:
         def discussion_content(remaining: float) -> str:
             return (
                 f"☀️ **{state.day_number}日目 - 議論タイム** (生存者: {len(state.alive_players())}人)\n"
-                "議論終了後、「投票」を押した順に1人ずつ投票発言を行います。\n"
+                "議論終了後、「投票参加」を押した順に1人ずつ投票発言を行います。\n"
                 + self._timer_line(remaining)
             )
 
-        # 投票は議論終了後の20秒発言枠でのみ受け付ける。議論中の仮投票を
+        # 投票は議論終了後の30秒発言枠でのみ受け付ける。議論中の仮投票を
         # 残すと、順番が来る前に票だけ確定して発言枠が空になるため作らない。
         timer_msg = await self._safe_village_send(discussion_content(duration))
         await self.post_village_panel()
@@ -4404,7 +5159,7 @@ class RoomRunner:
     def _turn_panel_reference(self) -> Optional[discord.Message]:
         """保存済みIDから再編集可能な話者パネル参照を作る。"""
         state = self.state
-        channel = state.village_channel
+        channel = self._ui_cleanup_channel()
         get_partial_message = getattr(channel, "get_partial_message", None)
         if state.turn_panel_message_id is None or not callable(get_partial_message):
             return None
@@ -4414,13 +5169,15 @@ class RoomRunner:
     # _refresh_turn_co_declaration_panel) は撤去した。CO一覧は #昼 常設パネル
     # (build_village_panel_content) が表示する。
 
-    async def _disable_recovered_turn_panel(self) -> None:
+    async def _disable_recovered_turn_panel(
+        self, *, clear_on_success: bool = False,
+    ) -> bool:
         """再起動前のViewを表示上も外し、再開時に同じ1枚を再利用する。"""
-        if not self.is_turn_discussion_mode():
-            return
+        if not self.is_turn_discussion_mode() and not clear_on_success:
+            return True
         panel = self._turn_panel_reference()
         if panel is None:
-            return
+            return self.state.turn_panel_message_id is None
         try:
             await self._discord_api_call(panel.edit, view=None)
         except discord.NotFound:
@@ -4429,6 +5186,11 @@ class RoomRunner:
             log.warning(
                 f"復元ターン話者パネルの無効化失敗 ({self.state.room_name}): {error}"
             )
+            return False
+        else:
+            if clear_on_success:
+                self.state.turn_panel_message_id = None
+        return True
 
     # ------------------------------------------------------------------
     # #昼 常設村パネル (VillagePanelView)
@@ -4834,7 +5596,7 @@ class RoomRunner:
         except (discord.Forbidden, discord.HTTPException) as error:
             log.warning(f"村パネル更新失敗 ({self.state.room_name}): {error}")
 
-    async def close_village_panel(self) -> None:
+    async def close_village_panel(self) -> bool:
         """試合終了時に村パネルを削除する (再起動残骸と同じ削除経路)。"""
         state = self.state
         if self._village_panel_view is not None:
@@ -4846,17 +5608,24 @@ class RoomRunner:
                 self._game_views.remove(self._village_panel_view)
             self._village_panel_view = None
         message_id = state.village_panel_message_id
-        state.village_panel_message_id = None
-        ch = state.village_channel
-        if message_id is None or ch is None:
-            return
+        ch = self._ui_cleanup_channel()
+        if message_id is None:
+            return True
+        if ch is None:
+            return False
         get_partial = getattr(ch, "get_partial_message", None)
         if not callable(get_partial):
-            return
+            return False
         try:
             await self._discord_api_call(get_partial(message_id).delete)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+        except discord.NotFound:
+            state.village_panel_message_id = None
+        except (discord.Forbidden, discord.HTTPException) as e:
             log.warning(f"村パネル削除失敗 ({state.room_name}): {e}")
+            return False
+        else:
+            state.village_panel_message_id = None
+        return True
 
     async def _disable_recovered_village_panel(self) -> None:
         """再起動前のViewを表示上も外す (ターン話者パネルと同じ方式)。
@@ -5733,7 +6502,7 @@ class RoomRunner:
         return True
 
     def _vote_queue_waiting(self) -> list[Player]:
-        """まだ「投票」を押していない生存者 (押すのを待っている人)。"""
+        """まだ「投票参加」を押していない生存者 (押すのを待っている人)。"""
         queued = set(self.state.vote_order)
         return [
             player for player in self.state.alive_players()
@@ -5741,7 +6510,7 @@ class RoomRunner:
         ]
 
     async def join_vote_queue(self, member: discord.Member) -> str:
-        """「投票」ボタン: 押した順に投票発言の列へ並ぶ。
+        """「投票参加」ボタン: 押した順に投票発言の列へ並ぶ。
 
         発言中でも先に並べる。並んだ順はそのまま公開パネルへ出す。
         """
@@ -5781,11 +6550,29 @@ class RoomRunner:
 
     def _vote_panel_reference(self) -> Optional[discord.Message]:
         state = self.state
-        channel = state.village_channel
+        channel = self._ui_cleanup_channel()
         get_partial_message = getattr(channel, "get_partial_message", None)
         if state.vote_panel_message_id is None or not callable(get_partial_message):
             return None
         return get_partial_message(state.vote_panel_message_id)
+
+    async def _disable_recovered_vote_panel(self) -> None:
+        """通常投票の公開パネルから、終了後に操作ボタンを外す。"""
+        panel = self._vote_panel_reference()
+        if panel is None:
+            return
+        try:
+            await self._discord_api_call(panel.edit, view=None)
+        except discord.NotFound:
+            self.state.vote_panel_message_id = None
+        except (discord.Forbidden, discord.HTTPException) as error:
+            log.warning(
+                "投票パネルの無効化に失敗 (%s): %s",
+                self.state.room_name,
+                error,
+            )
+        else:
+            self.state.vote_panel_message_id = None
 
     def _sequential_vote_detail(self) -> str:
         """公開済みの票を「A → C」で並べる (棄権もその場に残す)。"""
@@ -6071,7 +6858,7 @@ class RoomRunner:
         # 合図として区別できないため (議論終了SEに一本化)
         if initialized:
             await self._safe_village_send(
-                f"🗳️ **投票**「投票」を押した順に、1人{VOTE_SPEECH_TIME}秒発言し、"
+                f"🗳️ **投票**「投票参加」を押した順に、1人{VOTE_SPEECH_TIME}秒発言し、"
                 "発言終了後に投票先を確定します。"
             )
         await self._repost_gm_panel()
@@ -6184,7 +6971,13 @@ class RoomRunner:
 
             if voter.alive and not state.vote_slot_forced_abstain and voter.user_id not in state.votes:
                 choice_view = VoteView(
-                    self, candidates=by_number(state.alive_players()), voters=[voter]
+                    self,
+                    candidates=by_number(
+                        player
+                        for player in state.alive_players()
+                        if player.user_id != voter.user_id
+                    ),
+                    voters=[voter],
                 )
                 panel = await self._replace_sequential_vote_panel(
                     panel, self._sequential_vote_choice_content(voter), choice_view
@@ -6372,6 +7165,77 @@ class RoomRunner:
             tally[target_id] = tally.get(target_id, 0) + 1
         return tally
 
+    async def _remember_speech_panel(self, message) -> None:
+        """弁明・遺言パネルのIDを、再起動後の見た目の無効化用に保存する。"""
+        message_id = getattr(message, "id", None)
+        if (
+            isinstance(message_id, bool)
+            or not isinstance(message_id, int)
+            or message_id <= 0
+        ):
+            return
+        if self.state.speech_panel_message_id == message_id:
+            return
+        self.state.speech_panel_message_id = message_id
+        try:
+            await self._persist_room_state()
+        except Exception as error:
+            # UIの後始末用IDであり、弁明・遺言そのものの進行checkpointは
+            # 既に別途保存済み。ここだけの失敗でゲームを止めない。
+            log.warning("弁明/遺言パネルIDの保存に失敗 (%s): %s", self.state.room_name, error)
+
+    async def _disable_recovered_speech_panel(self) -> bool:
+        """再起動前の弁明・遺言終了ボタンを表示から外す。"""
+        state = self.state
+        message_id = state.speech_panel_message_id
+        channel = self._ui_cleanup_channel()
+        if message_id is None:
+            return True
+        if channel is None:
+            return False
+        get_partial = getattr(channel, "get_partial_message", None)
+        if not callable(get_partial):
+            return False
+        try:
+            await self._discord_api_call(get_partial(message_id).edit, view=None)
+        except discord.NotFound:
+            state.speech_panel_message_id = None
+        except (discord.Forbidden, discord.HTTPException) as error:
+            log.warning("復元した弁明/遺言パネルの無効化に失敗 (%s): %s", state.room_name, error)
+            return False
+        else:
+            state.speech_panel_message_id = None
+        return True
+
+    async def _require_recovered_speech_panel_closed(self) -> None:
+        """古い発言終了ボタンを孤立させず、失敗時は安全停止する。"""
+        if await self._disable_recovered_speech_panel():
+            return
+        error = StateDurabilityError("前回の弁明/遺言パネルを無効化できません")
+        await self._stop_for_durability_error("発言終了パネルの復旧", error)
+        raise error
+
+    async def _close_speech_panel(self, message, view: SpeechDoneView) -> None:
+        """終了パネルを表示上無効化してからViewを停止する。"""
+        visually_closed = message is not None and all(
+            item.disabled for item in view.children
+        )
+        if message is not None and not all(item.disabled for item in view.children):
+            for item in view.children:
+                item.disabled = True
+            try:
+                await self._discord_api_call(message.edit, view=view)
+            except discord.NotFound:
+                visually_closed = True
+            except (discord.Forbidden, discord.HTTPException):
+                # IDを残し、終了処理または再起動時のview=None編集で再試行する。
+                visually_closed = False
+            else:
+                visually_closed = True
+        view.stop()
+        if visually_closed:
+            self.state.speech_panel_message_id = None
+
     async def _runoff(
         self,
         candidate_ids: list[int],
@@ -6381,6 +7245,9 @@ class RoomRunner:
     ) -> Optional[int]:
         state = self.state
         await state.pause_event.wait()
+        # 再起動前に表示されていた弁明終了ボタンは、同じ話者を満額で
+        # やり直すときにも旧タイマーへ紐付いたままなので先に外す。
+        await self._require_recovered_speech_panel_closed()
         state.runoff_candidates = list(candidate_ids)
         if not resume_vote and not resume_speech:
             state.phase = Phase.DAY_RUNOFF_SPEECH
@@ -6441,6 +7308,7 @@ class RoomRunner:
                 )
 
             msg = await self._safe_village_send(speech_content(RUNOFF_SPEECH_TIME), view=view)
+            await self._remember_speech_panel(msg)
             await self._repost_gm_panel()
 
             # 弁明終了待ち (タイムアウト or ボタン, pause対応)
@@ -6449,7 +7317,7 @@ class RoomRunner:
                 msg, speech_content, RUNOFF_SPEECH_TIME, state.speech_done_event
             )
 
-            view.stop()
+            await self._close_speech_panel(msg, view)
             state.current_speaker_id = None
             await self._clear_speaker()
             state.runoff_speech_index += 1
@@ -6566,6 +7434,9 @@ class RoomRunner:
         """
         state = self.state
         await state.pause_event.wait()
+        # 復元時は以前の遺言終了ボタンを使い回せない。新しい満額タイマーを
+        # 投稿する前に、保存済みメッセージのコンポーネントを外す。
+        await self._require_recovered_speech_panel_closed()
         state.phase = Phase.DAY_LAST_WILL
         state.speech_done_event.clear()
         state.current_speaker_id = player.user_id
@@ -6585,6 +7456,7 @@ class RoomRunner:
             )
 
         msg = await self._safe_village_send(will_content(LAST_WILL_TIME), view=view)
+        await self._remember_speech_panel(msg)
         await self._repost_gm_panel()
 
         # 遺言終了待ち (タイムアウト or ボタン, pause対応)
@@ -6592,7 +7464,7 @@ class RoomRunner:
             msg, will_content, LAST_WILL_TIME, state.speech_done_event
         )
 
-        view.stop()
+        await self._close_speech_panel(msg, view)
         state.current_speaker_id = None
         await self._clear_speaker()
 
@@ -6926,8 +7798,8 @@ class RoomRunner:
         vs = getattr(player.member, "voice", None)
         vc = state.voice_channel
         will_mute = (
-            player.user_id != state.gm_id  # GMはミュート自動制御の対象外
-            and vs is not None and vs.channel is not None
+            # playerは必ずroster内なので、参加者兼GMも通常どおりmuteする。
+            vs is not None and vs.channel is not None
             and vc is not None and vs.channel.id == vc.id
             and not vs.mute
         )
@@ -7141,7 +8013,14 @@ class RoomRunner:
         await state.pause_event.wait()
         state.phase = Phase.NIGHT
 
-        # 前の夜・異常終了経路で残ったViewを先に停止する。
+        # 前の夜・異常終了経路で残ったViewを先に表示上も閉じる。
+        # stopだけではDMに古いボタンが残り、再起動後はDiscordの汎用エラーに
+        # なるため、現在プロセスのDMと保存済みIDの両方をbest effortで編集する。
+        await self._disable_live_wolf_vote_dms()
+        if resume_existing:
+            await self._disable_persisted_dm_views(
+                state.wolf_dm_message_ids, label="人狼襲撃",
+            )
         self._stop_night_views()
         if not resume_existing:
             state.night_generation += 1
@@ -7167,7 +8046,10 @@ class RoomRunner:
         # #昼チャンネル ロック & ミュート
         await self._lock_village()
         await self._mute_phase("夜フェーズに入ります。")
-        self._play_se("night")
+        # 朝待機まで進んだ夜を復元する場合、夜開始SEを再度鳴らさない。
+        # この経路は夜時間をやり直さず、朝パネルだけを復旧する。
+        if not (resume_existing and state.morning_ready_open):
+            self._play_se("night")
 
         duration = state.get_night_time()
         state.night_duration = duration
@@ -7202,12 +8084,23 @@ class RoomRunner:
                     view=wolf_view,
                 )
                 state.wolf_dm_messages[wolf.user_id] = msg
+                self._remember_dm_view_message(
+                    state.wolf_dm_message_ids, wolf.user_id, msg,
+                )
             except (discord.Forbidden, discord.HTTPException) as e:
                 log.warning(f"人狼DM送信失敗: {wolf.member.display_name} ({e})")
 
         wolves_alive = state.alive_wolves()
         if wolves_alive:
             await asyncio.gather(*(send_wolf_dm(w) for w in wolves_alive))
+            # 再起動後も古い襲撃UIを表示上閉じられるよう、DM送信直後に
+            # メッセージIDを控える。保存失敗はUI後始末だけの劣化なので、
+            # 夜の進行を止めず次の終了/復元で回収を試みる。
+            if state.wolf_dm_message_ids:
+                try:
+                    await self._persist_room_state()
+                except Exception as error:
+                    log.warning("人狼襲撃DM操作IDの保存に失敗 (%s): %s", state.room_name, error)
 
         # 占い師・狩人のDMは廃止した (v0.51)。#昼常設パネルの[占い][狩人]
         # ボタン経由のephemeral UIへ一本化している (仕様§2-3)。夜が明けるまで
@@ -7252,6 +8145,7 @@ class RoomRunner:
         # 停止中に先行しないよう、再開後に夜明け副作用を適用する。
         await state.pause_event.wait()
         # 夜UIを停止 (以降の操作は届かない)
+        await self._disable_live_wolf_vote_dms()
         self._stop_night_views()
         await self._close_morning_panel()
         # 夜明けのSEはここで鳴らす。朝ログ(_morning_log)まで待つと、
@@ -7543,7 +8437,10 @@ class RoomRunner:
         if state.morning_panel_message is not None:
             return
         # 再起動をまたいだ前回のパネルを先に消す (下の説明を参照)
-        await self._delete_stale_morning_panel()
+        if not await self._delete_stale_morning_panel():
+            error = StateDurabilityError("前回の朝パネルを削除できません")
+            await self._stop_for_durability_error("朝パネルの復旧", error)
+            raise error
         self._morning_view = MorningReadyView(self)
         state.morning_panel_message = await self._safe_village_send(
             self._morning_panel_content(), view=self._morning_view
@@ -7563,7 +8460,7 @@ class RoomRunner:
             # 消し損ねたパネルが1枚残るだけで進行は続けられる
             log.warning(f"朝パネルIDの保存に失敗 ({state.room_name}): {e}")
 
-    async def _delete_stale_morning_panel(self) -> None:
+    async def _delete_stale_morning_panel(self) -> bool:
         """再起動前に掲示した朝パネルを消す。
 
         Viewはプロセスをまたいで復元されない (ボタンに custom_id が無く
@@ -7575,18 +8472,24 @@ class RoomRunner:
         """
         state = self.state
         message_id = state.morning_panel_message_id
-        state.morning_panel_message_id = None
-        ch = state.village_channel
-        if message_id is None or ch is None:
-            return
+        ch = self._ui_cleanup_channel()
+        if message_id is None:
+            return True
+        if ch is None:
+            return False
         get_partial = getattr(ch, "get_partial_message", None)
         if not callable(get_partial):
-            return
+            return False
         try:
             await self._discord_api_call(get_partial(message_id).delete)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-            # 既に消えている・権限が無いなら放置してよい
+        except discord.NotFound:
+            state.morning_panel_message_id = None
+        except (discord.Forbidden, discord.HTTPException) as e:
             log.warning(f"前回の朝パネル削除に失敗 ({state.room_name}): {e}")
+            return False
+        else:
+            state.morning_panel_message_id = None
+        return True
 
     async def _reveal_morning_count(self) -> None:
         """押下後、同じ公開パネルの宣言人数を最新値へ更新する。"""
@@ -7614,21 +8517,28 @@ class RoomRunner:
         msg = state.morning_panel_message
         self._morning_view = None
         state.morning_panel_message = None
-        # 閉じたパネルは次の夜に消す対象ではない (ボタンは無効化済み)。
-        # 無効化に失敗した場合もViewをstopするので押しても動かない。
-        state.morning_panel_message_id = None
         if view is None:
+            await self._delete_stale_morning_panel()
             return
         # 先に表示を無効化してから stop する。逆順だと、編集が着地するまでの
         # 数百msに押した人へ汎用エラーが出る。
+        visually_closed = msg is not None and all(
+            item.disabled for item in view.children
+        )
         if msg is not None and not all(item.disabled for item in view.children):
             for item in view.children:
                 item.disabled = True
             try:
                 await self._discord_api_call(msg.edit, view=view)
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
+            except discord.NotFound:
+                visually_closed = True
+            except (discord.Forbidden, discord.HTTPException):
+                visually_closed = False
+            else:
+                visually_closed = True
         view.stop()
+        if visually_closed:
+            state.morning_panel_message_id = None
 
     async def toggle_morning_ready(self, member: discord.Member) -> tuple[str, Optional[str]]:
         """「朝を迎える」を一方向・冪等に宣言する。
@@ -7808,33 +8718,87 @@ class RoomRunner:
         )
 
     async def _post_prep_panel(self) -> None:
-        """役職確認タイムの宣言パネルを #昼 に掲示する"""
+        """役職確認タイムの宣言パネルを #昼 に掲示する。
+
+        再起動後のViewは復元されないため、保存済みの古いパネルを先に削除する。
+        """
         state = self.state
+        if state.prep_panel_message is not None:
+            return
+        if not await self._delete_stale_prep_panel():
+            error = StateDurabilityError("前回の役職確認パネルを削除できません")
+            await self._stop_for_durability_error("役職確認パネルの復旧", error)
+            raise error
         self._prep_view = PrepReadyView(self)
         state.prep_panel_message = await self._safe_village_send(
             self._prep_panel_content(), view=self._prep_view
         )
+        if state.prep_panel_message is None:
+            self._prep_view.stop()
+            self._prep_view = None
+            return
+        state.prep_panel_message_id = getattr(state.prep_panel_message, "id", None)
+        try:
+            await self._persist_room_state()
+        except Exception as error:
+            # 役職確認の待機自体は生きている。次の投稿/終了で古いパネルを
+            # 回収できるよう、IDはメモリ上に残して進行を継続する。
+            log.warning("役職確認パネルIDの保存に失敗 (%s): %s", state.room_name, error)
+
+    async def _delete_stale_prep_panel(self) -> bool:
+        """再起動前の役職確認パネルを、再掲前または終了時に削除する。"""
+        state = self.state
+        message_id = state.prep_panel_message_id
+        channel = self._ui_cleanup_channel()
+        if message_id is None:
+            return True
+        if channel is None:
+            return False
+        get_partial = getattr(channel, "get_partial_message", None)
+        if not callable(get_partial):
+            return False
+        try:
+            await self._discord_api_call(get_partial(message_id).delete)
+        except discord.NotFound:
+            state.prep_panel_message_id = None
+        except (discord.Forbidden, discord.HTTPException) as error:
+            log.warning("前回の役職確認パネル削除に失敗 (%s): %s", state.room_name, error)
+            return False
+        else:
+            state.prep_panel_message_id = None
+        return True
 
     async def _close_prep_panel(self) -> None:
-        """役職確認終了後にパネルのボタンを無効化する"""
+        """役職確認終了後にパネルのボタンを無効化する。"""
         state = self.state
         view = self._prep_view
         msg = state.prep_panel_message
         self._prep_view = None
         state.prep_panel_message = None
         if view is None:
+            # 再起動後はView実体が無い。残った見た目だけを削除する。
+            await self._delete_stale_prep_panel()
             return
+        # Viewをstopする前に表示を無効化する。逆順では編集がDiscordへ届く
+        # 数百msの間に旧ボタンを押すと、汎用のinteraction failedになり得る。
+        visually_closed = msg is not None and all(
+            item.disabled for item in view.children
+        )
+        if msg is not None and not all(item.disabled for item in view.children):
+            for item in view.children:
+                item.disabled = True
+            try:
+                await self._discord_api_call(msg.edit, view=view)
+            except discord.NotFound:
+                visually_closed = True
+            except (discord.Forbidden, discord.HTTPException):
+                # 保存済みIDを残し、終了処理または再起動時に削除を再試行する。
+                visually_closed = False
+            else:
+                visually_closed = True
         view.stop()
-        if msg is None:
-            return
-        if all(item.disabled for item in view.children):
-            return
-        for item in view.children:
-            item.disabled = True
-        try:
-            await self._discord_api_call(msg.edit, view=view)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-            pass
+        if visually_closed:
+            state.prep_panel_message_id = None
 
     async def toggle_prep_ready(self, member: discord.Member) -> tuple[str, Optional[str]]:
         """「役職を確認した」を宣言する (**一度きり。取り消せない**)。
@@ -8353,8 +9317,7 @@ class RoomRunner:
 
         state.phase = Phase.GAME_OVER
         state.paused = False
-        self._stop_all_game_views()
-        await self.close_village_panel()
+        await self._close_game_views_for_shutdown()
         # pending settlementのstage完了後にGAME_OVERを確定する。
         game_over_saved = False
         for delay in (0, 1, 2):
@@ -8819,6 +9782,21 @@ class RoomRunner:
             )
         finally:
             self._postgame_vote_pending = False
+            # 投票中に先に掲示したロビーは開始ボタンをdisabledにしている。
+            # 完了後に同じメッセージを静かに再描画し、押して初めて3分待ちと
+            # 分かる状態や、期限後もボタンだけ無効のまま残る状態を防ぐ。
+            state = self.state
+            if state.phase == Phase.LOBBY and not state.ending:
+                try:
+                    await self._post_lobby_ui(reuse_existing=True)
+                except Exception as error:
+                    # 推薦集計自体は完了済み。パネル再描画の一時失敗で
+                    # タスクを失敗扱いにせず、次のロビー更新で追いつかせる。
+                    log.warning(
+                        "終了後投票完了後のロビーパネル更新に失敗 (%s): %s",
+                        state.room_name,
+                        error,
+                    )
 
     async def _post_rating_results(
         self,
@@ -9378,6 +10356,8 @@ class RoomRunner:
         old_votes = dict(state.votes)
         old_vote_order = list(state.vote_order)
         old_disconnected = set(state.disconnected_players)
+        old_wolf_target = state.wolf_target
+        old_wolf_voters = dict(state.wolf_voters)
         old_guard_target = state.guard_target
         old_ready = set(state.morning_ready_ids)
         old_morning_warned = set(state.morning_warned_ids)
@@ -9400,6 +10380,14 @@ class RoomRunner:
             and guard is not None
             and guard.user_id != player.user_id
             and state.guard_target == player.user_id
+        )
+        # 襲撃先として除外した相手が残ると、夜結果処理が死亡済み対象を
+        # 襲撃しようとする。狼自身の除外も投票者一覧から消す。現在の襲撃先が
+        # 無効になった場合は、残存する狼に選び直してもらうため朝宣言を戻す。
+        wolf_target_invalidated = bool(
+            self._effective_phase() == Phase.NIGHT
+            and not state.night_resolved
+            and state.wolf_target == player.user_id
         )
         self.log_action(
             "死亡", target=player,
@@ -9450,6 +10438,36 @@ class RoomRunner:
         # 夜の未行動警告と「朝を迎える」宣言は、除外で条件が揃った可能性を再チェック
         # (除外された人の宣言・行動を待ち続けないようにする)
         state.morning_ready_ids.discard(player.user_id)
+        state.morning_warned_ids.discard(player.user_id)
+        state.wolf_voters = {
+            wolf_id: target_id
+            for wolf_id, target_id in state.wolf_voters.items()
+            if wolf_id != player.user_id and target_id != player.user_id
+        }
+        removed_wolf_choice_invalidated = bool(
+            self._effective_phase() == Phase.NIGHT
+            and not state.night_resolved
+            and player.is_wolf
+            and state.wolf_target is not None
+            # wolf_targetは「最後に選択された対象」。除外された狼の選択だけが
+            # 正本だった場合、残存狼の票に同じ対象が無ければ採用できない。
+            and state.wolf_target not in state.wolf_voters.values()
+        )
+        wolf_choice_invalidated = (
+            wolf_target_invalidated or removed_wolf_choice_invalidated
+        )
+        if wolf_choice_invalidated:
+            # 最後に選ばれた襲撃先が無効なら、部分的に残った投票履歴を
+            # 襲撃確定へ使わない。襲撃対象そのものの除外だけでなく、
+            # 最後の選択者だった狼の除外でも全生存狼に選び直してもらう。
+            state.wolf_target = None
+            state.wolf_voters.clear()
+            living_wolf_ids = {wolf.user_id for wolf in state.alive_wolves()}
+            state.morning_ready_ids.difference_update(living_wolf_ids)
+            state.morning_warned_ids.difference_update(living_wolf_ids)
+            state.morning_confirmed = False
+            state.morning_ready_event.clear()
+            state.night_complete_event.clear()
         if guard_target_invalidated and guard is not None:
             # 護衛先が死亡したままでは、狩人が「確定済み」扱いで
             # 再選択できず、未護衛の夜を解決する危険がある。除外と
@@ -9491,7 +10509,7 @@ class RoomRunner:
             and state.current_speaker_id == player.user_id
             and state.vote_speech_finished
         )
-        # 「投票」待ちで止まっている場合は、除外で生存者集合が変わった
+        # 「投票参加」待ちで止まっている場合は、除外で生存者集合が変わった
         # ことを知らせて条件を見直させる。最後の未押下者が抜けたときに
         # 誰も押さない待機のまま残り、GMのスキップ頼みになるのを防ぐ。
         release_vote_queue = self._effective_phase() == Phase.DAY_VOTE
@@ -9512,6 +10530,8 @@ class RoomRunner:
             state.votes = old_votes
             state.vote_order = old_vote_order
             state.disconnected_players = old_disconnected
+            state.wolf_target = old_wolf_target
+            state.wolf_voters = old_wolf_voters
             state.guard_target = old_guard_target
             state.morning_ready_ids = old_ready
             state.morning_warned_ids = old_morning_warned
@@ -9554,6 +10574,11 @@ class RoomRunner:
 
         if guard_target_invalidated and guard is not None:
             await self._request_guard_reselection(guard)
+        if wolf_choice_invalidated:
+            # 既存の狼DMは同じ夜のViewのまま使える。本文だけを空の襲撃先へ
+            # 更新し、残存狼が有効な候補を選び直せることを明示する。
+            await self.refresh_wolf_dm_displays(state.night_duration)
+            await self._reveal_morning_count()
 
         # 待機側は、死亡本体だけでなくDiscord副作用outboxの
         # 除去保存まで成功し、かつ勝敗確定でない場合にだけ解放する。
@@ -9614,10 +10639,11 @@ class RoomRunner:
         # 遮断され、ゲームループがこれ以降 phase を書き換えることもなくなる。
         state.ending = True
         state.phase = Phase.GAME_OVER
-        self._stop_all_game_views()
-        await self.close_village_panel()
         if state.game_task and not state.game_task.done():
             state.game_task.cancel()
+        # 古いボタンのIDを空LOBBYへ差し替える前に使い、
+        # 通常終了と同じ表示上の後始末を行う。
+        await self._close_game_views_for_shutdown()
         initial_saved = False
         for attempt, delay in enumerate((0, 1, 2), start=1):
             if delay:
@@ -9640,20 +10666,11 @@ class RoomRunner:
             state.pause_event.set()
 
         # 夜の「朝を迎える」宣言待ちで止まったままにならないよう解除する
-        # (パネルは編集しない。Viewの停止は _stop_all_game_views が行う)
+        # (パネルの無効化は _close_game_views_for_shutdown で実施済み)
         state.morning_ready_event.set()
-        if self._morning_view is not None:
-            self._morning_view.stop()
-            self._morning_view = None
-        state.morning_panel_message = None
-        state.morning_panel_message_id = None
 
         # 役職確認の宣言待ちも同様に解除する
         state.prep_ready_event.set()
-        if self._prep_view is not None:
-            self._prep_view.stop()
-            self._prep_view = None
-            state.prep_panel_message = None
 
         # ゲームループタスクの完了まで待つ
         # (待たないと残った game_task が古い state を見続けて副作用を起こしうる)
@@ -10084,6 +11101,16 @@ class RoomRunner:
             return {state.current_speaker_id} if state.current_speaker_id else set()
         return set()
 
+    def _is_dedicated_gm(self, user_id: int) -> bool:
+        """プレイヤーを兼ねない専任GMか。
+
+        専任GMだけは進行役として常時発言できるよう自動muteから外す。
+        rosterにもいる参加者兼GMは、役職情報を持つ通常プレイヤーとして
+        フェーズごとのmute/unmuteに必ず従わせる。
+        """
+        state = self.state
+        return state.gm_id == user_id and user_id not in state.players
+
     async def _sync_server_mutes(
         self,
         speakers: set[int],
@@ -10184,10 +11211,9 @@ class RoomRunner:
             if member.id in skip_ids:
                 skip_counts["既にmute"] += 1
                 continue
-            # GMは常にミュート自動制御の対象外 (参加者を兼ねていても)。
-            # Discordのサーバーミュートは本人では解除できない仕様のため、
-            # 進行役が不意に発言不能になる事故を避け、GM自身の手動管理に委ねる
-            if member.id == state.gm_id:
+            # 参加者を兼ねない専任GMだけを進行役として除外する。
+            # 参加者兼GMは他プレイヤーと同じ発言制御に従う。
+            if self._is_dedicated_gm(member.id):
                 skip_counts["gm"] += 1
                 continue
             vs = member.voice
@@ -10427,9 +11453,6 @@ class RoomRunner:
                 speaker, "発言順ですが通話に接続していません"
             )
             return
-        # 参加者GMは従来どおりBotのmute対象外で、本人/運営の手動管理に委ねる。
-        if speaker.user_id == state.gm_id:
-            return
         if not bool(getattr(voice, "mute", False)):
             return
 
@@ -10625,7 +11648,7 @@ class RoomRunner:
     async def _mute_all(
         self, *, skip_ids: Optional[set[int]] = None
     ) -> list[tuple[discord.Member, bool]]:
-        """VC接続中の全員をミュート (GMを除く)"""
+        """VC接続中の全員をミュート (参加者を兼ねない専任GMを除く)。"""
         return await self._sync_server_mutes(set(), skip_ids=skip_ids)
 
     async def _unmute_alive(self) -> list[tuple[discord.Member, bool]]:

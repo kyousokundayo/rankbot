@@ -1,4 +1,4 @@
-"""v0.52の参加受付・終了復旧の安全境界を固定する。"""
+"""参加受付・終了復旧の耐久性をv0.52以降の回帰契約として固定する。"""
 from __future__ import annotations
 
 import unittest
@@ -84,6 +84,58 @@ class StartConflictTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("プレイヤー", message)
         self.assertIn("GM", message)
 
+    async def test_start_rejects_registered_player_outside_game_vc(self) -> None:
+        runner = RoomRunner.__new__(RoomRunner)
+        game_vc = SimpleNamespace(id=500)
+        connected = _member(10, "接続済み")
+        missing = _member(11, "未接続")
+        gm = _member(20, "GM")
+        connected.voice = SimpleNamespace(channel=game_vc)
+        missing.voice = SimpleNamespace(channel=None)
+        gm.voice = SimpleNamespace(channel=game_vc)
+        players = {
+            connected.id: Player(connected.id, connected),
+            missing.id: Player(missing.id, missing),
+        }
+        state = SimpleNamespace(
+            phase=Phase.LOBBY,
+            ending=False,
+            room_id="target",
+            room_name="対象村",
+            players=players,
+            gm_id=gm.id,
+            original_nicknames={},
+            vc_default_permissions_captured=False,
+            vc_gm_speak_captured=False,
+            voice_channel=game_vc,
+        )
+        runner.state = state
+        runner.room_def = SimpleNamespace(variant_id="test-two")
+        runner._postgame_vote_pending = False
+        runner.manager = SimpleNamespace(
+            rooms={"target": runner},
+            find_active_user_room=lambda *_args, **_kwargs: None,
+        )
+        members = {member.id: member for member in (connected, missing, gm)}
+        sent = AsyncMock()
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(get_member=members.get),
+            followup=SimpleNamespace(send=sent),
+        )
+
+        with patch(
+            "room_runner.get_variant_definition",
+            return_value=SimpleNamespace(player_count=2),
+        ):
+            await runner._start_game_locked(interaction)
+
+        self.assertEqual(state.phase, Phase.LOBBY)
+        self.assertFalse(hasattr(state, "game_run_id"))
+        message = sent.await_args.args[0]
+        self.assertIn("ゲームVC", message)
+        self.assertIn("未接続", message)
+        self.assertNotIn("接続済み", message)
+
 
 class LobbyReopenAndPanelTest(unittest.IsolatedAsyncioTestCase):
     async def test_private_lobby_has_reopen_button_and_wires_to_manager(self) -> None:
@@ -129,6 +181,28 @@ class LobbyReopenAndPanelTest(unittest.IsolatedAsyncioTestCase):
                 await runner._post_lobby_ui()
 
         runner._purge_bot_messages.assert_not_awaited()
+
+    async def test_postgame_vote_completion_refreshes_existing_lobby_panel(self) -> None:
+        runner = RoomRunner.__new__(RoomRunner)
+        runner.state = SimpleNamespace(
+            phase=Phase.LOBBY,
+            ending=False,
+            room_name="対象村",
+        )
+        runner._postgame_vote_pending = True
+        runner._run_postgame_recommendations = AsyncMock()
+        runner._post_lobby_ui = AsyncMock()
+
+        await runner._run_postgame_recommendations_task(
+            SimpleNamespace(),
+            1,
+            {(10, "recommend")},
+            {20},
+            ladder_id="l13",
+        )
+
+        self.assertFalse(runner._postgame_vote_pending)
+        runner._post_lobby_ui.assert_awaited_once_with(reuse_existing=True)
 
 
 class NicknameAndRemovalSafetyTest(unittest.IsolatedAsyncioTestCase):
@@ -202,6 +276,11 @@ class GameOverRestoreTest(unittest.IsolatedAsyncioTestCase):
         source.state.gm_id = 20
         payload = source._build_room_snapshot()
         payload["phase"] = Phase.GAME_OVER.name
+        payload["prep_panel_message_id"] = 111
+        payload["speech_panel_message_id"] = 222
+        payload["wolf_dm_message_ids"] = [
+            {"user_id": member.id, "message_ids": [333]},
+        ]
 
         restored = RoomRunner(None, SimpleNamespace(), room_def)
         restored.state.guild = SimpleNamespace(
@@ -211,6 +290,12 @@ class GameOverRestoreTest(unittest.IsolatedAsyncioTestCase):
             get_channel=lambda _channel_id: None,
         )
         call_order: list[str] = []
+
+        async def close_views():
+            call_order.append("close_views")
+            self.assertEqual(restored.state.prep_panel_message_id, 111)
+            self.assertEqual(restored.state.speech_panel_message_id, 222)
+            self.assertEqual(restored.state.wolf_dm_message_ids, {member.id: [333]})
 
         async def restore_names(_state):
             call_order.append("restore_nicknames")
@@ -231,6 +316,7 @@ class GameOverRestoreTest(unittest.IsolatedAsyncioTestCase):
         restored._restore_nicknames = AsyncMock(side_effect=restore_names)
         restored._teardown_game_roles_and_perms = AsyncMock(side_effect=teardown)
         restored._transition_to_empty_lobby = AsyncMock(side_effect=transition)
+        restored._close_game_views_for_shutdown = AsyncMock(side_effect=close_views)
 
         await restored.restore_from_snapshot(payload)
 
@@ -238,8 +324,9 @@ class GameOverRestoreTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(restored.last_game_gm, 20)
         self.assertEqual(
             call_order,
-            ["restore_nicknames", "teardown", "transition"],
+            ["close_views", "restore_nicknames", "teardown", "transition"],
         )
+        restored._close_game_views_for_shutdown.assert_awaited_once()
         restored._transition_to_empty_lobby.assert_awaited_once()
 
 

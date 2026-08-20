@@ -2733,6 +2733,39 @@ class RecruitmentNotificationSettingsView(discord.ui.View):
         await self._refresh(interaction)
 
 
+async def _start_transferred_recruitment_game(
+    interaction: discord.Interaction,
+    manager: RecruitmentManager,
+    recruitment_id: int,
+) -> None:
+    """開催反映済みの募集から、通常・リセット確認で同じ開始経路へ進む。
+
+    ``RoomRunner.start_game`` は成否を返さず、開始できない理由は自ら
+    followupへ通知する契約である。開始前の成功表示は出さず、処理完了後に
+    LOBBYを抜け、ゲームループが設定されたことを確認できた場合だけ補う。
+    """
+    row = await database.get_recruitment(recruitment_id)
+    room = manager._room_for_row(row or {})
+    if room is None:
+        await interaction.followup.send(
+            "参加者は登録しましたが、GM村を確認できないため開始できません。",
+            ephemeral=True,
+        )
+        return
+    # 削除・形式変更と同じroom lockで開始条件をもう一度固定する。
+    # manager lockは開始中ずっと保持せず、他村の参加操作を止めない。
+    async with room.action_lock:
+        await room.start_game(interaction)
+    state = getattr(room, "state", None)
+    if (
+        getattr(state, "phase", None) not in (Phase.LOBBY, Phase.GAME_OVER)
+        and getattr(state, "game_task", None) is not None
+    ):
+        await interaction.followup.send(
+            "✅ ゲーム開始処理へ進みました。", ephemeral=True,
+        )
+
+
 class RecruitmentCardView(discord.ui.View):
     def __init__(self, manager: RecruitmentManager, recruitment_id: int, *, active: bool = True) -> None:
         super().__init__(timeout=None)
@@ -2857,7 +2890,16 @@ class RecruitmentCardView(discord.ui.View):
         except database.RecruitmentConflict as exc:
             return await interaction.followup.send(str(exc), ephemeral=True)
         embed = await self.manager.build_embed(interaction.guild, self.recruitment_id)
-        await interaction.message.edit(embed=embed, view=self)
+        try:
+            await interaction.message.edit(embed=embed, view=self)
+        except discord.NotFound:
+            # DB登録は完了している。古いカードが削除済みなら再描画を諦め、
+            # 押した本人には成功を返す。
+            log.info("参加後の古い募集カードを再描画せず終了: %s", self.recruitment_id)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            # DB登録は完了している。権限変更や一時的なDiscord API障害で
+            # カードを更新できなくても、登録成功の応答を優先する。
+            log.warning("参加後の募集カード再描画に失敗: %s", exc)
         await interaction.followup.send(f"{kind}として登録しました。", ephemeral=True)
         await self.manager.notify_ready_if_needed(await database.get_recruitment(self.recruitment_id))
 
@@ -2882,7 +2924,16 @@ class RecruitmentCardView(discord.ui.View):
         except database.RecruitmentConflict as exc:
             return await interaction.followup.send(str(exc), ephemeral=True)
         embed = await self.manager.build_embed(interaction.guild, self.recruitment_id)
-        await interaction.message.edit(embed=embed, view=self)
+        try:
+            await interaction.message.edit(embed=embed, view=self)
+        except discord.NotFound:
+            # DB取消は完了している。既に消えた古いカードの編集失敗で、
+            # 本人への成功応答を失わせない。
+            log.info("参加取消後の古い募集カードを再描画せず終了: %s", self.recruitment_id)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            # DB取消は完了している。権限変更や一時的なDiscord API障害で
+            # カードを更新できなくても、取消成功の応答を優先する。
+            log.warning("参加取消後の募集カード再描画に失敗: %s", exc)
         await interaction.followup.send("参加を取り消しました。", ephemeral=True)
 
     async def transfer(self, interaction: discord.Interaction) -> None:
@@ -2897,18 +2948,9 @@ class RecruitmentCardView(discord.ui.View):
             )
         if not result.startswith("✅"):
             return await interaction.followup.send(result, ephemeral=True)
-        row = await database.get_recruitment(self.recruitment_id)
-        room = self.manager._room_for_row(row or {})
-        if room is None:
-            return await interaction.followup.send(
-                "参加者は登録しましたが、GM村を確認できないため開始できません。",
-                ephemeral=True,
-            )
-        await interaction.followup.send("✅ 参加者を確定し、ゲームを開始します。", ephemeral=True)
-        # 削除・形式変更と同じroom lockで開始条件をもう一度固定する。
-        # manager lockは開始中ずっと保持せず、他村の参加操作を止めない。
-        async with room.action_lock:
-            await room.start_game(interaction)
+        await _start_transferred_recruitment_game(
+            interaction, self.manager, self.recruitment_id,
+        )
 
     async def host_menu(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
@@ -2954,7 +2996,11 @@ class RecruitmentLobbyResetConfirmView(discord.ui.View):
         await interaction.response.defer(ephemeral=True, thinking=True)
         async with self.manager.lock:
             result = await self.manager.transfer(interaction, self.recruitment_id, reset_lobby=True)
-        await interaction.followup.send(result, ephemeral=True)
+        if not result.startswith("✅"):
+            return await interaction.followup.send(result, ephemeral=True)
+        await _start_transferred_recruitment_game(
+            interaction, self.manager, self.recruitment_id,
+        )
 
     @discord.ui.button(label="中止", style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
