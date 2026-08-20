@@ -1013,6 +1013,7 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
                 "recruitment:42:notify",
                 # 受付中のGM村で規定を読める唯一の導線
                 "recruitment:42:rule", "recruitment:42:help",
+                "recruitment:42:call",
             },
         )
         # 受付が閉じても、読むだけのルール・ヘルプは押せるままにする

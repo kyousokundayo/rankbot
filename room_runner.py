@@ -9,6 +9,7 @@ import logging
 import random
 import secrets
 from dataclasses import replace
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, Optional
 
 import discord
@@ -36,10 +37,10 @@ from config import (
 from models import Player, GameState, by_number
 from views import (
     LobbyView, GMPanelEntryView, VoteView, VoteQueueView, RunoffVoteView,
-    WolfVoteView, WolfSurrenderView, SeerView, GuardView, SpeechDoneView,
+    WolfVoteView, WolfSurrenderView, SpeechDoneView,
     TurnSpeechView,
     MorningReadyView, PrepReadyView, PostgameVotePanelView,
-    WolfGuessSelectView,
+    VillagePanelView,
     build_vote_result_embed,
 )
 import database
@@ -51,6 +52,15 @@ if TYPE_CHECKING:
     from game import GameCog
 
 log = logging.getLogger(__name__)
+
+# 人狼予想の提出案内。死亡者だけへ届ける手段は個別DMしかないが、DMは廃止した
+# ため、既存の死亡告知へ1行だけ相乗りさせる (新しい送信を増やさない)。
+# 全員が死亡時に同じ条件で提出するので、公開しても誰の情報も漏れない。
+WOLF_GUESS_NOTICE = (
+    "🐺 亡くなった方は、このチャンネルの村パネル [人狼予想] から"
+    f"{WOLF_GUESS_TIMEOUT // 60}分以内に提出してください"
+    "（提出するか時間切れで霊界へ入れます）。"
+)
 
 
 class StateDurabilityError(RuntimeError):
@@ -360,6 +370,12 @@ class RoomRunner:
         # 投票待ちパネルのView。待機中だけ保持し、列が伸びたときの
         # 公開更新でボタンを消さずに貼り直すために使う。
         self._vote_queue_view: Optional[discord.ui.View] = None
+        # #昼 の常設村パネル (CO/役職行動の入口)。昼夜をまたいで
+        # 生きるため、朝パネルやターン話者パネルと違いゲーム中は作り直さない。
+        self._village_panel_view: Optional[VillagePanelView] = None
+        # CO等の連続押下でedit APIを連打しないための最新1件デバウンス。
+        self._village_panel_refresh_task: Optional[asyncio.Task] = None
+        self._village_panel_refresh_pending = False
 
     def is_private_room(self) -> bool:
         """GMが作成した名前村か。保存済みの村主IDで判定する。"""
@@ -559,26 +575,11 @@ class RoomRunner:
             and state.pending_winner is None
         )
 
-    def _turn_co_declaration_round_index(self) -> Optional[int]:
-        """当日COを受け付ける通常巡を返す。"""
-        if self.state.day_number == 1:
-            return 1
-        if self.state.day_number >= 2:
-            return 0
-        return None
-
-    def turn_co_declaration_open(self) -> bool:
-        """公開COボタンを受け付ける通常発言枠か。"""
-        state = self.state
-        co_round = self._turn_co_declaration_round_index()
-        return (
-            co_round is not None
-            and self.turn_actions_open()
-            and not state.turn_interrupt_active
-            and state.turn_interrupt_pending_id is None
-            and not state.turn_interrupt_event.is_set()
-            and state.turn_round_index == co_round
-        )
+    # 旧CO機構 (_turn_co_declaration_round_index / turn_co_declaration_open) は
+    # 撤去した。CO宣言は #昼 常設パネル (VillagePanelView) の [CO] ボタンへ
+    # 一本化している (declare_co / withdraw_co を参照)。
+    # ただし state.turn_co_declarations フィールドと _validate_turn_snapshot
+    # の検証は旧 snapshot 互換のため残す (今後は常に空になる)。
 
     def register_game_view(self, view: discord.ui.View, *, night: bool = False) -> None:
         """ゲーム進行Viewを終了時の一括停止対象へ登録する。"""
@@ -1498,6 +1499,22 @@ class RoomRunner:
                 "village": state.village_channel.id if state.village_channel else None,
                 "spirit": state.spirit_channel.id if state.spirit_channel else None,
             },
+            "co_claims": [
+                {
+                    "user_id": user_id,
+                    "number": claim.get("number"),
+                    "display_name": claim.get("display_name"),
+                    "role": claim.get("role"),
+                    "day": claim.get("day"),
+                }
+                for user_id, claim in state.co_claims.items()
+            ],
+            "medium_results": [dict(result) for result in state.medium_results],
+            "record_event_seq": state.record_event_seq,
+            "village_panel_message_id": state.village_panel_message_id,
+            "started_at": (
+                state.started_at.isoformat() if state.started_at is not None else None
+            ),
         }
 
     def _validate_turn_snapshot(
@@ -2154,6 +2171,40 @@ class RoomRunner:
         state.bot_muted_ids = set(payload.get("bot_muted_ids", []))
         state.bot_mute_intent_ids = set(payload.get("bot_mute_intent_ids", []))
         state.mute_marker_enabled = bool(payload.get("mute_marker_enabled", False))
+        # 公開CO宣言・霊能結果・記録seq・昼パネルID・開始時刻。
+        # 壊れた要素は例外を投げず読み飛ばす (旧payloadを隔離しないため)。
+        state.co_claims = {}
+        for row in payload.get("co_claims", []):
+            if not isinstance(row, dict):
+                continue
+            try:
+                state.co_claims[int(row["user_id"])] = {
+                    "number": int(row.get("number")),
+                    "display_name": str(row.get("display_name")),
+                    "role": str(row.get("role")),
+                    "day": int(row.get("day")),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+        state.medium_results = [
+            dict(result) for result in payload.get("medium_results", [])
+            if isinstance(result, dict)
+        ]
+        try:
+            state.record_event_seq = int(payload.get("record_event_seq", 0))
+        except (TypeError, ValueError):
+            state.record_event_seq = 0
+        village_panel_id = payload.get("village_panel_message_id")
+        state.village_panel_message_id = (
+            int(village_panel_id) if village_panel_id is not None else None
+        )
+        raw_started_at = payload.get("started_at")
+        state.started_at = None
+        if isinstance(raw_started_at, str) and raw_started_at:
+            try:
+                state.started_at = datetime.fromisoformat(raw_started_at)
+            except ValueError:
+                state.started_at = None
         # 復元時にサーバー不在で落としたプレイヤーへの票を
         # 残すと、集計結果が存在しない処刑対象になる。生存中の
         # 復元プレイヤー同士の票だけを保持する。
@@ -2209,6 +2260,7 @@ class RoomRunner:
                 )
 
         await self._disable_recovered_turn_panel()
+        await self._disable_recovered_village_panel()
 
         await self._reconcile_pending_death_effects()
 
@@ -2669,6 +2721,7 @@ class RoomRunner:
             return
         state.guild = guild
         state.game_run_id = secrets.token_hex(16)
+        state.started_at = datetime.now(timezone.utc)
         # 進行中カテゴリ・VCの開始時アクセス境界を再起動後も守るために保存する。
         # 終了ログは全村で
         # 共通の公開ログへ退避するため、この値では制限しない。
@@ -3227,15 +3280,28 @@ class RoomRunner:
                 raise StateDurabilityError(
                     "初日占い対象が開始checkpointにありません"
                 )
+            # 初日白はDMを送らず、記録テーブルへ書くだけにする。占い師は
+            # #昼パネルの[占い]からいつでも確認でき、DM不達で初日白を
+            # 受け取れない事故も無くなる。開始checkpointで対象は確定済み
+            # なので、この経路が再試行で何度走っても1行に保てるよう
+            # (run, actor, action, night) で重複を弾く …_once を使う。
+            # event_seq=0 は「0日目初夜より前」を意味する予約値。
             try:
-                await self._discord_api_call(
-                    seer.member.send,
-                    f"🔮 初日占い結果: {random_white.display_name} は **村人**"
+                await database.record_night_action_once(
+                    state.guild.id, state.room_id, state.game_run_id,
+                    event_seq=0, night_number=state.day_number,
+                    actor_id=seer.user_id, actor_number=seer.number,
+                    actor_role="占い師", action="初日白",
+                    target_id=random_white.user_id,
+                    target_number=random_white.number,
+                    result="村人",
                 )
-                state.initial_seer_result_sent = True
-                await self._persist_room_state()
-            except (discord.Forbidden, discord.HTTPException):
-                failed.append(seer.member)
+            except Exception as error:
+                log.exception(f"初日白のDB記録に失敗 ({state.room_name}): {error}")
+            # フラグはDM送信済みではなく「初日白を確定・記録済み」の意味で
+            # 使い続ける (snapshotの項目を減らさず、復元経路も変えない)。
+            state.initial_seer_result_sent = True
+            await self._persist_room_state()
         return failed
 
     async def _send_surrender_controls(self) -> None:
@@ -3794,6 +3860,7 @@ class RoomRunner:
         # 投票は議論終了後の20秒発言枠でのみ受け付ける。議論中の仮投票を
         # 残すと、順番が来る前に票だけ確定して発言枠が空になるため作らない。
         timer_msg = await self._safe_village_send(discussion_content(duration))
+        await self.post_village_panel()
         await self._repost_gm_panel()
 
         await self._pausable_countdown(timer_msg, discussion_content, duration)
@@ -3895,46 +3962,9 @@ class RoomRunner:
             return None
         return get_partial_message(state.turn_panel_message_id)
 
-    def _turn_co_declaration_line(self) -> str:
-        """役職や内容を含めない、当日の公開CO一覧を返す。"""
-        names: list[str] = []
-        for declaration in self.state.turn_co_declarations:
-            if not isinstance(declaration, dict):
-                continue
-            display_name = declaration.get("display_name")
-            if isinstance(display_name, str) and display_name:
-                names.append(display_name)
-        return "📣 **CO一覧**: " + (" / ".join(names) if names else "なし")
-
-    async def _refresh_turn_co_declaration_panel(self, turn_token: int) -> None:
-        """CO受付直後に同じ話者パネルの一覧だけを更新する。
-
-        ターン終了・次話者への切替と競合して古い本文を戻さないよう、呼出元の
-        action_lock下でtokenと受付窓を再確認してから編集する。
-        """
-        state = self.state
-        if (
-            state.turn_slot_token != turn_token
-            or not self.turn_co_declaration_open()
-        ):
-            return
-        speaker = state.get_player(state.current_speaker_id)
-        panel = self._turn_panel_reference()
-        if speaker is None or panel is None:
-            return
-        try:
-            await self._discord_api_call(
-                panel.edit,
-                content=self._turn_segment_content(
-                    speaker,
-                    state.turn_remaining_seconds,
-                    interrupt=False,
-                ),
-            )
-        except discord.NotFound:
-            state.turn_panel_message_id = None
-        except (discord.Forbidden, discord.HTTPException) as error:
-            log.warning(f"CO一覧パネル更新失敗 ({state.room_name}): {error}")
+    # 旧CO機構の一覧表示・パネル即時更新 (_turn_co_declaration_line /
+    # _refresh_turn_co_declaration_panel) は撤去した。CO一覧は #昼 常設パネル
+    # (build_village_panel_content) が表示する。
 
     async def _disable_recovered_turn_panel(self) -> None:
         """再起動前のViewを表示上も外し、再開時に同じ1枚を再利用する。"""
@@ -3951,6 +3981,596 @@ class RoomRunner:
             log.warning(
                 f"復元ターン話者パネルの無効化失敗 ({self.state.room_name}): {error}"
             )
+
+    # ------------------------------------------------------------------
+    # #昼 常設村パネル (VillagePanelView)
+    #
+    # 朝パネル (削除→新規) やターン話者パネル (編集で使い回す) と違い、
+    # このパネルは昼夜をまたいで1試合中ずっと生きる。フェーズが切り替わる
+    # たびに「削除→新規送信」でGMパネルより上流の位置から末尾へ動かし、
+    # フェーズ内の押下 (CO等) は同じメッセージへの edit で反映する。
+    # ------------------------------------------------------------------
+
+    # Discordのメッセージ上限は2000字。編集が落ちるとCO受付ごと死ぬので、
+    # 余裕を持たせた値で自分から先に切り詰める。
+    _VILLAGE_PANEL_MAX_LENGTH: int = 1900
+
+    _VILLAGE_PANEL_PHASE_LABELS: dict[Phase, str] = {
+        Phase.DAY_DISCUSSION: "昼の議論",
+        Phase.DAY_VOTE: "投票",
+        Phase.DAY_RUNOFF_SPEECH: "決選投票の弁明",
+        Phase.DAY_RUNOFF_VOTE: "決選投票",
+        Phase.DAY_LAST_WILL: "遺言",
+        Phase.NIGHT: "夜",
+        Phase.MORNING: "朝",
+    }
+
+    # CO宣言・撤回を受け付ける昼フェーズ (仕様§2-2)。
+    _CO_OPEN_PHASES: frozenset[Phase] = frozenset({
+        Phase.DAY_DISCUSSION,
+        Phase.DAY_VOTE,
+        Phase.DAY_RUNOFF_SPEECH,
+        Phase.DAY_RUNOFF_VOTE,
+        Phase.DAY_LAST_WILL,
+    })
+
+    # CO宣言で選べる役職の6択 (仕様§2-2)。
+    CO_CLAIMABLE_ROLES: tuple[str, ...] = (
+        "占い師", "霊能者", "狩人", "狂人", "村人", "その他",
+    )
+
+    def _village_panel_reference(self) -> Optional[discord.Message]:
+        """保存済みIDから再編集可能な村パネル参照を作る。"""
+        state = self.state
+        channel = state.village_channel
+        get_partial_message = getattr(channel, "get_partial_message", None)
+        if state.village_panel_message_id is None or not callable(get_partial_message):
+            return None
+        return get_partial_message(state.village_panel_message_id)
+
+    def build_village_panel_content(self) -> str:
+        """フェーズとCO一覧だけを1枚にまとめる。
+
+        v0.50で「結果を公開」を廃止したため、ここに載るのは役職CO
+        (自己申告) だけ。占い・霊能の結果はVCで口頭で伝える。操作説明も
+        載せない (盤面として読む本文にする)。
+        """
+        state = self.state
+        phase = self._effective_phase()
+        phase_label = self._VILLAGE_PANEL_PHASE_LABELS.get(
+            phase, phase.name if phase is not None else "不明"
+        )
+        lines = [f"🏘️ **村パネル**（現在フェーズ: {phase_label}）"]
+
+        # 役職名まで出すのが新CO機構の目的 (旧機構は名前だけだった)。
+        # co_claims は user_id をキーにした dict で、値の側に user_id は持たない。
+        co_entries = [
+            (user_id, claim)
+            for user_id, claim in state.co_claims.items()
+            if isinstance(claim, dict)
+        ]
+        co_entries.sort(key=lambda entry: entry[1].get("number") or 0)
+
+        # 「占いCO3人」のように役職ごとにまとめるのが盤面整理の読み方。
+        # 番号順に混在させるより、何COが何人出ているかが一目で分かる。
+        # 並びは CO_CLAIMABLE_ROLES の順 (占い師→霊能者→狩人→狂人→村人→その他)。
+        grouped: dict[str, list[tuple[object, dict]]] = {}
+        for user_id, claim in co_entries:
+            if not (claim.get("display_name") and claim.get("role")):
+                continue
+            grouped.setdefault(str(claim.get("role")), []).append((user_id, claim))
+
+        ordered_roles = [role for role in self.CO_CLAIMABLE_ROLES if role in grouped]
+        ordered_roles += [role for role in grouped if role not in ordered_roles]
+
+        co_lines: list[str] = []
+        for role in ordered_roles:
+            members = grouped[role]
+            co_lines.append(f"【{role}CO {len(members)}人】")
+            for _user_id, claim in members:
+                co_lines.append(
+                    f"・{claim.get('number')}番 {claim.get('display_name')}"
+                )
+        lines.append(
+            "📣 **CO一覧**\n" + ("\n".join(co_lines) if co_lines else "・なし")
+        )
+
+        # 操作説明は載せない。パネル本文はCO状況だけを映す盤面表示にする
+        # (ボタンのラベルで足りるものを常設本文へ書くと、毎日読む人にとって
+        #  ノイズにしかならない)。
+        # CO行は最大でも参加人数ぶんなので上限に達しないが、Discordの2000字で
+        # パネルの送信・編集が落ち続けるとCO受付ごと死ぬため保険で切る。
+        return "\n".join(lines)[:self._VILLAGE_PANEL_MAX_LENGTH]
+
+    def build_medium_results_content(self) -> str:
+        """霊媒ボタン用の霊能結果一覧 (新しい順) をephemeral向けに整形する。"""
+        state = self.state
+        if not state.medium_results:
+            return "👻 霊能結果はまだありません。"
+        lines = ["👻 **霊能結果**（新しい順）"]
+        for entry in reversed(state.medium_results):
+            if not isinstance(entry, dict):
+                continue
+            day = entry.get("day", "?")
+            name = entry.get("display_name", "?")
+            result = entry.get("result", "?")
+            lines.append(f"・{day}日目: {name} は {result} でした。")
+        return "\n".join(lines)
+
+    def _night_label(self, night_number: object) -> str:
+        """夜行動ログの night_number を表示用の日付ラベルにする。"""
+        try:
+            night = int(night_number)
+        except (TypeError, ValueError):
+            return "?日目夜"
+        return "0日目初夜" if night == 0 else f"{night}日目夜"
+
+    def _record_target_name(self, row: dict) -> str:
+        """夜行動ログ1行の対象を表示名にする。
+
+        GM除外などで state から居なくなった相手でも、記録側に残っている
+        番号で「#7」と出せるようにする (履歴が歯抜けに見えないため)。
+        """
+        target_id = row.get("target_id")
+        if target_id is not None:
+            target = self.state.get_player(int(target_id))
+            if target is not None:
+                return target.display_name
+        number = row.get("target_number")
+        return f"#{number}" if number else "?"
+
+    async def _load_night_records(
+        self,
+        *,
+        actor_id: Optional[int] = None,
+        actions: Optional[tuple[str, ...]] = None,
+    ) -> list[dict]:
+        """この試合の夜行動ログを読む。失敗しても空リストで進む。
+
+        履歴表示は「見えないと困るが、見えなくても進行は止めない」ので、
+        DB例外はここで吸収する (仕様§0-8と同じ扱い)。
+        """
+        state = self.state
+        try:
+            return await database.list_night_actions_for_run(
+                state.guild.id, state.room_id, state.game_run_id,
+                actor_id=actor_id, actions=actions,
+            )
+        except Exception as error:
+            log.warning(f"夜行動ログの読み出しに失敗 ({state.room_name}): {error}")
+            return []
+
+    async def build_seer_history_content(self, actor_id: int) -> str:
+        """占い師本人の[占い]ボタン用。初日白から直近までを古い順で返す。
+
+        DBが正 (再起動をまたいでも残る) だが、今夜ぶんの追記に失敗していた
+        場合だけ state.seer_target から補って、その夜の結果を落とさない。
+        """
+        state = self.state
+        rows = await self._load_night_records(
+            actor_id=actor_id, actions=("初日白", "占い"),
+        )
+        lines: list[str] = []
+        recorded_nights: set[int] = set()
+        for row in rows:
+            name = self._record_target_name(row)
+            result = row.get("result") or "?"
+            if row.get("action") == "初日白":
+                lines.append(f"・初日白（ランダム）: {name} は **{result}**")
+                continue
+            try:
+                recorded_nights.add(int(row.get("night_number")))
+            except (TypeError, ValueError):
+                pass
+            lines.append(
+                f"・{self._night_label(row.get('night_number'))}: {name} は **{result}**"
+            )
+        if state.seer_target is not None and state.day_number not in recorded_nights:
+            target = state.get_player(state.seer_target)
+            if target is not None:
+                judgement = "人狼" if target.role == Role.WEREWOLF else "村人"
+                lines.append(
+                    f"・{self._night_label(state.day_number)}: "
+                    f"{target.display_name} は **{judgement}**"
+                )
+        if not lines:
+            return "🔮 占いの記録はまだありません。"
+        return "🔮 **占いの記録**（古い順）\n" + "\n".join(lines)
+
+    async def build_guard_history_content(self, actor_id: int) -> str:
+        """狩人本人の[狩人]ボタン用。護衛先を古い順で返す。
+
+        GJの有無はここに出さない。朝の公開文は護衛成功・噛みなし・襲撃なしを
+        すべて「平和な朝」に統一しているので、狩人にだけ「これは自分のGJだ」と
+        教えると、村に出ていない情報を本人だけが持つことになる
+        (記録自体は `action='襲撃確定'` / `result='GJ'` としてDBに残す)。
+        """
+        rows = await self._load_night_records(actor_id=actor_id, actions=("護衛",))
+        state = self.state
+        lines: list[str] = []
+        recorded_nights: set[int] = set()
+        for row in rows:
+            try:
+                night = int(row.get("night_number"))
+            except (TypeError, ValueError):
+                night = -1
+            recorded_nights.add(night)
+            lines.append(
+                f"・{self._night_label(row.get('night_number'))}: "
+                f"{self._record_target_name(row)}"
+            )
+        if state.guard_target is not None and state.day_number not in recorded_nights:
+            target = state.get_player(state.guard_target)
+            if target is not None:
+                lines.append(
+                    f"・{self._night_label(state.day_number)}: {target.display_name}"
+                )
+        if not lines:
+            return "🛡️ 護衛の記録はまだありません。"
+        return "🛡️ **護衛の記録**（古い順）\n" + "\n".join(lines)
+
+    async def post_village_panel(self) -> None:
+        """村パネルを #昼 の末尾へ掲示し直す (旧メッセージは削除)。
+
+        GMパネルが常に最下部に残るよう、呼び出し順は必ず
+        `_repost_gm_panel()` の直前にする。
+        """
+        state = self.state
+        ch = state.village_channel
+        if ch is None:
+            return
+        old_message_id = state.village_panel_message_id
+        old_view = self._village_panel_view
+        new_view = VillagePanelView(self)
+        try:
+            new_message = await self._discord_api_call(
+                ch.send, self.build_village_panel_content(), view=new_view
+            )
+        except (discord.Forbidden, discord.HTTPException) as e:
+            log.warning(f"村パネル投稿失敗 ({state.room_name}): {e}")
+            new_view.stop()
+            if new_view in self._game_views:
+                self._game_views.remove(new_view)
+            return
+        self._village_panel_view = new_view
+        state.village_panel_message_id = getattr(new_message, "id", None)
+        if old_view is not None:
+            try:
+                old_view.stop()
+            except Exception:
+                pass
+            if old_view in self._game_views:
+                self._game_views.remove(old_view)
+        if old_message_id is not None:
+            get_partial = getattr(ch, "get_partial_message", None)
+            if callable(get_partial):
+                try:
+                    await self._discord_api_call(get_partial(old_message_id).delete)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                    log.warning(f"旧村パネル削除失敗 ({state.room_name}): {e}")
+        try:
+            await self._persist_room_state()
+        except Exception as e:
+            # 消し損ねたパネルが1枚残るだけで進行は続けられる
+            log.warning(f"村パネルIDの保存に失敗 ({state.room_name}): {e}")
+
+    def refresh_village_panel(self) -> None:
+        """村パネルの本文だけをeditする (1.5秒デバウンス)。
+
+        CO宣言等は連打され得るため、待機中の再要求は最新1件にまとめて
+        edit APIを連打しない。既にタスクが走っていれば、完了後の
+        `_village_panel_refresh_pending` を立てるだけで新規タスクは作らない。
+        """
+        if self._village_panel_refresh_task is not None and not self._village_panel_refresh_task.done():
+            self._village_panel_refresh_pending = True
+            return
+        self._village_panel_refresh_task = self.manager.spawn_bg_task(
+            self._debounced_village_panel_refresh()
+        )
+
+    async def _debounced_village_panel_refresh(self) -> None:
+        try:
+            await asyncio.sleep(1.5)
+            while True:
+                self._village_panel_refresh_pending = False
+                await self._apply_village_panel_refresh()
+                if not self._village_panel_refresh_pending:
+                    break
+                await asyncio.sleep(1.5)
+        finally:
+            self._village_panel_refresh_task = None
+
+    async def _apply_village_panel_refresh(self) -> None:
+        panel = self._village_panel_reference()
+        if panel is None:
+            return
+        try:
+            await self._discord_api_call(
+                panel.edit, content=self.build_village_panel_content()
+            )
+        except discord.NotFound:
+            self.state.village_panel_message_id = None
+        except (discord.Forbidden, discord.HTTPException) as error:
+            log.warning(f"村パネル更新失敗 ({self.state.room_name}): {error}")
+
+    async def close_village_panel(self) -> None:
+        """試合終了時に村パネルを削除する (再起動残骸と同じ削除経路)。"""
+        state = self.state
+        if self._village_panel_view is not None:
+            try:
+                self._village_panel_view.stop()
+            except Exception:
+                pass
+            if self._village_panel_view in self._game_views:
+                self._game_views.remove(self._village_panel_view)
+            self._village_panel_view = None
+        message_id = state.village_panel_message_id
+        state.village_panel_message_id = None
+        ch = state.village_channel
+        if message_id is None or ch is None:
+            return
+        get_partial = getattr(ch, "get_partial_message", None)
+        if not callable(get_partial):
+            return
+        try:
+            await self._discord_api_call(get_partial(message_id).delete)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            log.warning(f"村パネル削除失敗 ({state.room_name}): {e}")
+
+    async def _disable_recovered_village_panel(self) -> None:
+        """再起動前のViewを表示上も外す (ターン話者パネルと同じ方式)。
+
+        GMが「再開」を押すと、以後の `_day_discussion` / `_night_phase` が
+        `post_village_panel()` を呼ぶため、削除まではせず無効化だけする。
+        """
+        panel = self._village_panel_reference()
+        if panel is None:
+            return
+        try:
+            await self._discord_api_call(panel.edit, view=None)
+        except discord.NotFound:
+            self.state.village_panel_message_id = None
+        except (discord.Forbidden, discord.HTTPException) as error:
+            log.warning(
+                f"復元村パネルの無効化失敗 ({self.state.room_name}): {error}"
+            )
+
+    # ------------------------------------------------------------------
+    # CO宣言・撤回 (仕様§2-2)
+    #
+    # DBへの追記 (record_co_event/record_co_result) は state 更新 +
+    # _persist_room_state() が成功した「後」に行う。DB書き込みが失敗しても
+    # ログに残すだけで進行は止めない (仕様0-8)。event_seq は
+    # state.record_event_seq を単調増加させて払い出す (投票・夜行動ログと共有)。
+    # ------------------------------------------------------------------
+
+    def co_actions_open(self) -> bool:
+        """CO宣言・撤回を受け付ける昼フェーズか。"""
+        return self._effective_phase() in self._CO_OPEN_PHASES
+
+    def _co_action_reject_reason(self, actor_id: int) -> Optional[str]:
+        """CO関連の全操作に共通する受付判定。弾く理由があれば文言を返す。"""
+        state = self.state
+        if not self.is_current_game_view(state.game_run_id):
+            return "⏳ この村パネルは終了しています。"
+        actor = state.get_player(actor_id)
+        if actor is None or not actor.alive:
+            return "⏳ 生存中の参加者だけが操作できます。"
+        if not self.co_actions_open():
+            return "⏳ 現在はCOを受け付けていません。"
+        if actor_id in state.disconnected_players:
+            return "VCへ復帰してから操作してください。"
+        return None
+
+    async def declare_co(self, actor_id: int, role: str) -> Optional[str]:
+        """役職1個までのCO宣言。既にCO中なら拒否する (同時に複数役職は不可)。"""
+        async with self.action_lock:
+            state = self.state
+            reason = self._co_action_reject_reason(actor_id)
+            if reason is not None:
+                return reason
+            if actor_id in state.co_claims:
+                return "既にCOしています。先に撤回してください。"
+            actor = state.get_player(actor_id)
+            claim = {
+                "number": actor.number,
+                "display_name": actor.display_name,
+                "role": role,
+                "day": state.day_number,
+            }
+            state.co_claims[actor_id] = claim
+            state.record_event_seq += 1
+            seq = state.record_event_seq
+            try:
+                await self._persist_room_state()
+            except Exception as error:
+                del state.co_claims[actor_id]
+                state.record_event_seq -= 1
+                log.exception(f"CO宣言の保存に失敗: {error}")
+                return "CO宣言を保存できませんでした。もう一度お試しください。"
+
+            try:
+                await database.record_co_event(
+                    state.guild.id, state.room_id, state.game_run_id,
+                    event_seq=seq, day_number=state.day_number,
+                    phase=self._effective_phase().name,
+                    actor_id=actor_id, actor_number=actor.number,
+                    event_type="CO", claimed_role=role,
+                )
+            except Exception as error:
+                log.exception(f"CO宣言のDB記録に失敗 ({state.room_name}): {error}")
+            self.refresh_village_panel()
+            return None
+
+    async def withdraw_co(self, actor_id: int) -> Optional[str]:
+        """CO撤回。撤回後は別役職を改めてCOできる。"""
+        async with self.action_lock:
+            state = self.state
+            reason = self._co_action_reject_reason(actor_id)
+            if reason is not None:
+                return reason
+            claim = state.co_claims.get(actor_id)
+            if claim is None:
+                return "CO中ではありません。"
+            del state.co_claims[actor_id]
+            state.record_event_seq += 1
+            seq = state.record_event_seq
+            try:
+                await self._persist_room_state()
+            except Exception as error:
+                state.co_claims[actor_id] = claim
+                state.record_event_seq -= 1
+                log.exception(f"CO撤回の保存に失敗: {error}")
+                return "CO撤回を保存できませんでした。もう一度お試しください。"
+
+            try:
+                await database.record_co_event(
+                    state.guild.id, state.room_id, state.game_run_id,
+                    event_seq=seq, day_number=state.day_number,
+                    phase=self._effective_phase().name,
+                    actor_id=actor_id, actor_number=claim["number"],
+                    event_type="撤回", claimed_role=claim["role"],
+                )
+            except Exception as error:
+                log.exception(f"CO撤回のDB記録に失敗 ({state.room_name}): {error}")
+            self.refresh_village_panel()
+            return None
+
+    def _night_role_reject_reason(
+        self, actor_id: int, role: Role, role_label: str
+    ) -> Optional[str]:
+        """占い・狩人の#昼パネル操作に共通する受付判定。弾く理由があれば文言を返す。"""
+        state = self.state
+        if not self.is_current_game_view(state.game_run_id):
+            return "⏳ この村パネルは終了しています。"
+        actor = state.get_player(actor_id)
+        if actor is None or not actor.alive or actor.role != role:
+            return f"生存する{role_label}だけが使えます。"
+        if not self.night_actions_open():
+            return "⏳ 今は使えません（夜だけ操作できます）。"
+        return None
+
+    def seer_targets(self, actor_id: int) -> list:
+        """占い師が選べる対象 (自分以外の生存者)。既存 SeerView と同一の絞り込み。"""
+        state = self.state
+        return by_number(
+            [p for p in state.alive_players() if p.user_id != actor_id]
+        )
+
+    def guard_targets(self, actor_id: int) -> list:
+        """狩人が選べる対象 (自分と前回の護衛先を除く生存者)。既存 GuardView と同一の絞り込み。"""
+        state = self.state
+        return by_number([
+            p for p in state.alive_players()
+            if p.user_id != actor_id and p.user_id != state.guard_previous
+        ])
+
+    async def commit_seer_target(self, actor_id: int, target_id: int) -> tuple[str, bool]:
+        """#昼パネル[占い]の確定処理。(表示文字列, 確定したか) を返す。結果は即時開示。"""
+        async with self.action_lock:
+            state = self.state
+            reason = self._night_role_reject_reason(actor_id, Role.SEER, "占い師")
+            if reason is not None:
+                return reason, False
+            if state.seer_target is not None:
+                return "✅ 今夜の占いは既に確定しています。変更はできません。", False
+            target = state.get_player(target_id)
+            if target is None or not target.alive:
+                return "❌ その対象は占えません（既に死亡しています）。", False
+
+            actor = state.get_player(actor_id)
+            old_action_log_len = len(state.action_log)
+            state.seer_target = target.user_id
+            judgement = "人狼" if target.role == Role.WEREWOLF else "村人"
+            self.log_action(
+                "占い", actor=actor, target=target, detail=f"結果={judgement}",
+            )
+            state.record_event_seq += 1
+            seq = state.record_event_seq
+            try:
+                await self._persist_room_state()
+            except Exception as error:
+                state.seer_target = None
+                state.record_event_seq -= 1
+                del state.action_log[old_action_log_len:]
+                log.exception(f"占い結果の保存に失敗: {error}")
+                return "❌ 占い結果を保存できませんでした。もう一度実行してください。", False
+            # 未行動警告の対象から外す
+            self._check_night_complete()
+
+            try:
+                await database.record_night_action(
+                    state.guild.id, state.room_id, state.game_run_id,
+                    event_seq=seq, night_number=state.day_number,
+                    actor_id=actor_id, actor_number=actor.number,
+                    actor_role="占い師", action="占い",
+                    target_id=target.user_id, target_number=target.number,
+                    result=judgement,
+                )
+            except Exception as error:
+                log.exception(f"占い結果のDB記録に失敗 ({state.room_name}): {error}")
+
+            text = f"🔮 占い結果: **{target.display_name}** は **{judgement}** でした。"
+            # 通常DMは送らない。確認UIはエフェメラルで消えるが、[占い]は
+            # 何度押しても初日からの結果を返すようになったため、手元へ残す
+            # ためのDMは役目を終えた (DM 1通ぶんのAPI呼び出しも減る)。
+            # 村パネルの本文はCO一覧・公開結果のみで占い有無は表示しないため、
+            # ここでは refresh_village_panel() を呼ばない
+            # (見た目が変わらない編集APIを増やさない)。
+            return text, True
+
+    async def commit_guard_target(self, actor_id: int, target_id: int) -> tuple[str, bool]:
+        """#昼パネル[狩人]の確定処理。(表示文字列, 確定したか) を返す。"""
+        async with self.action_lock:
+            state = self.state
+            reason = self._night_role_reject_reason(actor_id, Role.GUARD, "狩人")
+            if reason is not None:
+                return reason, False
+            if state.guard_target is not None:
+                return "✅ 今夜の護衛は既に確定しています。変更はできません。", False
+            # 表示候補を迂回した護衛先も最終的に拒否する (既存 GuardView と同じ検証)。
+            target = state.get_player(target_id)
+            if target is None:
+                return "❌ その対象は護衛できません。", False
+            if target.user_id == actor_id:
+                return "⚠️ 自分は護衛できません。", False
+            if target.user_id == state.guard_previous:
+                return "⚠️ 前回と同じ対象は護衛できません。", False
+            if not target.alive:
+                return "❌ その対象は護衛できません（既に死亡しています）。", False
+
+            actor = state.get_player(actor_id)
+            old_action_log_len = len(state.action_log)
+            state.guard_target = target.user_id
+            self.log_action("護衛", actor=actor, target=target)
+            state.record_event_seq += 1
+            seq = state.record_event_seq
+            try:
+                await self._persist_room_state()
+            except Exception as error:
+                state.guard_target = None
+                state.record_event_seq -= 1
+                del state.action_log[old_action_log_len:]
+                log.exception(f"護衛先の保存に失敗: {error}")
+                return "❌ 護衛先を保存できませんでした。もう一度実行してください。", False
+            # 未行動警告の対象から外す
+            self._check_night_complete()
+
+            try:
+                await database.record_night_action(
+                    state.guild.id, state.room_id, state.game_run_id,
+                    event_seq=seq, night_number=state.day_number,
+                    actor_id=actor_id, actor_number=actor.number,
+                    actor_role="狩人", action="護衛",
+                    target_id=target.user_id, target_number=target.number,
+                    result=None,
+                )
+            except Exception as error:
+                log.exception(f"護衛先のDB記録に失敗 ({state.room_name}): {error}")
+
+            # 村パネルの本文は護衛有無を表示しないため refresh_village_panel() は
+            # 呼ばない (占いと同じ理由)。
+            return f"🛡️ **{target.display_name}** の護衛を確定しました。", True
 
     async def _replace_turn_message(
         self,
@@ -3994,10 +4614,7 @@ class RoomRunner:
                 0, self.variant.turn_interrupts_per_day - state.turn_interrupts_used
             )
             detail = f"本日の割り込み残数: **{remaining_interrupts}回**"
-        return (
-            f"{title}\n{detail}\n{self._turn_co_declaration_line()}\n"
-            + self._timer_line(remaining)
-        )
+        return f"{title}\n{detail}\n" + self._timer_line(remaining)
 
     async def _turn_segment_countdown(
         self,
@@ -4139,7 +4756,6 @@ class RoomRunner:
                 not interrupt
                 and state.turn_interrupts_used < self.variant.turn_interrupts_per_day
             ),
-            allow_co_declaration=self.turn_co_declaration_open(),
         )
         message = await self._replace_turn_message(
             message,
@@ -4288,6 +4904,7 @@ class RoomRunner:
             await self._safe_village_send(
                 f"♻️ **{state.day_number}日目のターン制議論** を保存済みの発言枠から再開します。"
             )
+        await self.post_village_panel()
         await self._repost_gm_panel()
 
         turn_message: Optional[discord.Message] = self._turn_panel_reference()
@@ -4317,8 +4934,7 @@ class RoomRunner:
         if turn_message is not None:
             await self._replace_turn_message(
                 turn_message,
-                f"✅ **{state.day_number}日目の規定発言がすべて終了しました。**\n"
-                f"{self._turn_co_declaration_line()}",
+                f"✅ **{state.day_number}日目の規定発言がすべて終了しました。**",
                 None,
             )
         self._play_se("discussion_end")
@@ -4342,44 +4958,8 @@ class RoomRunner:
             state.turn_signal_event.set()
             return None
 
-    async def request_turn_co_declaration(
-        self, actor_id: int, turn_token: int
-    ) -> Optional[str]:
-        """役職・内容なしの公開COを、当日1回だけ記録する。"""
-        async with self.action_lock:
-            state = self.state
-            if (
-                not self.turn_co_declaration_open()
-                or state.turn_slot_token != turn_token
-            ):
-                return "この発言枠ではCOを宣言できません。"
-            actor = state.get_player(actor_id)
-            if actor is None or not actor.alive:
-                return "生存中の参加者だけがCOを宣言できます。"
-            if actor_id in state.disconnected_players:
-                return "VCへ復帰してからCOを宣言してください。"
-            if any(
-                declaration.get("user_id") == actor_id
-                for declaration in state.turn_co_declarations
-                if isinstance(declaration, dict)
-            ):
-                return "本日のCOは既に宣言済みです。"
-
-            declaration = {
-                "user_id": actor.user_id,
-                "number": actor.number,
-                "display_name": actor.display_name,
-            }
-            state.turn_co_declarations.append(declaration)
-            try:
-                await self._persist_room_state()
-            except Exception as error:
-                state.turn_co_declarations.pop()
-                log.exception(f"CO宣言の保存に失敗: {error}")
-                return "CO宣言を保存できませんでした。もう一度押してください。"
-
-            await self._refresh_turn_co_declaration_panel(turn_token)
-            return None
+    # 旧CO機構 request_turn_co_declaration は撤去した。CO宣言は #昼 常設パネル
+    # (VillagePanelView) の [CO] ボタン (declare_co) に一本化している。
 
     async def request_turn_interrupt(
         self, actor_id: int, turn_token: int
@@ -4410,13 +4990,30 @@ class RoomRunner:
             old_used = state.turn_interrupts_used
             state.turn_interrupts_used += 1
             state.turn_interrupt_pending_id = actor_id
+            state.record_event_seq += 1
+            seq = state.record_event_seq
             try:
                 await self._persist_room_state()
             except Exception as error:
                 state.turn_interrupts_used = old_used
                 state.turn_interrupt_pending_id = None
+                state.record_event_seq -= 1
                 log.exception(f"割り込み受付の保存に失敗: {error}")
                 return "割り込みを保存できませんでした。もう一度押してください。", remaining
+
+            speaker = state.get_player(state.current_speaker_id)
+            try:
+                await database.record_turn_event(
+                    state.guild.id, state.room_id, state.game_run_id,
+                    event_seq=seq, day_number=state.day_number,
+                    event_type="割り込み",
+                    actor_id=actor_id, actor_number=actor.number,
+                    speaker_id=speaker.user_id if speaker is not None else None,
+                    speaker_number=speaker.number if speaker is not None else None,
+                )
+            except Exception as error:
+                log.exception(f"割り込みのDB記録に失敗 ({state.room_name}): {error}")
+
             state.turn_interrupt_event.set()
             state.turn_signal_event.set()
             return None, max(0, limit - state.turn_interrupts_used)
@@ -4731,6 +5328,7 @@ class RoomRunner:
             await self._safe_village_send(
                 f"⏰ **投票時間切れ** — 未投票者: {names}\n既投票分で集計します。"
             )
+            await self._record_vote_abstentions(not_voted, "本投票", 0)
 
         # 翌日の投票フェーズで古いボタンが反応しないよう停止する
         view.stop()
@@ -4803,6 +5401,7 @@ class RoomRunner:
                 await self._safe_village_send(
                     f"⏰ **{voter.display_name}** は時間切れのため無投票です。"
                 )
+                await self._record_vote_abstentions([voter], "本投票", 0)
             await self._advance_vote_cursor()
             # 自分の枠の中で投票先が除外されると、票だけ消えて棄権になる。
             # 除外側が置いた印をここで回収し、末尾へ枠を積み直す。
@@ -4882,6 +5481,37 @@ class RoomRunner:
             "target": int(target_id),
             "voters": voters,
         })
+
+    async def _record_vote_abstentions(
+        self, voters: list[Player], vote_kind: str, round_index: int,
+    ) -> None:
+        """投票タイムアウトによる棄権・未投票を record_vote_event へ1行ずつ追記する
+        (仕様§2-4)。target_id=NULL の行として残す。失敗しても進行は止めない。
+        """
+        if not voters:
+            return
+        state = self.state
+        entries: list[tuple[Player, int]] = []
+        for voter in voters:
+            state.record_event_seq += 1
+            entries.append((voter, state.record_event_seq))
+        try:
+            await self._persist_room_state()
+        except Exception as error:
+            state.record_event_seq -= len(entries)
+            log.exception(f"棄権ログの保存に失敗 ({state.room_name}): {error}")
+            return
+        for voter, seq in entries:
+            try:
+                await database.record_vote_event(
+                    state.guild.id, state.room_id, state.game_run_id,
+                    event_seq=seq, day_number=state.day_number,
+                    vote_kind=vote_kind, round_index=round_index,
+                    voter_id=voter.user_id, voter_number=voter.number,
+                    target_id=None, target_number=None,
+                )
+            except Exception as error:
+                log.exception(f"棄権ログのDB記録に失敗 ({state.room_name}): {error}")
 
     def _tally_votes(self, votes: dict) -> dict[int, int]:
         tally: dict[int, int] = {}
@@ -5025,6 +5655,7 @@ class RoomRunner:
             await self._safe_village_send(
                 f"⏰ **決戦投票時間切れ** — 未投票者: {names}\n既投票分で集計します。"
             )
+            await self._record_vote_abstentions(not_voted, "決選投票", 1)
 
         # 以降の投票フェーズで古いボタンが反応しないよう停止する
         view.stop()
@@ -5555,13 +6186,14 @@ class RoomRunner:
                 "死亡者の発言権を安全に剥奪できませんでした",
                 state_committed=True,
             )
-        # 陣営に関係なく同じ条件で人狼予想DMを送り、受付を締めるまで
-        # 霊界を開けない。陣営で挙動を変えると死亡者の正体が漏れる。
+        # 陣営に関係なく同じ条件で受付を締めるまで霊界を開けない。
+        # 陣営で挙動を変えると死亡者の正体が漏れる。提出はDMではなく
+        # #昼パネルの[人狼予想]から行う (DM送信ぶんのAPIを増やさず、
+        # DM不達で提出機会そのものを失う事故も無くす)。
         held_for_guess = self._should_hold_spirit(method)
         if held_for_guess:
             death_event_id = str(effect.get("event_id") or "")
             self._hold_spirit_for_guess(player.user_id, death_event_id)
-            await self._send_wolf_guess_dm(player, death_event_id)
         else:
             await self._open_spirit_for(player.member)
             await self._safe_spirit_send(
@@ -5572,22 +6204,48 @@ class RoomRunner:
             self._play_se("execution")
             await self._safe_village_send(
                 f"⚰️ **{player.display_name}** が処刑されました。"
+                + (f"\n{WOLF_GUESS_NOTICE}" if held_for_guess else "")
             )
 
-            # 霊媒師にDM
-            medium = next(
-                (p for p in state.players.values()
-                 if p.role == Role.MEDIUM and p.alive),
-                None,
+            # 霊能結果を state へ記録する (仕様§2-3)。DMは廃止し、霊媒ボタンで
+            # ephemeral表示する経路へ一本化した。霊能者の生存・在籍に関わらず
+            # 必ず記録する (統計のため。存在しなくても記録自体は残す)。
+            # このメソッドはoutbox経由でat-least-once再適用されるため、
+            # 同じ死亡 (day + target_id) の記録が既にあれば追記しない
+            # (再適用のたびに一覧が伸び続けるのを防ぐ)。
+            judgement = "人狼" if player.is_wolf else "村人"
+            already_recorded = any(
+                isinstance(entry, dict)
+                and entry.get("day") == state.day_number
+                and entry.get("target_id") == player.user_id
+                for entry in state.medium_results
             )
-            if medium:
-                result = "**人狼**" if player.is_wolf else "**村人**"
+            if not already_recorded:
+                state.medium_results.append({
+                    "day": state.day_number,
+                    "target_id": player.user_id,
+                    "target_number": player.number,
+                    "display_name": player.display_name,
+                    "result": judgement,
+                })
+                state.record_event_seq += 1
+                seq = state.record_event_seq
+                medium = next(
+                    (p for p in state.players.values() if p.role == Role.MEDIUM),
+                    None,
+                )
                 try:
-                    await medium.member.send(
-                        f"👻 霊能結果: {player.display_name} は {result} でした。"
+                    await database.record_night_action(
+                        state.guild.id, state.room_id, state.game_run_id,
+                        event_seq=seq, night_number=state.day_number,
+                        actor_id=medium.user_id if medium else 0,
+                        actor_number=medium.number if medium else 0,
+                        actor_role="霊能者", action="霊能",
+                        target_id=player.user_id, target_number=player.number,
+                        result=judgement,
                     )
-                except (discord.Forbidden, discord.HTTPException):
-                    pass
+                except Exception as error:
+                    log.exception(f"霊能結果のDB記録に失敗 ({state.room_name}): {error}")
         elif method == "除外":
             await self._safe_village_send(
                 f"🚪 **{player.display_name}** が{reason or ''}ゲームから除外されました "
@@ -5698,77 +6356,13 @@ class RoomRunner:
         if wolves_alive:
             await asyncio.gather(*(send_wolf_dm(w) for w in wolves_alive))
 
-        # 占い師DM
-        seer = next(
-            (p for p in state.players.values()
-             if p.role == Role.SEER and p.alive),
-            None,
-        )
-        if seer:
-            targets = by_number(
-                [p for p in state.alive_players() if p.user_id != seer.user_id]
-            )
-            if state.seer_target is None:
-                seer_view = SeerView(self, targets)
-                self.register_game_view(seer_view, night=True)
-                try:
-                    await self._discord_api_call(
-                        seer.member.send,
-                        "🔮 **占う対象を選んでください。**\n"
-                        "選ぶと実行確認が出ます。確定すると**その場で結果が表示**され、今夜は変更できません。",
-                        view=seer_view,
-                    )
-                except (discord.Forbidden, discord.HTTPException) as e:
-                    log.warning(f"占い師DM送信失敗: {seer.member.display_name} ({e})")
-            else:
-                target = state.get_player(state.seer_target)
-                if target is not None:
-                    result = "**人狼**" if target.role == Role.WEREWOLF else "**村人**"
-                    try:
-                        await self._discord_api_call(
-                            seer.member.send,
-                            f"♻️ 復元: 今夜の占いは確定済みです。\n"
-                            f"🔮 占い結果: **{target.display_name}** は {result} でした。",
-                        )
-                    except (discord.Forbidden, discord.HTTPException):
-                        pass
-
-        # 狩人DM
-        guard = next(
-            (p for p in state.players.values()
-             if p.role == Role.GUARD and p.alive),
-            None,
-        )
-        if guard:
-            targets = by_number([
-                p for p in state.alive_players()
-                if p.user_id != guard.user_id and p.user_id != state.guard_previous
-            ])
-            if state.guard_target is None:
-                guard_view = GuardView(self, targets)
-                self.register_game_view(guard_view, night=True)
-                try:
-                    await self._discord_api_call(
-                        guard.member.send,
-                        "🛡️ **護衛対象を選んでください。**\n"
-                        "選ぶと実行確認が出ます。確定すると今夜は変更できません。",
-                        view=guard_view,
-                    )
-                except (discord.Forbidden, discord.HTTPException) as e:
-                    log.warning(f"狩人DM送信失敗: {guard.member.display_name} ({e})")
-            else:
-                target = state.get_player(state.guard_target)
-                if target is not None:
-                    try:
-                        await self._discord_api_call(
-                            guard.member.send,
-                            f"♻️ 復元: 今夜の護衛は **{target.display_name}** で確定済みです。",
-                        )
-                    except (discord.Forbidden, discord.HTTPException):
-                        pass
+        # 占い師・狩人のDMは廃止した (v0.49)。#昼常設パネルの[占い][狩人]
+        # ボタン経由のephemeral UIへ一本化している (仕様§2-3)。夜が明けるまで
+        # 何度でも押せ、確定済みならそのまま確定内容を再表示する。
 
         # 制限時間中のGMパネルでは「朝」を無効にする。安全条件を無視した
         # 早送りにはせず、朝待機が始まってから既存の強制夜明けを使う。
+        await self.post_village_panel()
         await self._repost_gm_panel()
 
         if not state.morning_ready_open:
@@ -5882,7 +6476,7 @@ class RoomRunner:
         old_morning_event = state.morning_ready_event.is_set()
         old_night_complete = state.night_complete_event.is_set()
 
-        # 無効な値 (-1 / 自己 / 前夜 / 死亡済み) を残すとGuardViewが
+        # 無効な値 (-1 / 自己 / 前夜 / 死亡済み) を残すと#昼パネルの[狩人]が
         # 「既に確定済み」と判断して再選択できない。必ず未選択へ戻す。
         state.guard_target = None
         state.morning_ready_ids.discard(guard.user_id)
@@ -5917,7 +6511,15 @@ class RoomRunner:
         return guard
 
     async def _request_guard_reselection(self, guard: Player) -> None:
-        """GM除外で護衛先が無効になった狩人へ、同じ夜の再選択DMを送る。"""
+        """GM除外で護衛先が無効になった狩人へ、#昼パネルからの再選択を促す。
+
+        以前はDMにGuardViewを直接送っていたが、役職行動は#昼パネルの
+        [狩人]ボタンへ一本化したため (仕様§2-3)、再選択の入口もそちらに
+        統一する。ここではプレーンテキストの通知のみDMで送り、Viewは
+        付けない (人狼DM系のViewには一切触れない方針を守るため)。
+        state.guard_target は呼び出し側で既に None へ戻し済みなので、
+        [狩人] を押せばそのまま新しい対象候補が出る。
+        """
         state = self.state
         if (
             not guard.alive
@@ -5925,28 +6527,21 @@ class RoomRunner:
             or not self.night_actions_open()
         ):
             return
-        targets = by_number([
-            player for player in state.alive_players()
-            if player.user_id != guard.user_id
-            and player.user_id != state.guard_previous
-        ])
-        if not targets:
+        if not self.guard_targets(guard.user_id):
             await self.pause_game(
                 "⚠️ 必須の夜行動を再選択できる対象がいないため、安全のため一時停止しました。\n"
                 "GMはプレイヤー除外または強制終了を選んでください。"
             )
             return
 
-        view = GuardView(self, targets)
-        self.register_game_view(view, night=True)
         try:
             await self._discord_api_call(
                 guard.member.send,
-                "⚠️ **護衛先が除外されたため未確定です。** もう一度選んでください。",
-                view=view,
+                "⚠️ **護衛先が除外されたため未確定です。**"
+                " #昼 の [狩人] ボタンからもう一度選んでください。",
             )
         except (discord.Forbidden, discord.HTTPException) as e:
-            log.error("狩人への再選択DM送信失敗 (%s): %s", guard.display_name, e)
+            log.error("狩人への再選択通知DM送信失敗 (%s): %s", guard.display_name, e)
             await self.pause_game(
                 "⚠️ 必須の夜行動を再選択するDMを送信できないため、安全のため一時停止しました。\n"
                 "GMは権限を確認し、続行不能ならプレイヤー除外または強制終了を選んでください。"
@@ -5959,21 +6554,6 @@ class RoomRunner:
             return
         if not self._pending_night_actions():
             state.night_complete_event.set()
-
-    async def deliver_seer_result(self, seer_id: int, text: str) -> None:
-        """占い結果を占い師の通常DMへ送る (手元に残す用)。
-
-        確定時の表示はエフェメラルなので、閉じるかクライアントを再読み込み
-        すると消える。夜が明けると夜UIも停止するため、再表示の手段も無い。
-        送信に失敗しても占いは成立済みなので、ここでは進行を止めない。
-        """
-        seer = self.state.get_player(seer_id)
-        if seer is None:
-            return
-        try:
-            await self._discord_api_call(seer.member.send, text)
-        except (discord.Forbidden, discord.HTTPException) as e:
-            log.warning(f"占い結果DM送信失敗 ({seer.display_name}): {e}")
 
     async def _wait_for_morning(self) -> None:
         """夜の制限時間が切れた後、生存者全員の「朝を迎える」宣言を待つ。
@@ -6041,6 +6621,7 @@ class RoomRunner:
                     text = (
                         "⚠️ **まだ護衛先を選んでいません。** "
                         "護衛放棄はできず、確定するまで朝を迎えられません。"
+                        "#昼 の村パネル[狩人]から選んでください。"
                     )
                 else:
                     text = (
@@ -6222,7 +6803,7 @@ class RoomRunner:
         if (guard := self._pending_guard_player()) is not None and member.id == guard.user_id:
             return "", (
                 "🛡️ **護衛先を確定するまで朝を迎えられません。**\n"
-                "狩人は護衛放棄できません。DMの護衛先を選んでください。"
+                "狩人は護衛放棄できません。村パネルの[狩人]から選んでください。"
             )
 
         # 未行動の役職には1度だけ警告し、2度目の押下で確定させる (誤タップ防止)
@@ -6531,6 +7112,7 @@ class RoomRunner:
         old_last_killed = state._last_killed
         old_next_turn_anchor_number = state.next_turn_anchor_number
         old_action_log_len = len(state.action_log)
+        old_record_event_seq = state.record_event_seq
 
         try:
             # この印は襲撃死の alive=False と同じスナップショットへ保存される。
@@ -6556,6 +7138,21 @@ class RoomRunner:
             else:
                 state.guard_previous = None
 
+            # 襲撃投票・襲撃確定のログ用 event_seq をここで払い出し、
+            # これから行う persist (killed_id 有無どちらの分岐でも必ず通る)
+            # に含める。狼DMのコード (WolfVoteView 等) には一切触れず、
+            # 夜が確定するこの受付関数側で wolf_voters / wolf_target を
+            # 読むだけにとどめる。
+            wolf_vote_log_entries: list[tuple[Player, Optional[int], int]] = []
+            for wolf_id, voted_target_id in state.wolf_voters.items():
+                wolf = state.get_player(wolf_id)
+                if wolf is None:
+                    continue
+                state.record_event_seq += 1
+                wolf_vote_log_entries.append((wolf, voted_target_id, state.record_event_seq))
+            state.record_event_seq += 1
+            attack_result_seq = state.record_event_seq
+
             if state.wolf_target and state.wolf_target != -1:
                 if state.guard_target == state.wolf_target:
                     state._last_guarded = True
@@ -6577,6 +7174,58 @@ class RoomRunner:
                     peace_detail = "襲撃なし"
                 self.log_action("平和", detail=peace_detail)
                 await self._persist_room_state()
+
+            # 記録DBへの追記は state 側が durable になった後に行う。
+            # 失敗しても進行は止めない (仕様§0-8)。
+            try:
+                for wolf, voted_target_id, seq in wolf_vote_log_entries:
+                    if voted_target_id and voted_target_id != -1:
+                        vote_target = state.get_player(voted_target_id)
+                        vote_target_id = vote_target.user_id if vote_target else None
+                        vote_target_number = vote_target.number if vote_target else None
+                        vote_result = None
+                    else:
+                        vote_target_id = None
+                        vote_target_number = None
+                        vote_result = "噛みなし" if voted_target_id == -1 else None
+                    await database.record_night_action(
+                        state.guild.id, state.room_id, state.game_run_id,
+                        event_seq=seq, night_number=state.day_number,
+                        actor_id=wolf.user_id, actor_number=wolf.number,
+                        actor_role="人狼", action="襲撃投票",
+                        target_id=vote_target_id, target_number=vote_target_number,
+                        result=vote_result,
+                    )
+
+                if killed_id is not None:
+                    victim = state.get_player(killed_id)
+                    attack_target_id = victim.user_id if victim else killed_id
+                    attack_target_number = victim.number if victim else None
+                    attack_result = "襲撃成功"
+                elif state._last_guarded:
+                    guarded = state.get_player(state.guard_target)
+                    attack_target_id = guarded.user_id if guarded else None
+                    attack_target_number = guarded.number if guarded else None
+                    attack_result = "GJ"
+                elif state.wolf_target == -1:
+                    attack_target_id = None
+                    attack_target_number = None
+                    attack_result = "噛みなし"
+                else:
+                    attack_target_id = None
+                    attack_target_number = None
+                    attack_result = "襲撃なし"
+                await database.record_night_action(
+                    state.guild.id, state.room_id, state.game_run_id,
+                    event_seq=attack_result_seq, night_number=state.day_number,
+                    actor_id=0, actor_number=0,
+                    actor_role="人狼", action="襲撃確定",
+                    target_id=attack_target_id, target_number=attack_target_number,
+                    result=attack_result,
+                )
+            except Exception as error:
+                log.exception(f"襲撃ログのDB記録に失敗 ({state.room_name}): {error}")
+
             return killed_id
         except StateDurabilityError as e:
             if e.state_committed:
@@ -6588,6 +7237,7 @@ class RoomRunner:
             state._last_guarded = old_last_guarded
             state._last_killed = old_last_killed
             state.next_turn_anchor_number = old_next_turn_anchor_number
+            state.record_event_seq = old_record_event_seq
             del state.action_log[old_action_log_len:]
             await self._stop_for_durability_error("夜解決状態の保存", e)
             raise
@@ -6597,6 +7247,7 @@ class RoomRunner:
             state._last_guarded = old_last_guarded
             state._last_killed = old_last_killed
             state.next_turn_anchor_number = old_next_turn_anchor_number
+            state.record_event_seq = old_record_event_seq
             del state.action_log[old_action_log_len:]
             await self._stop_for_durability_error("夜解決状態の保存", e)
             raise StateDurabilityError("夜解決状態を保存できませんでした") from e
@@ -6605,14 +7256,9 @@ class RoomRunner:
     # 朝のログ
     # ============================================================
 
-    async def _morning_log(self) -> None:
+    def build_morning_log_text(self) -> str:
+        """朝のログ本文を組み立てる (Discordに触れない部分だけ)。"""
         state = self.state
-        await state.pause_event.wait()
-        state.phase = Phase.MORNING
-        await self._persist_room_state()
-        # 夜明けSEは _night_phase の末尾 (夜が終わった瞬間) で鳴らす。
-        # ここで二重に鳴らさない
-
         lines = []
 
         if state._last_executed:
@@ -6622,14 +7268,27 @@ class RoomRunner:
         # (理由を出し分けると護衛の生存状況などが村へ漏れるため)
         if state._last_killed:
             lines.append(f"🌙 襲撃: {state._last_killed.display_name}（死亡）")
+            # 襲撃死は朝まで本人も気づけない。人狼予想の受付が続いている
+            # ときだけ、提出先を1行だけ添える (DM廃止ぶんの導線)。
+            if state._last_killed.user_id in state.spirit_hold_ids:
+                lines.append(WOLF_GUESS_NOTICE)
         else:
             lines.append("🕊️ 平和な朝を迎えました")
 
         lines.append(f"\n現在の生存者: **{len(state.alive_players())}人**")
+        return "\n".join(lines)
+
+    async def _morning_log(self) -> None:
+        state = self.state
+        await state.pause_event.wait()
+        state.phase = Phase.MORNING
+        await self._persist_room_state()
+        # 夜明けSEは _night_phase の末尾 (夜が終わった瞬間) で鳴らす。
+        # ここで二重に鳴らさない
 
         embed = discord.Embed(
             title=f"🌅 {state.day_number}日目の朝",
-            description="\n".join(lines),
+            description=self.build_morning_log_text(),
             color=discord.Color.yellow(),
         )
         await self._safe_village_send(embed=embed)
@@ -6674,6 +7333,18 @@ class RoomRunner:
             "wolf_guess_slots": variant.wolf_guess_slots,
             "final_day_threshold": variant.final_day_threshold,
         }
+
+    def _started_at_str(self) -> Optional[str]:
+        """試合開始時刻をDB書式 (UTCの'YYYY-MM-DD HH:MM:SS') へ変換する。
+
+        state.started_at はゲーム開始採番時 (game_run_id 発行と同じ場所) に
+        設定される。未設定 (旧snapshotからの復帰直後など) ならNoneを返し、
+        stage_game_settlement側の既定Noneに委ねる。
+        """
+        started_at = self.state.started_at
+        if started_at is None:
+            return None
+        return started_at.strftime("%Y-%m-%d %H:%M:%S")
 
     async def _end_game(self, winner: Team) -> None:
         state = self.state
@@ -6792,6 +7463,7 @@ class RoomRunner:
                         gm_id=state.gm_id,
                         base_room_id=state.room_id,
                         recruitment_id=state.recruitment_id,
+                        started_at=self._started_at_str(),
                         **self._settlement_variant_kwargs(),
                     )
             else:
@@ -6808,6 +7480,7 @@ class RoomRunner:
                     gm_id=state.gm_id,
                     base_room_id=state.room_id,
                     recruitment_id=state.recruitment_id,
+                    started_at=self._started_at_str(),
                     **self._settlement_variant_kwargs(),
                 )
         except Exception as e:
@@ -6828,6 +7501,7 @@ class RoomRunner:
         state.phase = Phase.GAME_OVER
         state.paused = False
         self._stop_all_game_views()
+        await self.close_village_panel()
         # pending settlementのstage完了後にGAME_OVERを確定する。
         game_over_saved = False
         for delay in (0, 1, 2):
@@ -6933,6 +7607,7 @@ class RoomRunner:
                                     gm_id=state.gm_id,
                                     base_room_id=state.room_id,
                                     recruitment_id=state.recruitment_id,
+                                    started_at=self._started_at_str(),
                                     **self._settlement_variant_kwargs(),
                                 )
                                 rank_snapshot_staged = True
@@ -7646,6 +8321,23 @@ class RoomRunner:
             state.recovered_from_restart = False
             state.recovery_phase = None
 
+            # DAY_VOTE / DAY_RUNOFF_* / DAY_LAST_WILL / MORNING から再開する分岐は
+            # 「昼開始」を経由せず finish_recovered_vote / _day_vote / _runoff /
+            # _last_will / _morning_log を直接呼ぶため、村パネルの貼り直し
+            # (post_village_panel) を通る _day_discussion / _turn_day_discussion /
+            # _night_phase を一切経由しない。放置すると復元後その日が夜に
+            # 遷移するまでCO・CO撤回・占い・狩人・霊媒・人狼予想の全ボタンが
+            # 使えないままになる。
+            # そのためここで進行中フェーズなら無条件に1回貼り直す。
+            # _day_discussion / _night_phase を通る経路では二重貼り直しに
+            # なるが、post_village_panel は旧メッセージを削除してから送るため
+            # 実害はなく、再起動1回あたりAPI呼び出しが2回増えるだけ。
+            # 経路ごとに貼り直しの要否を分岐する複雑さより、単純さと
+            # 確実さ (どの経路で再開してもパネルが必ず生きている) を
+            # 優先する。
+            if state.phase not in (Phase.LOBBY, Phase.GAME_OVER):
+                await self.post_village_panel()
+
             async def finish_night(*, resume_existing: bool) -> bool:
                 """夜を解決して朝へ進む。勝敗確定ならTrue。"""
                 if not state.night_resolved:
@@ -8068,6 +8760,7 @@ class RoomRunner:
         # 遮断され、ゲームループがこれ以降 phase を書き換えることもなくなる。
         state.phase = Phase.GAME_OVER
         self._stop_all_game_views()
+        await self.close_village_panel()
         if state.game_task and not state.game_task.done():
             state.game_task.cancel()
         initial_saved = False
@@ -9258,57 +9951,6 @@ class RoomRunner:
         self._spirit_release_tasks.add(task)
         task.add_done_callback(self._spirit_release_tasks.discard)
 
-    async def _send_wolf_guess_dm(
-        self, player: Player, death_event_id: str,
-    ) -> bool:
-        """死亡者へ人狼予想をDMし、失敗時は即解放してGMだけへ知らせる。"""
-        view = WolfGuessSelectView(self, player.user_id, death_event_id)
-        try:
-            await self._discord_api_call(
-                player.member.send,
-                "🐺 **人狼予想**\n"
-                f"死亡から{WOLF_GUESS_TIMEOUT // 60}分以内に、"
-                f"人狼だと思う{self.variant.wolf_guess_slots}人を選んでください。\n"
-                "**確定すると変更できません。** 提出するとすぐ霊界へ入れます。\n"
-                "実際の人狼本人を除き、的中数がレート変動に反映されます。",
-                view=view,
-            )
-            return True
-        except (discord.Forbidden, discord.HTTPException) as e:
-            view.stop()
-            log.warning(
-                "人狼予想DMの送信失敗 (%s / %s): %s",
-                player.display_name,
-                death_event_id,
-                e,
-            )
-            await self._release_spirit_hold(player.user_id)
-            await self._notify_gm_wolf_guess_dm_failure(player)
-            return False
-
-    async def _notify_gm_wolf_guess_dm_failure(self, player: Player) -> None:
-        """人狼予想DM失敗を公開せず、GMのDMだけへ通知する。"""
-        state = self.state
-        gm = (
-            state.guild.get_member(state.gm_id)
-            if state.guild is not None and state.gm_id is not None
-            else None
-        )
-        if gm is None:
-            log.warning(
-                "人狼予想DM失敗をGMへ通知できません (GM不在 / ID:%s)",
-                state.gm_id,
-            )
-            return
-        try:
-            await self._discord_api_call(
-                gm.send,
-                f"⚠️ {player.display_name} へ人狼予想DMを送れなかったため、"
-                "待たせず霊界へ解放しました。公開チャンネルには通知していません。",
-            )
-        except (discord.Forbidden, discord.HTTPException) as e:
-            log.warning("人狼予想DM失敗をGMへDMできませんでした: %s", e)
-
     async def submit_wolf_guess(
         self,
         player_id: int,
@@ -9332,12 +9974,45 @@ class RoomRunner:
             ):
                 return False
             state.wolf_guesses[player_id] = unique_targets
+            # 予想の中身 (誰を挙げたか) は state だけだと試合終了で消え、
+            # game_players.wolf_guess_hits に正解数しか残らない。1人1行で
+            # 追記して後から精度・傾向を追えるようにする。seqは先に払い出し、
+            # persist に含めてから書く (仕様§0-8: state が durable になって
+            # からDBへ追記する)。
+            old_record_event_seq = state.record_event_seq
+            state.record_event_seq += len(unique_targets)
             try:
                 await self._persist_room_state()
             except Exception as e:
                 state.wolf_guesses.pop(player_id, None)
+                state.record_event_seq = old_record_event_seq
                 log.warning(f"人狼予想の保存に失敗 (ID:{player_id}): {e}")
                 return False
+            actor = state.get_player(player_id)
+            try:
+                for offset, target_id in enumerate(unique_targets, start=1):
+                    target = state.get_player(target_id)
+                    await database.record_night_action(
+                        state.guild.id, state.room_id, state.game_run_id,
+                        event_seq=old_record_event_seq + offset,
+                        night_number=state.day_number,
+                        actor_id=player_id,
+                        actor_number=actor.number if actor is not None else 0,
+                        actor_role=(
+                            actor.role.value
+                            if actor is not None and actor.role is not None
+                            else "不明"
+                        ),
+                        action="人狼予想",
+                        target_id=target_id,
+                        target_number=target.number if target is not None else None,
+                        result=(
+                            ("人狼" if target.is_wolf else "村人")
+                            if target is not None else None
+                        ),
+                    )
+            except Exception as error:
+                log.exception(f"人狼予想のDB記録に失敗 ({state.room_name}): {error}")
         await self._release_spirit_hold(player_id)
         return True
 

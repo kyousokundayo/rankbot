@@ -425,70 +425,12 @@ class TurnActionRaceTest(unittest.IsolatedAsyncioTestCase):
         )
 
 
-class TurnCoDeclarationTest(unittest.IsolatedAsyncioTestCase):
-    def setUp(self) -> None:
-        self.runner = make_runner("v9_turn")
-        add_players(self.runner, 9)
-        state = self.runner.state
-        state.turn_day_generation = state.day_generation
-        state.turn_order = list(range(1, 10))
-        state.turn_slot_active = True
-        state.turn_window_open = True
-        state.current_speaker_id = 1
-        state.turn_slot_token = 8
-
-    async def test_co_window_is_second_round_on_day_one_and_only_round_later(self) -> None:
-        state = self.runner.state
-        self.assertFalse(self.runner.turn_co_declaration_open())
-
-        state.turn_round_index = 1
-        self.assertTrue(self.runner.turn_co_declaration_open())
-
-        state.turn_interrupt_active = True
-        self.assertFalse(self.runner.turn_co_declaration_open())
-        state.turn_interrupt_active = False
-
-        state.day_number = 2
-        state.day_generation = 2
-        state.turn_round_index = 0
-        self.assertTrue(self.runner.turn_co_declaration_open())
-        state.turn_round_index = 1
-        self.assertFalse(self.runner.turn_co_declaration_open())
-
-    async def test_co_is_persisted_once_per_day_and_requires_vc_return(self) -> None:
-        state = self.runner.state
-        state.turn_round_index = 1
-
-        first, duplicate = await asyncio.gather(
-            self.runner.request_turn_co_declaration(2, 8),
-            self.runner.request_turn_co_declaration(2, 8),
-        )
-
-        self.assertEqual([first, duplicate].count(None), 1)
-        self.assertTrue(any("既に宣言済み" in result for result in (first, duplicate) if result))
-        self.assertEqual(
-            state.turn_co_declarations,
-            [{"user_id": 2, "number": 2, "display_name": "02.user-2"}],
-        )
-        self.runner._persist_room_state.assert_awaited_once()
-
-        state.disconnected_players.add(3)
-        error = await self.runner.request_turn_co_declaration(3, 8)
-        self.assertIn("VCへ復帰", error)
-        self.assertEqual(len(state.turn_co_declarations), 1)
-
-        error = await self.runner.request_turn_co_declaration(4, 7)
-        self.assertIn("この発言枠", error)
-
-    async def test_co_save_failure_rolls_back(self) -> None:
-        state = self.runner.state
-        state.turn_round_index = 1
-        self.runner._persist_room_state = AsyncMock(side_effect=RuntimeError("db down"))
-
-        error = await self.runner.request_turn_co_declaration(2, 8)
-
-        self.assertIn("保存できません", error)
-        self.assertEqual(state.turn_co_declarations, [])
+# 旧CO機構 (turn_co_declaration_open / request_turn_co_declaration) の
+# テストは撤去した。新機構 (declare_co / withdraw_co / publish_co_result)
+# の回帰テストは tests/test_village_panel_co.py にある。
+# state.turn_co_declarations フィールドと _validate_turn_snapshot の検証は
+# 旧 snapshot 互換のため残っており、TurnDurabilityAndSafetyTest 側で
+# 引き続き確認する。
 
 
 class TurnDurabilityAndSafetyTest(unittest.IsolatedAsyncioTestCase):
@@ -898,25 +840,12 @@ class TurnDurabilityAndSafetyTest(unittest.IsolatedAsyncioTestCase):
             speaker_id=1,
             turn_token=3,
             allow_interrupt=True,
-            allow_co_declaration=False,
         )
         self.assertEqual(
             {item.label for item in view.children},
             {"発言終了（パス）", "30秒割り込み"},
         )
-        co_view = TurnSpeechView(
-            runner,
-            speaker_id=1,
-            turn_token=3,
-            allow_interrupt=True,
-            allow_co_declaration=True,
-        )
-        self.assertEqual(
-            {item.label for item in co_view.children},
-            {"発言終了（パス）", "30秒割り込み", "COを宣言"},
-        )
         view.stop()
-        co_view.stop()
 
         variant = get_variant_definition("v9_turn")
         embeds = [*build_rule_embeds(variant), *build_help_embeds(variant)]

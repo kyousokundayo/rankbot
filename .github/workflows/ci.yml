@@ -37,4 +37,6 @@ jobs:
       - name: Compile check
         run: git ls-files -z '*.py' | xargs -0 python -m py_compile
       - name: Unit tests
-        run: python -m unittest discover -s tests
+        # -t . が無いと tests/ 自身が top-level 扱いになり tests/__init__.py の
+        # 本番DB隔離ガードが読み込まれない (unittest discover の仕様)。外さないこと。
+        run: python -m unittest discover -s tests -t .

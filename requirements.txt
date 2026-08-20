@@ -9,3 +9,5 @@ certifi==2026.7.22
 # 1.6.2 ではなく制約内の最新 1.5.0 を使う。
 PyNaCl==1.5.0
 davey==0.1.6  # discord.py 2.7系のDAVE E2EE実装
+# 戦績カード画像 (stats_image.py) の描画専用。Python 3.14 対応を確認済み。
+Pillow==12.3.0
