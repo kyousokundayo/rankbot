@@ -9248,6 +9248,9 @@ class RoomRunner:
         state = self.state
         vc = state.voice_channel
         if vc is None:
+            log.warning(
+                f"VC未解決のためミュート同期をスキップしました ({state.room_name})"
+            )
             return []
         skip_ids = skip_ids or set()
 
@@ -9286,18 +9289,23 @@ class RoomRunner:
                     failed.append((member, mute))
 
         targets: list[tuple[discord.Member, bool]] = []
+        skip_counts = {"bot": 0, "gm": 0, "vc不一致": 0, "既にmute": 0, "suppress": 0}
         for member in list(vc.members):
             if member.bot:
+                skip_counts["bot"] += 1
                 continue
             if member.id in skip_ids:
+                skip_counts["既にmute"] += 1
                 continue
             # GMは常にミュート自動制御の対象外 (参加者を兼ねていても)。
             # Discordのサーバーミュートは本人では解除できない仕様のため、
             # 進行役が不意に発言不能になる事故を避け、GM自身の手動管理に委ねる
             if member.id == state.gm_id:
+                skip_counts["gm"] += 1
                 continue
             vs = member.voice
             if vs is None or vs.channel is None or vs.channel.id != vc.id:
+                skip_counts["vc不一致"] += 1
                 continue
             should_speak = member.id in speakers
             if should_speak and vs.mute:
@@ -9309,12 +9317,24 @@ class RoomRunner:
                     log.warning(
                         f"手動サーバーミュートを保護しました: {member.display_name}"
                     )
+                    skip_counts["既にmute"] += 1
             elif not should_speak and not vs.mute:
                 if getattr(vs, "suppress", False):
+                    skip_counts["suppress"] += 1
                     continue  # 権限側で既に発言不可
                 targets.append((member, True))
+            else:
+                skip_counts["既にmute"] += 1
 
         if not targets:
+            log.info(
+                "ミュート同期: 対象0件 "
+                f"(VC接続{len(vc.members)}人, "
+                f"bot={skip_counts['bot']}, gm={skip_counts['gm']}, "
+                f"VC不一致={skip_counts['vc不一致']}, "
+                f"既にmute={skip_counts['既にmute']}, "
+                f"suppress={skip_counts['suppress']})"
+            )
             return []
         # Member.editはギルド共有バケットのため、Semaphore(5)だけで並列化すると
         # 13人の末尾が429になりやすい。全卓共通ペーサーで順番に流す。
