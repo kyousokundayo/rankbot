@@ -1072,10 +1072,19 @@ class GMControlView(discord.ui.View):
                     effective_phase in (Phase.DAY_RUNOFF_SPEECH, Phase.DAY_LAST_WILL)
                     and getattr(state, "current_speaker_id", None) is not None
                 )
+                or (
+                    # 昼の議論を打ち切って投票へ進める。同じブロックの他項目と
+                    # 同じくstateだけを見る (RoomRunner未実装のViewでも壊さない)。
+                    effective_phase == Phase.DAY_DISCUSSION
+                    and getattr(state, "day_discussion_skip_generation", None)
+                    != getattr(state, "day_generation", None)
+                )
             )
             and not self._settlement_locked()
         )
-        if effective_phase == Phase.DAY_VOTE and cog.uses_sequential_vote():
+        if effective_phase == Phase.DAY_DISCUSSION:
+            self.skip_wait_btn.label = "議論終了"
+        elif effective_phase == Phase.DAY_VOTE and cog.uses_sequential_vote():
             if state.vote_slot_active and not state.vote_speech_finished:
                 self.skip_wait_btn.label = "発言終了"
             elif state.vote_slot_active:
@@ -1683,7 +1692,8 @@ class SequentialVoteSpeechView(discord.ui.View):
         self.add_item(_VoteQueueButton(cog))
 
     @discord.ui.button(
-        label="発言終了",
+        # custom_idは変えない (再起動後の永続Viewの照合キー)。
+        label="終了",
         style=discord.ButtonStyle.secondary,
         custom_id="vote_speech_done",
     )
@@ -5339,7 +5349,7 @@ def build_rule_embeds(
         )
     else:
         vote_rule = (
-            "「投票参加」を押した順に1人30秒発言します。本人の「発言終了」または"
+            "「投票参加」を押した順に1人30秒発言します。本人の「終了」または"
             "時間経過で発言を終え、**発言終了SEと約2秒の切替後**に候補を選びます。\n"
             "候補を選んだ後は本人専用の確認で確定し、票をその場で公開します。"
             "**候補選択に時間制限はなく、自動棄権はしません。**\n"
@@ -5459,6 +5469,7 @@ def build_help_embeds(
             f"受付中は `#{CH_LOBBY}` の「GM管理」で除外・リセット。\n"
             f"ゲーム中は `#{CH_VILLAGE}` の「GMメニュー・状況」から一時停止 / 再開 / 朝"
             f" / 役職確認を締切 / スキップ{gm_turn_help} / 強制終了 / リセット / 除外ができます。\n"
+            "昼の議論中はスキップが「議論終了」になり、押すとその場で投票へ進みます。\n"
             "リセットは同じ参加者・GMを維持。強制終了はGMだけを残して参加者0人へ戻します。"
         ),
         inline=False,

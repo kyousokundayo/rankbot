@@ -2154,6 +2154,7 @@ class RoomRunner:
             "night_resolved": state.night_resolved,
             "pending_winner": state.pending_winner.name if state.pending_winner else None,
             "ending": state.ending,
+            "day_discussion_skip_generation": state.day_discussion_skip_generation,
             "lobby_return_mode": state.lobby_return_mode,
             "pending_recruitment_reopen": state.pending_recruitment_reopen,
             "preparation_dm_sent_ids": list(state.preparation_dm_sent_ids),
@@ -2875,6 +2876,16 @@ class RoomRunner:
         state.night_resolved = bool(payload.get("night_resolved", False))
         pending_winner_name = payload.get("pending_winner")
         state.pending_winner = Team[pending_winner_name] if pending_winner_name else None
+        skip_generation = payload.get("day_discussion_skip_generation")
+        if skip_generation is not None and (
+            isinstance(skip_generation, bool)
+            or not isinstance(skip_generation, int)
+            or skip_generation < 0
+        ):
+            raise StateDurabilityError(
+                f"議論スキップ世代が不正です: {skip_generation!r}"
+            )
+        state.day_discussion_skip_generation = skip_generation
         lobby_return_mode = payload.get("lobby_return_mode", "empty")
         if lobby_return_mode not in {"empty", "gm", "roster"}:
             raise StateDurabilityError(
@@ -4958,6 +4969,26 @@ class RoomRunner:
             state.initial_night_skip_event.set()
             await self._safe_village_send("⏭️ **GMの操作で0日目の初夜をスキップします。**")
             return "⏭️ 0日目の初夜をスキップしました。"
+        if phase == Phase.DAY_DISCUSSION:
+            if self._day_discussion_skipped():
+                return "⏳ 議論の終了は受付済みです。まもなく投票へ進みます。"
+            previous_generation = state.day_discussion_skip_generation
+            state.day_discussion_skip_generation = state.day_generation
+            try:
+                await self._persist_room_state()
+            except Exception as error:
+                state.day_discussion_skip_generation = previous_generation
+                log.exception(f"議論スキップの保存に失敗: {error}")
+                return "❌ 保存できませんでした。もう一度押してください。"
+            state.day_discussion_skip_event.set()
+            if self.is_turn_discussion_mode():
+                # 発言中なら現在の枠も閉じる。枠外なら次の枠を開かせない。
+                state.turn_done_event.set()
+                state.turn_signal_event.set()
+            await self._safe_village_send(
+                "⏭️ **GMの操作で議論を終了します。** まもなく投票フェーズに入ります。"
+            )
+            return "⏭️ 議論を終了して投票へ進みます。"
         if (
             # 一斉投票には発言枠も待機列もない。逐次投票用の締切分岐は
             # vote_order が空のターン制でも条件が揃ってしまい、締め切った
@@ -5213,6 +5244,8 @@ class RoomRunner:
         await state.pause_event.wait()
         state.phase = Phase.DAY_DISCUSSION
         state.votes.clear()
+        # 再起動をまたいでも、その日ぶんのGMスキップ指示だけを引き継ぐ。
+        self._sync_day_discussion_skip_event()
         await self._persist_room_state()
 
         # チャンネル権限: 生存者のみ書き込み可
@@ -5269,12 +5302,21 @@ class RoomRunner:
         await self.post_village_panel()
         await self._repost_gm_panel()
 
-        await self._pausable_countdown(timer_msg, discussion_content, duration)
+        skipped = await self._pausable_countdown(
+            timer_msg,
+            discussion_content,
+            duration,
+            state.day_discussion_skip_event,
+        )
 
         # 議論終了。ミュートが行き渡るまで数秒かかるので、
         # 「終了 = もう喋れない」と誤解させない文言にする
         self._play_se("discussion_end")
-        await self._safe_village_send("⏰ **議論時間終了！** 全員をミュートしています…")
+        await self._safe_village_send(
+            "⏰ **GMの操作で議論を終了しました！** 全員をミュートしています…"
+            if skipped
+            else "⏰ **議論時間終了！** 全員をミュートしています…"
+        )
         await self._lock_village()
         await self._mute_phase("まもなく投票フェーズに入ります。")
 
@@ -6364,6 +6406,9 @@ class RoomRunner:
         state.turn_done_event.clear()
         state.turn_interrupt_event.clear()
         state.turn_signal_event.clear()
+        if self._day_discussion_skipped():
+            # GMのスキップとこのclearが競合しても、新しい発言枠を開かない。
+            state.turn_done_event.set()
         await self._persist_turn_checkpoint("ターン話者の開始")
 
         while True:
@@ -6519,6 +6564,8 @@ class RoomRunner:
 
         # ターン制はVCだけで進行し、#昼のテキスト書き込みは許可しない。
         await self._lock_village()
+        # 再起動をまたいでも、その日ぶんのGMスキップ指示だけを引き継ぐ。
+        self._sync_day_discussion_skip_event()
         initialized = await self._initialize_turn_day()
         durations = self._turn_round_durations()
 
@@ -6541,7 +6588,8 @@ class RoomRunner:
         await self._repost_gm_panel()
 
         turn_message: Optional[discord.Message] = self._turn_panel_reference()
-        while state.turn_round_index < len(durations):
+        skipped = self._day_discussion_skipped()
+        while not skipped and state.turn_round_index < len(durations):
             if not state.turn_order:
                 raise StateDurabilityError("ターン順序が保存されていません")
             if state.turn_slot_index >= len(state.turn_order):
@@ -6559,6 +6607,9 @@ class RoomRunner:
             duration = durations[state.turn_round_index]
             turn_message = await self._run_main_turn(player, duration, turn_message)
             await self._advance_turn_cursor()
+            # 現在の発言を終えた時点で確認する。発言中に押された場合は
+            # turn_done_eventがその枠を先に閉じ、ここで残りの巡を打ち切る。
+            skipped = self._day_discussion_skipped()
 
         state.turn_slot_active = False
         state.current_speaker_id = None
@@ -6567,11 +6618,19 @@ class RoomRunner:
         if turn_message is not None:
             await self._replace_turn_message(
                 turn_message,
-                f"✅ **{state.day_number}日目の規定発言がすべて終了しました。**",
+                (
+                    f"⏭️ **{state.day_number}日目の議論をGMの操作で終了しました。**"
+                    if skipped
+                    else f"✅ **{state.day_number}日目の規定発言がすべて終了しました。**"
+                ),
                 None,
             )
         self._play_se("discussion_end")
-        await self._safe_village_send("⏰ **ターン制議論終了！** 投票フェーズに入ります。")
+        await self._safe_village_send(
+            "⏭️ **GMの操作でターン制議論を終了しました。** 投票フェーズに入ります。"
+            if skipped
+            else "⏰ **ターン制議論終了！** 投票フェーズに入ります。"
+        )
 
     async def request_turn_pass(
         self, actor_id: int, speaker_id: int, turn_token: int
@@ -10170,6 +10229,21 @@ class RoomRunner:
     # ============================================================
     # GM操作
     # ============================================================
+
+    def _day_discussion_skipped(self) -> bool:
+        """当日の議論をGMが打ち切ったか。世代一致だけを正とする。"""
+        state = self.state
+        return (
+            state.day_discussion_skip_generation is not None
+            and state.day_discussion_skip_generation == state.day_generation
+        )
+
+    def _sync_day_discussion_skip_event(self) -> None:
+        """保存済みのスキップ指示を、その日の進行イベントへ反映する。"""
+        if self._day_discussion_skipped():
+            self.state.day_discussion_skip_event.set()
+        else:
+            self.state.day_discussion_skip_event.clear()
 
     def _is_game_in_progress(self) -> bool:
         """ゲーム進行中。開始処理中・再起動復元後の停止状態も含む。"""
