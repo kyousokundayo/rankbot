@@ -1,4 +1,4 @@
-"""本番DB隔離ガード。
+"""本番DB・本番ログ隔離ガード。
 
 なぜここに置くか:
   tests/__init__.py に同種のガードを置いても、CIやscripts/run_checks.shが
@@ -22,6 +22,8 @@
 from __future__ import annotations
 
 import atexit
+import logging
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -35,6 +37,40 @@ import database
 _guard_tmpdir = tempfile.TemporaryDirectory(prefix="werewolf-tests-guard-")
 database.DB_PATH = str(Path(_guard_tmpdir.name) / "guard-default.db")
 atexit.register(_guard_tmpdir.cleanup)
+# ------------------------------------------------------------------------
+
+# --- モジュールレベルで即座に本番ログからも隔離する ----------------------
+# bot.py はモジュール読み込み時点 (import 時点) で
+# logs/bot.log へ RotatingFileHandler を張ってしまう。tests/test_startup_
+# resilience.py が bot を import するため、何もしなければテスト実行が
+# 稼働中Botと同じログファイルを掴み、ローテーションで本番ログを潰して
+# しまう。WEREWOLF_LOG_DIR を先回りしてテスト専用の一時ディレクトリへ
+# 向けておくことで、bot.py 側 (import時) がこの一時ディレクトリを使う
+# ようにする。ファイル名を "00" にして最初に import させているのは
+# database.DB_PATH の隔離と同じ理由 (モジュールdocstring参照)。
+_log_guard_tmpdir = tempfile.TemporaryDirectory(prefix="werewolf-tests-log-guard-")
+os.environ["WEREWOLF_LOG_DIR"] = _log_guard_tmpdir.name
+atexit.register(_log_guard_tmpdir.cleanup)
+
+
+def _detach_handlers_pointing_at_production_log() -> None:
+    """念のための保険: 本番 logs/bot.log を指すハンドラが既に張られていたら外す。
+
+    通常は WEREWOLF_LOG_DIR の先回り設定だけで十分だが、何らかの事情で
+    bot モジュールが本ファイルより先に import されていた場合に備え、
+    ルートロガーから本番ログファイルを指すハンドラを検出して除去する。
+    挙動 (テストの成否) には影響しない防御的処理。
+    """
+    production_log = str((Path(__file__).resolve().parent.parent / "logs" / "bot.log").resolve())
+    root_logger = logging.getLogger()
+    for handler in list(root_logger.handlers):
+        base_filename = getattr(handler, "baseFilename", None)
+        if base_filename and str(Path(base_filename).resolve()) == production_log:
+            root_logger.removeHandler(handler)
+            handler.close()
+
+
+_detach_handlers_pointing_at_production_log()
 # ------------------------------------------------------------------------
 
 
@@ -53,6 +89,33 @@ class DbPathGuardTest(unittest.TestCase):
 
     def test_default_db_path_lives_under_a_temporary_directory(self) -> None:
         self.assertIn("werewolf-tests-guard-", database.DB_PATH)
+
+
+class LogPathGuardTest(unittest.TestCase):
+    """このログガードが働いていることの回帰テスト。"""
+
+    def test_werewolf_log_dir_env_points_to_a_temporary_directory(self) -> None:
+        self.assertIn("werewolf-tests-log-guard-", os.environ.get("WEREWOLF_LOG_DIR", ""))
+
+    def test_bot_module_uses_the_guarded_log_dir_if_imported(self) -> None:
+        # bot をここで import しても (tests/test_startup_resilience.py が
+        # 既に import 済みでも、本ファイル単体実行で未import でも)、
+        # production の logs/bot.log ではなくガードされた一時ディレクトリを
+        # 掴んでいるはずであること。DISCORD_TOKEN 未設定でも import が
+        # 失敗しないよう、test_startup_resilience.py と同様に無害な値を
+        # 一時的に渡す (既に import 済みならこの値は使われない)。
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"DISCORD_TOKEN": "unit-test-token"}):
+            import bot as bot_module
+
+        production_log_dir = Path(bot_module.BASE_DIR) / "logs"
+        self.assertNotEqual(
+            Path(bot_module.LOG_DIR).resolve(),
+            production_log_dir.resolve(),
+            "bot.LOG_DIR が本番ログディレクトリを指しています。"
+            "WEREWOLF_LOG_DIR による退避が効いていない可能性があります。",
+        )
 
 
 if __name__ == "__main__":

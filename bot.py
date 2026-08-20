@@ -32,8 +32,11 @@ from command_sync import sync_application_commands
 
 sys.stdout.reconfigure(line_buffering=True)
 
-LOG_DIR = BASE_DIR / "logs"
-LOG_DIR.mkdir(exist_ok=True)
+# テスト実行時は tests/test_00_db_path_guard.py が WEREWOLF_LOG_DIR を
+# 一時ディレクトリへ差し替える。bot.py の import だけでログハンドラが
+# 張られてしまうため、本番ログ (logs/bot.log) を汚さないための退避先。
+LOG_DIR = Path(os.environ["WEREWOLF_LOG_DIR"]) if os.environ.get("WEREWOLF_LOG_DIR") else BASE_DIR / "logs"
+LOG_DIR.mkdir(exist_ok=True, parents=True)
 
 
 def _configure_ssl_cert_file() -> None:
