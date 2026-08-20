@@ -566,7 +566,7 @@ def render_player_card(data: dict) -> bytes:
 
 
 # ============================================================
-# レート推移グラフ (v0.50)
+# レート推移グラフ (v0.51)
 #
 # 戦績カードと同じ二段構え: DBの生データ → format_rating_chart_data() で
 # 描画用の辞書へ → render_rating_chart() でPNG。描画側はDiscordにもDBにも

@@ -15,7 +15,7 @@ from room_config import (
 )
 
 # Botのバージョン (ヘルプに表示。ソース公開された派生でも識別できるように)
-BOT_VERSION = "v0.50"
+BOT_VERSION = "v0.51"
 
 # 新規導入先に同名カテゴリが既にある場合、無関係なDiscord構成をBot所有と
 # 誤認しない。既存運用は保存済みchannel IDで自動再利用できる。
@@ -426,7 +426,7 @@ RECRUITMENT_CONTACT_COOLDOWN_SECONDS = 300
 PLAYER_BLOCK_LIMIT = 50
 
 # ------------------------------------------------------------
-# 「募集」ボタン (v0.49 §3-2) のDM送信ペース設定。
+# 「募集」ボタン (v0.51 §3-2) のDM送信ペース設定。
 # 既存の paced_discord_api_call は全卓共有の bulk_api_lock を占有し、
 # ゲーム開始時のロール付与・ミュートを数十秒待たせてしまうため、
 # 募集通知DMはRecruitmentManager専用のペーサーで別枠にする。

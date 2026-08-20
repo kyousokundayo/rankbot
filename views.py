@@ -1816,7 +1816,7 @@ class WolfVoteView(discord.ui.View):
 
 
 # ============================================================
-# 夜アクション: 占い師・狩人 (#昼パネル、v0.49で DM から移設)
+# 夜アクション: 占い師・狩人 (#昼パネル、v0.51で DM から移設)
 #
 # 占い師DM (旧 SeerView) と狩人DM (旧 GuardView) は廃止し、
 # VillagePanelView の [占い][狩人] ボタン経由の ephemeral UI に一本化した。
@@ -2314,7 +2314,7 @@ class COClaimRoleView(discord.ui.View):
 class VillageWolfGuessView(discord.ui.View):
     """#昼パネルの [人狼予想] ボタンから開くephemeral選択UI (仕様§2-3)。
 
-    人狼予想の提出口はここだけ (v0.50でDM経路を廃止した)。CO関連UIと同じく
+    人狼予想の提出口はここだけ (v0.51でDM経路を廃止した)。CO関連UIと同じく
     「同じ相手を選び直せない」Discordセレクト仕様を避けるため、ボタンで
     1人ずつ選ばせ、variant.wolf_guess_slots人ちょうど選び終えた時点で
     自動確定する。
@@ -2445,7 +2445,7 @@ class SpeechDoneView(discord.ui.View):
 class TurnSpeechView(discord.ui.View):
     """ターン制の発言終了・村全体の30秒割り込み。
 
-    旧「COを宣言」ボタンは撤去した (v0.49)。CO宣言は #昼 常設パネル
+    旧「COを宣言」ボタンは撤去した (v0.51)。CO宣言は #昼 常設パネル
     (VillagePanelView) の [CO] ボタンへ一本化している。
     """
 
@@ -3931,7 +3931,7 @@ async def _build_stats_card_png(
 
 
 # ============================================================
-# レート推移グラフ / 相性 (v0.50)
+# レート推移グラフ / 相性 (v0.51)
 # ============================================================
 
 # レート推移も戦績カードと同じPillow描画なので、生成の同時実行数は
