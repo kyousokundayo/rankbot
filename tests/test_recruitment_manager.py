@@ -29,6 +29,9 @@ from recruitment import (
     RecruitmentScheduleView,
 )
 import recruitment as recruitment_lib
+from room_config import RoomDefinition
+
+
 class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="werewolf-recruitment-manager-")
@@ -123,6 +126,7 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         )
         # 主催者以外は開けない
         await remove_button.callback(interaction)
+
         self.assertIn(
             "主催者だけ", interaction.response.send_message.await_args.args[0],
         )
@@ -151,6 +155,88 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         # 空いた参加枠へ補欠が繰り上がり、本人へDMが飛ぶ
         self.assertEqual(by_user[113], "参加")
         self.members[113].send.assert_awaited()
+
+    async def test_reopen_previous_recruitment_copies_settings_only(self) -> None:
+        source = await database.create_recruitment(
+            1,
+            1,
+            title="前回の村",
+            scheduled_at=datetime.now(timezone.utc) - timedelta(hours=2),
+            room_id=self.room_id,
+            variant_id="v9_cross",
+            streaming=True,
+            allowed_ranks={"ゴールド"},
+            note="前回備考",
+        )
+        await database.add_recruitment_entry(source, 100)
+        self.assertTrue(await database.set_recruitment_status(
+            source, database.RECRUITMENT_ARCHIVED,
+        ))
+        self.room.room_def = RoomDefinition(
+            self.room_id,
+            "GM村",
+            private_owner_id=1,
+            variant_id="v13_cross",
+        )
+        self.state.guild = self.guild
+        host = MagicMock(spec=discord.Member)
+        host.id = 1
+        host.roles = [SimpleNamespace(name=GM_ROLE_NAME)]
+        interaction = SimpleNamespace(guild=self.guild, user=host)
+        self.manager.publish_new_recruitment = AsyncMock()
+
+        result = await self.manager.reopen_previous_recruitment(
+            interaction, self.room,
+        )
+
+        self.assertIn("再開しました", result)
+        self.assertIsNotNone(self.state.recruitment_id)
+        self.assertNotEqual(self.state.recruitment_id, source)
+        self.assertEqual(self.state.gm_id, 1)
+        new_row = await database.get_recruitment(self.state.recruitment_id)
+        self.assertEqual(new_row["title"], "前回の村")
+        self.assertEqual(new_row["variant_id"], "v9_cross")
+        self.assertTrue(new_row["streaming"])
+        self.assertEqual(new_row["allowed_ranks"], frozenset({"ゴールド"}))
+        self.assertEqual(new_row["note"], "前回備考")
+        self.assertEqual(
+            await database.list_recruitment_entries(self.state.recruitment_id),
+            [],
+        )
+        self.assertEqual(
+            (await database.get_recruitment(source))["status"],
+            database.RECRUITMENT_ARCHIVED,
+        )
+        self.manager.publish_new_recruitment.assert_awaited_once_with(
+            self.guild, self.state.recruitment_id, announce=False,
+        )
+
+    async def test_host_menu_timeout_disables_controls_and_points_back_to_card(self) -> None:
+        view = recruitment_lib.RecruitmentHostView(self.manager, 10, 1)
+        view.message = SimpleNamespace(edit=AsyncMock())
+
+        await view.on_timeout()
+
+        self.assertTrue(all(item.disabled for item in view.children))
+        kwargs = view.message.edit.await_args.kwargs
+        self.assertIn("開き直してください", kwargs["content"])
+        self.assertIs(kwargs["view"], view)
+
+    async def test_valid_held_lobby_recruitment_is_not_archived_as_orphan(self) -> None:
+        recruitment_id = await self._full_recruitment(gm_id=1)
+        self.assertTrue(await database.set_recruitment_status(
+            recruitment_id, database.RECRUITMENT_HELD,
+        ))
+        self.state.recruitment_id = recruitment_id
+        self.state.gm_id = 1
+        self.state.players = {
+            user_id: object() for user_id in range(100, 113)
+        }
+
+        await self.manager._archive_orphaned_held_recruitments(self.guild)
+
+        row = await database.get_recruitment(recruitment_id)
+        self.assertEqual(row["status"], database.RECRUITMENT_HELD)
 
     async def test_player_block_view_pages_all_candidates_and_registered_users(self) -> None:
         members = [
@@ -809,7 +895,7 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
 
         message.delete.assert_awaited_once()
         row = await database.get_recruitment(recruitment_id)
-        self.assertEqual(row["status"], database.RECRUITMENT_HELD)
+        self.assertEqual(row["status"], database.RECRUITMENT_ARCHIVED)
         self.assertIsNone(row["message_id"])
 
     async def test_notification_loop_retries_hidden_card_after_discord_error(self) -> None:

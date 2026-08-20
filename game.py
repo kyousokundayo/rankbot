@@ -1634,6 +1634,36 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 return room
         return None
 
+    def find_active_user_room(
+        self,
+        user_id: int,
+        exclude_room_id: Optional[str] = None,
+        *,
+        include_ending_cleanup: bool = True,
+    ) -> Optional[RoomRunner]:
+        """指定ユーザーが参加中の、開始済みの別卓だけを返す。
+
+        募集中の複数卓へGM／参加者登録すること自体は許可するため、
+        LOBBY と終了処理済みの GAME_OVER は所属競合に含めない。ただし
+        GAME_OVERでも ``ending`` 中は名前・mute等のcleanupが残っているため、
+        通常は別卓開始と外部副作用を重ねないようactiveとして扱う。
+        ランクロール同期だけは終了処理自身がGAME_OVER中に行うため、呼出側が
+        ``include_ending_cleanup=False`` を指定して終了卓を除外できる。
+        """
+        for room in self.rooms.values():
+            if exclude_room_id is not None and room.state.room_id == exclude_room_id:
+                continue
+            if room.state.phase == Phase.LOBBY:
+                continue
+            if room.state.phase == Phase.GAME_OVER:
+                if not include_ending_cleanup:
+                    continue
+                if not getattr(room.state, "ending", False):
+                    continue
+            if room.state.gm_id == user_id or user_id in room.state.players:
+                return room
+        return None
+
     async def _ensure_rank_roles(self, guild: discord.Guild) -> dict[str, discord.Role]:
         existing = {r.name: r for r in guild.roles}
         result: dict[str, discord.Role] = {}
@@ -1716,8 +1746,10 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         # 伴う昇降格でプレイ中にカテゴリやVCが見えなくなるのを防ぐ。
         # 本人のゲームが終わればphaseがGAME_OVERになってから同期が走るし、
         # 起動時の全体同期・統計ボタンでも追い付くため取りこぼしはない
-        active_room = self.find_user_room(member.id)
-        if active_room is not None and active_room.state.phase not in (Phase.LOBBY, Phase.GAME_OVER):
+        active_room = self.find_active_user_room(
+            member.id, include_ending_cleanup=False,
+        )
+        if active_room is not None:
             log.info(
                 f"ゲーム中のためランクロール同期を保留 ({member.display_name} / {active_room.state.room_name})"
             )

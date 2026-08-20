@@ -1,6 +1,7 @@
 """常設パネルの段数と入口を守る回帰テスト。"""
 from __future__ import annotations
 
+import asyncio
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -163,6 +164,100 @@ class UsabilityViewLayoutTest(unittest.TestCase):
         self.assertEqual(len(entry.children), 1)
         _assert_within_three_rows(self, menu)
         self.assertEqual({item.row for item in menu.children}, {0, 1})
+
+
+class LobbyInteractionExpiryTest(unittest.IsolatedAsyncioTestCase):
+    async def test_start_acknowledges_before_waiting_for_action_lock(self) -> None:
+        state = SimpleNamespace(
+            phase=Phase.LOBBY,
+            players={1: object()},
+            gm_id=99,
+            room_id="beginner",
+        )
+        action_lock = asyncio.Lock()
+        cog = SimpleNamespace(
+            state=state,
+            action_lock=action_lock,
+            variant=SimpleNamespace(player_count=1),
+            is_private_room=lambda: False,
+            start_game=AsyncMock(),
+        )
+        view = LobbyView(cog)
+        start_button = next(
+            item for item in view.children if item.custom_id == "start_game"
+        )
+        acknowledged = asyncio.Event()
+
+        async def acknowledge() -> None:
+            acknowledged.set()
+
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=99),
+            response=SimpleNamespace(
+                defer=AsyncMock(side_effect=acknowledge),
+                send_message=AsyncMock(),
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        await action_lock.acquire()
+        callback_task = asyncio.create_task(start_button.callback(interaction))
+        try:
+            await asyncio.wait_for(acknowledged.wait(), timeout=1)
+            self.assertFalse(callback_task.done())
+            interaction.response.defer.assert_awaited_once_with()
+
+            # 待っている間に別の開始処理が村を進行中へ変えた場合でも、
+            # 期限切れの初回responseではなくfollowupで結果を返す。
+            state.phase = Phase.DAY_DISCUSSION
+        finally:
+            action_lock.release()
+
+        await asyncio.wait_for(callback_task, timeout=1)
+        interaction.followup.send.assert_awaited_once_with(
+            "現在ゲーム中です。", ephemeral=True,
+        )
+        interaction.response.send_message.assert_not_awaited()
+        cog.start_game.assert_not_awaited()
+
+    async def test_start_edits_panel_after_early_acknowledgement(self) -> None:
+        state = SimpleNamespace(
+            phase=Phase.LOBBY,
+            players={1: object()},
+            gm_id=99,
+            room_id="beginner",
+        )
+
+        async def start_game(_interaction) -> None:
+            state.phase = Phase.PREPARATION
+
+        cog = SimpleNamespace(
+            state=state,
+            action_lock=asyncio.Lock(),
+            variant=SimpleNamespace(player_count=1),
+            is_private_room=lambda: False,
+            start_game=AsyncMock(side_effect=start_game),
+        )
+        view = LobbyView(cog)
+        start_button = next(
+            item for item in view.children if item.custom_id == "start_game"
+        )
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=99),
+            response=SimpleNamespace(
+                defer=AsyncMock(),
+                edit_message=AsyncMock(),
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+            message=SimpleNamespace(edit=AsyncMock()),
+        )
+
+        await start_button.callback(interaction)
+
+        interaction.response.defer.assert_awaited_once_with()
+        interaction.message.edit.assert_awaited_once_with(view=view)
+        interaction.response.edit_message.assert_not_awaited()
+        cog.start_game.assert_awaited_once_with(interaction)
 
 
 class DangerConfirmationTest(unittest.IsolatedAsyncioTestCase):

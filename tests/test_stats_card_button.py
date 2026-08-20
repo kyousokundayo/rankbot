@@ -66,7 +66,12 @@ class StatsCardButtonTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_zero_games_player_gets_png_file(self) -> None:
         with patch.object(stats_image, "font_available", return_value=True), \
-                patch.object(views, "STATS_CARD_BUTTON_ENABLED", True):
+                patch.object(views, "STATS_CARD_BUTTON_ENABLED", True), \
+                patch.object(
+                    views,
+                    "_build_stats_card_png",
+                    AsyncMock(return_value=b"\x89PNG\r\n\x1a\n"),
+                ):
             view = views.StatsView(SimpleNamespace())
             interaction = _make_interaction(self.guild, self.user)
             await view.stats_card_image.callback(interaction)

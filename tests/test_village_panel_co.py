@@ -6,7 +6,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from config import Phase, RoomDefinition
+from config import Phase, Role, RoomDefinition
 from models import Player
 from room_runner import RoomRunner
 
@@ -124,12 +124,97 @@ class CoRejectionTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(error)
         self.assertEqual(runner.state.co_claims, {})
 
-class VillagePanelContentTest(unittest.IsolatedAsyncioTestCase):
-    """パネル本文の組み立て。役職名の表示と長さ上限の防御。
 
-    v0.51で [結果を公開] を廃止したため、本文に載るのは役職CO (自己申告)
-    だけになった。占い・霊能の結果はVCで口頭で伝える。
-    """
+class CoResultClaimTest(unittest.IsolatedAsyncioTestCase):
+    async def test_any_living_player_can_publish_fake_result_about_dead_player(self) -> None:
+        runner = make_runner()
+        actor = add_player(runner, 1)
+        actor.role = Role.VILLAGER
+        target = add_player(runner, 2, alive=False)
+
+        with patch(
+            "room_runner.database.record_co_result_events", new=AsyncMock()
+        ) as record:
+            error = await runner.publish_co_result(
+                actor.user_id,
+                Role.SEER.value,
+                target.user_id,
+                "黒",
+                expected_game_run_id="run-co",
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(len(runner.state.co_result_claims), 1)
+        self.assertEqual(runner.state.co_result_claims[0]["target_id"], target.user_id)
+        self.assertEqual(runner.state.co_result_claims[0]["judgement"], "黒")
+        events = record.await_args.kwargs["events"]
+        self.assertEqual([event["event_type"] for event in events], ["公開"])
+
+    async def test_same_day_same_type_is_idempotent_or_atomically_replaced(self) -> None:
+        runner = make_runner()
+        actor = add_player(runner, 1)
+        first = add_player(runner, 2)
+        second = add_player(runner, 3)
+
+        with patch(
+            "room_runner.database.record_co_result_events", new=AsyncMock()
+        ) as record:
+            await runner.publish_co_result(
+                actor.user_id, Role.MEDIUM.value, first.user_id, "白",
+                expected_game_run_id="run-co",
+            )
+            seq_after_first = runner.state.record_event_seq
+            await runner.publish_co_result(
+                actor.user_id, Role.MEDIUM.value, first.user_id, "白",
+                expected_game_run_id="run-co",
+            )
+            await runner.publish_co_result(
+                actor.user_id, Role.MEDIUM.value, second.user_id, "黒",
+                expected_game_run_id="run-co",
+            )
+
+        self.assertEqual(seq_after_first, 1)
+        self.assertEqual(runner.state.record_event_seq, 3)
+        self.assertEqual(record.await_count, 2)
+        replacement = record.await_args.kwargs["events"]
+        self.assertEqual(
+            [event["event_type"] for event in replacement], ["取消", "公開"]
+        )
+        self.assertEqual([event["event_seq"] for event in replacement], [2, 3])
+        self.assertEqual(len(runner.state.co_result_claims), 1)
+        self.assertEqual(runner.state.co_result_claims[0]["target_id"], second.user_id)
+
+    async def test_result_rejects_stale_run_night_self_and_invalid_judgement(self) -> None:
+        runner = make_runner()
+        actor = add_player(runner, 1)
+        target = add_player(runner, 2)
+        stale = await runner.publish_co_result(
+            actor.user_id, Role.SEER.value, target.user_id, "白",
+            expected_game_run_id="old-run",
+        )
+        self_target = await runner.publish_co_result(
+            actor.user_id, Role.SEER.value, actor.user_id, "白",
+            expected_game_run_id="run-co",
+        )
+        invalid = await runner.publish_co_result(
+            actor.user_id, Role.GUARD.value, target.user_id, "白",
+            expected_game_run_id="run-co",
+        )
+        runner.state.phase = Phase.NIGHT
+        night = await runner.publish_co_result(
+            actor.user_id, Role.SEER.value, target.user_id, "白",
+            expected_game_run_id="run-co",
+        )
+
+        self.assertIn("終了", stale)
+        self.assertIn("自分自身", self_target)
+        self.assertIn("申告できません", invalid)
+        self.assertIn("受け付けていません", night)
+        self.assertEqual(runner.state.co_result_claims, [])
+
+
+class VillagePanelContentTest(unittest.IsolatedAsyncioTestCase):
+    """パネル本文のCO・公開結果表示と長さ上限の防御。"""
 
     def _seed(self, runner: RoomRunner) -> None:
         for number in range(1, 14):
@@ -157,19 +242,22 @@ class VillagePanelContentTest(unittest.IsolatedAsyncioTestCase):
         self.assertLess(content.index("占い師CO"), content.index("霊能者CO"))
         self.assertLess(content.index("霊能者CO"), content.index("狩人CO"))
 
-    async def test_panel_never_carries_result_claims(self) -> None:
-        """Botは占い・霊能の結果を公開しない (真偽を扱わないため)。"""
-        runner = make_runner()
+    async def test_panel_carries_result_claims_during_night_too(self) -> None:
+        runner = make_runner(phase=Phase.NIGHT)
         add_player(runner, 3)
+        add_player(runner, 5, alive=False)
         runner.state.co_claims[3] = {
             "number": 3, "display_name": "太郎", "role": "占い師", "day": 1,
         }
+        runner.state.co_result_claims.append({
+            "user_id": 3, "number": 3, "display_name": "太郎",
+            "role": Role.MEDIUM.value, "target_id": 5, "target_number": 5,
+            "target_name": "次郎", "judgement": "黒", "day": 1,
+        })
         content = runner.build_village_panel_content()
+        self.assertIn("現在フェーズ: 夜", content)
         self.assertIn("・3番 太郎", content)
-        self.assertNotIn("　└", content)
-        self.assertNotIn("結果を公開", content)
-        self.assertFalse(hasattr(runner, "publish_co_result"))
-        self.assertFalse(hasattr(runner.state, "co_result_claims"))
+        self.assertIn("　└ 1日目 霊媒: 5番 次郎 → 黒", content)
 
     async def test_full_house_of_long_names_stays_within_the_limit(self) -> None:
         runner = make_runner()

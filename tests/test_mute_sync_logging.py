@@ -8,7 +8,9 @@ from __future__ import annotations
 import logging
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
+
+import discord
 
 from tests.test_turn_discussion import add_players, make_runner
 
@@ -113,6 +115,72 @@ class MuteSyncLoggingTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(victim.member.voice.mute)
         changed_ids = {m.id for m, _ in changed}
         self.assertEqual(changed_ids, {victim.user_id})
+
+    async def test_thirteen_player_empty_cache_mutes_all_except_gm(self) -> None:
+        """13人村でvc.membersが空でも12人を取りこぼさず、GMは除外する。"""
+        runner = make_runner()
+        players = add_players(runner, 13)
+        voice_channel = SimpleNamespace(id=50, members=[])
+        runner.state.voice_channel = voice_channel
+        runner.state.gm_id = players[-1].user_id
+        marker_role = SimpleNamespace(id=99, name=runner._mute_marker_role_name())
+        runner.state.mute_marker_enabled = True
+        by_id = {player.user_id: player.member for player in players}
+        runner.state.guild = SimpleNamespace(
+            get_member=by_id.get,
+            roles=[marker_role],
+        )
+
+        for player in players:
+            player.member.bot = False
+            player.member.roles = []
+            player.member.voice = SimpleNamespace(
+                channel=voice_channel, mute=False, suppress=False
+            )
+
+            async def edit_member(*, mute=None, _member=player.member, **_kwargs):
+                if mute is not None:
+                    _member.voice.mute = mute
+                return _member
+
+            player.member.edit = AsyncMock(side_effect=edit_member)
+
+        changed = await runner._sync_server_mutes(set())
+
+        self.assertEqual(len(changed), 12)
+        self.assertTrue(all(player.member.voice.mute for player in players[:-1]))
+        self.assertFalse(players[-1].member.voice.mute)
+        players[-1].member.edit.assert_not_awaited()
+
+    async def test_retry_exhaustion_logs_final_failed_members(self) -> None:
+        runner = make_runner()
+        (victim,) = add_players(runner, 1)
+        voice_channel = SimpleNamespace(id=50, members=[victim.member])
+        runner.state.voice_channel = voice_channel
+        victim.member.bot = False
+        victim.member.voice = SimpleNamespace(
+            channel=voice_channel, mute=False, suppress=False
+        )
+        unavailable = discord.HTTPException(
+            SimpleNamespace(status=503, reason="Unavailable", headers={}),
+            "retry failed",
+        )
+        runner._paced_discord_api_call = AsyncMock(side_effect=unavailable)
+        # 実装はDiscord Member.editをペーサー経由で呼ぶため、
+        # この失敗経路でも本番Member相当の属性を用意しておく。
+        victim.member.edit = AsyncMock()
+
+        with patch("room_runner.asyncio.sleep", new=AsyncMock()), self.assertLogs(
+            "room_runner", level="ERROR"
+        ) as cm:
+            changed = await runner._sync_server_mutes(set())
+
+        self.assertEqual(len(changed), 1)
+        self.assertEqual(runner._paced_discord_api_call.await_count, 2)
+        final_lines = [line for line in cm.output if "ミュート最終失敗" in line]
+        self.assertEqual(len(final_lines), 1)
+        self.assertIn(victim.member.display_name, final_lines[0])
+        self.assertIn("mute=True", final_lines[0])
 
     async def test_gm_is_never_muted_even_when_not_speaking(self) -> None:
         runner = make_runner()

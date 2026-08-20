@@ -150,7 +150,7 @@ class RecruitmentDatabaseTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertCountEqual(archived, [first, cross])
 
-    async def test_held_recruitment_still_occupies_room_and_participant_time(self) -> None:
+    async def test_held_recruitment_occupies_room_but_not_other_waiting_registration(self) -> None:
         held = await self._create(host=1)
         await database.add_recruitment_entry(held, 999)
         changed = await database.set_recruitment_status(
@@ -164,10 +164,11 @@ class RecruitmentDatabaseTest(unittest.IsolatedAsyncioTestCase):
         second = await self._create(
             host=2, room="private_2", offset=30, variant_id="v13_cross",
         )
-        with self.assertRaises(database.RecruitmentConflict):
-            await database.add_recruitment_entry(second, 999)
+        self.assertEqual(
+            await database.add_recruitment_entry(second, 999), "参加",
+        )
 
-    async def test_participant_overlap_includes_backup(self) -> None:
+    async def test_participant_and_backup_can_register_for_another_waiting_village(self) -> None:
         first = await self._create(host=1)
         second = await self._create(
             host=2, room="private_2", offset=30, variant_id="v13_cross",
@@ -175,8 +176,107 @@ class RecruitmentDatabaseTest(unittest.IsolatedAsyncioTestCase):
         for user_id in range(100, 113):
             self.assertEqual(await database.add_recruitment_entry(first, user_id), "参加")
         self.assertEqual(await database.add_recruitment_entry(first, 999), "補欠")
+        self.assertEqual(
+            await database.add_recruitment_entry(second, 999), "参加",
+        )
+
+    async def test_previous_settings_create_a_new_empty_recruitment(self) -> None:
+        source = await database.create_recruitment(
+            1,
+            1,
+            title="前回設定",
+            scheduled_at=self.base,
+            room_id="private_1",
+            variant_id="v9_turn",
+            streaming=True,
+            allowed_ranks={"ゴールド", "ランク未設定"},
+            note="配信卓",
+        )
+        await database.add_recruitment_entry(source, 999)
+        await database.set_recruitment_gm(source, 1)
+        await database.set_recruitment_message_id(source, 444)
+        self.assertTrue(await database.set_recruitment_status(
+            source, database.RECRUITMENT_ARCHIVED,
+        ))
+
+        reopened_at = self.base + timedelta(hours=3)
+        new_id, source_id = await database.create_recruitment_from_previous_settings(
+            1, "private_1", 1, scheduled_at=reopened_at,
+        )
+
+        self.assertEqual(source_id, source)
+        self.assertNotEqual(new_id, source)
+        old_row = await database.get_recruitment(source)
+        new_row = await database.get_recruitment(new_id)
+        self.assertEqual(old_row["status"], database.RECRUITMENT_ARCHIVED)
+        old_entries = await database.list_recruitment_entries(source)
+        self.assertEqual(
+            [(entry["user_id"], entry["kind"]) for entry in old_entries],
+            [(999, "参加")],
+        )
+        self.assertEqual(await database.list_recruitment_entries(new_id), [])
+        self.assertEqual(new_row["status"], database.RECRUITMENT_OPEN)
+        self.assertEqual(new_row["gm_id"], 1)
+        self.assertEqual(new_row["title"], "前回設定")
+        self.assertEqual(new_row["variant_id"], "v9_turn")
+        self.assertTrue(new_row["streaming"])
+        self.assertEqual(
+            new_row["allowed_ranks"],
+            frozenset({"ゴールド", "ランク未設定"}),
+        )
+        self.assertEqual(new_row["note"], "配信卓")
+        self.assertEqual(new_row["scheduled_at"], reopened_at.isoformat())
+        self.assertIsNone(new_row["notified_at"])
+        self.assertIsNone(new_row["message_id"])
+
+    async def test_archive_and_lobby_snapshot_are_committed_together(self) -> None:
+        recruitment_id = await self._create(host=1)
+        self.assertTrue(await database.set_recruitment_status(
+            recruitment_id, database.RECRUITMENT_HELD,
+        ))
+        payload = {
+            "public_log_archive_allowed": False,
+            "vc_default_permissions_captured": False,
+            "vc_gm_speak_captured": False,
+            "morning_confirmed": False,
+            "prep_confirmed": False,
+            "mute_marker_enabled": False,
+            "players": [],
+            "recruitment_id": None,
+        }
+
+        with self.assertRaises(ValueError):
+            await database.archive_linked_recruitment_and_save_lobby_state(
+                1,
+                "private_1",
+                recruitment_id,
+                {**payload, "players": [{"user_id": 999}]},
+            )
+        self.assertEqual(
+            (await database.get_recruitment(recruitment_id))["status"],
+            database.RECRUITMENT_HELD,
+        )
+
         with self.assertRaises(database.RecruitmentConflict):
-            await database.add_recruitment_entry(second, 999)
+            await database.archive_linked_recruitment_and_save_lobby_state(
+                1, "private_2", recruitment_id, payload,
+            )
+        self.assertEqual(
+            (await database.get_recruitment(recruitment_id))["status"],
+            database.RECRUITMENT_HELD,
+        )
+        self.assertNotIn("private_2", await database.load_room_states(1))
+
+        await database.archive_linked_recruitment_and_save_lobby_state(
+            1, "private_1", recruitment_id, payload,
+        )
+        self.assertEqual(
+            (await database.get_recruitment(recruitment_id))["status"],
+            database.RECRUITMENT_ARCHIVED,
+        )
+        saved = (await database.load_room_states(1))["private_1"]
+        self.assertEqual(saved["phase"], "LOBBY")
+        self.assertIsNone(saved["recruitment_id"])
 
     async def test_cancel_promotes_oldest_backup_without_recheck(self) -> None:
         recruitment_id = await self._create(host=1)

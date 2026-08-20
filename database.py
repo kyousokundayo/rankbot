@@ -209,7 +209,10 @@ def _validate_room_snapshot(phase: str, payload: dict) -> None:
         value = payload.get(key)
         if value is not None and not _is_snapshot_id(value):
             raise ValueError(f"{key} must be an ID or null")
-    for key in ("vote_slot_active", "vote_closed"):
+    for key in (
+        "vote_slot_active", "vote_speech_finished",
+        "vote_slot_forced_abstain", "vote_closed",
+    ):
         if key in payload and not isinstance(payload[key], bool):
             raise ValueError(f"{key} is not boolean")
     vote_order = payload.get("vote_order", [])
@@ -2301,6 +2304,55 @@ async def record_co_event(
         await db.commit()
 
 
+async def record_co_result_events(
+    guild_id: int,
+    room_id: str,
+    game_run_id: str,
+    *,
+    events: list[dict],
+) -> None:
+    """結果自己申告を1件以上、同じtransactionで追記する。
+
+    同日同種の申告変更は、旧行の「取消」と新行の「公開」をこのAPIへ
+    まとめて渡す。片方だけが残ると公開盤面と記録が食い違うため、途中で
+    1行でも失敗した場合は全行をrollbackする。
+    """
+    if not events:
+        return
+    rows = [
+        (
+            guild_id,
+            room_id,
+            game_run_id,
+            event["event_seq"],
+            event["day_number"],
+            event["actor_id"],
+            event["actor_number"],
+            event["claimed_role"],
+            event["event_type"],
+            event["target_id"],
+            event["target_number"],
+            event["judgement"],
+        )
+        for event in events
+    ]
+    async with connect_db() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            await db.executemany(
+                "INSERT INTO game_co_results "
+                "(guild_id, room_id, game_run_id, event_seq, day_number, "
+                "actor_id, actor_number, claimed_role, event_type, target_id, "
+                "target_number, judgement) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rows,
+            )
+        except BaseException:
+            await db.rollback()
+            raise
+        await db.commit()
+
+
 async def record_vote_event(
     guild_id: int,
     room_id: str,
@@ -2384,12 +2436,7 @@ async def list_co_events_for_run(
 async def list_co_results_for_run(
     guild_id: int, room_id: str, game_run_id: str,
 ) -> list[dict]:
-    """占い師・霊能者の結果自己申告を読む。
-
-    結果公開の導線は持たせていないため新しい行は増えない。テーブルと
-    この読み出しだけ残すのは、開発中に積んだ行を後から集計できるように
-    するためで、テーブルの廃止＝過去データを捨てる、ではない。
-    """
+    """占い・霊媒・護衛結果の自己申告イベントを読む。"""
     async with connect_db() as db:
         rows = await db.execute_fetchall(
             "SELECT event_seq, day_number, actor_id, actor_number, claimed_role, "
@@ -2844,7 +2891,8 @@ async def get_player_co_stats(
         )
         result_rows = await db.execute_fetchall(
             "SELECT COUNT(*) FROM game_co_results "
-            f"WHERE actor_id = ? AND game_id IN ({placeholders})",
+            f"WHERE actor_id = ? AND event_type = '公開' "
+            f"AND game_id IN ({placeholders})",
             (player_id, *game_ids),
         )
     result_claim_count = int(result_rows[0][0]) if result_rows else 0
@@ -4874,6 +4922,107 @@ async def create_recruitment(
     return result
 
 
+async def create_recruitment_from_previous_settings(
+    guild_id: int,
+    room_id: str,
+    host_id: int,
+    *,
+    scheduled_at: datetime | str,
+) -> tuple[int, int]:
+    """直近の終了募集から設定だけを複製し、空の新規募集を作る。
+
+    旧行はゲーム履歴の参照先としてARCHIVEDのまま固定する。参加者・補欠・
+    通知台帳・メッセージID・通知済み時刻は一切複製せず、新しい募集IDを発行する。
+    戻り値は ``(new_recruitment_id, source_recruitment_id)``。
+    """
+    start_text = _normalize_recruitment_time(scheduled_at)
+    async with connect_db() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            private_room_rows = await db.execute_fetchall(
+                "SELECT owner_id, status FROM private_rooms "
+                "WHERE guild_id = ? AND room_id = ?",
+                (guild_id, room_id),
+            )
+            if not private_room_rows:
+                raise RecruitmentConflict("参加受付を再開できるGM村が見つかりません。")
+            owner_id, room_status = private_room_rows[0]
+            if int(owner_id) != host_id:
+                raise RecruitmentConflict("村主だけが参加受付を再開できます。")
+            if str(room_status) != "active":
+                raise RecruitmentConflict("このGM村は現在利用できません。")
+
+            active_rows = await db.execute_fetchall(
+                "SELECT id FROM recruitments WHERE guild_id = ? AND room_id = ? "
+                "AND status IN (?, ?) LIMIT 1",
+                (guild_id, room_id, RECRUITMENT_OPEN, RECRUITMENT_HELD),
+            )
+            if active_rows:
+                raise RecruitmentConflict("この村には未終了の参加受付があります。")
+
+            source_rows = await db.execute_fetchall(
+                "SELECT id, title, streaming, allowed_ranks, note, variant_id "
+                "FROM recruitments WHERE guild_id = ? AND room_id = ? "
+                "AND host_id = ? AND status = ? ORDER BY id DESC LIMIT 1",
+                (guild_id, room_id, host_id, RECRUITMENT_ARCHIVED),
+            )
+            if not source_rows:
+                raise RecruitmentConflict("再利用できる前回の参加受付設定がありません。")
+            (
+                source_id,
+                title,
+                streaming,
+                allowed_ranks_json,
+                note,
+                variant_id,
+            ) = source_rows[0]
+            variant = get_variant_definition(str(variant_id))
+            if allowed_ranks_json is not None:
+                decoded_ranks = _decode_recruitment_allowed_ranks(allowed_ranks_json)
+                # 正常な保存値では空集合は作られない。壊れた条件を無制限として
+                # 複製すると参加境界が広がるため、再開自体を止める。
+                if not decoded_ranks:
+                    raise RecruitmentConflict(
+                        "前回募集のランク条件を安全に読み込めないため再開できません。"
+                    )
+
+            cursor = await db.execute(
+                "INSERT INTO recruitments "
+                "(guild_id, host_id, title, scheduled_at, room_id, gm_id, streaming, "
+                "allowed_ranks, note, status, variant_id, capacity, backup_capacity, "
+                "occupancy_minutes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    guild_id,
+                    host_id,
+                    str(title).strip(),
+                    start_text,
+                    room_id,
+                    host_id,
+                    int(bool(streaming)),
+                    allowed_ranks_json,
+                    str(note or "").strip(),
+                    RECRUITMENT_OPEN,
+                    variant.variant_id,
+                    int(variant.player_count),
+                    int(RECRUITMENT_BACKUP_CAPACITY),
+                    int(variant.recruitment_occupancy_minutes),
+                ),
+            )
+            new_id = int(cursor.lastrowid)
+            room_cursor = await db.execute(
+                "UPDATE private_rooms SET variant_id = ? "
+                "WHERE guild_id = ? AND room_id = ? AND owner_id = ? AND status = 'active'",
+                (variant.variant_id, guild_id, room_id, host_id),
+            )
+            if room_cursor.rowcount != 1:
+                raise RecruitmentConflict("GM村の状態が変わったため再開を中止しました。")
+        except BaseException:
+            await db.rollback()
+            raise
+        await db.commit()
+    return new_id, int(source_id)
+
+
 async def get_recruitment(recruitment_id: int) -> Optional[dict]:
     async with connect_db() as db:
         rows = await db.execute_fetchall(
@@ -5084,6 +5233,17 @@ async def list_open_recruitments(guild_id: int) -> list[dict]:
     return [_recruitment_row(row) for row in rows]
 
 
+async def list_held_recruitments(guild_id: int) -> list[dict]:
+    """開催反映済みの募集を、カードIDの有無にかかわらず返す。"""
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            _RECRUITMENT_SELECT
+            + "WHERE r.guild_id = ? AND r.status = ? GROUP BY r.id ORDER BY r.id",
+            (guild_id, RECRUITMENT_HELD),
+        )
+    return [_recruitment_row(row) for row in rows]
+
+
 async def list_recruitments_with_messages(guild_id: int) -> list[dict]:
     """公開カードを追跡中の募集を、状態にかかわらず返す。
 
@@ -5117,21 +5277,22 @@ async def list_recruitment_entries(recruitment_id: int) -> list[dict]:
 
 
 async def add_recruitment_entry(recruitment_id: int, user_id: int) -> str:
-    """時間重複・既存参加者の拒否・定員を原子的に判定して登録する。"""
+    """同じ募集の重複・既存参加者の拒否・定員を原子的に判定する。
+
+    待機中の募集は複数登録を許可し、実ゲームの同時参加だけを開始時に
+    RoomRunner側で拒否する。同時間帯の別募集はここでは競合にしない。
+    """
     async with connect_db() as db:
         await db.execute("BEGIN IMMEDIATE")
         rows = await db.execute_fetchall(
-            "SELECT guild_id, scheduled_at, status, capacity, backup_capacity, "
-            "occupancy_minutes FROM recruitments WHERE id = ?",
+            "SELECT guild_id, status, capacity, backup_capacity "
+            "FROM recruitments WHERE id = ?",
             (recruitment_id,),
         )
-        if not rows or rows[0][2] != RECRUITMENT_OPEN:
+        if not rows or rows[0][1] != RECRUITMENT_OPEN:
             await db.rollback()
             raise RecruitmentConflict("この募集は終了しています。")
-        (
-            guild_id, start_text, _status, capacity, backup_capacity,
-            occupancy_minutes,
-        ) = rows[0]
+        guild_id, _status, capacity, backup_capacity = rows[0]
         duplicate = await db.execute_fetchall(
             "SELECT 1 FROM recruitment_entries WHERE recruitment_id = ? AND user_id = ?",
             (recruitment_id, user_id),
@@ -5139,21 +5300,6 @@ async def add_recruitment_entry(recruitment_id: int, user_id: int) -> str:
         if duplicate:
             await db.rollback()
             raise RecruitmentConflict("既にこの募集へ登録しています。")
-        end_text = _recruitment_end_text(start_text, int(occupancy_minutes))
-        overlap = await db.execute_fetchall(
-            "SELECT r.id FROM recruitments r JOIN recruitment_entries e ON e.recruitment_id = r.id "
-            "WHERE r.guild_id = ? AND r.status IN (?, ?) "
-            "AND e.user_id = ? AND r.id <> ? "
-            "AND datetime(r.scheduled_at) < datetime(?) "
-            "AND datetime(r.scheduled_at, '+' || r.occupancy_minutes || ' minutes') "
-            "> datetime(?) LIMIT 1",
-            (guild_id, RECRUITMENT_OPEN, RECRUITMENT_HELD,
-             user_id, recruitment_id, end_text,
-             start_text),
-        )
-        if overlap:
-            await db.rollback()
-            raise RecruitmentConflict("同じ時間帯の別の募集へ既に登録しています。")
         # 新規参加者自身ではなく、先に入っている人の拒否だけを見る。
         blocked = await db.execute_fetchall(
             "SELECT 1 FROM recruitment_entries e JOIN player_blocks b "
@@ -5277,6 +5423,75 @@ async def set_recruitment_status(
         )
         await db.commit()
     return cursor.rowcount == 1
+
+
+async def archive_linked_recruitment_and_save_lobby_state(
+    guild_id: int,
+    room_id: str,
+    recruitment_id: Optional[int],
+    payload: dict,
+) -> Optional[int]:
+    """紐づく募集の終了と空ロビーsnapshotを同一transactionで確定する。
+
+    ``recruitment_id`` を先に捨ててHELDだけが残る事故と、募集だけ終了して
+    古いロビーsnapshotが残る事故をともに防ぐ。募集はOPEN/HELDから
+    ARCHIVEDへ進め、既にARCHIVEDなら冪等に受け入れる。追跡中だったカードの
+    message_idを返し、Discord表示を安全に差し替えた後で呼出側がclearする。
+    """
+    if payload.get("recruitment_id") is not None:
+        raise ValueError("lobby payload must clear recruitment_id")
+    if payload.get("players"):
+        raise ValueError("lobby payload must clear players")
+    if payload.get("gm_id") is not None:
+        raise ValueError("lobby payload must clear gm_id")
+    if payload.get("ending"):
+        raise ValueError("lobby payload must finish ending cleanup")
+    _validate_room_snapshot(Phase.LOBBY.name, payload)
+    stored_payload = dict(payload)
+    stored_payload["_schema_version"] = ROOM_STATE_SCHEMA_VERSION
+    payload_text = json.dumps(stored_payload, ensure_ascii=False)
+    tracked_message_id: Optional[int] = None
+
+    async with connect_db() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            if recruitment_id is not None:
+                rows = await db.execute_fetchall(
+                    "SELECT guild_id, room_id, status, message_id FROM recruitments "
+                    "WHERE id = ?",
+                    (int(recruitment_id),),
+                )
+                if not rows:
+                    raise RecruitmentConflict("紐づく募集が見つからないため受付を初期化できません。")
+                row_guild_id, row_room_id, status, message_id = rows[0]
+                if int(row_guild_id) != guild_id or str(row_room_id) != room_id:
+                    raise RecruitmentConflict("別の村の募集が紐づいているため受付を初期化できません。")
+                if status in {RECRUITMENT_OPEN, RECRUITMENT_HELD}:
+                    cursor = await db.execute(
+                        "UPDATE recruitments SET status = ?, "
+                        "closed_at = COALESCE(closed_at, CURRENT_TIMESTAMP) "
+                        "WHERE id = ? AND status = ?",
+                        (RECRUITMENT_ARCHIVED, int(recruitment_id), status),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RecruitmentConflict("募集状態が先に変更されました。")
+                elif status != RECRUITMENT_ARCHIVED:
+                    raise RecruitmentConflict("募集状態を安全に終了できません。")
+                tracked_message_id = int(message_id) if message_id is not None else None
+
+            await db.execute(
+                "INSERT INTO room_states (guild_id, room_id, phase, payload, updated_at) "
+                "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(guild_id, room_id) DO UPDATE SET "
+                "phase = excluded.phase, payload = excluded.payload, "
+                "updated_at = CURRENT_TIMESTAMP",
+                (guild_id, room_id, Phase.LOBBY.name, payload_text),
+            )
+        except BaseException:
+            await db.rollback()
+            raise
+        await db.commit()
+    return tracked_message_id
 
 
 async def archive_host_recruitments(guild_id: int, host_id: int) -> list[int]:

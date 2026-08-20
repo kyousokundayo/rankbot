@@ -186,14 +186,21 @@ class GameState:
         self.runoff_speech_index: int = 0
 
         # 通常投票のdurableな発言順とcursor。順番は「投票」ボタンを押した順で、
-        # 押した人から1人ずつ20秒だけ発言し、確定投票か時間切れで次へ進む。
+        # 押した人から1人ずつ30秒発言し、発言終了後は時間制限なしで確定投票を待つ。
         # 列が空になったら次に押した人が来るまで待つ。進行中に落ちた場合は
-        # 完了済みcursorを維持し、未完了だった枠だけを満額でやり直す。
+        # 発言中なら満額でやり直し、投票待ちならミュートのまま再開する。
         self.vote_day_generation: int = 0
         self.vote_order: list[int] = []
         self.vote_slot_index: int = 0
         self.vote_slot_token: int = 0
+        # activeは発言開始から投票確定までの枠全体。発言終了後も
+        # 投票先が確定するまでTrueを維持する。
         self.vote_slot_active: bool = False
+        self.vote_speech_finished: bool = False
+        # 現在枠をGMが明示的に棄権扱いにした。通常の30秒経過では立てない。
+        self.vote_slot_forced_abstain: bool = False
+        # 実際にVCを開けてよいプロセス内状態。復元直後の先走りunmuteを防ぐ。
+        self.vote_speech_window_open: bool = False
         # GMが待機を打ち切って締め切った状態。未発言者は棄権として集計する。
         self.vote_closed: bool = False
         # 自分の発言枠の中で投票先が除外され、票だけ失った人。cursorを
@@ -308,6 +315,10 @@ class GameState:
         # 列が空の待機中だけ待ち、起こされたら条件を見直す。
         self.vote_queue_event: asyncio.Event = asyncio.Event()
 
+        # クロストーク通常投票で、発言終了後の投票確定・GM棄権・
+        # 現在者除外を待つ合図。時間切れでは立てない。
+        self.vote_choice_event: asyncio.Event = asyncio.Event()
+
         # 夜アクション完了イベント (未行動者への警告DMを省くかの判定に使う)
         self.night_complete_event: asyncio.Event = asyncio.Event()
 
@@ -365,6 +376,10 @@ class GameState:
         # (turn_co_declarations と異なり、旧ターン制UIの日次リセットは
         # 引き継がない)。
         self.co_claims: dict[int, dict] = {}
+        # 公開する占い・霊媒・護衛結果の自己申告。実役職とは照合せず、
+        # 同じ日・申告者・結果種別につき最新1件だけを保持する。
+        # 死亡・CO撤回後も村の盤面として残すため、日次では消さない。
+        self.co_result_claims: list[dict] = []
         # 霊能結果 (処刑確定時に追記)。DMを廃止した代わりに、霊媒ボタンで
         # 一覧を ephemeral 表示するための保存先。
         self.medium_results: list[dict] = []

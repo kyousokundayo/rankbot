@@ -13,7 +13,7 @@ import discord
 
 import database
 from config import Phase, RECRUITMENT_CALL_DM_DAILY_LIMIT
-from recruitment import RecruitmentCardView, RecruitmentManager
+from recruitment import JST, RecruitmentCardView, RecruitmentManager
 
 
 def _make_interaction(guild, member):
@@ -161,7 +161,7 @@ class RecruitmentCallTest(unittest.IsolatedAsyncioTestCase):
         # 600の当日送信済み件数を上限まで積んでおく。UNIQUE(recruitment_id,
         # called_on) があるため、同じ called_on で複数回呼ぶには村を分けて
         # 別の recruitment_id を用意する。
-        called_on = datetime.now().astimezone().date().isoformat()
+        called_on = datetime.now(JST).date().isoformat()
         for i in range(RECRUITMENT_CALL_DM_DAILY_LIMIT):
             filler_room_id = f"private_filler_{i}"
             await database.save_private_room(1, filler_room_id, 1, f"GM村filler{i}", "v13_cross")
@@ -388,7 +388,7 @@ class RecruitmentCallTest(unittest.IsolatedAsyncioTestCase):
         await database.set_user_notification_prefs(
             1, 970, allow_notifications=True, notify_on_call=True,
         )
-        called_on = datetime.now(timezone.utc).astimezone().date().isoformat()
+        called_on = datetime.now(JST).date().isoformat()
         # open_recruitment_call だけ呼び、配信タスクは起動しない
         # (=Botが落ちて誰にも送達記録が残っていない状態を再現)。
         call_id = await database.open_recruitment_call(
@@ -410,7 +410,7 @@ class RecruitmentCallTest(unittest.IsolatedAsyncioTestCase):
         await database.set_user_notification_prefs(
             1, 980, allow_notifications=True, notify_on_call=True,
         )
-        called_on = datetime.now(timezone.utc).astimezone().date().isoformat()
+        called_on = datetime.now(JST).date().isoformat()
         call_id = await database.open_recruitment_call(
             recruitment_id, 1, 1, called_on,
         )
@@ -479,7 +479,7 @@ class RecruitmentCallTest(unittest.IsolatedAsyncioTestCase):
             await database.set_user_notification_prefs(
                 1, uid, allow_notifications=True, notify_on_call=True,
             )
-        called_on = datetime.now(timezone.utc).astimezone().date().isoformat()
+        called_on = datetime.now(JST).date().isoformat()
         call_id = await database.open_recruitment_call(recruitment_id, 1, 1, called_on)
         self.assertIsNotNone(call_id)
         embed = await self.manager.build_embed(self.guild, recruitment_id)
@@ -514,7 +514,7 @@ class RecruitmentCallTest(unittest.IsolatedAsyncioTestCase):
     async def test_claim_recruitment_call_delivery_is_exclusive(self) -> None:
         """claim_recruitment_call_delivery自体が「先着1人だけ確保できる」ことの直接テスト。"""
         recruitment_id = await self._create_recruitment()
-        called_on = datetime.now(timezone.utc).astimezone().date().isoformat()
+        called_on = datetime.now(JST).date().isoformat()
         call_id = await database.open_recruitment_call(recruitment_id, 1, 1, called_on)
         self.assertIsNotNone(call_id)
 
