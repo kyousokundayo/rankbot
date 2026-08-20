@@ -160,9 +160,9 @@ AppleScriptの実行環境へ明示的に渡した場合だけ最優先され、
 > （必須になった理由と起動停止の仕様は [SPEC.md](SPEC.md) の5章を参照）。本プロジェクトは
 > `discord.py[voice]==2.7.1`、`davey==0.1.6`、`PyNaCl==1.5.0` を固定し、
 > `setup_venv.sh` とBot起動時に依存を検査します。
-> macOS は `brew install opus`、Debian/Ubuntu は `apt install libopus0` を使用してください。
+> macOSで `brew install opus` を実行してください。
 > Pythonとネイティブwheel/libopusのCPUアーキテクチャも一致している必要があります。
-> libopusはプロジェクト同梱版をOSの自動探索より先にロードします。
+> `data/lib/libopus.dylib` がある場合はその同梱版をHomebrewより先にロードします。
 > SEを使わない場合だけ `config.py` の `SE_ENABLED = False` へ変更してください。
 
 > **戦績カード画像（任意）**: `/統計` の「画像で見る」で使う日本語対応PNGの

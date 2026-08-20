@@ -135,13 +135,7 @@ def _process_matches_bot(pid: int) -> bool:
 
 
 def _process_cwd(pid: int) -> Path | None:
-    """LinuxのprocfsまたはmacOS/Linuxのlsofから作業ディレクトリを得る。"""
-    proc_cwd = Path("/proc") / str(pid) / "cwd"
-    try:
-        if proc_cwd.is_symlink():
-            return proc_cwd.resolve(strict=True)
-    except OSError:
-        pass
+    """macOSのlsofから作業ディレクトリを得る。"""
     for executable in ("/usr/sbin/lsof", "/usr/bin/lsof"):
         if not Path(executable).exists():
             continue

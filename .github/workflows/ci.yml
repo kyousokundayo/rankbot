@@ -1,5 +1,5 @@
 # GitHubへリポジトリをpushすると自動で走るチェック
-# (ローカルでは scripts/run_checks.sh で同種の検証を実行。OS固有検査と対象範囲は異なる)
+# 稼働環境と同じ macOS / Apple Silicon で検証する。
 name: CI
 
 permissions:
@@ -19,21 +19,30 @@ concurrency:
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    runs-on: macos-26
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.14"
+      - name: Verify macOS runtime
+        run: |
+          test "$(uname -s)" = "Darwin"
+          test "$(uname -m)" = "arm64"
+          python scripts/verify_runtime.py
       - name: Install voice system dependency
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes libopus0
+          brew install opus
+          OPUS_LIB="$(brew --prefix opus)/lib/libopus.dylib"
+          file "$OPUS_LIB"
+          file "$OPUS_LIB" | grep -q arm64
       - name: Install dependencies
         run: |
           python -m pip install -r requirements.txt -c requirements-lock.txt
           python -m pip check
+      - name: Verify voice dependencies
+        run: python -c 'import sounds; sounds.require_voice_ready()'
       - name: Compile check
         run: git ls-files -z '*.py' | xargs -0 python -m py_compile
       - name: Unit tests

@@ -6,7 +6,7 @@
 SE_ENABLED=TrueではBot起動前に検証し、欠けた環境をreadyにしない。
 再生時の一時的な接続失敗はSEだけをスキップし、ゲーム進行には影響しない。
   - pip install davey PyNaCl
-  - macOS: brew install opus / Linux: apt install libopus0
+  - macOS: brew install opus
 
 同一ギルドでBotが同時に接続できるVCは1つのため、ギルド単位のロックで
 「接続 → 再生 (1秒前後) → 切断」を直列化する。複数卓の同時フェーズ切替では
@@ -54,9 +54,6 @@ _OPUS_PATHS = (
     "/opt/homebrew/lib/libopus.dylib",
     "/opt/homebrew/lib/libopus.0.dylib",
     "/usr/local/lib/libopus.dylib",
-    "/usr/lib/x86_64-linux-gnu/libopus.so.0",
-    "/usr/lib/aarch64-linux-gnu/libopus.so.0",
-    "/usr/lib/libopus.so.0",
 )
 
 
@@ -105,10 +102,7 @@ def _ensure_opus_loaded() -> Optional[str]:
     if not detail and default_error is not None:
         detail = str(default_error)
     suffix = f" ({detail})" if detail else ""
-    return (
-        "libopusをロードできません。macOSは `brew install opus`、"
-        f"Debian/Ubuntuは `apt install libopus0` を実行してください{suffix}"
-    )
+    return f"libopusをロードできません。`brew install opus` を実行してください{suffix}"
 
 
 def _voice_dependency_error() -> Optional[str]:

@@ -658,7 +658,7 @@ bot/
 - 変更中の高速確認は関係するユニットテストを使う
 - `scripts/run_checks.sh`: コミット前の完全確認。Apple Siliconネイティブ実行検査 + 作業ツリー内の全Pythonファイルのコンパイル + 依存整合 + 全ユニットテスト
 - ゲームシミュレーションは通常チェック・CI・リリース作業では実行しない。ユーザーから明示的に依頼された場合だけ実行する
-- `.github/workflows/ci.yml`: GitHubへのpush/PRで同種のチェックがCIで走る。CIはUbuntuで追跡済みPythonだけをコンパイルするため、ローカル固有のruntime/Apple Silicon検査と対象範囲は完全には同一でない
+- `.github/workflows/ci.yml`: GitHubへのpush/PRで同種のチェックがCIで走る。稼働Macと同系統の `macos-26` / Apple Silicon (arm64) を固定し、Python 3.14、Homebrewのarm64版libopus・DAVE、追跡済みPythonのコンパイル、依存整合、全ユニットテストを検証する
 
 ### 段階公開のリリースゲート
 
