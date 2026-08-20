@@ -348,8 +348,9 @@ class RecruitmentManager:
         """前回設定だけを複製し、同じGM村へ空の参加受付を再掲する。
 
         呼出側は先にinteractionをdeferする。旧募集はARCHIVEDの履歴として固定し、
-        参加者・補欠・通知台帳を再利用しない。権限判定は終了後に空になる
-        ``state.gm_id`` ではなく、永続的なGM村所有者を正本にする。
+        参加者・補欠・通知台帳を再利用しない。通常の手動再開は永続的な
+        GM村所有者だけが行う。強制終了からの耐障害回収中だけは、保持した
+        現在GMも同じ再開処理を再試行できる。
         """
         guild = interaction.guild
         member = interaction.user
@@ -358,6 +359,13 @@ class RecruitmentManager:
         owner_id = getattr(getattr(room, "room_def", None), "private_owner_id", None)
         if owner_id is None or not room.is_private_room():
             return "この操作はGM村の参加受付でのみ使えます。"
+        pending_reopen = bool(
+            getattr(room.state, "pending_recruitment_reopen", False)
+        )
+        if pending_reopen:
+            if member.id not in {owner_id, room.state.gm_id}:
+                return "現在のGMまたは村主だけが参加受付を再開できます。"
+            return await self.recover_pending_recruitment(room)
         if member.id != owner_id:
             return "このGM村の村主だけが参加受付を再開できます。"
         if not _has_private_room_creator_role(member):
@@ -375,7 +383,11 @@ class RecruitmentManager:
                     or getattr(room, "_postgame_vote_pending", False)
                 ):
                     return "ゲーム進行中または終了後処理中のため、参加受付を再開できません。"
-                if state.players or state.gm_id is not None or state.recruitment_id is not None:
+                if (
+                    state.players
+                    or state.gm_id not in (None, owner_id)
+                    or state.recruitment_id is not None
+                ):
                     return "現在の参加受付に登録または未終了の募集があるため再開できません。"
 
                 old_variant_id = room.room_def.variant_id
@@ -433,6 +445,103 @@ class RecruitmentManager:
                             return compensation_error
                     return "参加受付を安全に再開できませんでした。時間を置いて再度お試しください。"
         return "✅ 前回設定で空の参加受付を再開しました。"
+
+    async def recover_pending_recruitment(self, room) -> str:
+        """強制終了後の0人募集を、DB/Discord障害と再起動をまたいで回収する。"""
+        async with self.lock:
+            async with room.action_lock:
+                state = room.state
+                if not getattr(state, "pending_recruitment_reopen", False):
+                    return "✅ 参加受付は既に再開済みです。"
+                if (
+                    state.players
+                    and state.phase == Phase.LOBBY
+                    and not room._is_game_in_progress()
+                ):
+                    # 「次村」などでGM自身が参加者を組み直した。0人カードの
+                    # 再掲はもう意図と合わないので、待機を解除して自動再試行も
+                    # 終わらせる (放置すると再開待ちが永久に残る)。
+                    state.pending_recruitment_reopen = False
+                    state.lobby_return_mode = "empty"
+                    await room._persist_room_state()
+                    return (
+                        "参加者が登録済みのため、参加者0人の募集カード再掲は"
+                        "取り消しました。"
+                    )
+                if (
+                    state.phase != Phase.LOBBY
+                    or room._is_game_in_progress()
+                    or getattr(room, "_postgame_vote_pending", False)
+                ):
+                    return "ゲーム状態が変わったため、参加受付を自動再開できません。"
+                guild = state.guild
+                owner_id = getattr(
+                    getattr(room, "room_def", None), "private_owner_id", None
+                )
+                retained_gm_id = state.gm_id
+                if (
+                    guild is None
+                    or owner_id is None
+                    or retained_gm_id is None
+                    or not room.is_private_room()
+                ):
+                    return "GM村または保持中のGMを確認できないため自動再開できません。"
+
+                row = None
+                if state.recruitment_id is not None:
+                    row = await database.get_recruitment(state.recruitment_id)
+                if row is None:
+                    row = await database.get_open_recruitment_for_room(
+                        guild.id, state.room_id,
+                    )
+                if row is None:
+                    new_id, _source_id = (
+                        await database.create_recruitment_from_previous_settings(
+                            guild.id,
+                            state.room_id,
+                            owner_id,
+                            scheduled_at=datetime.now(timezone.utc),
+                            gm_id=retained_gm_id,
+                        )
+                    )
+                    row = await database.get_recruitment(new_id)
+                    if row is None:
+                        raise RuntimeError("作成した参加受付を読み直せませんでした。")
+
+                recruitment_gm_id = int(row["gm_id"] or row["host_id"])
+                if (
+                    row["status"] != database.RECRUITMENT_OPEN
+                    or str(row["room_id"]) != state.room_id
+                    or int(row["host_id"]) != int(owner_id)
+                    or recruitment_gm_id != int(retained_gm_id)
+                ):
+                    return (
+                        "別の参加受付状態と競合したため、自動再開を止めました。"
+                        "主催画面を確認してください。"
+                    )
+
+                room.room_def = replace(
+                    room.room_def, variant_id=str(row["variant_id"])
+                )
+                state.recruitment_id = int(row["id"])
+                # pending=Trueのsnapshotを先に保存する。カード公開後の最終保存前に
+                # 落ちても、同じOPEN行を採用して冪等に再試行できる。
+                await room._persist_room_state()
+                try:
+                    await self.ensure_recruitment_message(guild, row)
+                except Exception as error:
+                    log.exception(
+                        "強制終了後の募集カード再掲に失敗: %s",
+                        row["id"],
+                    )
+                    return (
+                        "⚠️ 参加受付カードを再掲できませんでした。"
+                        "自動で再試行します。"
+                    )
+                state.pending_recruitment_reopen = False
+                state.lobby_return_mode = "empty"
+                await room._persist_room_state()
+                return "✅ 前回設定で参加者0人の受付を再開しました。"
 
     async def _rollback_reopened_recruitment(
         self,

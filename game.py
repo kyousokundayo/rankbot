@@ -2489,7 +2489,10 @@ class GameCog(RoomPermissionMixin, commands.Cog):
     def _private_room_phase_blocks_delete(self, row: dict) -> bool:
         room = self.rooms.get(row["room_id"])
         phase = getattr(getattr(room, "state", None), "phase", None)
-        return phase is not None and phase not in (Phase.LOBBY, Phase.GAME_OVER)
+        # GAME_OVERは名前・mute・一時ロール・募集の回収途中に使うcheckpoint。
+        # LOBBYへ戻る前に村資産を削除するとcleanup対象そのものを失うため、
+        # 完全にLOBBYへ収束した村だけを削除対象にする。
+        return phase is not None and phase != Phase.LOBBY
 
     async def _send_private_room_delete_confirm(
         self,

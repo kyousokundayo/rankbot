@@ -350,14 +350,22 @@ class LobbyView(discord.ui.View):
             for item in tuple(self.children):
                 if getattr(item, "custom_id", None) in hidden_controls:
                     self.remove_item(item)
-            reopen_button = discord.ui.Button(
-                label="前回設定で参加受付を再開",
-                style=discord.ButtonStyle.primary,
-                custom_id=f"reopen_previous_recruitment:{self.cog.state.room_id}",
-                row=2,
-            )
-            reopen_button.callback = self.reopen_previous_recruitment
-            self.add_item(reopen_button)
+            # 同じ参加者を保持したゲームリセット直後は既に受付が完成しており、
+            # 前回設定の0人募集へ戻すボタンは実行不能なので出さない。
+            if not self.cog.state.players and (
+                getattr(self.cog.state, "recruitment_id", None) is None
+                or getattr(
+                    self.cog.state, "pending_recruitment_reopen", False
+                )
+            ):
+                reopen_button = discord.ui.Button(
+                    label="前回設定で参加受付を再開",
+                    style=discord.ButtonStyle.primary,
+                    custom_id=f"reopen_previous_recruitment:{self.cog.state.room_id}",
+                    row=2,
+                )
+                reopen_button.callback = self.reopen_previous_recruitment
+                self.add_item(reopen_button)
         # 再起動復元などでUIを再投稿した時点で13人+GMが揃っている場合に備え、
         # 生成時に開始ボタンの有効/無効を計算する
         self._refresh_start_button()
@@ -640,6 +648,13 @@ class LobbyView(discord.ui.View):
                         await self.cog._post_lobby_ui()
                     except Exception as error:
                         log.exception("開始拒否後の参加受付復旧に失敗: %s", error)
+                        self.cog._schedule_lobby_panel_recovery(
+                            self.cog.state,
+                            recruitment_id=getattr(
+                                self.cog.state, "recruitment_id", None
+                            ),
+                            log_label="ゲーム開始拒否",
+                        )
 
     @discord.ui.button(label="次村", style=discord.ButtonStyle.primary, custom_id="rematch_game", row=1)
     async def rematch_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -1285,12 +1300,31 @@ class GMControlView(discord.ui.View):
                 )
                 return
             ended = await self.cog.force_end("GMにより強制終了されました。")
+            result = (
+                "⏹️ ゲームを強制終了し、参加者0人の受付へ戻しました。"
+                if ended
+                else "⚠️ 終了処理が既に進行中か、参加受付への復帰を確認できませんでした。"
+            )
+            if (
+                ended
+                and self.cog.is_private_room()
+                and getattr(
+                    self.cog.state, "pending_recruitment_reopen", False
+                )
+            ):
+                manager = getattr(self.cog.manager, "recruitment_manager", None)
+                if manager is None:
+                    reopen_result = (
+                        "⚠️ 参加受付機能を利用できないため、募集カードを自動再掲"
+                        "できませんでした。主催画面から再試行してください。"
+                    )
+                else:
+                    reopen_result = await manager.recover_pending_recruitment(
+                        self.cog,
+                    )
+                result = f"{result}\n{reopen_result}"
             await confirm_interaction.followup.send(
-                (
-                    "⏹️ ゲームを強制終了しました。"
-                    if ended
-                    else "⚠️ 終了処理が既に進行中か、参加受付への復帰を確認できませんでした。"
-                ),
+                result,
                 ephemeral=True,
             )
 
@@ -1329,7 +1363,7 @@ class GMControlView(discord.ui.View):
             await confirm_interaction.followup.send(result, ephemeral=True)
 
         await interaction.response.send_message(
-            "⚠️ 現在のゲームを廃村にして参加受付へ戻します。実行しますか？",
+            "⚠️ 戦績を残さずゲームを終了し、同じ参加者・GMで受付へ戻します。実行しますか？",
             view=DangerConfirmView(
                 interaction.user.id, execute, confirm_label="ゲームをリセット"
             ),
@@ -1474,13 +1508,36 @@ class RemovePlayerSelectView(discord.ui.View):
                         ephemeral=True,
                     )
                     return
-                if state.lobby_message:
-                    try:
+                try:
+                    if state.lobby_message:
                         lobby_view = LobbyView(self.cog)
                         embed = lobby_view._build_embed()
                         await state.lobby_message.edit(embed=embed, view=lobby_view)
-                    except discord.HTTPException:
-                        pass
+                    else:
+                        await self.cog._post_lobby_ui()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    try:
+                        await self.cog._post_lobby_ui()
+                    except Exception as error:
+                        log.exception(
+                            "ロビー参加者除外後の参加受付再掲に失敗: %s",
+                            error,
+                        )
+                        self.cog._schedule_lobby_panel_recovery(
+                            state,
+                            recruitment_id=None,
+                            log_label="ロビー参加者除外",
+                        )
+                except Exception as error:
+                    log.exception(
+                        "ロビー参加者除外後の参加受付再掲に失敗: %s",
+                        error,
+                    )
+                    self.cog._schedule_lobby_panel_recovery(
+                        state,
+                        recruitment_id=None,
+                        log_label="ロビー参加者除外",
+                    )
                 await confirm_interaction.followup.send(
                     f"{display_name} の参加を取り消しました。", ephemeral=True
                 )
@@ -5353,14 +5410,14 @@ def build_help_embeds(
             f"1日{variant.turn_interrupts_per_day}回まで30秒割り込みができます。\n"
             "COは村パネルの[CO]で役職を宣言できます（タイミングはルール参照）。\n"
             "投票・弁明・遺言は発言中の本人だけ。夜と一時停止中は全員ミュート。\n"
-            "死亡者・観戦者は終了まで発言できません（専任GMのミュートだけは手動）。"
+            "死亡者・観戦者は終了まで発言できません（GMのミュートは手動）。"
         )
         gm_turn_help = " / 次の発言へ"
     else:
         speech_help = (
             "議論中は生存者のみ、投票・弁明・遺言は発言中の本人のみ発言できます。\n"
             "夜と一時停止中は全員ミュート。死亡者・観戦者は終了まで発言できません"
-            "（専任GMのミュートだけは手動）。"
+            "（GMのミュートは手動）。"
         )
         gm_turn_help = ""
     embed3 = discord.Embed(
@@ -5401,7 +5458,8 @@ def build_help_embeds(
         value=(
             f"受付中は `#{CH_LOBBY}` の「GM管理」で除外・リセット。\n"
             f"ゲーム中は `#{CH_VILLAGE}` の「GMメニュー・状況」から一時停止 / 再開 / 朝"
-            f" / 役職確認を締切 / スキップ{gm_turn_help} / 強制終了 / リセット / 除外ができます。"
+            f" / 役職確認を締切 / スキップ{gm_turn_help} / 強制終了 / リセット / 除外ができます。\n"
+            "リセットは同じ参加者・GMを維持。強制終了はGMだけを残して参加者0人へ戻します。"
         ),
         inline=False,
     )

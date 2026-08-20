@@ -118,7 +118,7 @@ class GameState:
         self.vc_default_permissions_captured: bool = False
         self.vc_default_speak_before_game: Optional[bool] = None
         self.vc_default_send_before_game: Optional[bool] = None
-        # 専任GMへゲーム中だけ付けるVC発言許可も、手動overwriteの他項目を
+        # 参加者兼任を含むGMへゲーム中だけ付けるVC発言許可も、手動overwriteの他項目を
         # 壊さず、終了時に開始前の三値へ戻す。再起動をまたぐためIDも保存する。
         self.vc_gm_speak_captured: bool = False
         self.vc_gm_speak_user_id: Optional[int] = None
@@ -142,6 +142,12 @@ class GameState:
         self.pending_winner: Optional[Team] = None
         # 終了処理開始後の古いView/除外/一時停止との競合を防ぐ。
         self.ending: bool = False
+        # GAME_OVER checkpoint後に再起動しても、終了種別ごとのLOBBY復帰を
+        # 失わない。empty=全解除 / gm=GMのみ / roster=参加者とGMを保持。
+        self.lobby_return_mode: str = "empty"
+        # 名前村の強制終了後、前回設定の0人募集カードを公開し終えるまで保持。
+        # Discord障害や再起動をまたいでRecruitmentManagerが回収する。
+        self.pending_recruitment_reopen: bool = False
 
         # PREPARATIONのdurable saga。役職・番号・初日白を先に
         # 保存し、外部Discord副作用は送信済み記録で再開可能にする。
