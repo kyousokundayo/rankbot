@@ -235,6 +235,44 @@ class OpsDashboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(floors[1300], 1)
         self.assertEqual(stats["monthly"][-1]["month"], "2026-08")
 
+    async def test_rating_health_monthly_uses_jst_month_not_utc_month(self) -> None:
+        """月別集計はJST基準で切ること (他の運営指標と同じ基準)。
+
+        games.played_at はSQLiteのCURRENT_TIMESTAMP=tz無しUTCで保存される。
+        ここでは UTC 16:00〜23:59台の played_at (= JST では翌日・翌月) を
+        入れて、月がUTCのまま "2026-07" にならず JST の "2026-08" に
+        集計されることを確認する。既存の test_rating_health_histogram_and_monthly
+        は docstring の通りUTC 03:00 (=JST日付は同日) に揃えて月境界を
+        踏まないようにしてあるため、ここでは意図的に境界を跨ぐ時刻を使う。
+        """
+        async with aiosqlite.connect(database.DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO player_ratings (player_id, guild_id, ladder_id, "
+                "rating, peak_rating, games, wins, season_games, season_wins) "
+                "VALUES (101, ?, 'l13', 1180, 1200, 10, 5, 9, 3)",
+                (GUILD_ID,),
+            )
+            # UTC 2026-07-31 16:00:00 = JST 2026-08-01 01:00:00 (月をまたぐ)
+            await db.execute(
+                "INSERT INTO games (game_id, guild_id, variant_id, ladder_id, "
+                "room_id, room_name, game_run_id, gm_id, winner_team, played_at) "
+                "VALUES (6, ?, 'v13_cross', 'l13', 'beginner', '初心者村', "
+                "'run-6', 900, ?, '2026-07-31 16:00:00')",
+                (GUILD_ID, Team.VILLAGE.value),
+            )
+            await db.execute(
+                "INSERT INTO rating_history (player_id, guild_id, game_id, variant_id, "
+                "ladder_id, rating_before, rating_after, elo_delta) "
+                "VALUES (101, ?, 6, 'v13_cross', 'l13', 1170, 1180, 10)",
+                (GUILD_ID,),
+            )
+            await db.commit()
+
+        stats = await database.get_ops_rating_health(GUILD_ID)
+        months = {row["month"]: row["settlements"] for row in stats["monthly"]}
+        self.assertNotIn("2026-07", months)  # UTC基準ならここに紛れ込む
+        self.assertEqual(months.get("2026-08"), 1)
+
     # --------------------------------------------------------
     # 表示
     # --------------------------------------------------------
