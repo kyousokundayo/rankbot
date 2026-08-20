@@ -3033,6 +3033,13 @@ class RatingChartButton(discord.ui.Button):
                 "❌ サーバー内でのみ使用できます。", ephemeral=True,
             )
             return
+        # Viewが他人へ渡らない前提(ephemeral)だけに頼らず、CompatibilityButton
+        # と同じ形で押下時にも本人確認する (親レビュー指摘3)。
+        if interaction.user.id != self.parent_view.viewer_id:
+            await interaction.response.send_message(
+                "本人だけが見られます。", ephemeral=True,
+            )
+            return
         now = time.monotonic()
         cooldown_until = _rating_chart_cooldown_until.get(interaction.user.id, 0.0)
         if now < cooldown_until:
@@ -3135,9 +3142,12 @@ class PlayerStatsVariantView(discord.ui.View):
         # レート推移と相性は #統計 の常設パネル (3段まで) ではなく、この
         # ephemeralな統計画面に置く。常設パネルの段数制約を崩さずに済み、
         # 「今見ている変種」をそのまま引き継げる。
-        if stats_image.font_available():
-            self.add_item(RatingChartButton(self))
+        # レート推移(いつ大きく負けたか)は既存の統計画面より踏み込んだ情報
+        # なので、相性と同じく本人が自分の統計を見ているときだけ出す
+        # (親レビュー指摘3)。
         if self.viewer_id == int(self.user.id):
+            if stats_image.font_available():
+                self.add_item(RatingChartButton(self))
             self.add_item(CompatibilityButton(self))
 
     def set_variant(self, variant_id: str) -> None:

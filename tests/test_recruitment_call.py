@@ -223,8 +223,82 @@ class RecruitmentCallTest(unittest.IsolatedAsyncioTestCase):
             await self._wait_background_tasks()
         subscriber.send.assert_not_awaited()
         interaction.followup.send.assert_awaited_with(
-            "募集情報を取得できなかったため、通知を送信しませんでした。", ephemeral=True,
+            "募集情報を取得できなかったため、通知を送信しませんでした。"
+            "枠は消費していません。あとで押し直せます。",
+            ephemeral=True,
         )
+
+    async def test_error_embed_releases_the_days_call_slot(self) -> None:
+        """指摘1: エラーEmbedで中止しても当日枠が残らず、同日中に再度押せる。"""
+        recruitment_id = await self._create_recruitment()
+        with patch.object(
+            self.manager, "build_embed",
+            AsyncMock(return_value=discord.Embed(title="エラー", color=discord.Color.red())),
+        ):
+            await self._press_call(recruitment_id)
+
+        with patch.object(
+            self.manager, "build_embed",
+            AsyncMock(return_value=discord.Embed(title="募集", color=discord.Color.green())),
+        ):
+            second = await self._press_call(recruitment_id)
+            await self._wait_background_tasks()
+        second.followup.send.assert_any_await(
+            "通知できる宛先が0人でした。枠は消費していません。あとで押し直せます。",
+            ephemeral=True,
+        )
+
+    async def test_zero_recipients_releases_the_days_call_slot(self) -> None:
+        """指摘1: 購読者0人でも当日枠が消費されず、同日中に再度押せる。"""
+        recruitment_id = await self._create_recruitment()
+        # 購読者が誰もいない状態で押す→0人へ送信。
+        first = await self._press_call(recruitment_id)
+        await self._wait_background_tasks()
+        first.followup.send.assert_any_await(
+            "通知できる宛先が0人でした。枠は消費していません。あとで押し直せます。",
+            ephemeral=True,
+        )
+
+        # 枠が解放されているので、購読者を追加してから同日中にもう一度押せる。
+        subscriber = self._add_member(950)
+        await database.set_user_notification_prefs(
+            1, 950, allow_notifications=True, notify_on_call=True,
+        )
+        second = await self._press_call(recruitment_id)
+        await self._wait_background_tasks()
+        subscriber.send.assert_awaited_once()
+        second.followup.send.assert_any_await(
+            "1人へ順次送信します。", ephemeral=True,
+        )
+
+    async def test_release_recruitment_call_keeps_row_once_delivered(self) -> None:
+        """指摘1: 送達台帳に1行でもあれば release_recruitment_call は削除せずFalse。"""
+        recruitment_id = await self._create_recruitment()
+        called_on = "2026-08-20"
+        call_id = await database.open_recruitment_call(recruitment_id, 1, 1, called_on)
+        await database.mark_recruitment_call_delivery(
+            call_id, 999, "2026-08-20T00:00:00+00:00", "sent",
+        )
+
+        released = await database.release_recruitment_call(call_id)
+
+        self.assertFalse(released)
+        # 行が残っているので UNIQUE 制約により再取得は失敗する (=枠は消費済みのまま)。
+        again = await database.open_recruitment_call(recruitment_id, 1, 1, called_on)
+        self.assertIsNone(again)
+
+    async def test_release_recruitment_call_deletes_row_when_untouched(self) -> None:
+        """指摘1: 送達台帳が空なら release_recruitment_call は行を消してTrue。"""
+        recruitment_id = await self._create_recruitment()
+        called_on = "2026-08-20"
+        call_id = await database.open_recruitment_call(recruitment_id, 1, 1, called_on)
+
+        released = await database.release_recruitment_call(call_id)
+
+        self.assertTrue(released)
+        # 行が消えているので同日中に再確保できる。
+        again = await database.open_recruitment_call(recruitment_id, 1, 1, called_on)
+        self.assertIsNotNone(again)
 
     # --- ペーサーの独立性 -------------------------------------------------
 

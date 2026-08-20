@@ -287,6 +287,66 @@ class OperationsMenuAuthorizationTest(unittest.TestCase):
         self.assertFalse(allowed)
 
 
+class OperationsDashboardSelectAuthorizationTest(unittest.IsolatedAsyncioTestCase):
+    """指摘2: パネル切替セレクトも押下ごとに運営権限を再検証する。"""
+
+    def _member(
+        self,
+        member_id: int,
+        *,
+        administrator: bool = False,
+        role_names: tuple[str, ...] = (),
+    ):
+        member = MagicMock(spec=discord.Member)
+        member.id = member_id
+        member.guild_permissions = SimpleNamespace(administrator=administrator)
+        member.roles = [SimpleNamespace(name=name) for name in role_names]
+        return member
+
+    def _interaction(self, member, *, owner_id: int = 999):
+        return SimpleNamespace(
+            user=member,
+            guild=SimpleNamespace(owner_id=owner_id),
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            edit_original_response=AsyncMock(),
+        )
+
+    async def test_no_longer_admin_is_rejected_on_switch(self) -> None:
+        """運営ロールを外れた後、View timeout前でも切替は拒否される。"""
+        view = recruitment_lib.OperationsDashboardView(guild_id=1)
+        select = view.children[0]
+        select._values = ["throughput"]
+        outsider = self._member(20, administrator=False, role_names=())
+        interaction = self._interaction(outsider)
+
+        with patch.object(recruitment_lib, "OPERATIONS_STAFF_ROLE_NAMES", frozenset()), \
+             patch.object(recruitment_lib, "OPERATIONS_STAFF_USER_IDS", frozenset()):
+            await select.callback(interaction)
+
+        interaction.response.send_message.assert_awaited_once_with(
+            "❌ 運営のみ操作できます。", ephemeral=True,
+        )
+        interaction.response.defer.assert_not_awaited()
+        # 拒否された切替は反映されない (面はデフォルトのまま)。
+        self.assertEqual(view.panel, "activity")
+
+    async def test_admin_can_switch(self) -> None:
+        admin = self._member(21, administrator=True)
+        view = recruitment_lib.OperationsDashboardView(guild_id=1)
+        select = view.children[0]
+        select._values = ["delivery"]
+        interaction = self._interaction(admin)
+
+        with patch.object(
+            recruitment_lib.database, "get_ops_delivery_stats", AsyncMock(return_value={}),
+        ), patch.object(recruitment_lib, "OPERATIONS_STAFF_ROLE_NAMES", frozenset()):
+            await select.callback(interaction)
+
+        interaction.response.send_message.assert_not_awaited()
+        interaction.response.defer.assert_awaited_once()
+        self.assertEqual(view.panel, "delivery")
+
+
 class OperationsLogChannelTest(unittest.IsolatedAsyncioTestCase):
     """同村拒否・報告を残す #運営記録 の用意と、記録先の切り替えを固定する。"""
 
