@@ -19,6 +19,8 @@ echo "== dependency consistency =="
 "$PY" -m pip check
 
 echo "== unit tests =="
-"$PY" -m unittest discover -s tests
+# -t . が無いと tests/ 自身が top-level 扱いになり tests/__init__.py の
+# 本番DB隔離ガードが読み込まれない (unittest discover の仕様)。外さないこと。
+"$PY" -m unittest discover -s tests -t .
 
 echo "== all checks passed =="

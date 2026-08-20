@@ -48,6 +48,13 @@ _GAME_SCOPED_TABLES = (
     "rating_history",
     "game_stats",
     "game_players",
+    # CO宣言・結果申告・投票・夜行動ログ (v0.49)。FKがONなので、
+    # 参照先の games を消すより前に子テーブルを空にする必要がある。
+    "game_co_events",
+    "game_co_results",
+    "game_vote_events",
+    "game_night_actions",
+    "game_turn_events",
     "games",
 )
 

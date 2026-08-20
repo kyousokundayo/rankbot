@@ -1,6 +1,8 @@
 """全UIコンポーネント定義"""
 from __future__ import annotations
 
+import asyncio
+import io
 import logging
 import math
 import time
@@ -11,6 +13,7 @@ import discord
 
 import database
 import rating as rating_lib
+import stats_image
 from config import (
     MAX_PLAYERS, Role, Team, Phase,
     RUNOFF_SPEECH_TIME, LAST_WILL_TIME, VOTE_TIMEOUT,
@@ -30,6 +33,7 @@ from config import (
     SLOW_INTERACTION_SECONDS,
     DEFAULT_VARIANT_ID, VariantDefinition, get_variant_definition,
     VARIANT_DEFINITIONS, LADDER_DEFINITIONS, USER_VISIBLE_VARIANT_IDS,
+    STATS_CARD_BUTTON_ENABLED,
 )
 from models import by_number, parse_select_id
 
@@ -1432,6 +1436,8 @@ class _BaseVoteView(discord.ui.View):
     button_prefix: str
     button_style: discord.ButtonStyle
     persist_label: str
+    vote_kind: str  # database.record_vote_event の vote_kind ('本投票'|'決選投票')
+    round_index: int  # 決選の回数。本投票は常に0
     # 通常投票のパネルだけ、発言中の人の候補ボタンと並べて
     # 「投票」(列へ並ぶ) を置く。決戦は一斉投票なので置かない。
     with_queue_button: bool = False
@@ -1550,16 +1556,36 @@ class _BaseVoteView(discord.ui.View):
                 self.persist_label, actor=state.get_player(voter_id),
                 target=state.get_player(target_id),
             )
+            state.record_event_seq += 1
+            seq = state.record_event_seq
             try:
                 await self.cog._persist_room_state()
             except Exception as e:
                 state.votes.pop(voter_id, None)
+                state.record_event_seq -= 1
                 del state.action_log[old_action_log_len:]
                 log.exception(f"{self.persist_label}の保存に失敗: {e}")
                 return (
                     "❌ 投票を保存できませんでした。もう一度投票してください。",
                     False,
                 )
+
+            # 投票の生ログを追記 (仕様§2-4)。票の変更・やり直しも1行として
+            # 追記し、上書きしない (最新は event_seq の最大値で判定)。
+            # 失敗しても進行は止めない。
+            voter = state.get_player(voter_id)
+            try:
+                await database.record_vote_event(
+                    state.guild.id, state.room_id, state.game_run_id,
+                    event_seq=seq, day_number=state.day_number,
+                    vote_kind=self.vote_kind, round_index=self.round_index,
+                    voter_id=voter_id,
+                    voter_number=voter.number if voter is not None else 0,
+                    target_id=target_id,
+                    target_number=target.number if target is not None else None,
+                )
+            except Exception as error:
+                log.exception(f"投票ログのDB記録に失敗 ({state.room_name}): {error}")
 
             if self.expected_phase == Phase.DAY_VOTE and self.cog.uses_sequential_vote():
                 # 保存した票を同じ公開パネルへ反映してから、現在の20秒枠を
@@ -1589,6 +1615,8 @@ class VoteView(_BaseVoteView):
     button_style = discord.ButtonStyle.primary
     persist_label = "投票"
     with_queue_button = True
+    vote_kind = "本投票"
+    round_index = 0
 
 
 class RunoffVoteView(_BaseVoteView):
@@ -1596,6 +1624,10 @@ class RunoffVoteView(_BaseVoteView):
     button_prefix = "runoff"
     button_style = discord.ButtonStyle.danger
     persist_label = "決戦投票"
+    vote_kind = "決選投票"
+    # このリポジトリの決戦投票は1日1回のみ (決戦が再同票でもランダム処刑になり、
+    # 決戦をやり直すことはない)。将来複数回に対応する場合はここを可変にする。
+    round_index = 1
 
 
 # ============================================================
@@ -1784,350 +1816,153 @@ class WolfVoteView(discord.ui.View):
 
 
 # ============================================================
-# 夜アクション: 占い師 (DM)
+# 夜アクション: 占い師・狩人 (#昼パネル、v0.49で DM から移設)
+#
+# 占い師DM (旧 SeerView) と狩人DM (旧 GuardView) は廃止し、
+# VillagePanelView の [占い][狩人] ボタン経由の ephemeral UI に一本化した。
+# 確定処理そのもの (検証・保存・ロールバック) は
+# RoomRunner.commit_seer_target / commit_guard_target が持つ
+# (action_lock を握るため、UIクラスではなくcog側に置く)。
 # ============================================================
 
-class NightActionConfirmView(discord.ui.View):
-    """占い・護衛の実行確認 (誤タップ防止)。
+class VillageSeerConfirmView(discord.ui.View):
+    """[占い] 対象選択後の実行確認。確定すると同時に結果を表示する。"""
 
-    選択直後にエフェメラルで表示し、「実行する」を押して初めて確定する。
-    確定した行動は取り消せない (占いは確定と同時に結果を開示するため)。
-    キャンセル時は元のDMのセレクトを作り直す: Discordのセレクトは
-    「既に選択済みの項目」を選び直しても操作が飛ばないため、
-    作り直さないと同じ相手を選べなくなる。
-    """
-
-    def __init__(
-        self,
-        origin: SeerView | GuardView,
-        target,
-        *,
-        label: str,
-        origin_message: Optional[discord.Message],
-    ) -> None:
-        # 夜は「全員が朝を迎えるを押すまで」続くので長さが読めない。
-        # View側のtimeoutは設けず、夜の終わりに _night_views で一括stopする
-        super().__init__(timeout=None)
-        origin.cog.register_game_view(self, night=True)
-        self.origin = origin
-        self.cog = origin.cog
-        self.target = target
-        self.label = label
-        # 元のセレクトが載っているDMメッセージ。
-        # 確認UIはエフェメラルなので、そのコールバックの interaction.message は
-        # エフェメラル側を指す。元のDMを触るにはここで持っておく必要がある
-        self.origin_message = origin_message
-        self.game_run_id = origin.game_run_id
-        self.night_generation = origin.night_generation
-
-    async def on_timeout(self) -> None:
-        # ephemeral Viewはdiscord.pyにより最大15分へ補正される。
-        # 無期限の夜でも同じ対象を選び直せるよう、失効時に元セレクトを再生成する。
-        if self.cog.is_current_night_view(self.game_run_id, self.night_generation):
-            await self._rebuild_origin(locked=False)
-
-    async def _rebuild_origin(self, *, locked: bool) -> None:
-        """元のDMのセレクトを作り直す。
-
-        locked=True : 確定済みとして無効化する
-        locked=False: 未選択状態に戻す (Discordのセレクトは選択済みの項目を
-                      選び直しても操作が飛ばないため、作り直さないと同じ相手を選べない)
-        """
-        if self.origin_message is None:
-            return
-        state = self.cog.state
-        # 同じセレクトから確認ダイアログが複数開かれた場合、
-        # 一方が確定した後に他方のキャンセル/タイムアウトが
-        # 元セレクトを再度有効化しないよう、実状態を最終決定にする。
-        if isinstance(self.origin, SeerView) and state.seer_target is not None:
-            locked = True
-        elif isinstance(self.origin, GuardView) and state.guard_target is not None:
-            locked = True
-        if not locked and not self.cog.is_current_night_view(
-            self.game_run_id, self.night_generation
-        ):
-            return
-        view = type(self.origin)(self.cog, self.origin.targets)
-        self.cog.register_game_view(view, night=True)
-        if locked:
-            for item in view.children:
-                item.disabled = True
-        try:
-            await self.origin_message.edit(view=view)
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-            log.warning(f"夜アクションUI再生成失敗: {e}")
+    def __init__(self, cog: RoomRunner, actor_id: int, target_id: int, target_display: str) -> None:
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.actor_id = actor_id
+        self.target_id = target_id
+        self.target_display = target_display
 
     @discord.ui.button(label="実行する", style=discord.ButtonStyle.success)
     async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not self.cog.is_current_night_view(self.game_run_id, self.night_generation):
-            return await interaction.response.send_message(
-                "⏳ この夜の操作受付は終了しています。", ephemeral=True
-            )
+        if interaction.user.id != self.actor_id:
+            await interaction.response.send_message("本人のみ操作できます。", ephemeral=True)
+            return
         # SQLite busy_timeout中でも3秒のInteraction応答期限を超えない。
         await interaction.response.defer()
-        async with self.cog.action_lock:
-            for item in self.children:
-                item.disabled = True
-            result, committed = await self.origin.commit(self.target)
-            self.stop()
-            try:
-                await interaction.edit_original_response(content=result, view=self)
-            except (discord.NotFound, discord.HTTPException):
-                pass
-            # 確定したらセレクトを無効化する (二重操作の見た目上の防止)
-            if committed:
-                await self._rebuild_origin(locked=True)
-            else:
-                # DB一時失敗等で未確定なら、同じ項目をもう一度
-                # 選べるよう元セレクトを作り直す。
-                await self._rebuild_origin(locked=False)
+        text, _committed = await self.cog.commit_seer_target(self.actor_id, self.target_id)
+        self.stop()
+        try:
+            await interaction.edit_original_response(content=text, view=None)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
     @discord.ui.button(label="やめる", style=discord.ButtonStyle.secondary)
     async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not self.cog.is_current_night_view(self.game_run_id, self.night_generation):
-            return await interaction.response.send_message(
-                "⏳ この夜の操作受付は終了しています。", ephemeral=True
+        if interaction.user.id != self.actor_id:
+            await interaction.response.send_message("本人のみ操作できます。", ephemeral=True)
+            return
+        self.stop()
+        await interaction.response.edit_message(
+            content="↩️ キャンセルしました。もう一度 [占い] を押して選び直してください。",
+            view=None,
+        )
+
+
+class VillageSeerTargetView(discord.ui.View):
+    """[占い] ボタンから開く対象選択 (ボタン方式、最大25人)。
+
+    「同じ相手を選び直せない」Discordセレクト仕様を避けるため、CO関連UIと
+    同じくSelectではなくボタンで選ばせる。
+    """
+
+    def __init__(self, cog: RoomRunner, actor_id: int, targets: list) -> None:
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.actor_id = actor_id
+        for player in targets[:25]:
+            button = discord.ui.Button(
+                label=player.display_name[:80], style=discord.ButtonStyle.secondary
             )
-        await interaction.response.defer()
-        async with self.cog.action_lock:
-            for item in self.children:
-                item.disabled = True
-            self.stop()
-            try:
-                await interaction.edit_original_response(
-                    content=f"↩️ キャンセルしました。{self.label}を選び直してください。", view=self
+            button.callback = self._make_callback(player.user_id, player.display_name)
+            self.add_item(button)
+
+    def _make_callback(self, target_id: int, target_display: str):
+        async def callback(interaction: discord.Interaction) -> None:
+            if interaction.user.id != self.actor_id:
+                await interaction.response.send_message(
+                    "本人のみ操作できます。", ephemeral=True
                 )
-            except (discord.NotFound, discord.HTTPException):
-                pass
-            await self._rebuild_origin(locked=False)
+                return
+            view = VillageSeerConfirmView(self.cog, self.actor_id, target_id, target_display)
+            await interaction.response.edit_message(
+                content=(
+                    f"🔮 **{target_display}** を占います。よろしいですか？\n"
+                    "確定すると結果がすぐ表示され、今夜は変更できません。"
+                ),
+                view=view,
+            )
+        return callback
 
 
-class SeerView(discord.ui.View):
-    """占い師のDMに送る占い先セレクト。
+class VillageGuardConfirmView(discord.ui.View):
+    """[狩人] 対象選択後の実行確認。"""
 
-    選択 → 実行確認 → 確定と同時に結果を開示する (1晩1回・変更不可)。
-    """
-
-    def __init__(self, cog: RoomRunner, targets: list) -> None:
-        super().__init__(timeout=None)
+    def __init__(self, cog: RoomRunner, actor_id: int, target_id: int, target_display: str) -> None:
+        super().__init__(timeout=180)
         self.cog = cog
-        self.targets = targets
-        self.game_run_id = cog.state.game_run_id
-        self.night_generation = cog.state.night_generation
-        # 確認UIから確定するときの操作者 (このViewは本人のDMにしか届かない)
-        self.actor_id: Optional[int] = None
+        self.actor_id = actor_id
+        self.target_id = target_id
+        self.target_display = target_display
 
-        options = [
-            discord.SelectOption(label=p.display_name, value=str(p.user_id))
-            for p in targets
-        ]
-        select = discord.ui.Select(
-            placeholder="占う対象を選択 (確認後に確定)",
-            options=options,
-        )
-        select.callback = self.select_callback
-        self.add_item(select)
-
-    def _validate(self, user_id: int) -> Optional[str]:
-        """操作できない理由を返す (操作可能なら None)"""
-        state = self.cog.state
-        # 古いDMビューからの操作を弾く (死亡した占い師など)
-        if not self.cog.is_current_night_view(self.game_run_id, self.night_generation):
-            return "⏳ 現在この操作はできません。"
-        sender = state.get_player(user_id)
-        if sender is None or not sender.alive or sender.role != Role.SEER:
-            return "⏳ 現在この操作はできません。"
-        if state.seer_target is not None:
-            self.cog.log_action(
-                "占い(拒否)", actor=state.get_player(user_id),
-                detail="既に確定済みのため拒否",
-            )
-            return "✅ 今夜の占いは既に確定しています。変更はできません。"
-        return None
-
-    async def select_callback(self, interaction: discord.Interaction) -> None:
-        state = self.cog.state
-
-        error = self._validate(interaction.user.id)
-        if error:
-            return await interaction.response.send_message(error, ephemeral=True)
-
-        target_id = parse_select_id(interaction.data["values"][0])
-        if target_id is None:
-            return await interaction.response.send_message(
-                "❌ 不正な対象です。", ephemeral=True
-            )
-        target = state.get_player(target_id)
-        if target is None or not target.alive:
-            return await interaction.response.send_message(
-                "❌ その対象は占えません (存在しないか、既に死亡しています)。", ephemeral=True
-            )
-
-        self.actor_id = interaction.user.id
-        await interaction.response.send_message(
-            f"🔮 **{target.display_name}** を占います。よろしいですか？\n"
-            "確定すると結果がすぐ表示され、今夜は変更できません。",
-            view=NightActionConfirmView(
-                self, target, label="占い先", origin_message=interaction.message
-            ),
-            ephemeral=True,
-        )
-
-    async def commit(self, target) -> tuple[str, bool]:
-        """確認後の確定処理。(表示文字列, 確定したか) を返す (結果は即時開示)"""
-        state = self.cog.state
-
-        error = self._validate(self.actor_id)
-        if error:
-            return error, False
-        if not target.alive:
-            return "❌ その対象は占えません (既に死亡しています)。", False
-
-        old_action_log_len = len(state.action_log)
-        state.seer_target = target.user_id
-        result = "**人狼**" if target.role == Role.WEREWOLF else "**村人**"
-        self.cog.log_action(
-            "占い", actor=state.get_player(self.actor_id), target=target,
-            detail=f"結果={'人狼' if target.role == Role.WEREWOLF else '村人'}",
-        )
+    @discord.ui.button(label="実行する", style=discord.ButtonStyle.success)
+    async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.actor_id:
+            await interaction.response.send_message("本人のみ操作できます。", ephemeral=True)
+            return
+        # SQLite busy_timeout中でも3秒のInteraction応答期限を超えない。
+        await interaction.response.defer()
+        text, _committed = await self.cog.commit_guard_target(self.actor_id, self.target_id)
+        self.stop()
         try:
-            await self.cog._persist_room_state()
-        except Exception as e:
-            state.seer_target = None
-            del state.action_log[old_action_log_len:]
-            log.exception(f"占い結果の保存に失敗: {e}")
-            return "❌ 占い結果を保存できませんでした。もう一度実行してください。", False
-        # 未行動警告の対象から外す
-        self.cog._check_night_complete()
+            await interaction.edit_original_response(content=text, view=None)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
-        text = f"🔮 占い結果: **{target.display_name}** は {result} でした。"
-        # 通常DMでも送って手元に残す。確認UIはエフェメラルなので、
-        # 閉じるかクライアントを再読み込みすると結果が消える。一方
-        # seer_target は確定済みで占い直せないため、DMが無いと
-        # その夜の占いを失う。霊媒結果・初日白と同じ扱いに揃える。
-        await self.cog.deliver_seer_result(self.actor_id, text)
-        return text, True
+    @discord.ui.button(label="やめる", style=discord.ButtonStyle.secondary)
+    async def cancel_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.actor_id:
+            await interaction.response.send_message("本人のみ操作できます。", ephemeral=True)
+            return
+        self.stop()
+        await interaction.response.edit_message(
+            content="↩️ キャンセルしました。もう一度 [狩人] を押して選び直してください。",
+            view=None,
+        )
 
 
-# ============================================================
-# 夜アクション: 狩人 (DM)
-# ============================================================
+class VillageGuardTargetView(discord.ui.View):
+    """[狩人] ボタンから開く対象選択 (ボタン方式、最大25人)。"""
 
-class GuardView(discord.ui.View):
-    """狩人のDMに送る護衛先セレクト。
-
-    選択 → 実行確認 → 確定 (1晩1回・変更不可)。
-    """
-
-    def __init__(self, cog: RoomRunner, targets: list) -> None:
-        super().__init__(timeout=None)
+    def __init__(self, cog: RoomRunner, actor_id: int, targets: list) -> None:
+        super().__init__(timeout=180)
         self.cog = cog
-        self.targets = targets
-        # Discordのセレクト表示だけを信頼せず、確認確定時にもこの夜に
-        # 提示した候補だけを受け付ける。
-        self.target_ids = frozenset(player.user_id for player in targets)
-        self.game_run_id = cog.state.game_run_id
-        self.night_generation = cog.state.night_generation
-        # 確認UIから確定するときの操作者 (このViewは本人のDMにしか届かない)
-        self.actor_id: Optional[int] = None
-
-        options = [
-            discord.SelectOption(label=p.display_name, value=str(p.user_id))
-            for p in targets
-        ]
-        select = discord.ui.Select(
-            placeholder="護衛対象を選択 (確認後に確定)",
-            options=options,
-        )
-        select.callback = self.select_callback
-        self.add_item(select)
-
-    def _validate(self, user_id: int) -> Optional[str]:
-        """操作できない理由を返す (操作可能なら None)"""
-        state = self.cog.state
-        # 古いDMビューからの操作を弾く (死亡した狩人など)
-        if not self.cog.is_current_night_view(self.game_run_id, self.night_generation):
-            return "⏳ 現在この操作はできません。"
-        sender = state.get_player(user_id)
-        if sender is None or not sender.alive or sender.role != Role.GUARD:
-            return "⏳ 現在この操作はできません。"
-        if state.guard_target is not None:
-            self.cog.log_action(
-                "護衛(拒否)", actor=state.get_player(user_id),
-                detail="既に確定済みのため拒否",
+        self.actor_id = actor_id
+        for player in targets[:25]:
+            button = discord.ui.Button(
+                label=player.display_name[:80], style=discord.ButtonStyle.secondary
             )
-            return "✅ 今夜の護衛は既に確定しています。変更はできません。"
-        return None
+            button.callback = self._make_callback(player.user_id, player.display_name)
+            self.add_item(button)
 
-    def _validate_target(self, actor_id: int, target) -> Optional[str]:
-        """表示候補を迂回した護衛先も最終的に拒否する。"""
-        state = self.cog.state
-        if target is None or target.user_id not in self.target_ids:
-            return "❌ その対象は護衛できません。"
-        if target.user_id == actor_id:
-            return "⚠️ 自分は護衛できません。"
-        if target.user_id == state.guard_previous:
-            return "⚠️ 前回と同じ対象は護衛できません。"
-        if not target.alive:
-            return "❌ その対象は護衛できません (既に死亡しています)。"
-        return None
-
-    async def select_callback(self, interaction: discord.Interaction) -> None:
-        state = self.cog.state
-
-        error = self._validate(interaction.user.id)
-        if error:
-            return await interaction.response.send_message(error, ephemeral=True)
-
-        target_id = parse_select_id(interaction.data["values"][0])
-        if target_id is None:
-            return await interaction.response.send_message(
-                "❌ 不正な対象です。", ephemeral=True
+    def _make_callback(self, target_id: int, target_display: str):
+        async def callback(interaction: discord.Interaction) -> None:
+            if interaction.user.id != self.actor_id:
+                await interaction.response.send_message(
+                    "本人のみ操作できます。", ephemeral=True
+                )
+                return
+            view = VillageGuardConfirmView(self.cog, self.actor_id, target_id, target_display)
+            await interaction.response.edit_message(
+                content=(
+                    f"🛡️ **{target_display}** を護衛します。よろしいですか？\n"
+                    "確定すると今夜は変更できません。"
+                ),
+                view=view,
             )
-
-        target = state.get_player(target_id)
-        target_error = self._validate_target(interaction.user.id, target)
-        if target_error:
-            return await interaction.response.send_message(
-                target_error, ephemeral=True
-            )
-
-        self.actor_id = interaction.user.id
-        await interaction.response.send_message(
-            f"🛡️ **{target.display_name}** を護衛します。よろしいですか？\n"
-            "確定すると今夜は変更できません。",
-            view=NightActionConfirmView(
-                self, target, label="護衛先", origin_message=interaction.message
-            ),
-            ephemeral=True,
-        )
-
-    async def commit(self, target) -> tuple[str, bool]:
-        """確認後の確定処理。(表示文字列, 確定したか) を返す"""
-        state = self.cog.state
-
-        error = self._validate(self.actor_id)
-        if error:
-            return error, False
-        target_error = self._validate_target(self.actor_id, target)
-        if target_error:
-            return target_error, False
-
-        old_action_log_len = len(state.action_log)
-        state.guard_target = target.user_id
-        self.cog.log_action(
-            "護衛", actor=state.get_player(self.actor_id), target=target,
-        )
-        try:
-            await self.cog._persist_room_state()
-        except Exception as e:
-            state.guard_target = None
-            del state.action_log[old_action_log_len:]
-            log.exception(f"護衛先の保存に失敗: {e}")
-            return "❌ 護衛先を保存できませんでした。もう一度実行してください。", False
-        # 未行動警告の対象から外す
-        self.cog._check_night_complete()
-        return f"🛡️ **{target.display_name}** の護衛を確定しました。", True
+        return callback
 
 
 # ============================================================
@@ -2233,12 +2068,257 @@ class MorningReadyView(discord.ui.View):
         timer.finish()
 
 
+class VillagePanelView(discord.ui.View):
+    """#昼 へ常設する村パネル。CO・役職行動への入口をまとめる。
+
+    進行中Viewは永続化されない既存方針 (`bot.add_view` 対象外) に従い、
+    custom_id は付けない。掲示・再掲示・削除は runner 側の
+    post_village_panel / refresh_village_panel / close_village_panel が担い、
+    このクラスはボタン配置と押下時の判定だけを持つ。
+
+    CO・CO撤回は cog._co_action_reject_reason() の判定 (世代照合・生存者判定・
+    昼フェーズ判定・VC切断判定) を defer より前に通す。
+    占い・狩人は cog._night_role_reject_reason() で「生存する当該役職か」
+    「夜フェーズ中か」を、霊媒・人狼予想はそれぞれ専用の判定を同じく
+    defer より前に通す。
+    """
+
+    def __init__(self, cog: RoomRunner) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.game_run_id = cog.state.game_run_id
+        cog.register_game_view(self)
+
+    def _is_current(self) -> bool:
+        # 昼夜をまたいで生きるパネルなので day/night の世代印までは見ず、
+        # ゲームそのものの有効性 (run_id・終了/勝敗確定していないか) だけ見る。
+        return self.cog.is_current_game_view(self.game_run_id)
+
+
+    @discord.ui.button(label="CO", style=discord.ButtonStyle.primary, row=0)
+    async def co_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        actor_id = interaction.user.id
+        reason = self.cog._co_action_reject_reason(actor_id)
+        if reason is None and actor_id in self.cog.state.co_claims:
+            reason = "既にCOしています。先に撤回してください。"
+        if reason is not None:
+            await interaction.response.send_message(reason, ephemeral=True)
+            return
+        view = COClaimRoleView(self.cog, actor_id)
+        await interaction.response.send_message(
+            "CO する役職を選んでください。", view=view, ephemeral=True
+        )
+
+    @discord.ui.button(label="CO撤回", style=discord.ButtonStyle.secondary, row=0)
+    async def co_withdraw_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        actor_id = interaction.user.id
+        reason = self.cog._co_action_reject_reason(actor_id)
+        if reason is None and actor_id not in self.cog.state.co_claims:
+            reason = "CO中ではありません。"
+        if reason is not None:
+            await interaction.response.send_message(reason, ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        error = await self.cog.withdraw_co(actor_id)
+        await interaction.followup.send(error or "✅ COを撤回しました。", ephemeral=True)
+
+    @discord.ui.button(label="占い", style=discord.ButtonStyle.primary, row=1)
+    async def seer_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """占い師本人なら、いつ押しても初日からの結果一覧を返す。
+
+        夜で未確定のときだけ、同じephemeralへ対象選択も並べる。結果の
+        見返しに昼夜・生死の制限を掛けないのは、本人が既に知っている情報
+        しか出さないため (霊媒ボタンと同じ扱い)。
+        """
+        if not self._is_current():
+            await interaction.response.send_message(
+                "⏳ この村パネルは終了しています。", ephemeral=True
+            )
+            return
+        actor_id = interaction.user.id
+        player = self.cog.state.get_player(actor_id)
+        if player is None or player.role != Role.SEER:
+            await interaction.response.send_message(
+                "占い師だけが使えます。", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        state = self.cog.state
+        content = await self.cog.build_seer_history_content(actor_id)
+        view: Optional[discord.ui.View] = None
+        if not player.alive:
+            content += "\n\n（死亡しているため、記録の確認のみです）"
+        elif state.seer_target is not None:
+            content += "\n\n♻️ 今夜の占いは確定済みです。変更はできません。"
+        else:
+            reason = self.cog._night_role_reject_reason(actor_id, Role.SEER, "占い師")
+            if reason is not None:
+                content += f"\n\n{reason}"
+            else:
+                targets = self.cog.seer_targets(actor_id)
+                if targets:
+                    view = VillageSeerTargetView(self.cog, actor_id, targets)
+                    content += "\n\n占う対象を選んでください。"
+                else:
+                    content += "\n\n占える対象がいません。"
+        await interaction.followup.send(
+            content, ephemeral=True,
+            **({"view": view} if view is not None else {}),
+        )
+
+    @discord.ui.button(label="霊媒", style=discord.ButtonStyle.primary, row=1)
+    async def medium_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        # 能動的な行動ではなく結果確認なので、昼夜を問わずいつでも押せる
+        # (仕様§2-3)。共通の _reject_reason は使わず、霊能者本人かどうか
+        # だけを判定する。
+        if not self._is_current():
+            await interaction.response.send_message(
+                "⏳ この村パネルは終了しています。", ephemeral=True
+            )
+            return
+        player = self.cog.state.get_player(interaction.user.id)
+        if player is None or player.role != Role.MEDIUM:
+            await interaction.response.send_message(
+                "霊能者だけが使えます。", ephemeral=True
+            )
+            return
+        # 死亡後も見返せる。本人が既に知っている結果しか出さないため、
+        # 生存判定は掛けない (占い・狩人の履歴と揃えた)。
+        content = self.cog.build_medium_results_content()
+        if not player.alive:
+            content += "\n\n（死亡しているため、記録の確認のみです）"
+        await interaction.response.send_message(content, ephemeral=True)
+
+    @discord.ui.button(label="狩人", style=discord.ButtonStyle.primary, row=1)
+    async def guard_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        """狩人本人なら、いつ押しても護衛先の記録を返す。
+
+        GJの有無はここに出さない (詳細は build_guard_history_content 参照)。
+        夜で未確定のときだけ、同じephemeralへ対象選択も並べる (占いと同じ)。
+        """
+        if not self._is_current():
+            await interaction.response.send_message(
+                "⏳ この村パネルは終了しています。", ephemeral=True
+            )
+            return
+        actor_id = interaction.user.id
+        player = self.cog.state.get_player(actor_id)
+        if player is None or player.role != Role.GUARD:
+            await interaction.response.send_message(
+                "狩人だけが使えます。", ephemeral=True
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        state = self.cog.state
+        content = await self.cog.build_guard_history_content(actor_id)
+        view: Optional[discord.ui.View] = None
+        if not player.alive:
+            content += "\n\n（死亡しているため、記録の確認のみです）"
+        elif state.guard_target is not None:
+            content += "\n\n♻️ 今夜の護衛は確定済みです。変更はできません。"
+        else:
+            reason = self.cog._night_role_reject_reason(actor_id, Role.GUARD, "狩人")
+            if reason is not None:
+                content += f"\n\n{reason}"
+            else:
+                targets = self.cog.guard_targets(actor_id)
+                if targets:
+                    view = VillageGuardTargetView(self.cog, actor_id, targets)
+                    content += "\n\n護衛する対象を選んでください。"
+                else:
+                    content += "\n\n護衛できる対象がいません。"
+        await interaction.followup.send(
+            content, ephemeral=True,
+            **({"view": view} if view is not None else {}),
+        )
+
+    @discord.ui.button(label="人狼予想", style=discord.ButtonStyle.secondary, row=1)
+    async def wolf_guess_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        # 対象は「未提出の死亡者 (霊界保留中)」であり、生存者判定を行う
+        # _reject_reason は使えない。ここだけ専用の判定を行う。
+        if not self._is_current():
+            await interaction.response.send_message(
+                "⏳ この村パネルは終了しています。", ephemeral=True
+            )
+            return
+        state = self.cog.state
+        user_id = interaction.user.id
+        if user_id not in state.spirit_hold_ids or user_id in state.wolf_guesses:
+            await interaction.response.send_message(
+                "⏳ 人狼予想は、死亡直後の未提出の間だけ使えます。", ephemeral=True
+            )
+            return
+        death_event_id = state.spirit_hold_events.get(user_id, "")
+        view = VillageWolfGuessView(self.cog, user_id, death_event_id)
+        await interaction.response.send_message(
+            f"人狼だと思う{view.guess_slots}人を選んでください。",
+            view=view,
+            ephemeral=True,
+        )
+
+
+class COClaimRoleView(discord.ui.View):
+    """[CO] ボタン押下後、ephemeralで役職6択を出す。
+
+    「同じ相手を選び直せない」Discordセレクト仕様を避けるため、Selectではなく
+    ボタンで選ばせる。押下者本人以外の操作は弾く。
+    """
+
+    def __init__(self, cog: RoomRunner, actor_id: int) -> None:
+        super().__init__(timeout=180)
+        self.cog = cog
+        self.actor_id = actor_id
+        for role in cog.CO_CLAIMABLE_ROLES:
+            button = discord.ui.Button(label=role, style=discord.ButtonStyle.primary)
+            button.callback = self._make_callback(role)
+            self.add_item(button)
+
+    def _make_callback(self, role: str):
+        async def callback(interaction: discord.Interaction) -> None:
+            if interaction.user.id != self.actor_id:
+                await interaction.response.send_message(
+                    "本人のみ操作できます。", ephemeral=True
+                )
+                return
+            # SQLite busy_timeout中でも3秒のInteraction応答期限を超えない。
+            # declare_co は action_lock 取得 → _persist_room_state → 記録DB追記と
+            # 続くため、ackを先に済ませないと「COは通ったのに操作は失敗表示」になる。
+            await interaction.response.defer()
+            error = await self.cog.declare_co(self.actor_id, role)
+            self.stop()
+            try:
+                await interaction.edit_original_response(
+                    content=error or f"✅ **{role}** をCOしました。", view=None
+                )
+            except (discord.NotFound, discord.HTTPException):
+                pass
+        return callback
+
+
 # ============================================================
 # 弁明終了ボタン
 # ============================================================
 
-class WolfGuessSelectView(discord.ui.View):
-    """死亡者本人のDMにだけ送る人狼予想UI。"""
+class VillageWolfGuessView(discord.ui.View):
+    """#昼パネルの [人狼予想] ボタンから開くephemeral選択UI (仕様§2-3)。
+
+    人狼予想の提出口はここだけ (v0.50でDM経路を廃止した)。CO関連UIと同じく
+    「同じ相手を選び直せない」Discordセレクト仕様を避けるため、ボタンで
+    1人ずつ選ばせ、variant.wolf_guess_slots人ちょうど選び終えた時点で
+    自動確定する。
+    """
 
     def __init__(self, cog: RoomRunner, user_id: int, death_event_id: str) -> None:
         super().__init__(timeout=WOLF_GUESS_TIMEOUT)
@@ -2249,58 +2329,75 @@ class WolfGuessSelectView(discord.ui.View):
         self.guess_slots = int(
             getattr(getattr(cog, "variant", None), "wolf_guess_slots", BONUS_WOLF_GUESS_SLOTS)
         )
-        options = [
-            discord.SelectOption(
-                # display_name自体が「01.名前」形式なので番号を重ねない。
-                label=player.display_name[:100],
-                value=str(player.user_id),
+        self.selected: list[int] = []
+        players = sorted(cog.state.players.values(), key=lambda p: p.number)
+        for player in players:
+            if player.user_id == user_id:
+                continue
+            if len(self.children) >= 25:
+                break
+            button = discord.ui.Button(
+                label=player.display_name[:80], style=discord.ButtonStyle.secondary
             )
-            for player in sorted(cog.state.players.values(), key=lambda p: p.number)
-            if player.user_id != user_id
-        ]
-        self.select = discord.ui.Select(
-            placeholder=f"人狼だと思う{self.guess_slots}人を選ぶ",
-            min_values=self.guess_slots,
-            max_values=self.guess_slots,
-            options=options[:25],
-        )
-        self.select.callback = self._on_select
-        self.add_item(self.select)
+            button.callback = self._make_callback(player.user_id, button)
+            self.add_item(button)
         cog.register_game_view(self)
 
-    async def _on_select(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message(
-                "この提出は本人だけが操作できます。", ephemeral=True
-            )
-            return
-        targets = [int(value) for value in self.select.values]
-        accepted = await self.cog.submit_wolf_guess(
-            self.user_id,
-            targets,
-            game_run_id=self.game_run_id,
-            death_event_id=self.death_event_id,
-        )
-        self.stop()
-        if not accepted:
-            await interaction.response.edit_message(
-                content="⏳ この人狼予想の受付は終了しているか、既に提出済みです。",
-                view=None,
-            )
-            return
-        names = "、".join(
+    def _selected_names(self) -> str:
+        return "、".join(
             player.display_name
-            for player in (self.cog.state.get_player(pid) for pid in targets)
+            for player in (self.cog.state.get_player(pid) for pid in self.selected)
             if player is not None
         )
-        await interaction.response.edit_message(
-            content=(
-                f"✅ **{names}** で提出しました。\n"
-                "実際の人狼本人を除き、的中数が試合終了後のレート変動に反映されます。"
-                "霊界へどうぞ。"
-            ),
-            view=None,
-        )
+
+    def _make_callback(self, target_id: int, button: discord.ui.Button):
+        async def callback(interaction: discord.Interaction) -> None:
+            if interaction.user.id != self.user_id:
+                await interaction.response.send_message(
+                    "この提出は本人だけが操作できます。", ephemeral=True
+                )
+                return
+            if target_id in self.selected or button.disabled:
+                await interaction.response.defer()
+                return
+            self.selected.append(target_id)
+            button.disabled = True
+
+            if len(self.selected) < self.guess_slots:
+                remaining = self.guess_slots - len(self.selected)
+                await interaction.response.edit_message(
+                    content=(
+                        f"選択中: {self._selected_names()}"
+                        f"（あと{remaining}人選んでください）"
+                    ),
+                    view=self,
+                )
+                return
+
+            for child in self.children:
+                child.disabled = True
+            accepted = await self.cog.submit_wolf_guess(
+                self.user_id,
+                self.selected,
+                game_run_id=self.game_run_id,
+                death_event_id=self.death_event_id,
+            )
+            self.stop()
+            if not accepted:
+                await interaction.response.edit_message(
+                    content="⏳ この人狼予想の受付は終了しているか、既に提出済みです。",
+                    view=None,
+                )
+                return
+            await interaction.response.edit_message(
+                content=(
+                    f"✅ **{self._selected_names()}** で提出しました。\n"
+                    "実際の人狼本人を除き、的中数が試合終了後のレート変動に反映されます。"
+                    "霊界へどうぞ。"
+                ),
+                view=None,
+            )
+        return callback
 
 
 class SpeechDoneView(discord.ui.View):
@@ -2346,7 +2443,11 @@ class SpeechDoneView(discord.ui.View):
 
 
 class TurnSpeechView(discord.ui.View):
-    """ターン制の発言終了・公開CO・村全体の30秒割り込み。"""
+    """ターン制の発言終了・村全体の30秒割り込み。
+
+    旧「COを宣言」ボタンは撤去した (v0.49)。CO宣言は #昼 常設パネル
+    (VillagePanelView) の [CO] ボタンへ一本化している。
+    """
 
     def __init__(
         self,
@@ -2355,7 +2456,6 @@ class TurnSpeechView(discord.ui.View):
         turn_token: int,
         *,
         allow_interrupt: bool,
-        allow_co_declaration: bool,
     ) -> None:
         # pause中にViewだけ失効しないよう、発言タイマーと同じく無期限にする。
         super().__init__(timeout=None)
@@ -2365,8 +2465,6 @@ class TurnSpeechView(discord.ui.View):
         self.game_run_id = cog.state.game_run_id
         self.day_generation = cog.state.day_generation
         self.interrupt_btn.disabled = not allow_interrupt
-        if not allow_co_declaration:
-            self.remove_item(self.co_declaration_btn)
         cog.register_game_view(self)
 
     def _is_current(self) -> bool:
@@ -2412,27 +2510,6 @@ class TurnSpeechView(discord.ui.View):
         )
         await interaction.followup.send(
             error or f"⚡ 割り込みを受け付けました（本日の残り **{remaining}回**）。",
-            ephemeral=True,
-        )
-
-    @discord.ui.button(
-        label="COを宣言",
-        style=discord.ButtonStyle.success,
-        custom_id="turn_speech_co_declaration",
-    )
-    async def co_declaration_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        if not self._is_current():
-            return await interaction.response.send_message(
-                "⏳ この発言枠は終了しています。", ephemeral=True
-            )
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        error = await self.cog.request_turn_co_declaration(
-            interaction.user.id, self.turn_token
-        )
-        await interaction.followup.send(
-            error or "📣 COを公開しました。役職・内容はVCで話してください。",
             ephemeral=True,
         )
 
@@ -2941,6 +3018,95 @@ def _build_unplayed_variant_embed(
     return embed
 
 
+class RatingChartButton(discord.ui.Button):
+    """統計画面から、今見ている変種のレート推移グラフを出す。"""
+
+    def __init__(self, parent: "PlayerStatsVariantView") -> None:
+        super().__init__(
+            label="レート推移", style=discord.ButtonStyle.secondary, row=1,
+        )
+        self.parent_view = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "❌ サーバー内でのみ使用できます。", ephemeral=True,
+            )
+            return
+        now = time.monotonic()
+        cooldown_until = _rating_chart_cooldown_until.get(interaction.user.id, 0.0)
+        if now < cooldown_until:
+            await interaction.response.send_message(
+                f"⏳ 画像生成は{_RATING_CHART_COOLDOWN_SECONDS}秒に1回までです。"
+                f"あと{int(cooldown_until - now) + 1}秒お待ちください。",
+                ephemeral=True,
+            )
+            return
+        # 生成の成否に関わらずここでクールダウンを起動する (戦績カードと同じ)。
+        _rating_chart_cooldown_until[interaction.user.id] = (
+            now + _RATING_CHART_COOLDOWN_SECONDS
+        )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            async with _stats_card_semaphore:
+                png_bytes = await _build_rating_chart_png(
+                    interaction.guild,
+                    self.parent_view.user,
+                    variant_id=self.parent_view.variant_id,
+                )
+        except Exception:
+            log.exception(
+                "レート推移グラフの生成に失敗しました (user_id=%s)",
+                self.parent_view.user.id,
+            )
+            await interaction.followup.send("❌ 画像の生成に失敗しました。", ephemeral=True)
+            return
+        if png_bytes is None:
+            await interaction.followup.send(
+                "画像機能は現在この環境では利用できません。", ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            file=discord.File(io.BytesIO(png_bytes), filename="rating_chart.png"),
+            ephemeral=True,
+        )
+
+
+class CompatibilityButton(discord.ui.Button):
+    """同陣営／敵対の相性を本人にだけ返す。
+
+    誰と組むと勝てるかは人間関係に直結するため、他人ぶんを引ける入口は
+    作らない (このボタン自体、本人が自分を見ているときだけ生える)。
+    """
+
+    def __init__(self, parent: "PlayerStatsVariantView") -> None:
+        super().__init__(label="相性", style=discord.ButtonStyle.secondary, row=1)
+        self.parent_view = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "❌ サーバー内でのみ使用できます。", ephemeral=True,
+            )
+            return
+        if interaction.user.id != self.parent_view.viewer_id:
+            await interaction.response.send_message(
+                "本人だけが見られます。", ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        data = await database.get_player_compatibility(
+            self.parent_view.user.id,
+            self.parent_view.guild_id,
+            variant_id=self.parent_view.variant_id,
+            min_games=COMPATIBILITY_MIN_GAMES,
+        )
+        embed = build_compatibility_embed(
+            data, interaction.guild, user=self.parent_view.user,
+        )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
 class PlayerStatsVariantView(discord.ui.View):
     """自分/選択ユーザーの統計を変種別に表示する。"""
 
@@ -2951,17 +3117,28 @@ class PlayerStatsVariantView(discord.ui.View):
         user: discord.abc.User,
         *,
         variant_id: str = DEFAULT_VARIANT_ID,
+        viewer_id: Optional[int] = None,
     ) -> None:
         super().__init__(timeout=300)
         self.cog = cog
         self.guild_id = guild_id
         self.user = user
+        # 相性は本人にしか出さないので、表示対象と閲覧者を別に持つ。
+        # 省略時は「本人が自分を見ている」とみなす (既存の呼び出しと同じ)。
+        self.viewer_id = int(viewer_id) if viewer_id is not None else int(user.id)
         self.variant_id = _stats_variant(variant_id).variant_id
         self._rebuild()
 
     def _rebuild(self) -> None:
         self.clear_items()
         self.add_item(StatsVariantSelect(self))
+        # レート推移と相性は #統計 の常設パネル (3段まで) ではなく、この
+        # ephemeralな統計画面に置く。常設パネルの段数制約を崩さずに済み、
+        # 「今見ている変種」をそのまま引き継げる。
+        if stats_image.font_available():
+            self.add_item(RatingChartButton(self))
+        if self.viewer_id == int(self.user.id):
+            self.add_item(CompatibilityButton(self))
 
     def set_variant(self, variant_id: str) -> None:
         self.variant_id = _stats_variant(variant_id).variant_id
@@ -3672,10 +3849,226 @@ class LeaderboardView(discord.ui.View):
         await interaction.edit_original_response(embed=embed, view=self)
 
 
+# ============================================================
+# 戦績カード画像 (§4)
+# ============================================================
+
+# 画像生成はPillowでのCPU拘束処理 (asyncio.to_thread) なので、同時実行数を
+# 絞ってイベントループへの影響と負荷を抑える。全ギルド・全ユーザーで共有。
+_stats_card_semaphore = asyncio.Semaphore(2)
+
+# ユーザー単位のクールダウン (連打によるスパム生成を防ぐ)。
+_STATS_CARD_COOLDOWN_SECONDS = 30
+_stats_card_cooldown_until: dict[int, float] = {}
+
+
+async def _build_stats_card_png(
+    guild: discord.Guild,
+    user: discord.abc.User,
+    *,
+    variant_id: str = DEFAULT_VARIANT_ID,
+) -> Optional[bytes]:
+    """戦績カード画像用のデータをDBから集め、PNGへ描画する。
+
+    フォントが無い環境では None を返す (呼び出し側は font_available() を
+    先に見てボタン自体を出さないが、直接呼ばれた場合の防御としても効く)。
+    新しいSQLは書かず、既存の集計API (Phase 1) と get_player_* を
+    そのまま組み合わせるだけ。
+
+    `variant_id` は StatsView のボタンからは既定値のまま使うが、
+    scripts/generate_season_cards.py から変種を切り替えられるように
+    キーワード引数として残す (同じ組み立てロジックを再利用するため)。
+    """
+    if not stats_image.font_available():
+        return None
+    variant = _stats_variant(variant_id)
+    stats = await database.get_player_stats(
+        user.id, guild.id, variant_id=variant.variant_id,
+    )
+    if stats is None:
+        # 0戦のプレイヤーは get_player_stats が None を返す。
+        # ゼロ埋めして「試合数0」のカードとして描く。
+        stats = {"total": 0, "wins": 0, "roles": {}, "teams": {}}
+    rating_info = await database.get_player_current_rank_info(
+        user.id, guild.id, ladder_id=variant.ladder_id,
+    )
+    vote_stats = await database.get_player_vote_stats(
+        user.id, guild.id, variant_id=variant.variant_id,
+    )
+    co_stats = await database.get_player_co_stats(
+        user.id, guild.id, variant_id=variant.variant_id,
+    )
+    # 「3人予想の正解率」は集計専用のSQLが無いため、既存の全体ランキングAPI
+    # (wolf_guess_accuracy) から本人分だけを拾う。min_samples=1にして、
+    # 閾値未満でも本人の生データ (samples) だけは受け取り、表示側で判定する。
+    leaderboard = await database.get_metric_leaderboard(
+        guild.id, "wolf_guess_accuracy",
+        viewer_id=user.id, variant_id=variant.variant_id, min_samples=1,
+    )
+    recent_games = await database.get_player_recent_games(
+        user.id, guild.id, limit=10, variant_id=variant.variant_id,
+    )
+
+    avatar_bytes: Optional[bytes] = None
+    try:
+        # アバター取得は1回だけ。失敗しても既定アイコンで描画を続ける。
+        avatar_bytes = await user.display_avatar.read()
+    except Exception as exc:
+        log.warning("戦績カード用アバター取得に失敗 (user_id=%s): %s", user.id, exc)
+
+    data = stats_image.format_card_data(
+        display_name=getattr(user, "display_name", None) or str(user),
+        avatar_bytes=avatar_bytes,
+        stats=stats,
+        rating_info=rating_info,
+        vote_stats=vote_stats,
+        co_stats=co_stats,
+        wolf_guess=leaderboard.get("viewer"),
+        recent_games=recent_games,
+    )
+    # 描画はCPU拘束処理なのでイベントループを止めない。
+    return await asyncio.to_thread(stats_image.render_player_card, data)
+
+
+# ============================================================
+# レート推移グラフ / 相性 (v0.50)
+# ============================================================
+
+# レート推移も戦績カードと同じPillow描画なので、生成の同時実行数は
+# _stats_card_semaphore を共有して絞る。クールダウンはボタンごとに持つ
+# (片方を見た直後にもう片方を見たい、が普通の使い方のため)。
+_RATING_CHART_COOLDOWN_SECONDS = 30
+_rating_chart_cooldown_until: dict[int, float] = {}
+
+# 相性の足切り。13人卓では同陣営の共戦がなかなか伸びないため、これ未満は
+# 「まだ出さない」。少数試合の偏りを相性として断定しないための下限。
+COMPATIBILITY_MIN_GAMES = 10
+COMPATIBILITY_TOP_N = 3
+
+
+async def _build_rating_chart_png(
+    guild: discord.Guild,
+    user: discord.abc.User,
+    *,
+    variant_id: str = DEFAULT_VARIANT_ID,
+) -> Optional[bytes]:
+    """レート推移グラフ用のデータを集めてPNGへ描画する。
+
+    新しい記録は増やさない。rating_history はシーズンリセットでも消えない
+    ので、全期間の折れ線をそのまま引ける。
+    """
+    if not stats_image.font_available():
+        return None
+    variant = _stats_variant(variant_id)
+    series = await database.get_rating_series(
+        user.id, guild.id, variant_id=variant.variant_id,
+    )
+    rank_info = await database.get_player_current_rank_info(
+        user.id, guild.id, ladder_id=variant.ladder_id,
+    )
+    data = stats_image.format_rating_chart_data(
+        display_name=user.display_name,
+        series=series,
+        variant_label=variant.label,
+        rank_name=(rank_info or {}).get("rank_name"),
+    )
+    return await asyncio.to_thread(stats_image.render_rating_chart, data)
+
+
+def _player_label(guild: Optional[discord.Guild], player_id: int) -> str:
+    member = guild.get_member(player_id) if guild is not None else None
+    return member.display_name if member is not None else f"ID:{player_id}"
+
+
+def _compatibility_lines(
+    rows: list[dict],
+    guild: Optional[discord.Guild],
+    *,
+    best: bool,
+) -> list[str]:
+    """相性の上位/下位を「期待値との差」つきで整形する。"""
+    ordered = rows if best else list(reversed(rows))
+    lines = []
+    for row in ordered[:COMPATIBILITY_TOP_N]:
+        low, high = _wilson_interval(int(row["wins"]), int(row["games"]))
+        lines.append(
+            f"{_player_label(guild, int(row['player_id']))}: "
+            f"{row['diff'] * 100:+.1f}pt"
+            f"（勝率{row['rate'] * 100:.0f}% / 期待{row['expected'] * 100:.0f}% ・"
+            f"{row['wins']}勝{int(row['games']) - int(row['wins'])}敗 ・"
+            f"95%CI {low * 100:.0f}–{high * 100:.0f}%）"
+        )
+    return lines
+
+
+def build_compatibility_embed(
+    data: dict, guild: Optional[discord.Guild], *, user: discord.abc.User,
+) -> discord.Embed:
+    """同陣営／敵対それぞれの相性を本人向けに表示する。
+
+    素の勝率ではなく「自分の陣営別勝率から期待される勝率との差」を主役に
+    据える。13人卓では引いた陣営で勝率が大きく動くため、素の勝率を並べると
+    “村を多く引いた相手”が全員相性◎に見えてしまう。
+    """
+    variant = _stats_variant(str(data.get("variant_id") or DEFAULT_VARIANT_ID))
+    min_games = int(data.get("min_games") or COMPATIBILITY_MIN_GAMES)
+    embed = discord.Embed(
+        title=f"{user.display_name} の相性 — {variant.label}",
+        description=(
+            f"共戦**{min_games}戦以上**の相手だけを表示します。\n"
+            "「差」は自分の陣営別勝率から計算した期待勝率との差で、"
+            "プラスほどその相手と一緒（または対面）のときに勝てているという意味です。"
+        ),
+        color=discord.Color.blurple(),
+    )
+    if not data.get("games"):
+        embed.add_field(name="データなし", value="対象の試合がまだありません。", inline=False)
+        return embed
+
+    for key, title in (("same", "🤝 同じ陣営のとき"), ("opposite", "⚔️ 敵対したとき")):
+        rows = [
+            row for row in (data.get(key) or [])
+            if int(row["games"]) >= min_games
+        ]
+        if not rows:
+            embed.add_field(
+                name=title,
+                value=f"まだ{min_games}戦以上の相手がいません。",
+                inline=False,
+            )
+            continue
+        best_lines = _compatibility_lines(rows, guild, best=True)
+        worst_lines = _compatibility_lines(rows, guild, best=False)
+        embed.add_field(
+            name=f"{title}・勝ちやすい", value="\n".join(best_lines), inline=False,
+        )
+        embed.add_field(
+            name=f"{title}・勝ちにくい", value="\n".join(worst_lines), inline=False,
+        )
+
+    embed.set_footer(
+        text=(
+            f"共戦相手 {data.get('partners', 0)}人 / 自分の通算 "
+            f"{data.get('games', 0)}戦 勝率{(data.get('win_rate') or 0) * 100:.1f}%"
+            " ・ 試合数が少ないほど差はブレます（95%CIが広い相手は参考値）"
+        )
+    )
+    return embed
+
+
 class StatsView(discord.ui.View):
     def __init__(self, cog: GameCog) -> None:
         super().__init__(timeout=None)
         self.cog = cog
+        if not stats_image.font_available() or not STATS_CARD_BUTTON_ENABLED:
+            # フォントが無い環境 (VPSにNoto CJK未導入など) ではボタンごと
+            # 出さない。押しても失敗するボタンを見せない方針。
+            # STATS_CARD_BUTTON_ENABLED が False (既定) のときも同様に
+            # 隠す。シーズン1開始前はデータ項目とレイアウトが未確定なため、
+            # 描画エンジン自体は残しつつプレイヤーから見える入口だけ閉じる。
+            item = discord.utils.get(self.children, custom_id="stats_card_image")
+            if item is not None:
+                self.remove_item(item)
 
     @staticmethod
     async def _require_guild(interaction: discord.Interaction) -> bool:
@@ -3736,6 +4129,42 @@ class StatsView(discord.ui.View):
         await interaction.response.send_message(
             "報告の種類を選んでください。内容は管理用データベースへ保存されます。",
             view=FeedbackCategoryView(self.cog),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="画像で見る", style=discord.ButtonStyle.secondary, custom_id="stats_card_image", row=0)
+    async def stats_card_image(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self._require_guild(interaction):
+            return
+        now = time.monotonic()
+        cooldown_until = _stats_card_cooldown_until.get(interaction.user.id, 0.0)
+        if now < cooldown_until:
+            await interaction.response.send_message(
+                f"⏳ 画像生成は{_STATS_CARD_COOLDOWN_SECONDS}秒に1回までです。"
+                f"あと{int(cooldown_until - now) + 1}秒お待ちください。",
+                ephemeral=True,
+            )
+            return
+        # 生成の成否に関わらずここでクールダウンを起動する。失敗時に
+        # 即再試行を許すと、壊れた入力で連打され続ける恐れがあるため。
+        _stats_card_cooldown_until[interaction.user.id] = now + _STATS_CARD_COOLDOWN_SECONDS
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            async with _stats_card_semaphore:
+                png_bytes = await _build_stats_card_png(interaction.guild, interaction.user)
+        except Exception:
+            log.exception(
+                "戦績カード画像の生成に失敗しました (user_id=%s)", interaction.user.id,
+            )
+            await interaction.followup.send("❌ 画像の生成に失敗しました。", ephemeral=True)
+            return
+        if png_bytes is None:
+            await interaction.followup.send(
+                "画像機能は現在この環境では利用できません。", ephemeral=True,
+            )
+            return
+        await interaction.followup.send(
+            file=discord.File(io.BytesIO(png_bytes), filename="stats_card.png"),
             ephemeral=True,
         )
 
@@ -3820,6 +4249,7 @@ class StatsView(discord.ui.View):
         target = select.values[0]
         view = PlayerStatsVariantView(
             self.cog, interaction.guild.id, target,
+            viewer_id=interaction.user.id,
         )
         embed = await view.load_embed(interaction.guild)
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
@@ -3830,7 +4260,11 @@ class StatsView(discord.ui.View):
 # ============================================================
 
 def _parse_db_timestamp(text: Optional[str]) -> Optional[datetime]:
-    """SQLiteのCURRENT_TIMESTAMP (UTC, 'YYYY-MM-DD HH:MM:SS') をaware datetimeへ"""
+    """SQLiteのCURRENT_TIMESTAMP (UTC, 'YYYY-MM-DD HH:MM:SS') をaware datetimeへ
+
+    database.py にも同名の関数があるが、あちらはISO8601形式なども受理する
+    別実装で、受理する書式が異なるため統合すると挙動が変わる。意図的な重複。
+    """
     if not text:
         return None
     try:
@@ -4256,7 +4690,7 @@ def _role_rule_lines(variant: VariantDefinition) -> str:
         Role.WEREWOLF: "夜に1人を襲撃。相方が誰か分かり、DMの発言は狼同士に中継",
         Role.MADMAN: "能力なし。狼が誰かは分からない",
         Role.SEER: "夜に1人を占い「人狼 / 村人」を判定。開始時に初日白が1件届く",
-        Role.MEDIUM: "処刑された人が「人狼 / 村人」かをDMで受信",
+        Role.MEDIUM: f"処刑された人が「人狼 / 村人」かを`#{CH_VILLAGE}`の[霊媒]から確認",
         Role.GUARD: "毎夜1人を護衛（放棄不可）。自分と前夜と同じ人は選べない",
         Role.VILLAGER: "能力なし",
     }
@@ -4277,7 +4711,8 @@ def build_rule_embeds(
         first, second, later = variant.turn_round_seconds
         channel_description = (
             f"**{variant.player_count}人固定**。昼の議論はVCのみで、"
-            f"`#{CH_VILLAGE}` へのテキスト投稿はできません。夜の役職行動はDMです。"
+            f"`#{CH_VILLAGE}` へのテキスト投稿はできません。"
+            "夜の役職行動は村パネルのボタンからです（人狼の襲撃だけDM）。"
         )
         discussion_rule = (
             "朝の結果発表 → ターン制議論 → 投票 →（同票なら弁明と決戦投票）→ 遺言 → 処刑 → 夜\n"
@@ -4299,11 +4734,11 @@ def build_rule_embeds(
         day_min_min = day_minimum // 60
         channel_description = (
             f"**{variant.player_count}人固定**。昼はVCと `#{CH_VILLAGE}`、"
-            "夜の役職行動はDMで進行します。"
+            "夜の役職行動は村パネルのボタンからです（人狼の襲撃だけDM）。"
         )
         discussion_rule = (
             "朝の結果発表 → 議論 → 投票 →（同票なら弁明と決戦投票）→ 遺言 → 処刑 → 夜\n"
-            "**議論中の仮投票はありません。** 議論後に「投票」を押した順で発言します。\n"
+            "**議論中の仮投票はありません。**\n"
             f"議論 **初日{day_base_min}分 / 毎日{day_drop_min}分短縮 / 最低{day_min_min}分**"
             " ／ 通常投票 **1人20秒**\n"
             f"弁明 **{RUNOFF_SPEECH_TIME}秒** ／ 遺言 **{LAST_WILL_TIME}秒**（本人かGMが短縮可）\n"
@@ -4343,9 +4778,9 @@ def build_rule_embeds(
         )
     else:
         vote_rule = (
-            "「投票」を押した順に1人20秒。自分の番に名前を押して確定すると"
-            "投票がすぐ公開され、次の人へ進みます（時間切れは棄権）。\n"
-            "ボタンはいつでも押せます。押した人がいなくなると全員ミュートで待機するので、"
+            "「投票」を押した順に1人20秒。自分の番に名前を押すとすぐ公開され、"
+            "次の人へ進みます（時間切れは棄権）。\n"
+            "ボタンはいつでも押せますが、押した人がいなくなると全員ミュートで待機するので"
             "必ず押してください（棄権ボタンはなく、自分には投票できません）。\n"
         )
     embed.add_field(
@@ -4362,10 +4797,11 @@ def build_rule_embeds(
     embed.add_field(
         name="亡くなったら",
         value=(
-            f"陣営に関係なく、DMで**人狼だと思う{variant.wolf_guess_slots}人**を提出できます"
-            "（実際の人狼本人を除き、的中するとレートに加点。既に亡くなった人も選べます）。\n"
-            f"受付は**死亡から{WOLF_GUESS_TIMEOUT // 60}分**で、"
-            f"**提出するか時間切れになるまで `#{CH_SPIRIT}` へ入れません。**"
+            f"陣営に関係なく、`#{CH_VILLAGE}` の**[人狼予想]** から"
+            f"**人狼だと思う{variant.wolf_guess_slots}人**を提出できます"
+            "（人狼本人を除き的中するとレートに加点。死亡者も選べます）。\n"
+            f"受付は**死亡から{WOLF_GUESS_TIMEOUT // 60}分**、"
+            f"**提出か時間切れまで `#{CH_SPIRIT}` へ入れません。**"
         ),
         inline=False,
     )
@@ -4374,10 +4810,13 @@ def build_rule_embeds(
         value=(
             "占い・護衛は**実行確認**を挟んで確定し、今夜は変更できません。"
             "**占い結果は確定と同時に表示**されます。\n"
+            "[占い][狩人][霊媒]は本人ならいつでも押せ、"
+            "**初日（ランダム白）からの自分の記録**——占い結果・護衛先・霊能結果"
+            "——を自分にだけ表示し、夜は同じボタンから行動も選べます。\n"
             "人狼は最後に選んだ対象を襲撃します（「噛みなし」も可）。**人狼同士は噛めません。**\n"
-            "襲撃先の変更は制限時間中だけ狼全員に伝わります。"
-            "**時間後も変更はできますが、他の狼には伝わりません。**\n"
-            "襲撃がなかった朝は、理由を問わず「平和な朝を迎えました」と表示されます。"
+            "襲撃先の変更は制限時間中だけ狼全員に伝わり、"
+            "**時間後の変更は他の狼には伝わりません。**\n"
+            "襲撃がなかった朝は理由を問わず「平和な朝を迎えました」と表示されます。"
         ),
         inline=False,
     )
@@ -4385,9 +4824,9 @@ def build_rule_embeds(
         name="宣言で進みます",
         value=(
             f"どちらも `#{CH_VILLAGE}` のパネル。宣言待ちは**時間切れでは進みません**。\n"
-            "**📩 役職を確認した** — 参加者全員が押すと0日目初夜へ（**一度きり**）\n"
-            "**🌅 朝を迎える** — 夜時間終了後に0/生存人数で表示。"
-            "押下ごとに人数更新し、全員が押すと朝（**取り消し不可**）\n"
+            "**📩 役職を確認した** — 全員が押すと0日目初夜へ（**一度きり**）\n"
+            "**🌅 朝を迎える** — 夜時間終了後に0/生存人数で表示し、"
+            "押下ごとに人数更新、全員で朝（**取り消し不可**）\n"
             "離席中は押さずに待たせてください。"
         ),
         inline=False,
@@ -4406,7 +4845,7 @@ def build_help_embeds(
         speech_help = (
             "ターン制は**現在の話者だけ**発言できます。本人はパス、ほかの生存者は村全体で"
             f"1日{variant.turn_interrupts_per_day}回まで30秒割り込みができます。\n"
-            "COは「COを宣言」で名前のみ公開できます（タイミングはルール参照）。\n"
+            "COは村パネルの[CO]で役職を宣言できます（タイミングはルール参照）。\n"
             "投票・弁明・遺言は発言中の本人だけ。夜と一時停止中は全員ミュート。\n"
             "死亡者・観戦者は終了まで発言できません（GMのミュートだけは手動）。"
         )
@@ -4424,13 +4863,15 @@ def build_help_embeds(
     )
     embed3.set_footer(text=BOT_VERSION)
     embed3.add_field(
-        name="DMに届くもの",
+        name="DMと村パネルの使い分け",
         value=(
-            "役職確認、人狼の相談と襲撃、占い・護衛、霊媒結果、"
-            f"死亡後の**{variant.wolf_guess_slots}狼予想**はDMです。\n"
+            "DMは**役職確認**と**人狼の相談・襲撃**だけです。\n"
+            "占い・護衛・霊媒結果・初日ランダム白・"
+            f"死亡後の**{variant.wolf_guess_slots}狼予想**は"
+            f"`#{CH_VILLAGE}` の村パネルから本人にだけ表示されます"
+            "（何度でも初日からの記録を確認可）。\n"
             "生存中の人狼はDMの**🏳️ サレンダー**に全員同意すると村陣営の勝利になります。\n"
-            f"終了後の投票は `#{CH_VILLAGE}` のボタンで行います"
-            "（投票内容は本人にしか見えません）。\n"
+            f"終了後の投票も `#{CH_VILLAGE}` のボタンから（本人にしか見えません）。\n"
             "未行動でも朝を迎えられますが、**狩人だけは護衛先を確定するまで進めません。**"
         ),
         inline=False,
@@ -4444,7 +4885,7 @@ def build_help_embeds(
         name="困ったとき",
         value=(
             "VC切断・脱退で**自動停止**します。復帰後はGMが「再開」、"
-            "戻れない人はGMが除外します。\n"
+            "戻れない人はGMが除外。\n"
             "停止中も夜の操作と朝の宣言はできます。GMが抜けた場合は廃村です。"
         ),
         inline=False,
@@ -4469,9 +4910,8 @@ def build_help_embeds(
     embed3.add_field(
         name="終わった試合を読み返す",
         value=(
-            f"全村で `#{CH_VILLAGE}` を **{LOG_CATEGORY_VILLAGE}** へ保存します"
-            f"（`#{CH_SPIRIT}` は保存せず削除します）。\n"
-            f"終了後は全員が読み返せますが書き込みはできません。\n"
+            f"全村で `#{CH_VILLAGE}` を **{LOG_CATEGORY_VILLAGE}** へ保存"
+            f"（`#{CH_SPIRIT}` は削除）。終了後は全員が読み返せますが書き込みはできません。\n"
             f"試合番号で `#統計` と照合できます（直近{LOG_CATEGORY_LIMIT}試合）。"
         ),
         inline=False,

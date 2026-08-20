@@ -15,7 +15,7 @@ from room_config import (
 )
 
 # Botのバージョン (ヘルプに表示。ソース公開された派生でも識別できるように)
-BOT_VERSION = "v0.48"
+BOT_VERSION = "v0.50"
 
 # 新規導入先に同名カテゴリが既にある場合、無関係なDiscord構成をBot所有と
 # 誤認しない。既存運用は保存済みchannel IDで自動再利用できる。
@@ -424,6 +424,74 @@ RECRUITMENT_NOTIFICATION_WINDOW_MINUTES = 15
 RECRUITMENT_CONTACT_COOLDOWN_SECONDS = 300
 # Discordの選択肢上限25件を2ページまで使い、本人ごとに最大50人を管理する。
 PLAYER_BLOCK_LIMIT = 50
+
+# ------------------------------------------------------------
+# 「募集」ボタン (v0.49 §3-2) のDM送信ペース設定。
+# 既存の paced_discord_api_call は全卓共有の bulk_api_lock を占有し、
+# ゲーム開始時のロール付与・ミュートを数十秒待たせてしまうため、
+# 募集通知DMはRecruitmentManager専用のペーサーで別枠にする。
+# 環境変数は WEREWOLF_ 接頭辞、不正値は起動時に RuntimeError で止める。
+# ------------------------------------------------------------
+def _parse_positive_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        raise RuntimeError(f"{name} は数値で指定してください: {raw!r}")
+    if not (value > 0):
+        raise RuntimeError(f"{name} は正の数で指定してください: {raw!r}")
+    return value
+
+
+def _parse_positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        raise RuntimeError(f"{name} は整数で指定してください: {raw!r}")
+    if value <= 0:
+        raise RuntimeError(f"{name} は正の整数で指定してください: {raw!r}")
+    return value
+
+
+# 募集通知DMの送信間隔 (秒)。連続DM送信でのレート制限回避が目的。
+RECRUITMENT_CALL_DM_INTERVAL_SECONDS = _parse_positive_float_env(
+    "WEREWOLF_RECRUITMENT_CALL_DM_INTERVAL_SECONDS", 0.7,
+)
+# 1人が1日に受け取れる募集通知DMの上限。複数の村から立て続けに
+# 呼ばれてDMが埋まるのを防ぐ (超過分は skipped_cap として記録)。
+RECRUITMENT_CALL_DM_DAILY_LIMIT = _parse_positive_int_env(
+    "WEREWOLF_RECRUITMENT_CALL_DM_DAILY_LIMIT", 5,
+)
+
+
+def _parse_bool_env(name: str, default: bool) -> bool:
+    """真偽値の環境変数を厳格パースする。"1"/"0" のみ許可し、それ以外は
+    起動時に RuntimeError で止める (数値・浮動小数点パーサと同じ方針)。
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    stripped = raw.strip()
+    if stripped == "1":
+        return True
+    if stripped == "0":
+        return False
+    raise RuntimeError(f"{name} は 1 か 0 で指定してください: {raw!r}")
+
+
+# 戦績カード画像 (§4) の「画像で見る」ボタンを出すかどうか。
+# 描画エンジン・シーズン末の一括生成スクリプト・テストは常に動かせるが、
+# プレイヤーから見える入口 (StatsView のボタン) だけはシーズン1開始前に
+# 集めるデータ項目とレイアウトを確定するまで既定で閉じておく。
+# 有効化したい場合のみ環境変数を "1" にする。
+STATS_CARD_BUTTON_ENABLED = _parse_bool_env(
+    "WEREWOLF_STATS_CARD_BUTTON_ENABLED", False,
+)
 
 # 不具合・改善報告の1人あたり投稿上限 (直近24時間)。
 # 誰でも押せるフォームなので、連投でDBとバックアップが膨らむのを防ぐ。

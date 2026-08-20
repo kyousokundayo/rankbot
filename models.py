@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Iterable, Optional
 
 import discord
@@ -358,6 +359,27 @@ class GameState:
 
         # 「役職を確認した」パネル (役職確認タイム中 #昼 に掲示。非永続)
         self.prep_panel_message: Optional[discord.Message] = None
+
+        # 公開CO宣言 (昼パネル)。1人1役職まで。撤回すると削除され、
+        # 別役職を宣言し直せる。試合を通じて保持し、日ごとにクリアしない
+        # (turn_co_declarations と異なり、旧ターン制UIの日次リセットは
+        # 引き継がない)。
+        self.co_claims: dict[int, dict] = {}
+        # 霊能結果 (処刑確定時に追記)。DMを廃止した代わりに、霊媒ボタンで
+        # 一覧を ephemeral 表示するための保存先。
+        self.medium_results: list[dict] = []
+        # CO・投票・夜行動ログで共有するrun内単調増加カウンタ。
+        # 復元時に巻き戻ると記録DB側の event_seq と食い違うため、
+        # 保存された値を下回らないよう常に最大値を維持する。
+        self.record_event_seq: int = 0
+        # 昼パネル (#昼 に1枚。フェーズ遷移のたびに削除→新規で最下部へ)。
+        # 掲示中パネルのメッセージID (永続)。再起動するとViewが復元
+        # されないため、次の掲示より前にこのIDで消す (朝パネルと同じ作法)。
+        self.village_panel_message_id: Optional[int] = None
+        # 試合開始時刻 (UTC)。game_run_id の採番と同じ場所で設定する。
+        # 精算時に games.started_at / game_settlements.started_at へ運ぶ。
+        # 旧snapshotには存在しないためNone始まりを許容する。
+        self.started_at: Optional[datetime] = None
 
     def alive_players(self) -> list[Player]:
         return [p for p in self.players.values() if p.alive]

@@ -30,10 +30,11 @@ from game import GameCog
 # シミュレーションは必ずテンポラリDBへ差し替えてから実行する。
 PRODUCTION_DB_PATH = database.DB_PATH
 from views import (
-    RunoffVoteView, SeerView, SpeechDoneView, VoteView, VoteQueueView,
-    WolfVoteView, GuardView,
+    RunoffVoteView, SpeechDoneView, VoteView, VoteQueueView,
+    WolfVoteView,
     MorningReadyView,
     PrepReadyView,
+    VillagePanelView,
 )
 
 
@@ -179,6 +180,12 @@ class FakeResponse:
 
     async def edit_message(self, **kwargs) -> None:
         self._done = True
+        # #昼パネル発の占い・狩人フローは、確認UIをこのメソッドで返す
+        # (ephemeral選択メッセージをその場で編集して差し替えるため、
+        # send_messageのような新規メッセージにはならない)。これを
+        # send_messageと同じくsent_viewから辿れるようにする。
+        if "view" in kwargs:
+            self.interaction.sent_view = kwargs["view"]
         if self.interaction.message is not None:
             await self.interaction.message.edit(**kwargs)
 
@@ -665,15 +672,16 @@ class SimulationController:
             self._schedule(self._handle_prep_ready_view(message, view))
         elif isinstance(view, MorningReadyView):
             self._schedule(self._handle_morning_ready_view(message, view))
+        elif isinstance(view, VillagePanelView):
+            self._schedule(self._handle_village_panel_view(message, view))
 
     def on_dm_message(self, member: FakeMember, message: FakeMessage) -> None:
+        # 占い師・狩人のDMはv0.49で廃止し、#昼常設パネルの[占い][狩人]
+        # ボタン経由へ移した (room_runner._night_phase 参照)。人狼のDMのみ
+        # ここに残る。
         view = message.view
         if isinstance(view, WolfVoteView):
             self._schedule(self._handle_wolf_view(member, message, view))
-        elif isinstance(view, SeerView):
-            self._schedule(self._handle_seer_view(member, message, view))
-        elif isinstance(view, GuardView):
-            self._schedule(self._handle_guard_view(member, message, view))
 
     async def drain(self) -> None:
         """保留中のUI操作タスクを全て完了させる (エラーは投げずに保持)。
@@ -887,42 +895,94 @@ class SimulationController:
         )
         await select.callback(select_interaction)
 
-    async def _select_and_confirm(
-        self, member: FakeMember, message: FakeMessage, view: discord.ui.View
+    async def _handle_village_panel_view(
+        self, message: FakeMessage, view: VillagePanelView
     ) -> None:
-        """セレクトで対象を選び、続く実行確認で「実行する」を押す。
+        """#昼常設パネルの[占い][狩人]ボタンを、夜フェーズの間だけ操作する。
 
-        占い・護衛は誤タップ防止のため、選択だけでは確定しない。
+        v0.49で占い師DM・狩人DMを廃止し、#昼パネル経由のephemeral UIへ
+        一本化した (VillageSeerTargetView/VillageGuardTargetView →
+        VillageSeerConfirmView/VillageGuardConfirmView)。狩人は護衛を
+        放棄できない仕様のため、ここで確実に押させないと朝が来ない。
+        パネルは昼夜をまたいで常設されるため、昼に貼られた/更新された
+        ときは何もしない。
         """
-        select = next(child for child in view.children if isinstance(child, discord.ui.Select))
-        choices = [int(option.value) for option in select.options]
-        if not choices:
+        await asyncio.sleep(0)
+        state = self.cog.state
+        if not self.cog.night_actions_open():
             return
-        target_id = self.rng.choice(choices)
-        interaction = FakeInteraction(
-            user=member,
-            message=message,
-            data={"values": [str(target_id)]},
-        )
-        await select.callback(interaction)
 
-        confirm_view = interaction.sent_view
+        seer_button = next(
+            (child for child in view.children if getattr(child, "label", None) == "占い"),
+            None,
+        )
+        if seer_button is not None and state.seer_target is None:
+            for player in state.alive_players():
+                if player.role != config.Role.SEER:
+                    continue
+                member = self.guild.get_member(player.user_id)
+                if member is None:
+                    continue
+                await self._select_village_target(member, seer_button)
+                break
+
+        guard_button = next(
+            (child for child in view.children if getattr(child, "label", None) == "狩人"),
+            None,
+        )
+        if guard_button is not None and state.guard_target is None:
+            for player in state.alive_players():
+                if player.role != config.Role.GUARD:
+                    continue
+                member = self.guild.get_member(player.user_id)
+                if member is None:
+                    continue
+                await self._select_village_target(member, guard_button)
+                break
+
+    async def _select_village_target(
+        self, member: FakeMember, entry_button: discord.ui.Button
+    ) -> None:
+        """[占い]/[狩人] を押す → ephemeralの対象ボタンを1つ押す → 実行確認を押す。
+
+        VillageSeerTargetView/VillageGuardTargetViewはSelectではなくボタン
+        方式 (同じ相手を選び直せないDiscordセレクト仕様を避けるため)。
+
+        いずれもephemeral連鎖 (公開パネルの押下→ephemeral表示→ephemeral編集)
+        であり、公開パネル本体のFakeMessageは編集対象ではない。message=None
+        で渡し、実本番と同じくephemeral側だけが差し替わるようにする
+        (公開パネルのFakeMessage.viewを誤って書き換えないため)。
+        """
+        entry_interaction = FakeInteraction(user=member, guild=self.guild, message=None)
+        await entry_button.callback(entry_interaction)
+
+        target_view = entry_interaction.sent_view
+        if target_view is None or not target_view.children:
+            return  # 既に確定済み・対象なし等で弾かれた
+
+        target_buttons = [
+            child for child in target_view.children if isinstance(child, discord.ui.Button)
+        ]
+        if not target_buttons:
+            return
+        target_button = self.rng.choice(target_buttons)
+
+        select_interaction = FakeInteraction(user=member, guild=self.guild, message=None)
+        await target_button.callback(select_interaction)
+
+        confirm_view = select_interaction.sent_view
         if confirm_view is None:
-            return  # 選択が弾かれた (確認UIが出ていない)
+            return
         confirm_btn = next(
-            child for child in confirm_view.children
-            if isinstance(child, discord.ui.Button) and child.label == "実行する"
+            (
+                child for child in confirm_view.children
+                if isinstance(child, discord.ui.Button) and child.label == "実行する"
+            ),
+            None,
         )
-        # 確認UIはエフェメラルなので、元のDMメッセージは編集させない
-        await confirm_btn.callback(FakeInteraction(user=member, message=None))
-
-    async def _handle_seer_view(self, member: FakeMember, message: FakeMessage, view: SeerView) -> None:
-        await asyncio.sleep(0)
-        await self._select_and_confirm(member, message, view)
-
-    async def _handle_guard_view(self, member: FakeMember, message: FakeMessage, view: GuardView) -> None:
-        await asyncio.sleep(0)
-        await self._select_and_confirm(member, message, view)
+        if confirm_btn is None:
+            return
+        await confirm_btn.callback(FakeInteraction(user=member, guild=self.guild, message=None))
 
     async def _handle_morning_ready_view(
         self, message: FakeMessage, view: MorningReadyView

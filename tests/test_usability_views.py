@@ -4,8 +4,10 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
+import stats_image
+import views
 from config import BOT_VERSION, Phase, SLOW_INTERACTION_SECONDS
 from recruitment import OperationsView
 from views import (
@@ -96,6 +98,37 @@ class UsabilityViewLayoutTest(unittest.TestCase):
         self.assertFalse(
             any(item.custom_id == "stats_variant_balance" for item in view.children)
         )
+
+    def test_stats_panel_image_button_follows_font_availability(self) -> None:
+        # フォントが使えてもSTATS_CARD_BUTTON_ENABLEDが既定OFFの間はボタンを出さない
+        # (シーズン1開始前のデータ項目・レイアウト未確定のための一時措置)。
+        with patch.object(stats_image, "font_available", return_value=True):
+            view = StatsView(SimpleNamespace())
+            _assert_within_three_rows(self, view)
+            self.assertFalse(
+                any(item.custom_id == "stats_card_image" for item in view.children)
+            )
+
+        # フォントが使え、かつ有効化されていればボタンを出し、3行制約も崩さない。
+        with patch.object(stats_image, "font_available", return_value=True), \
+                patch.object(views, "STATS_CARD_BUTTON_ENABLED", True):
+            view = StatsView(SimpleNamespace())
+            _assert_within_three_rows(self, view)
+            self.assertIsNotNone(
+                next(
+                    item for item in view.children
+                    if item.custom_id == "stats_card_image"
+                )
+            )
+
+        # フォントが無い環境ではボタンごと出さない (押しても失敗するボタンを見せない)。
+        with patch.object(stats_image, "font_available", return_value=False), \
+                patch.object(views, "STATS_CARD_BUTTON_ENABLED", True):
+            view = StatsView(SimpleNamespace())
+            _assert_within_three_rows(self, view)
+            self.assertFalse(
+                any(item.custom_id == "stats_card_image" for item in view.children)
+            )
 
     def test_variant_balance_is_in_operations_panel(self) -> None:
         manager = SimpleNamespace()

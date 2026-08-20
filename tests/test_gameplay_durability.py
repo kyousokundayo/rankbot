@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import discord
 
 import database
+import room_runner
 from config import (
     LOG_CATEGORY_LIMIT,
     LOG_CATEGORY_SPIRIT,
@@ -27,14 +28,10 @@ from room_runner import (
     timer_should_update,
 )
 from views import (
-    GuardView,
     MorningReadyView,
-    NightActionConfirmView,
-    SeerView,
     VoteQueueView,
     VoteView,
     build_gm_status_embed,
-    WolfGuessSelectView,
     WolfSurrenderView,
     WolfVoteView,
 )
@@ -253,50 +250,24 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runner.state.wolf_guesses[victim.user_id], [2, 3, 4])
         runner._release_spirit_hold.assert_awaited_once_with(victim.user_id)
 
-    async def test_wolf_guess_dm_has_single_number_and_no_public_notice(self) -> None:
+    async def test_wolf_guess_dm_is_gone_and_panel_notice_rides_on_death_notice(self) -> None:
+        """v0.50: 人狼予想DMは廃止。案内は既存の死亡告知へ1行足すだけにする。"""
+        self.assertFalse(hasattr(RoomRunner, "_send_wolf_guess_dm"))
+        self.assertFalse(hasattr(RoomRunner, "_notify_gm_wolf_guess_dm_failure"))
+        self.assertIn("人狼予想", room_runner.WOLF_GUESS_NOTICE)
+
+    async def test_morning_log_adds_the_notice_only_while_holding(self) -> None:
         runner = make_runner()
         victim = add_player(runner, 1)
         victim.alive = False
-        for user_id in range(2, 6):
-            add_player(runner, user_id)
-        event_id = "run-1:処刑:4:1"
+        runner.state._last_killed = victim
 
-        sent = await runner._send_wolf_guess_dm(victim, event_id)
+        without_hold = runner.build_morning_log_text()
+        runner.state.spirit_hold_ids.add(victim.user_id)
+        with_hold = runner.build_morning_log_text()
 
-        self.assertTrue(sent)
-        kwargs = victim.member.send.await_args.kwargs
-        view = kwargs["view"]
-        self.assertIsInstance(view, WolfGuessSelectView)
-        self.assertEqual(view.game_run_id, "run-1")
-        self.assertEqual(view.death_event_id, event_id)
-        self.assertEqual(view.select.options[0].label, "02.user-2")
-        self.assertNotIn("02. 02.", view.select.options[0].label)
-        runner._safe_village_send.assert_not_awaited()
-        view.stop()
-
-    async def test_wolf_guess_dm_failure_releases_and_only_notifies_gm(self) -> None:
-        runner = make_runner()
-        victim = add_player(runner, 1)
-        victim.alive = False
-        gm = FakeMember(99, "gm")
-        runner.state.gm_id = gm.id
-        runner.state.guild = FakeGuild([victim.member, gm], [])
-        runner._release_spirit_hold = AsyncMock()
-        denied = discord.Forbidden(
-            SimpleNamespace(status=403, reason="Forbidden", headers={}),
-            "denied",
-        )
-        victim.member.send.side_effect = denied
-
-        sent = await runner._send_wolf_guess_dm(
-            victim, "run-1:処刑:4:1"
-        )
-
-        self.assertFalse(sent)
-        runner._release_spirit_hold.assert_awaited_once_with(victim.user_id)
-        gm.send.assert_awaited_once()
-        self.assertIn("霊界へ解放", gm.send.await_args.args[0])
-        runner._safe_village_send.assert_not_awaited()
+        self.assertNotIn(room_runner.WOLF_GUESS_NOTICE, without_hold)
+        self.assertIn(room_runner.WOLF_GUESS_NOTICE, with_hold)
 
     async def test_releasing_wolf_guess_hold_opens_spirit_and_invalidates_dm(self) -> None:
         runner = make_runner()
@@ -931,7 +902,8 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
                 runner.state.guard_target = None
                 self.assertIs(runner._pending_guard_player(), guard)
 
-    async def test_v9_guard_view_rejects_self_previous_and_offered_out_targets(self) -> None:
+    async def test_v9_guard_commit_rejects_self_previous_and_offered_out_targets(self) -> None:
+        """#昼パネル[狩人]の確定処理も、表示候補を迂回した対象を最終的に拒否する。"""
         for variant_id in ("v9_cross", "v9_turn"):
             with self.subTest(variant_id=variant_id):
                 runner = make_runner(variant_id)
@@ -939,30 +911,34 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
                 allowed = add_player(runner, 2, Role.VILLAGER)
                 previous = add_player(runner, 3, Role.VILLAGER)
                 outside = add_player(runner, 4, Role.VILLAGER)
-                # 通常の候補生成では自己/前夜対象を含めない。ここでは確認UIを
-                # 迂回された場合の最終検証を直接通すため、意図的に含める。
-                view = GuardView(runner, [guard, allowed, previous])
-                view.actor_id = guard.user_id
+                outside.alive = False
 
-                text, committed = await view.commit(guard)
+                text, committed = await runner.commit_guard_target(
+                    guard.user_id, guard.user_id
+                )
                 self.assertFalse(committed)
                 self.assertIn("自分", text)
 
                 runner.state.guard_previous = previous.user_id
-                text, committed = await view.commit(previous)
+                text, committed = await runner.commit_guard_target(
+                    guard.user_id, previous.user_id
+                )
                 self.assertFalse(committed)
                 self.assertIn("前回", text)
 
                 runner.state.guard_previous = None
-                text, committed = await view.commit(outside)
+                text, committed = await runner.commit_guard_target(
+                    guard.user_id, outside.user_id
+                )
                 self.assertFalse(committed)
                 self.assertIn("対象は護衛できません", text)
                 self.assertIsNone(runner.state.guard_target)
 
-                text, committed = await view.commit(allowed)
+                text, committed = await runner.commit_guard_target(
+                    guard.user_id, allowed.user_id
+                )
                 self.assertTrue(committed, text)
                 self.assertEqual(runner.state.guard_target, allowed.user_id)
-                view.stop()
 
     async def test_v9_panel_failure_pauses_instead_of_skipping_unprotected_guard(self) -> None:
         for variant_id in ("v9_cross", "v9_turn"):
@@ -1523,71 +1499,17 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(runner.state.morning_confirmed)
         self.assertFalse(runner.state.morning_ready_event.is_set())
 
-    async def test_other_confirmation_timeout_and_cancel_never_unlock_after_commit(self) -> None:
-        runner = make_runner()
-        seer = add_player(runner, 1, Role.SEER)
-        target = add_player(runner, 2, Role.VILLAGER)
-        origin = SeerView(runner, [target])
-        origin.actor_id = seer.user_id
-        message = SimpleNamespace(edit=AsyncMock())
-        timed_out = NightActionConfirmView(
-            origin, target, label="占い先", origin_message=message
-        )
-        cancelled = NightActionConfirmView(
-            origin, target, label="占い先", origin_message=message
-        )
-        runner.state.seer_target = target.user_id
-
-        await timed_out.on_timeout()
-        timeout_view = message.edit.await_args.kwargs["view"]
-        self.assertTrue(all(item.disabled for item in timeout_view.children))
-
-        interaction = SimpleNamespace(
-            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
-            edit_original_response=AsyncMock(),
-        )
-        cancel_button = next(item for item in cancelled.children if item.label == "やめる")
-        await cancel_button.callback(interaction)
-        cancel_view = message.edit.await_args.kwargs["view"]
-        self.assertTrue(all(item.disabled for item in cancel_view.children))
-
-    async def test_confirmation_persist_failure_rebuilds_unlocked_for_retry(self) -> None:
-        runner = make_runner()
-        seer = add_player(runner, 1, Role.SEER)
-        target = add_player(runner, 2, Role.VILLAGER)
-        origin = SeerView(runner, [target])
-        origin.actor_id = seer.user_id
-        origin.commit = AsyncMock(return_value=("DB保存失敗", False))
-        message = SimpleNamespace(edit=AsyncMock())
-        confirm = NightActionConfirmView(
-            origin, target, label="占い先", origin_message=message
-        )
-        interaction = SimpleNamespace(
-            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
-            edit_original_response=AsyncMock(),
-        )
-        confirm_button = next(item for item in confirm.children if item.label == "実行する")
-
-        await confirm_button.callback(interaction)
-
-        interaction.response.defer.assert_awaited_once()
-        rebuilt = message.edit.await_args.kwargs["view"]
-        self.assertTrue(any(not item.disabled for item in rebuilt.children))
-
     async def test_seer_action_log_is_inside_same_checkpoint_and_rolls_back(self) -> None:
         runner = make_runner()
         seer = add_player(runner, 1, Role.SEER)
         target = add_player(runner, 2, Role.WEREWOLF)
-        view = SeerView(runner, [target])
-        view.actor_id = seer.user_id
         captured: list[list[dict]] = []
 
         async def capture_checkpoint() -> None:
             captured.append([dict(item) for item in runner.state.action_log])
 
         runner._persist_room_state = AsyncMock(side_effect=capture_checkpoint)
-        runner.deliver_seer_result = AsyncMock()
-        text, committed = await view.commit(target)
+        text, committed = await runner.commit_seer_target(seer.user_id, target.user_id)
 
         self.assertTrue(committed, text)
         self.assertEqual(captured[0][-1]["kind"], "占い")
@@ -1596,10 +1518,10 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         failed = make_runner()
         failed_seer = add_player(failed, 1, Role.SEER)
         failed_target = add_player(failed, 2, Role.VILLAGER)
-        failed_view = SeerView(failed, [failed_target])
-        failed_view.actor_id = failed_seer.user_id
         failed._persist_room_state = AsyncMock(side_effect=RuntimeError("DB down"))
-        _, committed = await failed_view.commit(failed_target)
+        _, committed = await failed.commit_seer_target(
+            failed_seer.user_id, failed_target.user_id
+        )
         self.assertFalse(committed)
         self.assertIsNone(failed.state.seer_target)
         self.assertEqual(failed.state.action_log, [])
@@ -1608,11 +1530,9 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         guard_runner = make_runner()
         guard = add_player(guard_runner, 1, Role.GUARD)
         target = add_player(guard_runner, 2, Role.VILLAGER)
-        guard_view = GuardView(guard_runner, [target])
-        guard_view.actor_id = guard.user_id
         guard_runner._persist_room_state = AsyncMock(side_effect=RuntimeError("DB down"))
 
-        _, committed = await guard_view.commit(target)
+        _, committed = await guard_runner.commit_guard_target(guard.user_id, target.user_id)
 
         self.assertFalse(committed)
         self.assertIsNone(guard_runner.state.guard_target)
@@ -1740,6 +1660,50 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         await runner._resume_recovered_game()
         runner._day_vote.assert_not_awaited()
         runner._morning_log.assert_awaited_once()
+
+    async def test_day_vote_recovery_reposts_village_panel(self) -> None:
+        """DAY_VOTEから再開したとき、_day_discussionを通らない経路でも
+        村パネル (post_village_panel) が貼り直されること。
+
+        DAY_VOTE / DAY_RUNOFF_* / DAY_LAST_WILL / MORNING からの再開は
+        _day_discussion / _night_phase を経由しないため、対策前は
+        CO・結果公開等のボタンが夜まで一切使えなくなる不具合があった。
+        """
+        runner = make_runner()
+        add_player(runner, 1)
+        runner.state.phase = Phase.DAY_VOTE
+        runner.state.phase_before_pause = Phase.DAY_VOTE
+        runner.state.recovery_phase = Phase.DAY_VOTE
+        runner.state.recovered_from_restart = True
+        runner.state.day_execution_resolved = True
+        runner.state.night_resolved = True
+        runner.state.check_win = lambda: None
+        runner._morning_log = AsyncMock()
+        runner._day_vote = AsyncMock()
+        runner.post_village_panel = AsyncMock()
+
+        async def stop_after_checkpoint():
+            raise asyncio.CancelledError
+
+        runner._day_discussion = stop_after_checkpoint
+        await runner._resume_recovered_game()
+
+        runner.post_village_panel.assert_awaited_once()
+
+    async def test_lobby_recovery_does_not_repost_village_panel(self) -> None:
+        """LOBBY等の非進行フェーズではpost_village_panelを呼ばないこと。"""
+        runner = make_runner()
+        add_player(runner, 1)
+        runner.state.phase = Phase.LOBBY
+        runner.state.phase_before_pause = Phase.LOBBY
+        runner.state.recovery_phase = Phase.LOBBY
+        runner.state.recovered_from_restart = True
+        runner.post_village_panel = AsyncMock()
+        runner._day_discussion = AsyncMock(side_effect=asyncio.CancelledError)
+
+        await runner._resume_recovered_game()
+
+        runner.post_village_panel.assert_not_awaited()
 
     async def test_vote_is_persisted_and_removed_voter_does_not_block_completion(self) -> None:
         runner = make_runner()
@@ -3390,20 +3354,25 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         seer = add_player(runner, 1, Role.SEER)
         white = add_player(runner, 2, Role.VILLAGER)
         runner.state.initial_seer_target = white.user_id
+        runner.state.guild = SimpleNamespace(id=1)
 
-        failed = await runner._send_role_dms()
-        first_messages = [call.args[0] for call in seer.member.send.await_args_list]
-        failed_again = await runner._send_role_dms()
+        with patch(
+            "room_runner.database.record_night_action_once", new=AsyncMock(),
+        ) as record:
+            failed = await runner._send_role_dms()
+            messages = [call.args[0] for call in seer.member.send.await_args_list]
+            failed_again = await runner._send_role_dms()
 
         self.assertEqual(failed, [])
         self.assertEqual(failed_again, [])
         self.assertTrue(runner.state.initial_seer_result_sent)
         self.assertEqual(runner.state.initial_seer_target, white.user_id)
-        self.assertEqual(
-            sum("初日占い結果" in message for message in first_messages),
-            1,
-        )
-        self.assertEqual(seer.member.send.await_count, len(first_messages))
+        # v0.50: 初日白はDMせず記録だけ残す。役職DMは1通のまま。
+        self.assertEqual(sum("初日占い結果" in message for message in messages), 0)
+        self.assertEqual(seer.member.send.await_count, 1)
+        self.assertEqual(record.await_count, 1)
+        self.assertEqual(record.await_args.kwargs["action"], "初日白")
+        self.assertEqual(record.await_args.kwargs["target_id"], white.user_id)
 
     async def test_game_over_checkpoint_failure_does_not_turn_result_into_abandonment(self) -> None:
         runner = make_runner()
@@ -3428,6 +3397,9 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
                 "room_runner.database.settle_game_settlement",
                 new=AsyncMock(return_value=(False, None, None)),
             ) as settle,
+            # 再試行ループの実待機(0,1,2秒)をスキップして高速化する。
+            # 再試行回数や最終phaseの検証内容は変えない。
+            patch("room_runner.asyncio.sleep", new=AsyncMock()),
         ):
             await runner._end_game(Team.VILLAGE)
 
@@ -3566,6 +3538,63 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(nick.endswith("(処刑)"))
         self.assertLessEqual(len(nick), 32)
 
+    async def test_execution_records_medium_result_without_dm(self) -> None:
+        """処刑確定時、霊能結果はstateへ記録され、霊媒師への裸DMは廃止済み (v0.49)。"""
+        runner = make_runner()
+        wolf = add_player(runner, 1, Role.WEREWOLF)
+        medium = add_player(runner, 2, Role.MEDIUM)
+        wolf.base_name = "処刑対象"
+        everyone = FakeRole(1, "@everyone", default=True)
+        marker = FakeRole(3, runner._mute_marker_role_name())
+        wolf.member.roles = [everyone]
+        guild = SimpleNamespace(
+            id=1, roles=[everyone, marker], get_member=lambda _: wolf.member
+        )
+        runner.state.guild = guild
+        runner.state.day_number = 2
+        runner.state.voice_channel = SimpleNamespace(id=10, members=[wolf.member])
+        runner.state.village_channel = permission_text_channel()
+        runner.state.mute_marker_enabled = True
+        runner._enable_mute_markers = AsyncMock(return_value=marker)
+        runner._remove_alive_role = AsyncMock(return_value=True)
+        runner._play_se = Mock()
+        wolf.member.edit = AsyncMock(return_value=wolf.member)
+        medium.member.send = AsyncMock()
+        effect = {
+            "event_id": "run-1:処刑:2",
+            "player_id": wolf.user_id,
+            "method": "処刑",
+            "reason": None,
+        }
+        runner.state.pending_death_effects = [effect]
+
+        with patch.object(
+            database, "record_night_action", new=AsyncMock()
+        ) as record_night_action:
+            await runner._apply_death_effect(effect)
+
+        medium.member.send.assert_not_awaited()
+        self.assertEqual(len(runner.state.medium_results), 1)
+        entry = runner.state.medium_results[0]
+        self.assertEqual(entry["day"], 2)
+        self.assertEqual(entry["target_id"], wolf.user_id)
+        self.assertEqual(entry["result"], "人狼")
+        record_night_action.assert_awaited_once()
+        kwargs = record_night_action.await_args.kwargs
+        self.assertEqual(kwargs["actor_id"], medium.user_id)
+        self.assertEqual(kwargs["action"], "霊能")
+        self.assertEqual(kwargs["result"], "人狼")
+
+        # クラッシュ再適用 (at-least-once) で同じ死亡が重複追記されない
+        record_night_action.reset_mock()
+        runner.state.pending_death_effects = [effect]
+        with patch.object(
+            database, "record_night_action", new=AsyncMock()
+        ) as record_night_action_retry:
+            await runner._apply_death_effect(effect)
+        self.assertEqual(len(runner.state.medium_results), 1)
+        record_night_action_retry.assert_not_awaited()
+
     async def test_vote_buttons_are_ordered_by_number(self) -> None:
         runner = make_runner()
         runner.state.phase = Phase.DAY_VOTE
@@ -3599,7 +3628,10 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
                 raise RuntimeError("DB down")
 
         runner._persist_room_state = fail_first_three
-        await runner.force_end("テスト廃村")
+        # 再試行ループの実待機(0,1,2秒)をスキップして高速化する。
+        # 再試行回数や最終phaseの検証内容は変えない。
+        with patch("room_runner.asyncio.sleep", new=AsyncMock()):
+            await runner.force_end("テスト廃村")
 
         self.assertEqual(runner.state.phase, Phase.LOBBY)
         runner._restore_nicknames.assert_awaited_once()

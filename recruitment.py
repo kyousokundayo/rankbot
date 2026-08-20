@@ -25,6 +25,8 @@ from config import (
     PLAYER_BLOCK_LIMIT,
     PRIVATE_ROOM_CREATOR_ROLE_LABEL,
     PRIVATE_ROOM_CREATOR_ROLE_NAMES,
+    RECRUITMENT_CALL_DM_DAILY_LIMIT,
+    RECRUITMENT_CALL_DM_INTERVAL_SECONDS,
     RECRUITMENT_CONTACT_COOLDOWN_SECONDS,
     RECRUITMENT_IMMEDIATE_LEAD_MINUTES,
     RECRUITMENT_MAX_DAYS_AHEAD,
@@ -266,6 +268,21 @@ class RecruitmentManager:
         # 埋まらないよう間隔を空ける。主催者だけが使う機能なので、
         # 再起動をまたぐ厳密さは要らずメモリ保持で足りる。
         self._contact_sent_at: dict[int, float] = {}
+        # 「募集」ボタンのDM送信専用ペーサー (実装仕様 v0.49 §3-2)。
+        # 全卓共有の bulk_api_lock (paced_discord_api_call) は使わない。
+        # ゲーム開始時のロール付与・ミュートを数十秒待たせてしまうため、
+        # ここだけ独立した直列化と間隔を持たせる。
+        self._call_dm_semaphore = asyncio.Semaphore(1)
+        self._call_dm_last_sent: float = 0.0
+        # 「募集」DM配信タスクへの強参照 (room_runner._spirit_release_tasks と
+        # 同じ手法)。asyncio.create_task の戻り値を握らないと、300人規模で
+        # 210秒超かかる配信の途中でGCに回収されうる (指摘1)。
+        self._call_delivery_tasks: set[asyncio.Task] = set()
+        # 現在配信中の call_id 集合 (指摘2)。定期ループの再開処理はこれを見て、
+        # まだ配信タスクが走っている call_id を二重に spawn しない。
+        # (行単位の重複は claim_recruitment_call_delivery のDB側ガードで防ぐが、
+        #  そもそも同じ call_id へ2つ目の配信タスクを立てないことを二重の安全策とする)
+        self._active_call_ids: set[int] = set()
 
     async def start_village_creation(self, interaction: discord.Interaction) -> None:
         """GM村と、その#参加受付に置く募集カードの一体作成を開始する。"""
@@ -434,6 +451,57 @@ class RecruitmentManager:
                     return f"#{getattr(channel, 'name', '?')}で個別権限を許可されています"
         return None
 
+    def _cached_notification_role_membership(
+        self, role: discord.Role, member: discord.Member,
+    ) -> bool:
+        """直後の連打でも安定するよう、15秒以内の自己変更意図を優先して返す。"""
+        cached_intent = self._notification_membership_intent.get(member.id)
+        if cached_intent is not None and time.monotonic() - cached_intent[1] < 15:
+            return cached_intent[0]
+        return any(
+            getattr(member_role, "id", None) == role.id
+            for member_role in member.roles
+        )
+
+    async def _apply_notification_role_membership(
+        self,
+        guild: discord.Guild,
+        member: discord.Member,
+        *,
+        desired: Optional[bool] = None,
+    ) -> Optional[bool]:
+        """@通知 ロールの所持状態を desired に合わせる (Noneなら現状を反転)。
+
+        実際に確定した状態 (bool) を返す。安全なロールを用意できない、
+        またはDiscord API呼び出しに失敗した場合は None を返す。
+        現状とdesiredが一致していればAPIは呼ばずそのまま返す。
+        """
+        role = await self._ensure_notification_role(guild)
+        if role is None:
+            return None
+        async with self.notification_role_lock:
+            has_role = self._cached_notification_role_membership(role, member)
+            target = (not has_role) if desired is None else desired
+            if has_role != target:
+                try:
+                    if target:
+                        await self.game_cog.paced_discord_api_call(
+                            member.add_roles,
+                            role,
+                            reason="本人が募集通知をON",
+                        )
+                    else:
+                        await self.game_cog.paced_discord_api_call(
+                            member.remove_roles,
+                            role,
+                            reason="本人が募集通知をOFF",
+                        )
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                    log.warning("@%s ロールの自己変更に失敗: %s", RECRUITMENT_NOTIFICATION_ROLE_NAME, exc)
+                    return None
+            self._notification_membership_intent[member.id] = (target, time.monotonic())
+            return target
+
     async def toggle_notification_role(
         self, interaction: discord.Interaction,
     ) -> None:
@@ -449,46 +517,256 @@ class RecruitmentManager:
                 "安全な通知ロールを用意できませんでした。Botのロール管理権限と並び順を確認してください。",
                 ephemeral=True,
             )
-        async with self.notification_role_lock:
-            cached_intent = self._notification_membership_intent.get(
-                interaction.user.id
+        # ここは設定パネルの「村ができた時に通知」と同じ@通知ロールを操作する
+        # もう一つの入口。マスターOFFのまま押すと同じ穴 (指摘4) が開くため、
+        # ロールを新たに付ける方向のときだけ先にマスターの許可を求める。
+        # OFFへ向かう操作 (既にロール持ち→外す) は常に許可する。
+        prefs = await database.get_user_notification_prefs(
+            interaction.guild.id, interaction.user.id,
+        )
+        has_role = self._cached_notification_role_membership(role, interaction.user)
+        if not has_role and not prefs["allow_notifications"]:
+            return await interaction.followup.send(
+                "先に設定パネルの「通知の許可」をONにしてください。", ephemeral=True,
             )
-            if cached_intent is not None and time.monotonic() - cached_intent[1] < 15:
-                has_role = cached_intent[0]
-            else:
-                has_role = any(
-                    getattr(member_role, "id", None) == role.id
-                    for member_role in interaction.user.roles
-                )
-            try:
-                if has_role:
-                    await self.game_cog.paced_discord_api_call(
-                        interaction.user.remove_roles,
-                        role,
-                        reason="本人が募集通知をOFF",
-                    )
-                else:
-                    await self.game_cog.paced_discord_api_call(
-                        interaction.user.add_roles,
-                        role,
-                        reason="本人が募集通知をON",
-                    )
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
-                log.warning("@%s ロールの自己変更に失敗: %s", RECRUITMENT_NOTIFICATION_ROLE_NAME, exc)
-                return await interaction.followup.send(
-                    "通知設定を変更できませんでした。Botのロール管理権限と並び順を確認してください。",
-                    ephemeral=True,
-                )
-            self._notification_membership_intent[interaction.user.id] = (
-                not has_role,
-                time.monotonic(),
+        new_state = await self._apply_notification_role_membership(
+            interaction.guild, interaction.user, desired=None,
+        )
+        if new_state is None:
+            return await interaction.followup.send(
+                "通知設定を変更できませんでした。Botのロール管理権限と並び順を確認してください。",
+                ephemeral=True,
             )
-
-        state = "OFF" if has_role else "ON"
+        state = "ON" if new_state else "OFF"
         await interaction.followup.send(
             f"🔔 募集通知を **{state}** にしました。",
             ephemeral=True,
         )
+
+    async def send_notification_settings_panel(
+        self, interaction: discord.Interaction,
+    ) -> None:
+        """募集カードの「通知」ボタンから、3チェックの設定パネルを表示する。
+
+        ロール状態と prefs.notify_on_create が食い違っていたら、ロールを
+        正としてこの時点で prefs 側を合わせる (実装仕様 v0.49 §3-1)。
+        """
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message(
+                "サーバー内でのみ使えます。", ephemeral=True,
+            )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild, member = interaction.guild, interaction.user
+        prefs = await database.get_user_notification_prefs(guild.id, member.id)
+        role = await self._ensure_notification_role(guild)
+        if role is not None:
+            has_role = self._cached_notification_role_membership(role, member)
+            if has_role != prefs["notify_on_create"]:
+                prefs = await database.set_user_notification_prefs(
+                    guild.id, member.id, notify_on_create=has_role,
+                )
+        view = RecruitmentNotificationSettingsView(self, guild.id, member.id, prefs)
+        await interaction.followup.send(
+            content=view.render_content(), view=view, ephemeral=True,
+        )
+
+    async def send_recruitment_call(
+        self, interaction: discord.Interaction, recruitment_id: int,
+    ) -> None:
+        """募集カードの「募集」ボタン: DM購読者へこの村を知らせる。
+
+        1村1日1回は open_recruitment_call の UNIQUE 制約 (recruitment_id,
+        called_on) で担保する。宛先の絞り込みとエラーEmbed判定を終えたら、
+        実際の送信は専用ペーサーでバックグラウンド実行し、押した本人には
+        即座に人数だけ返す (実装仕様 v0.49 §3-2)。
+        """
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            return await interaction.response.send_message(
+                "サーバー内でのみ使えます。", ephemeral=True,
+            )
+        guild, member = interaction.guild, interaction.user
+        row = await database.get_recruitment(recruitment_id)
+        if row is None or member.id != row["host_id"]:
+            return await interaction.response.send_message(
+                "主催者だけ操作できます。", ephemeral=True,
+            )
+        if row["status"] != database.RECRUITMENT_OPEN:
+            return await interaction.response.send_message(
+                "受付中の募集だけ通知を呼べます。", ephemeral=True,
+            )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        called_on = datetime.now(JST).date().isoformat()
+        call_id = await database.open_recruitment_call(
+            recruitment_id, guild.id, member.id, called_on,
+        )
+        if call_id is None:
+            return await interaction.followup.send(
+                "この村の募集通知は今日すでに送りました。", ephemeral=True,
+            )
+        embed = await self.build_embed(guild, recruitment_id)
+        if embed.color == discord.Color.red():
+            # 募集情報の取得自体が壊れているため、1通も送らずに中止する。
+            log.error("募集通知DMをエラーEmbedのため中止 (%s)", recruitment_id)
+            return await interaction.followup.send(
+                "募集情報を取得できなかったため、通知を送信しませんでした。", ephemeral=True,
+            )
+        recipients = await self._resolve_call_recipients(
+            guild, recruitment_id, member.id, call_id,
+        )
+        await interaction.followup.send(
+            f"{len(recipients)}人へ順次送信します。", ephemeral=True,
+        )
+        self._spawn_call_delivery(guild, call_id, called_on, embed, recipients)
+
+    async def _resolve_call_recipients(
+        self, guild: discord.Guild, recruitment_id: int, host_id: int, call_id: int,
+    ) -> list[discord.Member]:
+        """「募集」DMの宛先を絞り込む (押下時・再開時の両方から使う)。
+
+        再開時 (指摘2) もこの絞り込みをそのまま再計算する。送達台帳
+        (recruitment_call_deliveries) に記録済みの人は
+        list_pending_call_recipient_ids で自然に除外されるため、
+        二重送信の心配なく毎回全候補から計算し直してよい。
+        """
+        entries = await database.list_recruitment_entries(recruitment_id)
+        excluded = {e["user_id"] for e in entries}
+        excluded.add(host_id)
+        subscriber_ids = await database.list_call_dm_subscriber_ids(guild.id)
+        candidate_ids = [uid for uid in subscriber_ids if uid not in excluded]
+        # 主催者を同村拒否している人 (blocker=候補, blocked=主催者) を除く。
+        block_pairs = await database.list_player_blocks_between(
+            guild.id, [host_id, *candidate_ids],
+        )
+        blocked_host = {
+            blocker for blocker, blocked in block_pairs if blocked == host_id
+        }
+        candidate_ids = [uid for uid in candidate_ids if uid not in blocked_host]
+        # 送達台帳に既に記録済みの人を除く (この call_id への再送を弾く)。
+        candidate_ids = await database.list_pending_call_recipient_ids(
+            call_id, candidate_ids,
+        )
+        return [
+            target for target in (guild.get_member(uid) for uid in candidate_ids)
+            if target is not None
+        ]
+
+    def _spawn_call_delivery(
+        self,
+        guild: discord.Guild,
+        call_id: int,
+        called_on: str,
+        embed: discord.Embed,
+        recipients: list[discord.Member],
+    ) -> None:
+        """募集通知DM配信タスクを起動し、GCで消えないよう強参照を保持する (指摘1)。"""
+        self._active_call_ids.add(call_id)
+        task = asyncio.create_task(
+            self._deliver_recruitment_call(guild, call_id, called_on, embed, recipients)
+        )
+        self._call_delivery_tasks.add(task)
+
+        def _done(_task: asyncio.Task, call_id: int = call_id) -> None:
+            self._call_delivery_tasks.discard(_task)
+            self._active_call_ids.discard(call_id)
+
+        task.add_done_callback(_done)
+
+    async def _deliver_recruitment_call(
+        self,
+        guild: discord.Guild,
+        call_id: int,
+        called_on: str,
+        embed: discord.Embed,
+        recipients: list[discord.Member],
+    ) -> None:
+        """募集通知DMを専用ペーサーで順次送る (バックグラウンドタスク)。
+
+        失敗しても募集全体の進行は止めない (実装仕様の既定方針)。
+        Forbiddenは恒久抑止、HTTPExceptionは次回再試行可として記録を分ける。
+        """
+        sent = 0
+        try:
+            for target in recipients:
+                notified_at = datetime.now(timezone.utc).isoformat()
+                try:
+                    # 実際に送る「前」に送達台帳へ席を確保する (指摘2)。
+                    # 同じ call_id への配信が (再開処理などで) 並行して走っていても、
+                    # この INSERT OR IGNORE で勝てるのはどちらか一方だけなので
+                    # 二重送信にならない。取れなかった場合は既に他方が担当中/送達
+                    # 済みなので、ここでは何もせず次の受信者へ進む。
+                    claimed = await database.claim_recruitment_call_delivery(
+                        call_id, target.id, notified_at,
+                    )
+                except Exception:
+                    log.exception("募集通知DM送達席の確保に失敗 (call_id=%s, user=%s)", call_id, target.id)
+                    continue
+                if not claimed:
+                    continue
+                try:
+                    sent_today = await database.count_call_dms_sent_today(
+                        guild.id, target.id, called_on,
+                    )
+                except Exception:
+                    log.exception("募集通知DM上限確認に失敗 (call_id=%s, user=%s)", call_id, target.id)
+                    continue
+                if sent_today >= RECRUITMENT_CALL_DM_DAILY_LIMIT:
+                    try:
+                        await database.mark_recruitment_call_delivery(
+                            call_id, target.id, notified_at, "skipped_cap",
+                        )
+                    except Exception:
+                        log.exception("募集通知DM上限記録に失敗 (call_id=%s, user=%s)", call_id, target.id)
+                    continue
+                status: Optional[str] = None
+                try:
+                    await self._send_call_dm_paced(target, embed)
+                except asyncio.CancelledError:
+                    # キャンセルは握り潰さず、配信ループ自体を止める。
+                    raise
+                except discord.Forbidden:
+                    status = "forbidden"
+                except discord.HTTPException as exc:
+                    log.warning("募集通知DM送信失敗 (call_id=%s, user=%s): %s", call_id, target.id, exc)
+                    status = "failed"
+                except Exception:
+                    # discord.py起因以外 (ネットワーク断など) でforループを
+                    # 抜けて残り全員へ届かなくなるのを防ぐ (指摘3)。1人失敗
+                    # しても記録だけ残し、次の受信者へ進む。
+                    log.exception("募集通知DM送信で想定外の例外 (call_id=%s, user=%s)", call_id, target.id)
+                    status = "failed"
+                else:
+                    status = "sent"
+                    sent += 1
+                try:
+                    await database.mark_recruitment_call_delivery(
+                        call_id, target.id, notified_at, status,
+                    )
+                except Exception:
+                    log.exception("募集通知DM送達記録に失敗 (call_id=%s, user=%s)", call_id, target.id)
+        finally:
+            try:
+                await database.set_recruitment_call_recipients(call_id, sent)
+            except Exception:
+                log.exception("募集通知DM送信数の記録に失敗 (call_id=%s)", call_id)
+
+    async def _send_call_dm_paced(
+        self, member: discord.Member, embed: discord.Embed,
+    ) -> None:
+        """募集通知DM専用のペーサーで1通送る。
+
+        既存 paced_discord_api_call の bulk_api_lock (全卓共有) は使わない。
+        ここは Semaphore(1) と間隔だけの、募集通知DM専用の直列化にする。
+        """
+        async with self._call_dm_semaphore:
+            wait = RECRUITMENT_CALL_DM_INTERVAL_SECONDS - (
+                time.monotonic() - self._call_dm_last_sent
+            )
+            if wait > 0:
+                await asyncio.sleep(wait)
+            try:
+                await member.send(embed=embed)
+            finally:
+                self._call_dm_last_sent = time.monotonic()
 
     async def _notify_new_recruitment(
         self, guild: discord.Guild, row: dict,
@@ -1597,6 +1875,60 @@ class RecruitmentManager:
             expired_ids = await database.archive_expired_recruitments(guild.id, now)
         for recruitment_id in expired_ids:
             await self.cleanup_archived_recruitment(guild, recruitment_id)
+        await self._resume_stalled_recruitment_calls(guild, now)
+
+    async def _resume_stalled_recruitment_calls(
+        self, guild: discord.Guild, now: datetime,
+    ) -> None:
+        """再起動でGCされた「募集」DM配信を10分周期のこのループから再開する (指摘2)。
+
+        再開してよいと判定する条件 (list_resumable_recruitment_calls に渡す):
+          - called_on が当日 (JST)
+          - called_at が直近60分以内
+          - 募集がまだ OPEN
+        スキーマは変更していない。60分を過ぎたものは対象外 = 主催者が
+        再度「募集」を押しても当日中は「今日はもう送りました」で弾かれる
+        (open_recruitment_callのUNIQUE制約) が、それは指摘2の対応範囲外の
+        既知の制約として許容する。宛先は _resolve_call_recipients で
+        毎回再計算するが、送達台帳に記録済みの人は自然に除外されるので
+        二重送信にはならない。
+
+        なお、この call_id への配信タスクが既にこのプロセスで動いている場合
+        (_active_call_ids) は spawn しない。前回tickの配信がまだ終わっていない
+        状態でここへ来ても、同じ call_id へ2つ目の配信タスクを立てないための
+        ガード。行単位の重複防止は claim_recruitment_call_delivery 側のDB制約が
+        担うが、そもそも同じプロセス内で無駄な二重タスクを立てないための対策。
+        """
+        called_on = now.astimezone(JST).date().isoformat()
+        since = now - timedelta(minutes=60)
+        try:
+            calls = await database.list_resumable_recruitment_calls(
+                guild.id, called_on, since,
+            )
+        except Exception:
+            log.exception("募集通知DM再開対象の取得に失敗")
+            return
+        for call in calls:
+            recruitment_id = call["recruitment_id"]
+            call_id = call["id"]
+            if call_id in self._active_call_ids:
+                # 前回tickの配信タスクがまだ走っている。同じ call_id へ2つ目の
+                # 配信タスクを立てない (指摘2)。
+                continue
+            embed = await self.build_embed(guild, recruitment_id)
+            if embed.color == discord.Color.red():
+                log.warning("募集通知DM再開をエラーEmbedのため抑止 (call_id=%s)", call_id)
+                continue
+            recipients = await self._resolve_call_recipients(
+                guild, recruitment_id, call["host_id"], call_id,
+            )
+            if not recipients:
+                continue
+            log.info(
+                "募集通知DMを再開します (call_id=%s, recruitment_id=%s, 残り%s人)",
+                call_id, recruitment_id, len(recipients),
+            )
+            self._spawn_call_delivery(guild, call_id, call["called_on"], embed, recipients)
 
     async def notify_feedback_report(
         self, guild: discord.Guild, report: dict,
@@ -2069,6 +2401,134 @@ class RecruitmentCreateModal(discord.ui.Modal, title="募集内容"):
         )
 
 
+class RecruitmentNotificationSettingsView(discord.ui.View):
+    """通知3チェックの設定パネル (ephemeral)。
+
+    - 通知の許可: マスタースイッチ。OFFにすると @通知 ロールも外す
+      (DM購読のnotify_on_callは値を保ったまま、許可OFFで実質無効になる。
+      user_notification_prefsのWHERE句がallow_notifications=1を要求するため)。
+    - 村ができた時に通知: @通知 ロールの付与/解除
+      (`RecruitmentManager._apply_notification_role_membership` を流用)。
+    - この村を通知を受け取る: 「募集」ボタンDMの購読フラグ。
+    押すたびに1項目だけトグルし、同じephemeralをeditして現在状態を表示する。
+    """
+
+    def __init__(
+        self,
+        manager: RecruitmentManager,
+        guild_id: int,
+        user_id: int,
+        prefs: dict,
+    ) -> None:
+        super().__init__(timeout=180)
+        self.manager = manager
+        self.guild_id = guild_id
+        self.user_id = user_id
+        self.prefs = dict(prefs)
+        self._role_unavailable = False
+        self._build_buttons()
+
+    @staticmethod
+    def _label(text: str, on: bool) -> str:
+        return f"{'✅' if on else '⬜'} {text}"
+
+    def _build_buttons(self) -> None:
+        self.clear_items()
+        specs = [
+            ("通知の許可", "allow_notifications", self.toggle_allow, 0),
+            ("村ができた時に通知", "notify_on_create", self.toggle_create, 1),
+            ("この村を通知を受け取る", "notify_on_call", self.toggle_call, 2),
+        ]
+        for text, key, callback, row in specs:
+            on = bool(self.prefs.get(key))
+            button = discord.ui.Button(
+                label=self._label(text, on),
+                style=discord.ButtonStyle.primary if on else discord.ButtonStyle.secondary,
+                row=row,
+            )
+            button.callback = callback
+            self.add_item(button)
+
+    def render_content(self) -> str:
+        base = (
+            "🔔 通知設定です。押すたびにON/OFFが切り替わります。\n"
+            "「通知の許可」をOFFにすると他の通知もまとめて無効になります。"
+        )
+        if self._role_unavailable:
+            base += (
+                "\n⚠️ 安全な@通知ロールを用意できないため、"
+                "「村ができた時に通知」は今は変更できません。"
+            )
+        return base
+
+    async def _authorized(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "この設定パネルは開いた本人だけが操作できます。", ephemeral=True,
+            )
+            return False
+        return True
+
+    async def _refresh(self, interaction: discord.Interaction) -> None:
+        self._build_buttons()
+        await interaction.edit_original_response(content=self.render_content(), view=self)
+
+    async def toggle_allow(self, interaction: discord.Interaction) -> None:
+        if not await self._authorized(interaction):
+            return
+        await interaction.response.defer()
+        desired = not self.prefs["allow_notifications"]
+        self.prefs = await database.set_user_notification_prefs(
+            self.guild_id, self.user_id, allow_notifications=desired,
+        )
+        if not desired and isinstance(interaction.guild, discord.Guild):
+            new_role_state = await self.manager._apply_notification_role_membership(
+                interaction.guild, interaction.user, desired=False,
+            )
+            if new_role_state is not None:
+                self.prefs = await database.set_user_notification_prefs(
+                    self.guild_id, self.user_id, notify_on_create=False,
+                )
+        await self._refresh(interaction)
+
+    async def toggle_create(self, interaction: discord.Interaction) -> None:
+        if not await self._authorized(interaction):
+            return
+        await interaction.response.defer()
+        desired = not self.prefs["notify_on_create"]
+        if desired and not self.prefs["allow_notifications"]:
+            # マスターOFFのままロールを付けると、_notify_new_recruitmentは
+            # DB設定を見ずに@通知ロールをメンションするため、UI上OFF表示のまま
+            # 実際にはピンを受け取ってしまう (指摘4)。ONにする前にマスターの
+            # 許可を求める。トグル自体はせず現在状態のまま返す。
+            await interaction.followup.send(
+                "先に「通知の許可」をONにしてください。", ephemeral=True,
+            )
+            return
+        new_role_state = None
+        if isinstance(interaction.guild, discord.Guild):
+            new_role_state = await self.manager._apply_notification_role_membership(
+                interaction.guild, interaction.user, desired=desired,
+            )
+        if new_role_state is None:
+            self._role_unavailable = True
+        else:
+            self.prefs = await database.set_user_notification_prefs(
+                self.guild_id, self.user_id, notify_on_create=new_role_state,
+            )
+        await self._refresh(interaction)
+
+    async def toggle_call(self, interaction: discord.Interaction) -> None:
+        if not await self._authorized(interaction):
+            return
+        await interaction.response.defer()
+        desired = not self.prefs["notify_on_call"]
+        self.prefs = await database.set_user_notification_prefs(
+            self.guild_id, self.user_id, notify_on_call=desired,
+        )
+        await self._refresh(interaction)
+
+
 class RecruitmentCardView(discord.ui.View):
     def __init__(self, manager: RecruitmentManager, recruitment_id: int, *, active: bool = True) -> None:
         super().__init__(timeout=None)
@@ -2087,6 +2547,9 @@ class RecruitmentCardView(discord.ui.View):
             # 閉じたカードでも押せるままにする。
             ("ルール", discord.ButtonStyle.secondary, "rule", self.rule, 1),
             ("ヘルプ", discord.ButtonStyle.secondary, "help", self.help, 1),
+            # 主催者だけがDM一斉通知を送るためのボタン。押下可否と1村1日1回の
+            # 判定はコールバック側 (send_recruitment_call) で行う。
+            ("募集", discord.ButtonStyle.primary, "call", self.call, 1),
         ]
         for label, style, suffix, callback, row in buttons:
             button = discord.ui.Button(
@@ -2126,7 +2589,10 @@ class RecruitmentCardView(discord.ui.View):
         )
 
     async def notification(self, interaction: discord.Interaction) -> None:
-        await self.manager.toggle_notification_role(interaction)
+        await self.manager.send_notification_settings_panel(interaction)
+
+    async def call(self, interaction: discord.Interaction) -> None:
+        await self.manager.send_recruitment_call(interaction, self.recruitment_id)
 
     async def join(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
@@ -2894,6 +3360,361 @@ class PlayerBlockSettingsView(discord.ui.View):
         await self._refresh(interaction, remove_page=self.remove_page + 1)
 
 
+# ============================================================
+# 運営ダッシュボード (v0.50)
+#
+# #運営 はボタンだけの操作盤に保つ方針なので、指標は1枚のephemeralへ
+# まとめ、セレクトで面を切り替える。押した面のSQLだけを都度投げる
+# (6面ぶんを毎回集計しない)。
+# ============================================================
+
+_OPS_DASHBOARD_PANELS: tuple[tuple[str, str, str], ...] = (
+    ("activity", "稼働", "DAU/WAU/MAU と直近14日の日別"),
+    ("retention", "定着", "新規流入・2戦目到達・週次継続率"),
+    ("churn", "離脱", "休眠人数・最終プレイからの経過・プレイ間隔"),
+    ("throughput", "回転", "募集の成立率・試合数・所要時間"),
+    ("delivery", "通知", "DM送達失敗率・通知オプトアウト"),
+    ("rating", "レート", "分布・仮ランク・月別の増減"),
+)
+
+
+def _ops_int(value: object) -> str:
+    return "—" if value is None else f"{int(value)}"
+
+
+def _ops_percent(value: object, *, digits: int = 1) -> str:
+    return "—" if value is None else f"{float(value) * 100:.{digits}f}%"
+
+
+def _ops_number(value: object, *, digits: int = 1, suffix: str = "") -> str:
+    return "—" if value is None else f"{float(value):.{digits}f}{suffix}"
+
+
+def _build_ops_activity_embed(stats: dict) -> discord.Embed:
+    embed = discord.Embed(
+        title="📈 稼働",
+        description=(
+            f"JST {stats.get('today')} 時点 / 集計窓 {stats.get('window_days')}日\n"
+            "練習卓を含む「実際に遊ばれた回数」で数えます。"
+        ),
+        color=discord.Color.green(),
+    )
+    embed.add_field(
+        name="アクティブ人数",
+        value=(
+            f"DAU **{_ops_int(stats.get('dau'))}** / "
+            f"WAU **{_ops_int(stats.get('wau'))}** / "
+            f"MAU **{_ops_int(stats.get('mau'))}**\n"
+            f"DAU÷MAU {_ops_percent(stats.get('stickiness'))} ・ "
+            f"WAU÷MAU {_ops_percent(stats.get('wau_mau'))}\n"
+            f"累計プレイヤー {_ops_int(stats.get('total_players'))}人"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="試合数",
+        value=(
+            f"本日 {_ops_int(stats.get('games_today'))} / "
+            f"7日 {_ops_int(stats.get('games_7d'))} / "
+            f"30日 {_ops_int(stats.get('games_30d'))}"
+        ),
+        inline=False,
+    )
+    daily = stats.get("daily") or []
+    lines = [
+        f"`{row['date'][5:]}` 試合{row['games']:>3} / 参加{row['players']:>3}人"
+        + (f" / 新規{row['new_players']}" if row["new_players"] else "")
+        for row in daily
+    ]
+    embed.add_field(
+        name="直近の日別", value="\n".join(lines) or "記録なし", inline=False,
+    )
+    return embed
+
+
+def _build_ops_retention_embed(stats: dict) -> discord.Embed:
+    embed = discord.Embed(
+        title="🌱 定着",
+        description="新しく入った人が残っているかを見る面です。",
+        color=discord.Color.teal(),
+    )
+    embed.add_field(
+        name="新規プレイヤー",
+        value=(
+            f"本日 {_ops_int(stats.get('new_today'))}人 / "
+            f"7日 {_ops_int(stats.get('new_7d'))}人 / "
+            f"30日 {_ops_int(stats.get('new_30d'))}人"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="2戦目到達率",
+        value=(
+            f"{_ops_percent(stats.get('second_game_rate'))}"
+            f"（初参加から30日以上経った {_ops_int(stats.get('second_game_sample'))}人が母数）"
+        ),
+        inline=False,
+    )
+    cohorts = stats.get("cohorts") or []
+    if cohorts:
+        lines = [
+            f"`{row['week'][5:]}週` {row['size']:>2}人 → "
+            f"W1 {_ops_percent(row['w1_rate'], digits=0)} / "
+            f"W4 {_ops_percent(row['w4_rate'], digits=0)}"
+            for row in cohorts[-8:]
+        ]
+        value = "\n".join(lines)
+    else:
+        value = "28日以上経過したコホートがまだありません。"
+    embed.add_field(name="週次コホート（初参加週別）", value=value, inline=False)
+    embed.set_footer(
+        text="W1=初参加から1〜7日目に再プレイ / W4=22〜28日目に再プレイ"
+    )
+    return embed
+
+
+def _build_ops_churn_embed(stats: dict) -> discord.Embed:
+    embed = discord.Embed(
+        title="🚪 離脱",
+        description="どれだけ間が空いているかを見る面です。",
+        color=discord.Color.orange(),
+    )
+    embed.add_field(
+        name="休眠人数",
+        value=(
+            f"14日以上 {_ops_int(stats.get('dormant_14'))}人 / "
+            f"30日以上 {_ops_int(stats.get('dormant_30'))}人 / "
+            f"60日以上 {_ops_int(stats.get('dormant_60'))}人\n"
+            f"直近7日の復帰（14日以上空けて再開） **{_ops_int(stats.get('returning_7d'))}人**"
+        ),
+        inline=False,
+    )
+    buckets = stats.get("last_play_buckets") or {}
+    embed.add_field(
+        name="最終プレイからの経過",
+        value="\n".join(
+            f"{label}: {count}人" for label, count in buckets.items()
+        ) or "記録なし",
+        inline=False,
+    )
+    streaks = stats.get("longest_streaks") or []
+    embed.add_field(
+        name="プレイ間隔 / 連続日数",
+        value=(
+            f"間隔の中央値 {_ops_number(stats.get('gap_median'), suffix='日')} ・ "
+            f"90%点 {_ops_number(stats.get('gap_p90'), suffix='日')}\n"
+            + (
+                "最長連続: "
+                + " / ".join(f"{row['days']}日" for row in streaks)
+                if streaks else "連続プレイ（2日以上）はまだありません。"
+            )
+        ),
+        inline=False,
+    )
+    return embed
+
+
+def _ops_identity(guild: Optional[discord.Guild], user_id: int) -> str:
+    """運営表示用の名前。guildが取れない経路でも落とさない。"""
+    if guild is None:
+        return f"ID: {user_id}"
+    return _plain_identity(guild, user_id)
+
+
+def _build_ops_throughput_embed(
+    stats: dict, guild: Optional[discord.Guild],
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="🔁 回転",
+        description=f"直近{stats.get('days')}日の募集と試合。",
+        color=discord.Color.blue(),
+    )
+    status = stats.get("recruitment_status") or {}
+    embed.add_field(
+        name="募集",
+        value=(
+            f"作成 {_ops_int(stats.get('recruitments'))}件 / "
+            f"成立率 {_ops_percent(stats.get('held_rate'))}\n"
+            + ("内訳: " + " / ".join(f"{k} {v}" for k, v in status.items()) if status else "内訳なし")
+            + f"\n定員充足の中央値 {_ops_percent(stats.get('fill_rate_median'), digits=0)}\n"
+            f"満席までの時間 中央値 {_ops_number(stats.get('ready_wait_median_min'), suffix='分')} ・ "
+            f"90%点 {_ops_number(stats.get('ready_wait_p90_min'), suffix='分')}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="試合",
+        value=(
+            f"{_ops_int(stats.get('games'))}戦 / "
+            f"稼働日あたり {_ops_number(stats.get('games_per_active_day'))}戦\n"
+            f"所要時間 中央値 {_ops_number(stats.get('duration_median_min'), suffix='分')} ・ "
+            f"90%点 {_ops_number(stats.get('duration_p90_min'), suffix='分')}"
+            f"（n={_ops_int(stats.get('duration_sample'))}）\n"
+            f"終了日数の中央値 {_ops_number(stats.get('game_days_median'), suffix='日')}\n"
+            f"途中離脱 {_ops_int(stats.get('dropouts'))} / 参加席 {_ops_int(stats.get('seats'))}"
+            f"（{_ops_percent(stats.get('dropout_rate'), digits=2)}）"
+        ),
+        inline=False,
+    )
+    hours = stats.get("hour_buckets") or {}
+    embed.add_field(
+        name="時間帯（JST）",
+        value=" / ".join(f"{label} {count}" for label, count in hours.items()) or "記録なし",
+        inline=False,
+    )
+    gm_top = stats.get("gm_top") or []
+    if gm_top:
+        embed.add_field(
+            name="GM実施回数",
+            value="\n".join(
+                f"{_ops_identity(guild, row['player_id'])}: {row['games']}回"
+                for row in gm_top
+            ),
+            inline=False,
+        )
+    return embed
+
+
+def _build_ops_delivery_embed(stats: dict) -> discord.Embed:
+    embed = discord.Embed(
+        title="📮 通知",
+        description=(
+            f"直近{stats.get('days')}日のDM送達。失敗率が上がっていると、"
+            "本人にもホストにも見えないまま募集が回らなくなります。"
+        ),
+        color=discord.Color.purple(),
+    )
+    for key, label in (("call_dm", "「募集」ボタンのDM"), ("recruitment_dm", "開始前の通知DM")):
+        block = stats.get(key) or {}
+        by_status = block.get("by_status") or {}
+        embed.add_field(
+            name=label,
+            value=(
+                f"送信 {_ops_int(block.get('total'))}件 / "
+                f"失敗率 **{_ops_percent(block.get('failure_rate'), digits=2)}**\n"
+                + ("内訳: " + " / ".join(f"{k} {v}" for k, v in by_status.items())
+                   if by_status else "内訳なし")
+            ),
+            inline=False,
+        )
+    embed.add_field(
+        name="通知設定",
+        value=(
+            f"設定済み {_ops_int(stats.get('prefs_configured'))}人 / "
+            f"オプトアウト {_ops_int(stats.get('prefs_opted_out'))}人"
+            f"（{_ops_percent(stats.get('opt_out_rate'))}）\n"
+            f"作成時に通知 {_ops_int(stats.get('prefs_notify_on_create'))}人 / "
+            f"「募集」ボタン {_ops_int(stats.get('prefs_notify_on_call'))}人"
+        ),
+        inline=False,
+    )
+    return embed
+
+
+def _build_ops_rating_embed(stats: dict) -> discord.Embed:
+    embed = discord.Embed(
+        title="🎯 レート健全性",
+        description=(
+            f"{stats.get('variant_id')} / ラダー {stats.get('ladder_id')}。"
+            "平均が一方向へ動き続けていたら配分の見直し時です。"
+        ),
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="分布",
+        value=(
+            f"対象 {_ops_int(stats.get('players'))}人 / "
+            f"平均 {_ops_number(stats.get('mean'), digits=0)} / "
+            f"中央値 {_ops_number(stats.get('median'), digits=0)}\n"
+            f"最小 {_ops_int(stats.get('min'))} 〜 最大 {_ops_int(stats.get('max'))} ・ "
+            f"仮ランク {_ops_int(stats.get('provisional'))}人"
+        ),
+        inline=False,
+    )
+    histogram = stats.get("histogram") or []
+    if histogram:
+        peak = max(row["count"] for row in histogram) or 1
+        lines = [
+            f"`{row['floor']:>5}` {'█' * max(1, round(row['count'] / peak * 18))} {row['count']}"
+            for row in histogram
+        ]
+        embed.add_field(name="レート帯（100刻み）", value="\n".join(lines[-14:]), inline=False)
+    monthly = stats.get("monthly") or []
+    if monthly:
+        embed.add_field(
+            name="月別（精算ベース）",
+            value="\n".join(
+                f"`{row['month']}` 精算{row['settlements']:>4}件 / "
+                f"平均レート {_ops_number(row['avg_rating_after'], digits=0)} / "
+                f"平均増減 {_ops_number(row['avg_total_delta'], digits=2)}"
+                for row in monthly
+            ),
+            inline=False,
+        )
+    return embed
+
+
+class OperationsDashboardSelect(discord.ui.Select):
+    def __init__(self, parent: "OperationsDashboardView") -> None:
+        super().__init__(
+            placeholder="見る面を選ぶ",
+            options=[
+                discord.SelectOption(
+                    label=label, value=key, description=description,
+                    default=(key == parent.panel),
+                )
+                for key, label, description in _OPS_DASHBOARD_PANELS
+            ],
+            row=0,
+        )
+        self.parent_view = parent
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            return await interaction.response.send_message(
+                "❌ サーバー内でのみ使用できます。", ephemeral=True,
+            )
+        self.parent_view.panel = self.values[0]
+        await interaction.response.defer()
+        self.parent_view.rebuild()
+        embed = await self.parent_view.load_embed(interaction.guild)
+        await interaction.edit_original_response(embed=embed, view=self.parent_view)
+
+
+class OperationsDashboardView(discord.ui.View):
+    """運営専用の指標をまとめた1枚。面ごとに必要なSQLだけを投げる。"""
+
+    def __init__(self, guild_id: int, *, panel: str = "activity") -> None:
+        super().__init__(timeout=300)
+        self.guild_id = guild_id
+        self.panel = panel
+        self.rebuild()
+
+    def rebuild(self) -> None:
+        self.clear_items()
+        self.add_item(OperationsDashboardSelect(self))
+
+    async def load_embed(self, guild: Optional[discord.Guild]) -> discord.Embed:
+        if self.panel in ("activity", "retention", "churn"):
+            stats = await database.get_ops_activity_stats(self.guild_id)
+            if self.panel == "activity":
+                return _build_ops_activity_embed(stats)
+            if self.panel == "retention":
+                return _build_ops_retention_embed(stats)
+            return _build_ops_churn_embed(stats)
+        if self.panel == "throughput":
+            return _build_ops_throughput_embed(
+                await database.get_ops_throughput_stats(self.guild_id), guild,
+            )
+        if self.panel == "delivery":
+            return _build_ops_delivery_embed(
+                await database.get_ops_delivery_stats(self.guild_id),
+            )
+        return _build_ops_rating_embed(
+            await database.get_ops_rating_health(self.guild_id),
+        )
+
+
 class OperationsView(discord.ui.View):
     def __init__(self, manager: RecruitmentManager) -> None:
         super().__init__(timeout=None)
@@ -3004,6 +3825,19 @@ class OperationsView(discord.ui.View):
         await interaction.followup.send(
             embed=build_variant_balance_embed(rows), ephemeral=True,
         )
+
+    @discord.ui.button(label="運営データ", style=discord.ButtonStyle.primary, custom_id="operations:dashboard", row=0)
+    async def dashboard(
+        self, interaction: discord.Interaction, button: discord.ui.Button,
+    ) -> None:
+        if not self._is_admin(interaction) or interaction.guild is None:
+            return await interaction.response.send_message(
+                "運営のみ操作できます。", ephemeral=True,
+            )
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        view = OperationsDashboardView(interaction.guild.id)
+        embed = await view.load_embed(interaction.guild)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     @discord.ui.button(label="GM解除", style=discord.ButtonStyle.danger, custom_id="operations:release_gm", row=1)
     async def release_gm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:

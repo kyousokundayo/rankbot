@@ -7,7 +7,7 @@ import re
 import aiosqlite
 from collections.abc import Collection
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -340,7 +340,7 @@ _CURRENT_SCHEMA_REQUIRED_COLUMNS = {
     "games": {
         "game_id", "guild_id", "variant_id", "ladder_id", "room_id",
         "room_name", "game_run_id", "gm_id", "base_room_id",
-        "recruitment_id", "winner_team", "played_at",
+        "recruitment_id", "winner_team", "played_at", "started_at",
     },
     "game_players": {
         "id", "game_id", "player_id", "role", "team", "won",
@@ -382,7 +382,7 @@ _CURRENT_SCHEMA_REQUIRED_COLUMNS = {
         "bonus_payload", "gm_id", "base_room_id", "recruitment_id",
         "village_win_pool", "wolf_win_pool", "wolf_guess_slots",
         "final_day_threshold", "status", "game_id", "last_error", "created_at",
-        "updated_at",
+        "updated_at", "started_at",
     },
     "game_recommendations": {
         "game_id", "guild_id", "voter_id", "kind", "recipient_id", "status",
@@ -407,6 +407,42 @@ _CURRENT_SCHEMA_REQUIRED_COLUMNS = {
         "report_id", "guild_id", "user_id", "category", "summary", "details",
         "bot_version", "room_id", "room_name", "phase", "source_channel_id", "created_at",
     },
+    "game_co_events": {
+        "id", "guild_id", "room_id", "game_run_id", "game_id", "event_seq",
+        "day_number", "phase", "actor_id", "actor_number", "event_type",
+        "claimed_role", "created_at",
+    },
+    "game_co_results": {
+        "id", "guild_id", "room_id", "game_run_id", "game_id", "event_seq",
+        "day_number", "actor_id", "actor_number", "claimed_role", "event_type",
+        "target_id", "target_number", "judgement", "created_at",
+    },
+    "game_vote_events": {
+        "id", "guild_id", "room_id", "game_run_id", "game_id", "event_seq",
+        "day_number", "vote_kind", "round_index", "voter_id", "voter_number",
+        "target_id", "target_number", "created_at",
+    },
+    "game_night_actions": {
+        "id", "guild_id", "room_id", "game_run_id", "game_id", "event_seq",
+        "night_number", "actor_id", "actor_number", "actor_role", "action",
+        "target_id", "target_number", "result", "created_at",
+    },
+    "user_notification_prefs": {
+        "guild_id", "user_id", "allow_notifications", "notify_on_create",
+        "notify_on_call", "updated_at",
+    },
+    "recruitment_calls": {
+        "id", "recruitment_id", "guild_id", "host_id", "called_on", "called_at",
+        "recipients",
+    },
+    "recruitment_call_deliveries": {
+        "call_id", "user_id", "notified_at", "delivery_status",
+    },
+    "game_turn_events": {
+        "id", "guild_id", "room_id", "game_run_id", "game_id", "event_seq",
+        "day_number", "event_type", "actor_id", "actor_number",
+        "speaker_id", "speaker_number", "created_at",
+    },
 }
 
 # 既存DBは列名だけでなく、現行DDLが依存する宣言型・NULL可否・DEFAULTも
@@ -415,7 +451,12 @@ _CURRENT_SCHEMA_REQUIRED_COLUMNS = {
 _CURRENT_SCHEMA_TEXT_COLUMNS = frozenset("""
 bot_meta.key bot_meta.value feedback_reports.bot_version feedback_reports.category
 feedback_reports.details feedback_reports.phase feedback_reports.room_id
-feedback_reports.room_name feedback_reports.summary game_players.death_cause
+feedback_reports.room_name feedback_reports.summary game_co_events.claimed_role
+game_co_events.event_type game_co_events.game_run_id game_co_events.phase
+game_co_events.room_id game_co_results.claimed_role game_co_results.event_type
+game_co_results.game_run_id game_co_results.judgement game_co_results.room_id
+game_night_actions.action game_night_actions.actor_role game_night_actions.game_run_id
+game_night_actions.result game_night_actions.room_id game_players.death_cause
 game_players.rank_at_game game_players.role game_players.team
 game_recommendations.expires_at game_recommendations.kind game_recommendations.status
 game_settlements.base_room_id game_settlements.bonus_payload
@@ -423,11 +464,15 @@ game_settlements.game_run_id game_settlements.ladder_id game_settlements.last_er
 game_settlements.player_records game_settlements.room_id game_settlements.room_name
 game_settlements.stats_payload game_settlements.status game_settlements.variant_id
 game_settlements.winner_team game_stats.rank_bucket game_stats.wolf_alive_by_day
+game_vote_events.game_run_id game_vote_events.room_id game_vote_events.vote_kind
+game_turn_events.event_type game_turn_events.game_run_id game_turn_events.room_id
 games.base_room_id games.game_run_id games.ladder_id games.room_id games.room_name
 games.variant_id games.winner_team player_ratings.ladder_id private_rooms.last_error
 private_rooms.room_id private_rooms.room_name private_rooms.status
 private_rooms.variant_id rating_history.ladder_id rating_history.variant_id
-rating_snapshots.ladder_id rating_snapshots.season_rank recruitment_entries.kind
+rating_snapshots.ladder_id rating_snapshots.season_rank
+recruitment_call_deliveries.delivery_status recruitment_call_deliveries.notified_at
+recruitment_calls.called_on recruitment_entries.kind
 recruitment_notification_deliveries.delivery_status
 recruitment_notification_deliveries.notified_at recruitments.allowed_ranks
 recruitments.closed_at recruitments.note recruitments.notified_at
@@ -438,19 +483,28 @@ room_state_quarantine.room_id room_states.payload room_states.phase room_states.
 season_resets.note
 """.split())
 _CURRENT_SCHEMA_TIMESTAMP_COLUMNS = frozenset("""
-bot_meta.updated_at feedback_reports.created_at game_recommendations.awarded_at
+bot_meta.updated_at feedback_reports.created_at game_co_events.created_at
+game_co_results.created_at game_night_actions.created_at
+game_recommendations.awarded_at
 game_recommendations.confirmed_at game_recommendations.created_at
-game_settlements.created_at game_settlements.updated_at games.played_at
+game_settlements.created_at game_settlements.started_at game_settlements.updated_at
+game_vote_events.created_at game_turn_events.created_at games.played_at games.started_at
 pending_unmutes.created_at player_blocks.created_at player_ratings.last_updated
-private_rooms.created_at rating_history.created_at recruitment_entries.joined_at
+private_rooms.created_at rating_history.created_at recruitment_calls.called_at
+recruitment_entries.joined_at
 recruitments.created_at room_state_quarantine.quarantined_at room_states.updated_at
-season_resets.reset_at
+season_resets.reset_at user_notification_prefs.updated_at
 """.split())
 _CURRENT_SCHEMA_REAL_COLUMNS = frozenset({"rating_snapshots.top_percent"})
 _CURRENT_SCHEMA_NULLABLE_COLUMNS = frozenset("""
 bot_meta.updated_at feedback_reports.created_at feedback_reports.details
 feedback_reports.phase feedback_reports.report_id feedback_reports.room_id
-feedback_reports.room_name feedback_reports.source_channel_id game_players.death_cause
+feedback_reports.room_name feedback_reports.source_channel_id
+game_co_events.created_at game_co_events.game_id game_co_events.id
+game_co_results.created_at game_co_results.game_id game_co_results.id
+game_night_actions.created_at game_night_actions.game_id game_night_actions.id
+game_night_actions.result game_night_actions.target_id game_night_actions.target_number
+game_players.death_cause
 game_players.died_on_day game_players.id game_players.rank_at_game
 game_players.rank_provisional game_players.wolf_guess_hits
 game_recommendations.awarded_at game_recommendations.confirmed_at
@@ -458,25 +512,37 @@ game_recommendations.created_at game_recommendations.recipient_id
 game_settlements.base_room_id game_settlements.bonus_payload game_settlements.created_at
 game_settlements.final_day_threshold game_settlements.game_id game_settlements.gm_id
 game_settlements.last_error game_settlements.recruitment_id
+game_settlements.started_at
 game_settlements.stats_payload game_settlements.updated_at
 game_settlements.village_win_pool game_settlements.wolf_guess_slots
 game_settlements.wolf_win_pool game_stats.day1_execution_was_wolf game_stats.game_id
-game_stats.night1_kill_had_role game_stats.rank_bucket games.base_room_id games.game_id
-games.game_run_id games.gm_id games.played_at games.recruitment_id
+game_stats.night1_kill_had_role game_stats.rank_bucket
+game_vote_events.created_at game_vote_events.game_id game_vote_events.id
+game_vote_events.target_id game_vote_events.target_number
+game_turn_events.created_at game_turn_events.game_id game_turn_events.id
+game_turn_events.speaker_id game_turn_events.speaker_number
+games.base_room_id games.game_id
+games.game_run_id games.gm_id games.played_at games.recruitment_id games.started_at
 pending_unmutes.created_at player_blocks.created_at player_ratings.last_updated
 private_rooms.category_id private_rooms.created_at private_rooms.last_error
 rating_history.created_at rating_history.id rating_snapshots.id
 rating_snapshots.rank_position rating_snapshots.season_rank rating_snapshots.top_percent
+recruitment_calls.called_at recruitment_calls.id
 recruitment_entries.joined_at recruitments.allowed_ranks recruitments.closed_at
 recruitments.created_at recruitments.gm_id recruitments.id recruitments.message_id
 recruitments.note recruitments.notified_at recruitments.ready_notified_at
 room_state_quarantine.payload room_state_quarantine.phase
 room_state_quarantine.quarantined_at room_states.updated_at season_resets.id
-season_resets.note season_resets.reset_at
+season_resets.note season_resets.reset_at user_notification_prefs.updated_at
 """.split())
 _CURRENT_SCHEMA_DEFAULTS = {
     "bot_meta.updated_at": "CURRENT_TIMESTAMP",
     "feedback_reports.created_at": "CURRENT_TIMESTAMP",
+    "game_co_events.created_at": "CURRENT_TIMESTAMP",
+    "game_co_results.created_at": "CURRENT_TIMESTAMP",
+    "game_night_actions.created_at": "CURRENT_TIMESTAMP",
+    "game_vote_events.created_at": "CURRENT_TIMESTAMP",
+    "game_turn_events.created_at": "CURRENT_TIMESTAMP",
     "game_recommendations.created_at": "CURRENT_TIMESTAMP",
     "game_recommendations.kind": "'recommend'",
     "game_recommendations.status": "'pending'",
@@ -511,6 +577,9 @@ _CURRENT_SCHEMA_DEFAULTS = {
     "rating_snapshots.ladder_id": "'l13'",
     "rating_snapshots.season_games": "0",
     "rating_snapshots.season_wins": "0",
+    "recruitment_call_deliveries.delivery_status": "'sent'",
+    "recruitment_calls.called_at": "CURRENT_TIMESTAMP",
+    "recruitment_calls.recipients": "0",
     "recruitment_entries.joined_at": "CURRENT_TIMESTAMP",
     "recruitment_notification_deliveries.delivery_status": "'sent'",
     "recruitments.backup_capacity": "3",
@@ -524,6 +593,10 @@ _CURRENT_SCHEMA_DEFAULTS = {
     "room_states.updated_at": "CURRENT_TIMESTAMP",
     "season_resets.affected_players": "0",
     "season_resets.reset_at": "CURRENT_TIMESTAMP",
+    "user_notification_prefs.allow_notifications": "1",
+    "user_notification_prefs.notify_on_create": "0",
+    "user_notification_prefs.notify_on_call": "0",
+    "user_notification_prefs.updated_at": "CURRENT_TIMESTAMP",
 }
 _CURRENT_SCHEMA_PRIMARY_KEYS = {
     "games": ["game_id"],
@@ -545,6 +618,14 @@ _CURRENT_SCHEMA_PRIMARY_KEYS = {
     "recruitment_notification_deliveries": ["recruitment_id", "user_id"],
     "player_blocks": ["guild_id", "blocker_id", "blocked_id"],
     "feedback_reports": ["report_id"],
+    "game_co_events": ["id"],
+    "game_co_results": ["id"],
+    "game_vote_events": ["id"],
+    "game_night_actions": ["id"],
+    "game_turn_events": ["id"],
+    "user_notification_prefs": ["guild_id", "user_id"],
+    "recruitment_calls": ["id"],
+    "recruitment_call_deliveries": ["call_id", "user_id"],
 }
 _CURRENT_SCHEMA_UNIQUE_KEYS = {
     # 村主あたりの村数はロール別上限で決めるため、(guild_id, owner_id) の
@@ -552,6 +633,9 @@ _CURRENT_SCHEMA_UNIQUE_KEYS = {
     # `_migrate_private_rooms_multi_owner` がテーブル再構築で外す。
     "private_rooms": {
         ("guild_id", "room_name"),
+    },
+    "recruitment_calls": {
+        ("recruitment_id", "called_on"),
     },
 }
 _CURRENT_SCHEMA_FOREIGN_KEYS = {
@@ -565,6 +649,13 @@ _CURRENT_SCHEMA_FOREIGN_KEYS = {
     "recruitment_notification_deliveries": {
         ("recruitment_id", "recruitments", "id")
     },
+    "game_co_events": {("game_id", "games", "game_id")},
+    "game_co_results": {("game_id", "games", "game_id")},
+    "game_vote_events": {("game_id", "games", "game_id")},
+    "game_night_actions": {("game_id", "games", "game_id")},
+    "game_turn_events": {("game_id", "games", "game_id")},
+    "recruitment_calls": {("recruitment_id", "recruitments", "id")},
+    "recruitment_call_deliveries": {("call_id", "recruitment_calls", "id")},
 }
 _CURRENT_SCHEMA_CHECK_PATTERNS = {
     "recruitment_entries": (
@@ -583,6 +674,171 @@ _CURRENT_SCHEMA_CHECK_PATTERNS = {
         ),
     ),
 }
+
+# ============================================================
+# 記録テーブル (v0.49 Phase1: CO/結果申告/投票/夜行動ログ、通知設定、
+# 「募集」ボタンの送達台帳。ターン制の割り込みログを追加で同居させる)
+#
+# DDL文字列をここへ1本化し、新規DB作成経路 (init_db の CREATE TABLE 群) と
+# 既存DB移行経路 (_apply_record_tables) の両方から同じ定数を実行する。
+# 片方だけ書き換えて定義がずれる (drift) 事故を避けるため。
+# ============================================================
+_RECORD_TABLES_DDL: tuple[str, ...] = (
+    """
+    CREATE TABLE IF NOT EXISTS game_co_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        room_id TEXT NOT NULL,
+        game_run_id TEXT NOT NULL,
+        game_id INTEGER,
+        event_seq INTEGER NOT NULL,
+        day_number INTEGER NOT NULL,
+        phase TEXT NOT NULL,
+        actor_id INTEGER NOT NULL,
+        actor_number INTEGER NOT NULL,
+        event_type TEXT NOT NULL,
+        claimed_role TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (game_id) REFERENCES games(game_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS game_co_results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        room_id TEXT NOT NULL,
+        game_run_id TEXT NOT NULL,
+        game_id INTEGER,
+        event_seq INTEGER NOT NULL,
+        day_number INTEGER NOT NULL,
+        actor_id INTEGER NOT NULL,
+        actor_number INTEGER NOT NULL,
+        claimed_role TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        target_id INTEGER NOT NULL,
+        target_number INTEGER NOT NULL,
+        judgement TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (game_id) REFERENCES games(game_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS game_vote_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        room_id TEXT NOT NULL,
+        game_run_id TEXT NOT NULL,
+        game_id INTEGER,
+        event_seq INTEGER NOT NULL,
+        day_number INTEGER NOT NULL,
+        vote_kind TEXT NOT NULL,
+        round_index INTEGER NOT NULL,
+        voter_id INTEGER NOT NULL,
+        voter_number INTEGER NOT NULL,
+        target_id INTEGER,
+        target_number INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (game_id) REFERENCES games(game_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS game_night_actions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        room_id TEXT NOT NULL,
+        game_run_id TEXT NOT NULL,
+        game_id INTEGER,
+        event_seq INTEGER NOT NULL,
+        night_number INTEGER NOT NULL,
+        actor_id INTEGER NOT NULL,
+        actor_number INTEGER NOT NULL,
+        actor_role TEXT NOT NULL,
+        action TEXT NOT NULL,
+        target_id INTEGER,
+        target_number INTEGER,
+        result TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (game_id) REFERENCES games(game_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS user_notification_prefs (
+        guild_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        allow_notifications INTEGER NOT NULL DEFAULT 1,
+        notify_on_create INTEGER NOT NULL DEFAULT 0,
+        notify_on_call INTEGER NOT NULL DEFAULT 0,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (guild_id, user_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS recruitment_calls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        recruitment_id INTEGER NOT NULL,
+        guild_id INTEGER NOT NULL,
+        host_id INTEGER NOT NULL,
+        called_on TEXT NOT NULL,
+        called_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        recipients INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (recruitment_id, called_on),
+        FOREIGN KEY (recruitment_id) REFERENCES recruitments(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS recruitment_call_deliveries (
+        call_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        notified_at TEXT NOT NULL,
+        delivery_status TEXT NOT NULL DEFAULT 'sent',
+        PRIMARY KEY (call_id, user_id),
+        FOREIGN KEY (call_id) REFERENCES recruitment_calls(id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS game_turn_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        guild_id INTEGER NOT NULL,
+        room_id TEXT NOT NULL,
+        game_run_id TEXT NOT NULL,
+        game_id INTEGER,
+        event_seq INTEGER NOT NULL,
+        day_number INTEGER NOT NULL,
+        event_type TEXT NOT NULL,
+        actor_id INTEGER NOT NULL,
+        actor_number INTEGER NOT NULL,
+        speaker_id INTEGER,
+        speaker_number INTEGER,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (game_id) REFERENCES games(game_id)
+    )
+    """,
+)
+
+
+async def _apply_record_tables(db: aiosqlite.Connection) -> None:
+    """CO・結果申告・投票・夜行動ログ等の記録テーブルを既存DBへ追加する。
+
+    「新しく足すだけ・既存を書き換えない」移行。8テーブルの
+    CREATE TABLE IF NOT EXISTS と、games/game_settlements への
+    started_at列追加 (無ければ) だけを行う。既存の「未移行スキーマは
+    書き換えず起動を止める」方針を破らないよう、削除・型変更は一切しない。
+    init_db の既存DB分岐で _validate_current_schema より前に呼ぶこと
+    ——新テーブルを契約定義へ載せた状態で検証を先に走らせると、
+    移行前の本番DBが「テーブルが無い」で起動不能になる。
+    """
+    for create_sql in _RECORD_TABLES_DDL:
+        await db.execute(create_sql)
+    for table, column in (
+        ("games", "started_at"),
+        ("game_settlements", "started_at"),
+    ):
+        existing_columns = {
+            str(row[1])
+            for row in await db.execute_fetchall(f"PRAGMA table_info({table})")
+        }
+        if column not in existing_columns:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} TIMESTAMP")
 
 
 def _normalized_schema_default(value) -> Optional[str]:
@@ -1022,6 +1278,55 @@ _CURRENT_INDEX_DEFINITIONS = {
         "CREATE UNIQUE INDEX idx_rating_snapshots_reset_player_ladder "
         "ON rating_snapshots(season_reset_id, player_id, guild_id, ladder_id)"
     ),
+    "idx_game_co_events_game_id": (
+        "CREATE INDEX idx_game_co_events_game_id ON game_co_events(game_id)"
+    ),
+    "idx_game_co_events_run_seq": (
+        "CREATE INDEX idx_game_co_events_run_seq "
+        "ON game_co_events(guild_id, room_id, game_run_id, event_seq)"
+    ),
+    "idx_game_co_events_actor_id": (
+        "CREATE INDEX idx_game_co_events_actor_id ON game_co_events(actor_id)"
+    ),
+    "idx_game_co_results_game_id": (
+        "CREATE INDEX idx_game_co_results_game_id ON game_co_results(game_id)"
+    ),
+    "idx_game_co_results_run_seq": (
+        "CREATE INDEX idx_game_co_results_run_seq "
+        "ON game_co_results(guild_id, room_id, game_run_id, event_seq)"
+    ),
+    "idx_game_vote_events_game_id": (
+        "CREATE INDEX idx_game_vote_events_game_id ON game_vote_events(game_id)"
+    ),
+    "idx_game_vote_events_run_seq": (
+        "CREATE INDEX idx_game_vote_events_run_seq "
+        "ON game_vote_events(guild_id, room_id, game_run_id, event_seq)"
+    ),
+    "idx_game_vote_events_voter_id": (
+        "CREATE INDEX idx_game_vote_events_voter_id ON game_vote_events(voter_id)"
+    ),
+    "idx_game_night_actions_game_id": (
+        "CREATE INDEX idx_game_night_actions_game_id "
+        "ON game_night_actions(game_id)"
+    ),
+    "idx_game_night_actions_run_seq": (
+        "CREATE INDEX idx_game_night_actions_run_seq "
+        "ON game_night_actions(guild_id, room_id, game_run_id, event_seq)"
+    ),
+    "idx_game_night_actions_actor_id": (
+        "CREATE INDEX idx_game_night_actions_actor_id "
+        "ON game_night_actions(actor_id)"
+    ),
+    "idx_game_turn_events_game_id": (
+        "CREATE INDEX idx_game_turn_events_game_id ON game_turn_events(game_id)"
+    ),
+    "idx_game_turn_events_run_seq": (
+        "CREATE INDEX idx_game_turn_events_run_seq "
+        "ON game_turn_events(guild_id, room_id, game_run_id, event_seq)"
+    ),
+    "idx_game_turn_events_actor_id": (
+        "CREATE INDEX idx_game_turn_events_actor_id ON game_turn_events(actor_id)"
+    ),
 }
 
 
@@ -1052,6 +1357,24 @@ async def init_db() -> None:
             "AND name NOT LIKE 'sqlite_%'"
         ))[0][0])
         if user_table_count:
+            # 記録テーブル8種と started_at 列は「新しく足すだけ」の移行。
+            # 検証は不足列を見つけると即RuntimeErrorで起動を止めるため、
+            # 新テーブルを契約定義へ載せた状態で検証を先に走らせると
+            # 移行前の本番DBが起動不能になる。必ず検証より前に置く。
+            # SAVEPOINTで包むのは、v0.40より前の未知スキーマ (games/
+            # game_settlements自体が想定と違う形) でALTER TABLEが失敗した
+            # ときに、中途半端にテーブルを作った状態を残さないため。
+            # 失敗時はロールバックして検証に委ね、「未移行のDBスキーマは
+            # 書き換えず拒否する」既存方針をそのまま保つ。
+            try:
+                await db.execute("SAVEPOINT apply_record_tables")
+                await _apply_record_tables(db)
+            except Exception:
+                await db.execute("ROLLBACK TO SAVEPOINT apply_record_tables")
+                await db.execute("RELEASE SAVEPOINT apply_record_tables")
+            else:
+                await db.execute("RELEASE SAVEPOINT apply_record_tables")
+                await db.commit()
             await _validate_current_schema(db)
             # 検証を通ったDBだけを書き換える。検証は「不足している制約」しか
             # 見ないので、旧版の UNIQUE(guild_id, owner_id) はここまで残る。
@@ -1082,7 +1405,8 @@ async def init_db() -> None:
                 base_room_id TEXT,
                 recruitment_id INTEGER,
                 winner_team TEXT NOT NULL,
-                played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                played_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at TIMESTAMP
             )
         """)
         await db.execute("""
@@ -1257,6 +1581,7 @@ async def init_db() -> None:
                 last_error TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at TIMESTAMP,
                 PRIMARY KEY (guild_id, room_id, game_run_id),
                 FOREIGN KEY (game_id) REFERENCES games(game_id)
             )
@@ -1348,6 +1673,10 @@ async def init_db() -> None:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # 記録テーブル8種 (CO/結果申告/投票/夜行動/割り込みログ、通知設定、
+        # 募集通知の送達台帳)。既存DB移行 (_apply_record_tables) と同じ定数を使う。
+        for create_sql in _RECORD_TABLES_DDL:
+            await db.execute(create_sql)
         await _validate_current_schema(db)
         await _validate_foreign_key_integrity(db)
         await _validate_check_integrity(db)
@@ -1461,8 +1790,14 @@ async def stage_game_settlement(
     gm_id: Optional[int] = None,
     base_room_id: Optional[str] = None,
     recruitment_id: Optional[int] = None,
+    started_at: Optional[str] = None,
 ) -> None:
-    """結果を先に永続化し、クラッシュ後も同じrun IDで精算できるようにする。"""
+    """結果を先に永続化し、クラッシュ後も同じrun IDで精算できるようにする。
+
+    started_at は試合開始時刻 (UTCの'YYYY-MM-DD HH:MM:SS')。呼び出し側
+    (room_runner.py) がまだ渡していない移行期間があるため、既定Noneで
+    省略可能にしてある。settle時にそのまま games.started_at へ運ばれる。
+    """
     if not game_run_id:
         raise ValueError("game_run_id is required")
     expected_ladder_id = rating_lib.ladder_id_for_variant(variant_id)
@@ -1504,8 +1839,8 @@ async def stage_game_settlement(
             "(guild_id, room_id, game_run_id, variant_id, ladder_id, room_name, rated, winner_team, "
             "player_records, stats_payload, bonus_payload, gm_id, base_room_id, "
             "recruitment_id, village_win_pool, wolf_win_pool, wolf_guess_slots, "
-            "final_day_threshold, status, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP) "
+            "final_day_threshold, started_at, status, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', CURRENT_TIMESTAMP) "
             "ON CONFLICT(guild_id, room_id, game_run_id) DO UPDATE SET "
             "variant_id = excluded.variant_id, ladder_id = excluded.ladder_id, "
             "room_name = excluded.room_name, rated = excluded.rated, winner_team = excluded.winner_team, "
@@ -1515,7 +1850,8 @@ async def stage_game_settlement(
             "recruitment_id = excluded.recruitment_id, "
             "village_win_pool = excluded.village_win_pool, wolf_win_pool = excluded.wolf_win_pool, "
             "wolf_guess_slots = excluded.wolf_guess_slots, "
-            "final_day_threshold = excluded.final_day_threshold, updated_at = CURRENT_TIMESTAMP "
+            "final_day_threshold = excluded.final_day_threshold, started_at = excluded.started_at, "
+            "updated_at = CURRENT_TIMESTAMP "
             "WHERE game_settlements.status = 'pending' "
             "AND game_settlements.variant_id = excluded.variant_id "
             "AND game_settlements.ladder_id = excluded.ladder_id "
@@ -1532,6 +1868,7 @@ async def stage_game_settlement(
                 rating_parameters["wolf_win_pool"],
                 rating_parameters["wolf_guess_slots"],
                 rating_parameters["final_day_threshold"],
+                started_at,
             ),
         )
         if cursor.rowcount == 0:
@@ -1626,6 +1963,30 @@ async def _write_game_stats(
     )
 
 
+async def _attach_run_records_to_game(
+    db: aiosqlite.Connection,
+    guild_id: int,
+    room_id: str,
+    game_run_id: str,
+    game_id: int,
+) -> None:
+    """進行中に追記したイベントログへ、精算で確定した game_id を後埋めする。
+
+    `game_id IS NULL` の行だけを対象にするので、起動時の冪等再精算で
+    もう一度呼ばれても二重更新にならない (UNIQUE制約を張らない代わりに
+    この条件で冪等性を担保する設計、実装仕様1-6)。
+    """
+    for table in (
+        "game_co_events", "game_co_results", "game_vote_events", "game_night_actions",
+        "game_turn_events",
+    ):
+        await db.execute(
+            f"UPDATE {table} SET game_id = ? "
+            "WHERE guild_id = ? AND room_id = ? AND game_run_id = ? AND game_id IS NULL",
+            (game_id, guild_id, room_id, game_run_id),
+        )
+
+
 async def settle_game_settlement(
     guild_id: int,
     room_id: str,
@@ -1645,6 +2006,7 @@ async def settle_game_settlement(
             "bonus_payload, gm_id, "
             "base_room_id, recruitment_id, "
             "village_win_pool, wolf_win_pool, wolf_guess_slots, final_day_threshold, "
+            "started_at, "
             "status, game_id "
             "FROM game_settlements WHERE guild_id = ? AND room_id = ? AND game_run_id = ?",
             (guild_id, room_id, game_run_id),
@@ -1656,6 +2018,7 @@ async def settle_game_settlement(
             variant_id, ladder_id, room_name, rated_int, winner_team, records_text,
             stats_payload, bonus_payload, gm_id, base_room_id, recruitment_id,
             village_win_pool, wolf_win_pool, wolf_guess_slots, final_day_threshold,
+            started_at,
             status, stored_game_id,
         ) = rows[0]
         expected_ladder_id = rating_lib.ladder_id_for_variant(str(variant_id))
@@ -1682,6 +2045,16 @@ async def settle_game_settlement(
         )
         if existing:
             game_id = int(existing[0][0])
+            try:
+                # クラッシュ再実行で games INSERT だけ済んでいた場合の後埋め。
+                # 通常経路 (_write_game_stats と同位置) でも同じ関数を呼ぶが、
+                # game_id IS NULL 条件があるためここで先に呼んでも二重にはならない。
+                await _attach_run_records_to_game(db, guild_id, room_id, game_run_id, game_id)
+            except Exception as exc:
+                # 付加ログの後埋め失敗は精算そのものを止めない。
+                log.exception(
+                    "記録ログのgame_id後埋めに失敗しました (game_id=%s): %s", game_id, exc,
+                )
             await db.execute(
                 "UPDATE game_settlements SET status = 'settled', game_id = ?, last_error = NULL, "
                 "updated_at = CURRENT_TIMESTAMP WHERE guild_id = ? AND room_id = ? AND game_run_id = ?",
@@ -1694,13 +2067,23 @@ async def settle_game_settlement(
         player_records = json.loads(records_text)
         cursor = await db.execute(
             "INSERT INTO games (guild_id, variant_id, ladder_id, room_id, room_name, game_run_id, gm_id, "
-            "base_room_id, recruitment_id, winner_team) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "base_room_id, recruitment_id, winner_team, started_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 guild_id, variant_id, ladder_id, room_id, room_name, game_run_id, gm_id,
-                base_room_id or room_id, recruitment_id, winner_team,
+                base_room_id or room_id, recruitment_id, winner_team, started_at,
             ),
         )
         game_id = int(cursor.lastrowid)
+        try:
+            # CO・投票・夜行動ログを今回確定した game_id へ後埋めする。
+            # _write_game_stats と同じ「付加情報は失敗しても精算を止めない」
+            # 方針で try/except に包む。game_id IS NULL 条件で冪等。
+            await _attach_run_records_to_game(db, guild_id, room_id, game_run_id, game_id)
+        except Exception as exc:
+            log.exception(
+                "記録ログのgame_id後埋めに失敗しました (game_id=%s): %s", game_id, exc,
+            )
 
         # プレイボーナスの材料。的中数は game_players へも残して統計に使う
         bonus_facts: Optional[dict] = None
@@ -1877,6 +2260,739 @@ async def load_pending_game_settlements(guild_id: int) -> list[dict]:
         }
         for row in rows
     ]
+
+
+# ============================================================
+# CO・結果申告・投票・夜行動の記録 (v0.49 Phase1)
+#
+# 「発生した瞬間に追記する」純粋な追記ログ。UNIQUE制約は張らない
+# (張ると再精算や再送で衝突する)。撤回・やり直しは行を消さず
+# event_type を変えて追記する。game_id は settle_game_settlement の
+# 同一トランザクション内 (_attach_run_records_to_game) で後埋めする。
+# 失敗しても呼び出し側 (room_runner.py) の進行は止めない方針のため、
+# ここでは例外をそのまま伝播させ、握り潰すかどうかは呼び出し側に委ねる。
+# ============================================================
+
+async def record_co_event(
+    guild_id: int,
+    room_id: str,
+    game_run_id: str,
+    *,
+    event_seq: int,
+    day_number: int,
+    phase: str,
+    actor_id: int,
+    actor_number: int,
+    event_type: str,
+    claimed_role: str,
+) -> None:
+    """CO宣言・撤回を1行追記する。"""
+    async with connect_db() as db:
+        await db.execute(
+            "INSERT INTO game_co_events "
+            "(guild_id, room_id, game_run_id, event_seq, day_number, phase, "
+            "actor_id, actor_number, event_type, claimed_role) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                guild_id, room_id, game_run_id, event_seq, day_number, phase,
+                actor_id, actor_number, event_type, claimed_role,
+            ),
+        )
+        await db.commit()
+
+
+async def record_vote_event(
+    guild_id: int,
+    room_id: str,
+    game_run_id: str,
+    *,
+    event_seq: int,
+    day_number: int,
+    vote_kind: str,
+    round_index: int,
+    voter_id: int,
+    voter_number: int,
+    target_id: Optional[int],
+    target_number: Optional[int],
+) -> None:
+    """投票の生ログを1行追記する。変更票・棄権も1行として残す。"""
+    async with connect_db() as db:
+        await db.execute(
+            "INSERT INTO game_vote_events "
+            "(guild_id, room_id, game_run_id, event_seq, day_number, vote_kind, "
+            "round_index, voter_id, voter_number, target_id, target_number) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                guild_id, room_id, game_run_id, event_seq, day_number, vote_kind,
+                round_index, voter_id, voter_number, target_id, target_number,
+            ),
+        )
+        await db.commit()
+
+
+async def record_night_action(
+    guild_id: int,
+    room_id: str,
+    game_run_id: str,
+    *,
+    event_seq: int,
+    night_number: int,
+    actor_id: int,
+    actor_number: int,
+    actor_role: str,
+    action: str,
+    target_id: Optional[int],
+    target_number: Optional[int],
+    result: Optional[str],
+) -> None:
+    """夜行動の生ログを1行追記する。"""
+    async with connect_db() as db:
+        await db.execute(
+            "INSERT INTO game_night_actions "
+            "(guild_id, room_id, game_run_id, event_seq, night_number, actor_id, "
+            "actor_number, actor_role, action, target_id, target_number, result) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                guild_id, room_id, game_run_id, event_seq, night_number, actor_id,
+                actor_number, actor_role, action, target_id, target_number, result,
+            ),
+        )
+        await db.commit()
+
+
+async def list_co_events_for_run(
+    guild_id: int, room_id: str, game_run_id: str,
+) -> list[dict]:
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT event_seq, day_number, phase, actor_id, actor_number, "
+            "event_type, claimed_role, created_at FROM game_co_events "
+            "WHERE guild_id = ? AND room_id = ? AND game_run_id = ? "
+            "ORDER BY event_seq",
+            (guild_id, room_id, game_run_id),
+        )
+    return [
+        {
+            "event_seq": row[0], "day_number": row[1], "phase": row[2],
+            "actor_id": row[3], "actor_number": row[4], "event_type": row[5],
+            "claimed_role": row[6], "created_at": row[7],
+        }
+        for row in rows
+    ]
+
+
+async def list_co_results_for_run(
+    guild_id: int, room_id: str, game_run_id: str,
+) -> list[dict]:
+    """占い師・霊能者の結果自己申告を読む (v0.49限定の記録)。
+
+    v0.50で [結果を公開] ごと廃止したため新しい行は増えない。テーブルと
+    この読み出しだけ残すのは、v0.49で積んだ行を後から集計できるようにする
+    ため (廃止＝過去データを捨てる、ではない)。
+    """
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT event_seq, day_number, actor_id, actor_number, claimed_role, "
+            "event_type, target_id, target_number, judgement, created_at "
+            "FROM game_co_results "
+            "WHERE guild_id = ? AND room_id = ? AND game_run_id = ? "
+            "ORDER BY event_seq",
+            (guild_id, room_id, game_run_id),
+        )
+    return [
+        {
+            "event_seq": row[0], "day_number": row[1], "actor_id": row[2],
+            "actor_number": row[3], "claimed_role": row[4], "event_type": row[5],
+            "target_id": row[6], "target_number": row[7], "judgement": row[8],
+            "created_at": row[9],
+        }
+        for row in rows
+    ]
+
+
+# ============================================================
+# ターン制の割り込みログ (v0.49 Phase1後追い)
+#
+# 汎用の event_type 列を持つが、今回書き込むのは "割り込み" だけ。
+# パス・発言時間・遺言・途中抜けは対象外 (本人判断で「ゲームへの
+# 関係が薄い」ため見送り)。将来これらを足すときも同じテーブルへ
+# event_type を増やすだけで済むよう名前を汎用にしてある。
+# game_id は他の記録テーブルと同じく _attach_run_records_to_game で
+# 精算時に後埋めする。失敗しても呼び出し側 (room_runner.py) の進行を
+# 止めない方針のため、ここでは例外をそのまま伝播させる。
+# ============================================================
+
+async def record_turn_event(
+    guild_id: int,
+    room_id: str,
+    game_run_id: str,
+    *,
+    event_seq: int,
+    day_number: int,
+    event_type: str,
+    actor_id: int,
+    actor_number: int,
+    speaker_id: Optional[int],
+    speaker_number: Optional[int],
+) -> None:
+    """ターン制の割り込みを1行追記する。"""
+    async with connect_db() as db:
+        await db.execute(
+            "INSERT INTO game_turn_events "
+            "(guild_id, room_id, game_run_id, event_seq, day_number, event_type, "
+            "actor_id, actor_number, speaker_id, speaker_number) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                guild_id, room_id, game_run_id, event_seq, day_number, event_type,
+                actor_id, actor_number, speaker_id, speaker_number,
+            ),
+        )
+        await db.commit()
+
+
+# ============================================================
+# 通知設定と「募集」ボタン (v0.49 Phase1)
+# ============================================================
+
+async def get_user_notification_prefs(guild_id: int, user_id: int) -> dict:
+    """行が無ければ既定値 (許可=ON、村作成/募集呼び出し通知=OFF) を返す。"""
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT allow_notifications, notify_on_create, notify_on_call "
+            "FROM user_notification_prefs WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+    if not rows:
+        return {
+            "allow_notifications": True,
+            "notify_on_create": False,
+            "notify_on_call": False,
+        }
+    row = rows[0]
+    return {
+        "allow_notifications": bool(row[0]),
+        "notify_on_create": bool(row[1]),
+        "notify_on_call": bool(row[2]),
+    }
+
+
+async def set_user_notification_prefs(
+    guild_id: int,
+    user_id: int,
+    *,
+    allow_notifications: Optional[bool] = None,
+    notify_on_create: Optional[bool] = None,
+    notify_on_call: Optional[bool] = None,
+) -> dict:
+    """指定したキーだけを更新する (Noneは現在値を維持)。更新後の値を返す。"""
+    current = await get_user_notification_prefs(guild_id, user_id)
+    merged = {
+        "allow_notifications": (
+            current["allow_notifications"] if allow_notifications is None
+            else bool(allow_notifications)
+        ),
+        "notify_on_create": (
+            current["notify_on_create"] if notify_on_create is None
+            else bool(notify_on_create)
+        ),
+        "notify_on_call": (
+            current["notify_on_call"] if notify_on_call is None
+            else bool(notify_on_call)
+        ),
+    }
+    async with connect_db() as db:
+        await db.execute(
+            "INSERT INTO user_notification_prefs "
+            "(guild_id, user_id, allow_notifications, notify_on_create, notify_on_call, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(guild_id, user_id) DO UPDATE SET "
+            "allow_notifications = excluded.allow_notifications, "
+            "notify_on_create = excluded.notify_on_create, "
+            "notify_on_call = excluded.notify_on_call, "
+            "updated_at = CURRENT_TIMESTAMP",
+            (
+                guild_id, user_id,
+                int(merged["allow_notifications"]), int(merged["notify_on_create"]),
+                int(merged["notify_on_call"]),
+            ),
+        )
+        await db.commit()
+    return merged
+
+
+async def list_call_dm_subscriber_ids(guild_id: int) -> list[int]:
+    """通知を許可し、かつ「募集」ボタンDMを購読している user_id 一覧。"""
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT user_id FROM user_notification_prefs "
+            "WHERE guild_id = ? AND allow_notifications = 1 AND notify_on_call = 1",
+            (guild_id,),
+        )
+    return [int(row[0]) for row in rows]
+
+
+async def open_recruitment_call(
+    recruitment_id: int, guild_id: int, host_id: int, called_on: str,
+) -> Optional[int]:
+    """当日分の「募集」通知枠をUNIQUEで確保する。
+
+    2回目以降の押下は (recruitment_id, called_on) のUNIQUE違反でNoneを
+    返す (=今日はもう呼んだ)。行を消さないので、同日中の重複呼び出しは
+    何度呼ばれても安全に弾ける。
+    """
+    async with connect_db() as db:
+        try:
+            cursor = await db.execute(
+                "INSERT INTO recruitment_calls "
+                "(recruitment_id, guild_id, host_id, called_on) VALUES (?, ?, ?, ?)",
+                (recruitment_id, guild_id, host_id, called_on),
+            )
+        except aiosqlite.IntegrityError as exc:
+            # UNIQUE(recruitment_id, called_on) 違反=今日はもう呼んだ、だけを
+            # Noneに丸める。存在しない recruitment_id を渡すバグ (FK違反) まで
+            # 「呼んだことにする」と誤魔化してしまうので、それは再送出する。
+            if "UNIQUE constraint failed" not in str(exc):
+                await db.rollback()
+                raise
+            await db.rollback()
+            return None
+        await db.commit()
+        return int(cursor.lastrowid)
+
+
+async def claim_recruitment_call_delivery(
+    call_id: int, user_id: int, notified_at: str,
+) -> bool:
+    """この (call_id, user_id) への配信席を送信前に確保する (指摘2, at-most-once優先)。
+
+    INSERT OR IGNORE で status='sending' の行を先に確保してから実際のDM送信へ進む。
+    PRIMARY KEY (call_id, user_id) により、別タスク・別プロセスが同時に同じ宛先へ
+    配信しようとしても挿入できるのは片方だけ。挿入できたとき (=このタスクが送信権を
+    得たとき) だけ True を返す。False が返った受信者はこのタスクからは送らない
+    (二重送信より、ごく稀に1人取りこぼす方を優先する方針)。
+    """
+    async with connect_db() as db:
+        cursor = await db.execute(
+            "INSERT OR IGNORE INTO recruitment_call_deliveries "
+            "(call_id, user_id, notified_at, delivery_status) VALUES (?, ?, ?, 'sending')",
+            (call_id, user_id, notified_at),
+        )
+        await db.commit()
+        return cursor.rowcount == 1
+
+
+async def mark_recruitment_call_delivery(
+    call_id: int, user_id: int, notified_at: str, status: str,
+) -> None:
+    """送達結果を記録する (claim_recruitment_call_delivery で確保した行を更新する想定)。
+
+    delivery_status の想定値:
+      - 'sending'    : 送信権を確保したが、まだ送信結果が確定していない
+                        (claim直後の暫定状態。再起動でこのまま残ることがあるが、
+                        list_pending_call_recipient_ids は行の存在だけで除外判定を
+                        するため、再送はされない = 取りこぼしうるが二重送信はしない)
+      - 'sent'       : 送信成功
+      - 'forbidden'  : DM拒否設定などで恒久的に届かない
+      - 'failed'     : 一時的な失敗 (次回呼び出しでは既に行があるため再送されない)
+      - 'skipped_cap': 日次上限超過でスキップ
+    行が無い状態からの呼び出しにも備えて INSERT ... ON CONFLICT DO UPDATE のまま残す
+    (claimを経由しない古い呼び出し経路や将来の直接呼び出しでも壊れないように)。
+    """
+    async with connect_db() as db:
+        await db.execute(
+            "INSERT INTO recruitment_call_deliveries "
+            "(call_id, user_id, notified_at, delivery_status) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(call_id, user_id) DO UPDATE SET "
+            "notified_at = excluded.notified_at, delivery_status = excluded.delivery_status",
+            (call_id, user_id, notified_at, status),
+        )
+        await db.commit()
+
+
+async def list_pending_call_recipient_ids(
+    call_id: int, candidate_ids: list[int],
+) -> list[int]:
+    """候補のうち、この呼び出しでまだ送達記録の無い user_id を順序を保って返す。"""
+    if not candidate_ids:
+        return []
+    placeholders = ",".join("?" * len(candidate_ids))
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT user_id FROM recruitment_call_deliveries "
+            f"WHERE call_id = ? AND user_id IN ({placeholders})",
+            (call_id, *candidate_ids),
+        )
+    delivered = {int(row[0]) for row in rows}
+    return [user_id for user_id in candidate_ids if user_id not in delivered]
+
+
+async def count_call_dms_sent_today(guild_id: int, user_id: int, called_on: str) -> int:
+    """その日その人へ送信成功した「募集」DMの件数 (日次上限判定用)。"""
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT COUNT(*) FROM recruitment_call_deliveries d "
+            "JOIN recruitment_calls c ON c.id = d.call_id "
+            "WHERE c.guild_id = ? AND d.user_id = ? AND c.called_on = ? "
+            "AND d.delivery_status = 'sent'",
+            (guild_id, user_id, called_on),
+        )
+    return int(rows[0][0]) if rows else 0
+
+
+async def list_resumable_recruitment_calls(
+    guild_id: int, called_on: str, since: datetime,
+) -> list[dict]:
+    """再起動で配信が止まった「募集」呼び出しを再開対象として返す (指摘2)。
+
+    スキーマは変更しない。判定条件は呼び出し元 (recruitment_notification_loop)
+    と合わせて次の3つ:
+      - called_on が当日 (JSTの日付文字列をそのまま渡してもらう)
+      - called_at が since 以降 (呼び出し元は「直近60分以内」を渡す想定。
+        古い呼び出しまで毎周期蒸し返さないための下限)
+      - 募集本体がまだ OPEN (募集終了/GM村解散後に今さら送らない)
+    宛先の再計算は呼び出し元で行う。送達台帳 (recruitment_call_deliveries)
+    に記録済みの人は list_pending_call_recipient_ids で自然に除外されるため、
+    ここで「未送達か」までは絞り込まない (二重送信の心配はない)。
+    """
+    since_text = _normalize_recruitment_time(since)
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT c.id, c.recruitment_id, c.host_id, c.called_on "
+            "FROM recruitment_calls c "
+            "JOIN recruitments r ON r.id = c.recruitment_id "
+            "WHERE c.guild_id = ? AND c.called_on = ? "
+            "AND datetime(c.called_at) >= datetime(?) "
+            "AND r.status = ? "
+            "ORDER BY c.id",
+            (guild_id, called_on, since_text, RECRUITMENT_OPEN),
+        )
+    return [
+        {
+            "id": int(row[0]),
+            "recruitment_id": int(row[1]),
+            "host_id": int(row[2]),
+            "called_on": row[3],
+        }
+        for row in rows
+    ]
+
+
+async def set_recruitment_call_recipients(call_id: int, count: int) -> None:
+    async with connect_db() as db:
+        await db.execute(
+            "UPDATE recruitment_calls SET recipients = ? WHERE id = ?",
+            (count, call_id),
+        )
+        await db.commit()
+
+
+# ============================================================
+# 記録ログの集計API (v0.49 Phase1)
+#
+# game_vote_events / game_co_events / game_co_results は
+# record_*_event 導入後の試合にしか存在しない (過去分は空)。
+# 0件でも例外を出さず「対象0件」を返すのがここでの約束
+# (実装仕様6・テスト方針)。
+# ============================================================
+
+async def get_player_vote_stats(
+    player_id: int, guild_id: int, variant_id: str = DEFAULT_VARIANT_ID,
+) -> dict:
+    """投票参加率・処刑投票率・狼へ投票できた率・決選参加数を集計する。
+
+    投票は変更されうるため、同じ (game_id, day_number, vote_kind,
+    round_index) ごとに event_seq が最大の行だけを「その回の最終投票」
+    として数える。
+    """
+    room_filter, room_params = _stats_room_filter()
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "WITH latest AS ("
+            " SELECT ve.game_id, ve.day_number, ve.vote_kind, ve.round_index, "
+            " ve.target_id, "
+            " ROW_NUMBER() OVER ("
+            "  PARTITION BY ve.game_id, ve.day_number, ve.vote_kind, ve.round_index "
+            "  ORDER BY ve.event_seq DESC"
+            " ) AS rn "
+            " FROM game_vote_events ve JOIN games g ON g.game_id = ve.game_id "
+            " WHERE ve.voter_id = ? AND g.guild_id = ? AND g.variant_id = ? "
+            " AND ve.game_id IS NOT NULL" + room_filter
+            + ") SELECT game_id, day_number, vote_kind, round_index, target_id "
+            "FROM latest WHERE rn = 1",
+            (player_id, guild_id, variant_id, *room_params),
+        )
+        total = len(rows)
+        if total == 0:
+            return {
+                "total_opportunities": 0,
+                "participation_rate": None,
+                "execution_match_rate": None,
+                "wolf_target_rate": None,
+                "runoff_count": 0,
+            }
+        voted = [row for row in rows if row[4] is not None]
+        participated = len(voted)
+        runoff_count = sum(1 for row in voted if row[2] == "決選投票")
+
+        executed_map: dict[tuple[int, int], int] = {}
+        team_map: dict[int, dict[int, str]] = {}
+        game_ids = sorted({int(row[0]) for row in voted})
+        if game_ids:
+            placeholders = ",".join("?" * len(game_ids))
+            exec_rows = await db.execute_fetchall(
+                "SELECT game_id, died_on_day, player_id FROM game_players "
+                f"WHERE game_id IN ({placeholders}) "
+                "AND death_cause = '処刑' AND died_on_day IS NOT NULL",
+                game_ids,
+            )
+            for gid, day, pid in exec_rows:
+                executed_map[(int(gid), int(day))] = int(pid)
+            team_rows = await db.execute_fetchall(
+                "SELECT game_id, player_id, team FROM game_players "
+                f"WHERE game_id IN ({placeholders})",
+                game_ids,
+            )
+            for gid, pid, team in team_rows:
+                team_map.setdefault(int(gid), {})[int(pid)] = str(team)
+
+    honban_eligible = [
+        row for row in voted
+        if row[2] == "本投票" and (int(row[0]), int(row[1])) in executed_map
+    ]
+    exec_matches = sum(
+        1 for row in honban_eligible
+        if executed_map[(int(row[0]), int(row[1]))] == int(row[4])
+    )
+    wolf_matches = sum(
+        1 for row in voted
+        if team_map.get(int(row[0]), {}).get(int(row[4])) == Team.WOLF.value
+    )
+    return {
+        "total_opportunities": total,
+        "participation_rate": participated / total,
+        "execution_match_rate": (
+            exec_matches / len(honban_eligible) if honban_eligible else None
+        ),
+        "wolf_target_rate": wolf_matches / participated if participated else None,
+        "runoff_count": runoff_count,
+    }
+
+
+async def get_player_co_stats(
+    player_id: int, guild_id: int, variant_id: str = DEFAULT_VARIANT_ID,
+) -> dict:
+    """CO率・初日CO率・CO役職分布・真偽COの内訳を集計する。
+
+    「最終的なCO」は試合ごとに event_seq 順で event_type を
+    CO→撤回→CO...と辿った末尾の状態 (撤回で終われば「CO無し」扱い)。
+    """
+    room_filter, room_params = _stats_room_filter()
+    async with connect_db() as db:
+        game_rows = await db.execute_fetchall(
+            "SELECT gp.game_id, gp.role, gp.won FROM game_players gp "
+            "JOIN games g ON g.game_id = gp.game_id "
+            "WHERE gp.player_id = ? AND g.guild_id = ? AND g.variant_id = ?"
+            + room_filter,
+            (player_id, guild_id, variant_id, *room_params),
+        )
+        total_games = len(game_rows)
+        if total_games == 0:
+            return {
+                "total_games": 0,
+                "co_rate": None,
+                "day1_co_rate": None,
+                "role_distribution": {},
+                "true_seer_co_count": 0,
+                "fake_co_count": 0,
+                "fake_co_win_rate": None,
+                "result_claim_count": 0,
+            }
+        role_by_game = {int(row[0]): str(row[1]) for row in game_rows}
+        won_by_game = {int(row[0]): bool(row[2]) for row in game_rows}
+        game_ids = sorted(role_by_game.keys())
+        placeholders = ",".join("?" * len(game_ids))
+        co_rows = await db.execute_fetchall(
+            "SELECT game_id, day_number, event_type, claimed_role, event_seq "
+            f"FROM game_co_events WHERE actor_id = ? AND game_id IN ({placeholders}) "
+            "ORDER BY game_id, event_seq",
+            (player_id, *game_ids),
+        )
+        result_rows = await db.execute_fetchall(
+            "SELECT COUNT(*) FROM game_co_results "
+            f"WHERE actor_id = ? AND game_id IN ({placeholders})",
+            (player_id, *game_ids),
+        )
+    result_claim_count = int(result_rows[0][0]) if result_rows else 0
+
+    co_games: set[int] = set()
+    day1_co_games: set[int] = set()
+    final_role_by_game: dict[int, Optional[str]] = {}
+    for gid, day, event_type, claimed_role, _seq in co_rows:
+        gid = int(gid)
+        co_games.add(gid)
+        if event_type == "CO":
+            if int(day) == 1:
+                day1_co_games.add(gid)
+            final_role_by_game[gid] = str(claimed_role)
+        elif event_type == "撤回":
+            final_role_by_game[gid] = None
+
+    role_distribution: dict[str, int] = {}
+    true_seer_co = 0
+    fake_co_games: list[int] = []
+    for gid, claimed_role in final_role_by_game.items():
+        if claimed_role is None:
+            continue
+        role_distribution[claimed_role] = role_distribution.get(claimed_role, 0) + 1
+        actual_role = role_by_game.get(gid)
+        if claimed_role == Role.SEER.value and actual_role == Role.SEER.value:
+            true_seer_co += 1
+        if actual_role is not None and claimed_role != actual_role:
+            fake_co_games.append(gid)
+
+    fake_co_wins = sum(1 for gid in fake_co_games if won_by_game.get(gid))
+    return {
+        "total_games": total_games,
+        "co_rate": len(co_games) / total_games,
+        "day1_co_rate": len(day1_co_games) / total_games,
+        "role_distribution": role_distribution,
+        "true_seer_co_count": true_seer_co,
+        "fake_co_count": len(fake_co_games),
+        "fake_co_win_rate": (
+            fake_co_wins / len(fake_co_games) if fake_co_games else None
+        ),
+        "result_claim_count": result_claim_count,
+    }
+
+
+async def get_co_distribution_stats(
+    guild_id: int, variant_id: str = DEFAULT_VARIANT_ID,
+) -> dict:
+    """占いCO人数 (1/2/3/4+) ごとの村・狼陣営勝率と試合数を返す。"""
+    room_filter, room_params = _stats_room_filter()
+    async with connect_db() as db:
+        game_rows = await db.execute_fetchall(
+            "SELECT g.game_id, g.winner_team FROM games g "
+            "WHERE g.guild_id = ? AND g.variant_id = ?" + room_filter,
+            (guild_id, variant_id, *room_params),
+        )
+        if not game_rows:
+            return {"buckets": {}}
+        game_ids = sorted({int(row[0]) for row in game_rows})
+        winner_by_game = {int(row[0]): str(row[1]) for row in game_rows}
+        placeholders = ",".join("?" * len(game_ids))
+        co_rows = await db.execute_fetchall(
+            "SELECT game_id, actor_id, event_type, event_seq FROM game_co_events "
+            f"WHERE game_id IN ({placeholders}) AND claimed_role = ? "
+            "ORDER BY game_id, actor_id, event_seq",
+            (*game_ids, Role.SEER.value),
+        )
+
+    final_is_co: dict[tuple[int, int], bool] = {}
+    for gid, actor_id, event_type, _seq in co_rows:
+        final_is_co[(int(gid), int(actor_id))] = (event_type == "CO")
+    seer_co_counts: dict[int, int] = {}
+    for (gid, _actor_id), is_co in final_is_co.items():
+        if is_co:
+            seer_co_counts[gid] = seer_co_counts.get(gid, 0) + 1
+
+    buckets: dict[str, dict[str, int]] = {}
+    for gid in game_ids:
+        count = seer_co_counts.get(gid, 0)
+        if count <= 0:
+            continue
+        key = str(count) if count < 4 else "4+"
+        bucket = buckets.setdefault(key, {"games": 0, "village_wins": 0, "wolf_wins": 0})
+        bucket["games"] += 1
+        if winner_by_game[gid] == Team.VILLAGE.value:
+            bucket["village_wins"] += 1
+        elif winner_by_game[gid] == Team.WOLF.value:
+            bucket["wolf_wins"] += 1
+
+    result: dict[str, dict[str, object]] = {}
+    for key, bucket in buckets.items():
+        games = bucket["games"]
+        result[key] = {
+            "games": games,
+            "village_win_rate": bucket["village_wins"] / games,
+            "wolf_win_rate": bucket["wolf_wins"] / games,
+        }
+    return {"buckets": result}
+
+
+async def get_game_duration_stats(
+    guild_id: int, variant_id: str = DEFAULT_VARIANT_ID,
+) -> dict:
+    """平均試合時間・中央値・集計対象試合数を返す (started_at がNULLの試合は除外)。"""
+    room_filter, room_params = _stats_room_filter()
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT (julianday(g.played_at) - julianday(g.started_at)) * 86400.0 "
+            "FROM games g WHERE g.guild_id = ? AND g.variant_id = ? "
+            "AND g.started_at IS NOT NULL" + room_filter,
+            (guild_id, variant_id, *room_params),
+        )
+    durations = sorted(
+        float(row[0]) for row in rows if row[0] is not None and float(row[0]) >= 0
+    )
+    count = len(durations)
+    if count == 0:
+        return {"count": 0, "average_seconds": None, "median_seconds": None}
+    average = sum(durations) / count
+    mid = count // 2
+    if count % 2 == 1:
+        median = durations[mid]
+    else:
+        median = (durations[mid - 1] + durations[mid]) / 2
+    return {"count": count, "average_seconds": average, "median_seconds": median}
+
+
+async def get_player_interrupt_stats(
+    player_id: int, guild_id: int, variant_id: str = DEFAULT_VARIANT_ID,
+) -> dict:
+    """ターン制の割り込み回数・1試合あたり平均・割り込まれた回数を集計する。
+
+    game_turn_events は record_turn_event 導入後の試合にしか存在しない
+    (過去分は空)。表示先は今回作らない (本人がシーズン1前にレイアウトを
+    決めてから繋ぐ)。0件でも例外を出さず「対象0件」を返す。
+    """
+    room_filter, room_params = _stats_room_filter()
+    async with connect_db() as db:
+        game_rows = await db.execute_fetchall(
+            "SELECT gp.game_id FROM game_players gp "
+            "JOIN games g ON g.game_id = gp.game_id "
+            "WHERE gp.player_id = ? AND g.guild_id = ? AND g.variant_id = ?"
+            + room_filter,
+            (player_id, guild_id, variant_id, *room_params),
+        )
+        total_games = len(game_rows)
+        if total_games == 0:
+            return {
+                "total_games": 0,
+                "interrupt_count": 0,
+                "interrupts_per_game": None,
+                "interrupted_count": 0,
+            }
+        game_ids = sorted({int(row[0]) for row in game_rows})
+        placeholders = ",".join("?" * len(game_ids))
+        interrupt_rows = await db.execute_fetchall(
+            "SELECT COUNT(*) FROM game_turn_events "
+            f"WHERE actor_id = ? AND game_id IN ({placeholders}) AND event_type = ?",
+            (player_id, *game_ids, "割り込み"),
+        )
+        interrupted_rows = await db.execute_fetchall(
+            "SELECT COUNT(*) FROM game_turn_events "
+            f"WHERE speaker_id = ? AND game_id IN ({placeholders}) AND event_type = ?",
+            (player_id, *game_ids, "割り込み"),
+        )
+    interrupt_count = int(interrupt_rows[0][0]) if interrupt_rows else 0
+    interrupted_count = int(interrupted_rows[0][0]) if interrupted_rows else 0
+    return {
+        "total_games": total_games,
+        "interrupt_count": interrupt_count,
+        "interrupts_per_game": interrupt_count / total_games,
+        "interrupted_count": interrupted_count,
+    }
 
 
 # ============================================================
@@ -3491,6 +4607,8 @@ async def get_player_stats(
         guard_successes = 0
         first_night_kills = 0
         detailed_games = 0
+        survival_days_total = 0
+        survival_days_count = 0
         season_roles: dict[int, dict[str, dict[str, int]]] = {}
         reset_times = [str(row[0]) for row in reset_rows]
         for (
@@ -3520,6 +4638,13 @@ async def get_player_stats(
 
             if detail_days is not None:
                 detailed_games += 1
+                # 生存日数: 死亡していれば死亡日、最後まで生存していた
+                # (died_on_day が NULL) 場合はゲーム全体の日数 (gs.days) を
+                # 生存日数として扱う。gs.days が無いゲームは母数に含めない。
+                survival_days_total += (
+                    died_on_day if died_on_day is not None else detail_days
+                )
+                survival_days_count += 1
                 if role == Role.SEER.value:
                     seer_checks += int(checks)
                     seer_hits += int(hits)
@@ -3554,6 +4679,10 @@ async def get_player_stats(
             "first_night_kills": first_night_kills,
             "recommendations_received": int(recommendation_rows[0][0]) if recommendation_rows else 0,
             "detailed_games": detailed_games,
+            "average_survival_days": (
+                round(survival_days_total / survival_days_count, 1)
+                if survival_days_count else None
+            ),
         }
 
 
@@ -4373,3 +5502,827 @@ async def get_blocked_counts(guild_id: int) -> list[dict]:
             "GROUP BY blocked_id ORDER BY COUNT(*) DESC, blocked_id", (guild_id,)
         )
     return [{"blocked_id": int(r[0]), "count": int(r[1])} for r in rows]
+
+
+# ============================================================
+# v0.50: 記録の読み出し・レート推移・運営ダッシュボード・相性
+#
+# ここに足す集計はすべて「既存テーブルを読むだけ」で、新規テーブルも
+# 列追加も行わない (移行事故を増やさないため)。
+#
+# 練習卓 (UNRATED_ROOM_IDS) の扱いは用途で分ける:
+#   - 競技面 (レート推移・相性) は従来どおり _stats_room_filter() で除外
+#   - 運営面 (稼働・定着・離脱) は除外しない。除外すると「人が遊んでいるか」
+#     という実態からずれるため。
+# ============================================================
+
+_JST = timezone(timedelta(hours=9))
+
+
+def _parse_db_timestamp(value: object) -> Optional[datetime]:
+    """DBのTIMESTAMP文字列を aware datetime (UTC基準) へ直す。
+
+    SQLiteのCURRENT_TIMESTAMPはtz無しUTCなので、tzが無ければUTCとみなす。
+    パースできない値は None を返し、集計側で黙って捨てる (1行の欠損で
+    運営画面ごと落とさない)。
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _jst_date(value: object) -> Optional[date]:
+    parsed = _parse_db_timestamp(value)
+    return parsed.astimezone(_JST).date() if parsed is not None else None
+
+
+def _median(values: list[float]) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[mid])
+    return (float(ordered[mid - 1]) + float(ordered[mid])) / 2
+
+
+def _percentile(values: list[float], ratio: float) -> Optional[float]:
+    """線形補間なしの単純なパーセンタイル (件数が少ない運営指標向け)。"""
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, int(round(ratio * (len(ordered) - 1)))))
+    return float(ordered[index])
+
+
+# ------------------------------------------------------------
+# 夜行動ログの読み出し (占い/護衛/霊能の履歴ボタン用)
+# ------------------------------------------------------------
+
+async def record_night_action_once(
+    guild_id: int,
+    room_id: str,
+    game_run_id: str,
+    *,
+    event_seq: int,
+    night_number: int,
+    actor_id: int,
+    actor_number: int,
+    actor_role: str,
+    action: str,
+    target_id: Optional[int],
+    target_number: Optional[int],
+    result: Optional[str],
+) -> bool:
+    """同じ (run, actor, action, night) が無いときだけ1行追記する。
+
+    初日ランダム白のように「DM送信が失敗すると再試行され、成功するまで
+    何度も同じ経路を通る」記録のためのAPI。追記したら True。
+    """
+    async with connect_db() as db:
+        cursor = await db.execute(
+            "INSERT INTO game_night_actions "
+            "(guild_id, room_id, game_run_id, event_seq, night_number, actor_id, "
+            "actor_number, actor_role, action, target_id, target_number, result) "
+            "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? "
+            "WHERE NOT EXISTS ("
+            "  SELECT 1 FROM game_night_actions "
+            "  WHERE guild_id = ? AND game_run_id = ? AND actor_id = ? "
+            "    AND action = ? AND night_number = ?"
+            ")",
+            (
+                guild_id, room_id, game_run_id, event_seq, night_number, actor_id,
+                actor_number, actor_role, action, target_id, target_number, result,
+                guild_id, game_run_id, actor_id, action, night_number,
+            ),
+        )
+        await db.commit()
+    return cursor.rowcount == 1
+
+
+async def list_night_actions_for_run(
+    guild_id: int,
+    room_id: str,
+    game_run_id: str,
+    *,
+    actor_id: Optional[int] = None,
+    actions: Optional[Collection[str]] = None,
+) -> list[dict]:
+    """1試合ぶんの夜行動ログを event_seq 順に返す。
+
+    占い師・狩人が「初日から今まで」を見返すボタンの供給元。actor_id を
+    渡すと本人の行を、actions を渡すとその種別だけを返す。
+    """
+    where = "guild_id = ? AND room_id = ? AND game_run_id = ?"
+    params: list[object] = [guild_id, room_id, game_run_id]
+    if actor_id is not None:
+        where += " AND actor_id = ?"
+        params.append(actor_id)
+    action_list = sorted(set(actions)) if actions else []
+    if action_list:
+        where += f" AND action IN ({','.join('?' * len(action_list))})"
+        params.extend(action_list)
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT event_seq, night_number, actor_id, actor_number, actor_role, "
+            "action, target_id, target_number, result, created_at "
+            f"FROM game_night_actions WHERE {where} ORDER BY event_seq",
+            tuple(params),
+        )
+    return [
+        {
+            "event_seq": row[0], "night_number": row[1], "actor_id": row[2],
+            "actor_number": row[3], "actor_role": row[4], "action": row[5],
+            "target_id": row[6], "target_number": row[7], "result": row[8],
+            "created_at": row[9],
+        }
+        for row in rows
+    ]
+
+
+# ------------------------------------------------------------
+# レート推移 (グラフ用)
+# ------------------------------------------------------------
+
+async def get_rating_series(
+    player_id: int,
+    guild_id: int,
+    *,
+    variant_id: str = DEFAULT_VARIANT_ID,
+    limit: int = 300,
+) -> dict:
+    """レート推移グラフ1枚ぶんのデータを返す。
+
+    rating_history はシーズンリセットでも消さない (season_half_reset は
+    player_ratings を書き換えるだけ) ので、全期間の折れ線が引ける。
+    リセット地点は縦線を引けるよう season_resets から併せて返す。
+    """
+    ladder_id = rating_lib.ladder_id_for_variant(variant_id)
+    room_filter, room_params = _stats_room_filter()
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT rh.id, rh.game_id, g.played_at, rh.rating_before, rh.rating_after, "
+            "rh.elo_delta, rh.bonus, rh.play_bonus, rh.recommendation_bonus, gp.won "
+            "FROM rating_history rh "
+            "JOIN games g ON g.game_id = rh.game_id "
+            "LEFT JOIN game_players gp "
+            "  ON gp.game_id = rh.game_id AND gp.player_id = rh.player_id "
+            "WHERE rh.player_id = ? AND rh.guild_id = ? AND rh.ladder_id = ?"
+            + room_filter
+            + " ORDER BY g.played_at DESC, rh.id DESC LIMIT ?",
+            (player_id, guild_id, ladder_id, *room_params, limit),
+        )
+        rating_row = await db.execute_fetchall(
+            "SELECT rating, peak_rating, games, wins FROM player_ratings "
+            "WHERE player_id = ? AND guild_id = ? AND ladder_id = ?",
+            (player_id, guild_id, ladder_id),
+        )
+        resets = await db.execute_fetchall(
+            "SELECT reset_at FROM season_resets WHERE guild_id = ? ORDER BY reset_at",
+            (guild_id,),
+        )
+
+    points = [
+        {
+            "game_id": int(row[1]),
+            "played_at": row[2],
+            "rating_before": int(row[3]),
+            "rating_after": int(row[4]),
+            "elo_delta": int(row[5]),
+            "bonus": int(row[6] or 0) + int(row[7] or 0) + int(row[8] or 0),
+            "won": None if row[9] is None else bool(row[9]),
+        }
+        for row in reversed(rows)
+    ]
+    current = int(rating_row[0][0]) if rating_row else None
+    peak = int(rating_row[0][1]) if rating_row else None
+    return {
+        "variant_id": variant_id,
+        "ladder_id": ladder_id,
+        "points": points,
+        "current_rating": current if current is not None else (
+            points[-1]["rating_after"] if points else None
+        ),
+        "peak_rating": peak,
+        "games": int(rating_row[0][2]) if rating_row else len(points),
+        "wins": int(rating_row[0][3]) if rating_row else 0,
+        "season_resets": [row[0] for row in resets],
+        "truncated": len(points) >= limit,
+    }
+
+
+# ------------------------------------------------------------
+# 相性 (同陣営 / 敵対)
+# ------------------------------------------------------------
+
+async def get_player_compatibility(
+    player_id: int,
+    guild_id: int,
+    *,
+    variant_id: str = DEFAULT_VARIANT_ID,
+    min_games: int = 10,
+) -> dict:
+    """同陣営／敵対それぞれの「勝ちやすさ」を、期待値との差で返す。
+
+    素の勝率をそのまま並べると、13人卓では同陣営の共戦数が伸びないうえ、
+    「村を多く引いた相手」が全員相性◎に見えてしまう。そこで自分の
+    陣営別勝率 (村のときの勝率／狼のときの勝率) から、その相手との
+    共戦の陣営構成で期待される勝率を出し、実測との差 (diff) を返す。
+    表示する/しないの足切りは呼び出し側が min_games で行う。
+    """
+    rating_lib.ladder_id_for_variant(variant_id)
+    room_filter, room_params = _stats_room_filter()
+    base_params = (player_id, guild_id, variant_id, *room_params)
+    async with connect_db() as db:
+        team_rows = await db.execute_fetchall(
+            "SELECT me.team, COUNT(*), SUM(me.won) "
+            "FROM game_players me JOIN games g ON g.game_id = me.game_id "
+            "WHERE me.player_id = ? AND g.guild_id = ? AND g.variant_id = ?"
+            + room_filter
+            + " GROUP BY me.team",
+            base_params,
+        )
+        pair_rows = await db.execute_fetchall(
+            "SELECT o.player_id, "
+            "  CASE WHEN o.team = me.team THEN 1 ELSE 0 END AS same_team, "
+            "  me.team, COUNT(*), SUM(me.won) "
+            "FROM game_players me "
+            "JOIN games g ON g.game_id = me.game_id "
+            "JOIN game_players o "
+            "  ON o.game_id = me.game_id AND o.player_id <> me.player_id "
+            "WHERE me.player_id = ? AND g.guild_id = ? AND g.variant_id = ?"
+            + room_filter
+            + " GROUP BY o.player_id, same_team, me.team",
+            base_params,
+        )
+
+    baseline: dict[str, float] = {}
+    total_games = 0
+    total_wins = 0
+    for team, count, wins in team_rows:
+        count = int(count or 0)
+        wins = int(wins or 0)
+        total_games += count
+        total_wins += wins
+        if count:
+            baseline[str(team)] = wins / count
+    if total_games == 0:
+        return {
+            "variant_id": variant_id, "min_games": min_games,
+            "games": 0, "win_rate": None,
+            "partners": 0, "same": [], "opposite": [],
+        }
+    overall_rate = total_wins / total_games
+
+    buckets: dict[tuple[int, int], dict] = {}
+    for opponent_id, same_team, my_team, count, wins in pair_rows:
+        key = (int(opponent_id), int(same_team))
+        entry = buckets.setdefault(
+            key, {"player_id": int(opponent_id), "games": 0, "wins": 0, "expected_wins": 0.0}
+        )
+        count = int(count or 0)
+        entry["games"] += count
+        entry["wins"] += int(wins or 0)
+        entry["expected_wins"] += count * baseline.get(str(my_team), overall_rate)
+
+    same: list[dict] = []
+    opposite: list[dict] = []
+    for (opponent_id, same_team), entry in buckets.items():
+        games = entry["games"]
+        if games <= 0:
+            continue
+        rate = entry["wins"] / games
+        expected = entry["expected_wins"] / games
+        row = {
+            "player_id": opponent_id,
+            "games": games,
+            "wins": entry["wins"],
+            "rate": rate,
+            "expected": expected,
+            "diff": rate - expected,
+        }
+        (same if same_team else opposite).append(row)
+
+    for rows in (same, opposite):
+        rows.sort(key=lambda item: (-item["diff"], -item["games"], item["player_id"]))
+    return {
+        "variant_id": variant_id,
+        "min_games": min_games,
+        "games": total_games,
+        "win_rate": overall_rate,
+        "team_win_rates": baseline,
+        "partners": len({opponent_id for opponent_id, _ in buckets}),
+        "same": same,
+        "opposite": opposite,
+    }
+
+
+# ------------------------------------------------------------
+# 運営ダッシュボード
+# ------------------------------------------------------------
+
+def _daily_series(
+    day_players: dict[date, set[int]],
+    day_games: dict[date, int],
+    new_by_day: dict[date, int],
+    *,
+    today: date,
+    days: int,
+) -> list[dict]:
+    series = []
+    for offset in range(days - 1, -1, -1):
+        target = today - timedelta(days=offset)
+        series.append({
+            "date": target.isoformat(),
+            "games": day_games.get(target, 0),
+            "players": len(day_players.get(target, ())),
+            "new_players": new_by_day.get(target, 0),
+        })
+    return series
+
+
+def _longest_streak(days: list[date]) -> int:
+    """連続してプレイした日数の最大値。"""
+    if not days:
+        return 0
+    ordered = sorted(set(days))
+    best = current = 1
+    for previous, following in zip(ordered, ordered[1:]):
+        if (following - previous).days == 1:
+            current += 1
+            best = max(best, current)
+        else:
+            current = 1
+    return best
+
+
+async def get_ops_activity_stats(
+    guild_id: int,
+    *,
+    window_days: int = 90,
+    recent_days: int = 14,
+    now: Optional[datetime] = None,
+) -> dict:
+    """稼働・定着・離脱をまとめて返す (運営専用)。
+
+    練習卓も含めた「実際に遊ばれた回数」で数える。日付はすべてJST基準。
+    重い集計に見えるが、投げるSQLは4本 (プレイヤー要約・期間内の参加行・
+    期間内の試合・期間前の最終プレイ) だけで、残りはPython側で組み立てる。
+    日別・コホート・連続日数のような形の違う指標をSQLで個別に書くより、
+    一度読んだ行を使い回す方が本数も総処理時間も小さい。
+    """
+    now = now or datetime.now(timezone.utc)
+    today = now.astimezone(_JST).date()
+    window_start = now - timedelta(days=window_days)
+    recent_boundary = now - timedelta(days=7)
+
+    async with connect_db() as db:
+        summary_rows = await db.execute_fetchall(
+            "SELECT gp.player_id, MIN(g.played_at), MAX(g.played_at), COUNT(*) "
+            "FROM game_players gp JOIN games g ON g.game_id = gp.game_id "
+            "WHERE g.guild_id = ? GROUP BY gp.player_id",
+            (guild_id,),
+        )
+        window_rows = await db.execute_fetchall(
+            "SELECT gp.player_id, g.played_at "
+            "FROM game_players gp JOIN games g ON g.game_id = gp.game_id "
+            "WHERE g.guild_id = ? AND g.played_at >= ?",
+            (guild_id, window_start.strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        game_rows = await db.execute_fetchall(
+            "SELECT played_at FROM games WHERE guild_id = ? AND played_at >= ?",
+            (guild_id, window_start.strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        prior_rows = await db.execute_fetchall(
+            "SELECT gp.player_id, MAX(g.played_at) "
+            "FROM game_players gp JOIN games g ON g.game_id = gp.game_id "
+            "WHERE g.guild_id = ? AND g.played_at < ? GROUP BY gp.player_id",
+            (guild_id, recent_boundary.strftime("%Y-%m-%d %H:%M:%S")),
+        )
+
+    first_date: dict[int, date] = {}
+    last_date: dict[int, date] = {}
+    total_games: dict[int, int] = {}
+    for player_id, first_at, last_at, games in summary_rows:
+        first_day = _jst_date(first_at)
+        last_day = _jst_date(last_at)
+        if first_day is None or last_day is None:
+            continue
+        player_id = int(player_id)
+        first_date[player_id] = first_day
+        last_date[player_id] = last_day
+        total_games[player_id] = int(games or 0)
+
+    play_days: dict[int, set[date]] = {}
+    day_players: dict[date, set[int]] = {}
+    for player_id, played_at in window_rows:
+        played_day = _jst_date(played_at)
+        if played_day is None:
+            continue
+        player_id = int(player_id)
+        play_days.setdefault(player_id, set()).add(played_day)
+        day_players.setdefault(played_day, set()).add(player_id)
+
+    day_games: dict[date, int] = {}
+    for (played_at,) in game_rows:
+        played_day = _jst_date(played_at)
+        if played_day is not None:
+            day_games[played_day] = day_games.get(played_day, 0) + 1
+
+    prior_date: dict[int, date] = {}
+    for player_id, prior_at in prior_rows:
+        prior_day = _jst_date(prior_at)
+        if prior_day is not None:
+            prior_date[int(player_id)] = prior_day
+
+    def active_within(days: int) -> set[int]:
+        boundary = today - timedelta(days=days - 1)
+        return {
+            player_id for player_id, days_set in play_days.items()
+            if any(day >= boundary for day in days_set)
+        }
+
+    dau = len(day_players.get(today, ()))
+    weekly = active_within(7)
+    monthly = active_within(30)
+
+    new_by_day: dict[date, int] = {}
+    for first_day in first_date.values():
+        new_by_day[first_day] = new_by_day.get(first_day, 0) + 1
+    new_counts = {
+        span: sum(
+            count for day, count in new_by_day.items()
+            if day >= today - timedelta(days=span - 1)
+        )
+        for span in (1, 7, 30)
+    }
+
+    # 2戦目到達率: 初参加から30日以上経った人だけで測る (直近の新規を
+    # 「定着しなかった人」として数えないため)。
+    matured = [
+        player_id for player_id, first_day in first_date.items()
+        if first_day <= today - timedelta(days=30)
+    ]
+    repeated = [pid for pid in matured if total_games.get(pid, 0) >= 2]
+    second_game_rate = (len(repeated) / len(matured)) if matured else None
+
+    # 週次コホートのW1/W4継続率。window内に初参加し、かつ観測期間が
+    # 足りている (28日経過) コホートだけを返す。
+    cohorts: dict[date, dict] = {}
+    window_first_day = (now - timedelta(days=window_days)).astimezone(_JST).date()
+    for player_id, first_day in first_date.items():
+        if first_day < window_first_day or first_day > today - timedelta(days=28):
+            continue
+        cohort_key = first_day - timedelta(days=first_day.weekday())
+        bucket = cohorts.setdefault(cohort_key, {"size": 0, "w1": 0, "w4": 0})
+        bucket["size"] += 1
+        days_set = play_days.get(player_id, set())
+        if any(1 <= (day - first_day).days <= 7 for day in days_set):
+            bucket["w1"] += 1
+        if any(22 <= (day - first_day).days <= 28 for day in days_set):
+            bucket["w4"] += 1
+    cohort_rows = [
+        {
+            "week": key.isoformat(), "size": value["size"],
+            "w1": value["w1"], "w4": value["w4"],
+            "w1_rate": value["w1"] / value["size"] if value["size"] else None,
+            "w4_rate": value["w4"] / value["size"] if value["size"] else None,
+        }
+        for key, value in sorted(cohorts.items())
+    ]
+
+    # 休眠・復帰
+    dormant = {14: 0, 30: 0, 60: 0}
+    last_play_buckets = {
+        "0-1日": 0, "2-7日": 0, "8-14日": 0,
+        "15-30日": 0, "31-60日": 0, "61日以上": 0,
+    }
+    for player_id, last_day in last_date.items():
+        elapsed = (today - last_day).days
+        for threshold in dormant:
+            if elapsed >= threshold:
+                dormant[threshold] += 1
+        if elapsed <= 1:
+            last_play_buckets["0-1日"] += 1
+        elif elapsed <= 7:
+            last_play_buckets["2-7日"] += 1
+        elif elapsed <= 14:
+            last_play_buckets["8-14日"] += 1
+        elif elapsed <= 30:
+            last_play_buckets["15-30日"] += 1
+        elif elapsed <= 60:
+            last_play_buckets["31-60日"] += 1
+        else:
+            last_play_buckets["61日以上"] += 1
+
+    recent_boundary_day = recent_boundary.astimezone(_JST).date()
+    returning = 0
+    for player_id in weekly:
+        prior_day = prior_date.get(player_id)
+        if prior_day is None:
+            continue  # 直近7日が初参加 = 新規であって復帰ではない
+        recent_days_set = [
+            day for day in play_days.get(player_id, set()) if day > recent_boundary_day
+        ]
+        if recent_days_set and (min(recent_days_set) - prior_day).days >= 14:
+            returning += 1
+
+    # プレイ間隔と連続プレイ日数
+    gaps: list[float] = []
+    streaks: list[tuple[int, int]] = []
+    for player_id, days_set in play_days.items():
+        ordered = sorted(days_set)
+        gaps.extend(
+            float((following - previous).days)
+            for previous, following in zip(ordered, ordered[1:])
+        )
+        streaks.append((player_id, _longest_streak(ordered)))
+    streaks.sort(key=lambda item: (-item[1], item[0]))
+
+    return {
+        "generated_at": now.isoformat(),
+        "today": today.isoformat(),
+        "window_days": window_days,
+        "dau": dau,
+        "wau": len(weekly),
+        "mau": len(monthly),
+        "stickiness": (dau / len(monthly)) if monthly else None,
+        "wau_mau": (len(weekly) / len(monthly)) if monthly else None,
+        "games_today": day_games.get(today, 0),
+        "games_7d": sum(
+            count for day, count in day_games.items()
+            if day >= today - timedelta(days=6)
+        ),
+        "games_30d": sum(
+            count for day, count in day_games.items()
+            if day >= today - timedelta(days=29)
+        ),
+        "total_players": len(first_date),
+        "new_today": new_counts[1],
+        "new_7d": new_counts[7],
+        "new_30d": new_counts[30],
+        "second_game_rate": second_game_rate,
+        "second_game_sample": len(matured),
+        "cohorts": cohort_rows,
+        "dormant_14": dormant[14],
+        "dormant_30": dormant[30],
+        "dormant_60": dormant[60],
+        "returning_7d": returning,
+        "last_play_buckets": last_play_buckets,
+        "gap_median": _median(gaps),
+        "gap_p90": _percentile(gaps, 0.9),
+        "longest_streaks": [
+            {"player_id": player_id, "days": days}
+            for player_id, days in streaks[:5] if days > 1
+        ],
+        "daily": _daily_series(
+            day_players, day_games, new_by_day, today=today, days=recent_days,
+        ),
+    }
+
+
+async def get_ops_throughput_stats(
+    guild_id: int,
+    *,
+    days: int = 30,
+    now: Optional[datetime] = None,
+) -> dict:
+    """募集の成立と試合の回転を返す (運営専用)。"""
+    now = now or datetime.now(timezone.utc)
+    boundary = (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    async with connect_db() as db:
+        recruitment_rows = await db.execute_fetchall(
+            "SELECT r.id, r.status, r.capacity, r.created_at, r.ready_notified_at, "
+            "  (SELECT COUNT(*) FROM recruitment_entries e "
+            "   WHERE e.recruitment_id = r.id AND e.kind = '参加') "
+            "FROM recruitments r WHERE r.guild_id = ? AND r.created_at >= ?",
+            (guild_id, boundary),
+        )
+        game_rows = await db.execute_fetchall(
+            "SELECT g.game_id, g.played_at, g.started_at, g.gm_id, gs.days "
+            "FROM games g LEFT JOIN game_stats gs ON gs.game_id = g.game_id "
+            "WHERE g.guild_id = ? AND g.played_at >= ?",
+            (guild_id, boundary),
+        )
+        dropout_rows = await db.execute_fetchall(
+            "SELECT COUNT(*), SUM(CASE WHEN gp.death_cause = '除外' THEN 1 ELSE 0 END) "
+            "FROM game_players gp JOIN games g ON g.game_id = gp.game_id "
+            "WHERE g.guild_id = ? AND g.played_at >= ?",
+            (guild_id, boundary),
+        )
+
+    status_counts: dict[str, int] = {}
+    fill_rates: list[float] = []
+    ready_waits: list[float] = []
+    for _rid, status, capacity, created_at, ready_at, entries in recruitment_rows:
+        status = str(status)
+        status_counts[status] = status_counts.get(status, 0) + 1
+        capacity = int(capacity or 0)
+        if capacity > 0:
+            fill_rates.append(min(1.0, int(entries or 0) / capacity))
+        created = _parse_db_timestamp(created_at)
+        ready = _parse_db_timestamp(ready_at)
+        if created is not None and ready is not None and ready >= created:
+            ready_waits.append((ready - created).total_seconds() / 60)
+
+    durations: list[float] = []
+    day_counts: list[int] = []
+    hour_buckets = {"深夜 0–5時": 0, "朝 6–11時": 0, "昼 12–17時": 0, "夜 18–23時": 0}
+    gm_counts: dict[int, int] = {}
+    played_days: set[date] = set()
+    for _game_id, played_at, started_at, gm_id, game_days in game_rows:
+        played = _parse_db_timestamp(played_at)
+        started = _parse_db_timestamp(started_at)
+        if played is not None and started is not None and played >= started:
+            durations.append((played - started).total_seconds() / 60)
+        if game_days is not None:
+            day_counts.append(int(game_days))
+        hour = _played_at_jst_hour(played_at)
+        if hour is not None:
+            if hour < 6:
+                hour_buckets["深夜 0–5時"] += 1
+            elif hour < 12:
+                hour_buckets["朝 6–11時"] += 1
+            elif hour < 18:
+                hour_buckets["昼 12–17時"] += 1
+            else:
+                hour_buckets["夜 18–23時"] += 1
+        if gm_id is not None:
+            gm_counts[int(gm_id)] = gm_counts.get(int(gm_id), 0) + 1
+        played_day = _jst_date(played_at)
+        if played_day is not None:
+            played_days.add(played_day)
+
+    total_recruitments = len(recruitment_rows)
+    held = status_counts.get(RECRUITMENT_HELD, 0)
+    seats, dropouts = (dropout_rows[0] if dropout_rows else (0, 0))
+    seats = int(seats or 0)
+    dropouts = int(dropouts or 0)
+    return {
+        "days": days,
+        "recruitments": total_recruitments,
+        "recruitment_status": status_counts,
+        "held_rate": (held / total_recruitments) if total_recruitments else None,
+        "fill_rate_median": _median(fill_rates),
+        "ready_wait_median_min": _median(ready_waits),
+        "ready_wait_p90_min": _percentile(ready_waits, 0.9),
+        "games": len(game_rows),
+        "games_per_active_day": (
+            len(game_rows) / len(played_days) if played_days else None
+        ),
+        "duration_median_min": _median(durations),
+        "duration_p90_min": _percentile(durations, 0.9),
+        "duration_sample": len(durations),
+        "game_days_median": _median([float(value) for value in day_counts]),
+        "hour_buckets": hour_buckets,
+        "gm_top": [
+            {"player_id": player_id, "games": count}
+            for player_id, count in sorted(
+                gm_counts.items(), key=lambda item: (-item[1], item[0])
+            )[:5]
+        ],
+        "seats": seats,
+        "dropouts": dropouts,
+        "dropout_rate": (dropouts / seats) if seats else None,
+    }
+
+
+async def get_ops_delivery_stats(
+    guild_id: int,
+    *,
+    days: int = 30,
+    now: Optional[datetime] = None,
+) -> dict:
+    """通知の送達失敗率とオプトアウト率を返す (運営専用)。
+
+    DMが黙って落ちているかどうかは、放置すると誰も気づかないまま
+    「募集が回らない」だけが観測される。ここで率として見えるようにする。
+    """
+    now = now or datetime.now(timezone.utc)
+    boundary = (now - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    async with connect_db() as db:
+        call_rows = await db.execute_fetchall(
+            "SELECT d.delivery_status, COUNT(*) "
+            "FROM recruitment_call_deliveries d "
+            "JOIN recruitment_calls c ON c.id = d.call_id "
+            "WHERE c.guild_id = ? AND d.notified_at >= ? "
+            "GROUP BY d.delivery_status",
+            (guild_id, boundary),
+        )
+        notify_rows = await db.execute_fetchall(
+            "SELECT d.delivery_status, COUNT(*) "
+            "FROM recruitment_notification_deliveries d "
+            "JOIN recruitments r ON r.id = d.recruitment_id "
+            "WHERE r.guild_id = ? AND d.notified_at >= ? "
+            "GROUP BY d.delivery_status",
+            (guild_id, boundary),
+        )
+        pref_rows = await db.execute_fetchall(
+            "SELECT COUNT(*), "
+            "  SUM(CASE WHEN allow_notifications = 0 THEN 1 ELSE 0 END), "
+            "  SUM(CASE WHEN notify_on_create = 1 THEN 1 ELSE 0 END), "
+            "  SUM(CASE WHEN notify_on_call = 1 THEN 1 ELSE 0 END) "
+            "FROM user_notification_prefs WHERE guild_id = ?",
+            (guild_id,),
+        )
+
+    def _summarize(rows) -> dict:
+        counts = {str(status): int(count or 0) for status, count in rows}
+        total = sum(counts.values())
+        failed = total - counts.get("sent", 0)
+        return {
+            "total": total,
+            "by_status": counts,
+            "failure_rate": (failed / total) if total else None,
+        }
+
+    configured, opted_out, on_create, on_call = (
+        pref_rows[0] if pref_rows else (0, 0, 0, 0)
+    )
+    return {
+        "days": days,
+        "call_dm": _summarize(call_rows),
+        "recruitment_dm": _summarize(notify_rows),
+        "prefs_configured": int(configured or 0),
+        "prefs_opted_out": int(opted_out or 0),
+        "prefs_notify_on_create": int(on_create or 0),
+        "prefs_notify_on_call": int(on_call or 0),
+        "opt_out_rate": (
+            int(opted_out or 0) / int(configured) if configured else None
+        ),
+    }
+
+
+async def get_ops_rating_health(
+    guild_id: int,
+    *,
+    variant_id: str = DEFAULT_VARIANT_ID,
+    months: int = 6,
+    bucket_size: int = 100,
+) -> dict:
+    """レート分布とインフレ/デフレの傾向を返す (運営専用)。
+
+    月別平均は「その月に精算された rating_after の平均」であり、全在籍者の
+    平均ではない。よく遊んだ人ほど重く出る近似だが、上振れ/下振れが続いて
+    いるかを見るには十分で、全プレイヤーぶんを月ごとに再構成するより安い。
+    """
+    ladder_id = rating_lib.ladder_id_for_variant(variant_id)
+    room_filter, room_params = _stats_room_filter()
+    async with connect_db() as db:
+        rating_rows = await db.execute_fetchall(
+            "SELECT rating, peak_rating, games, season_games FROM player_ratings "
+            "WHERE guild_id = ? AND ladder_id = ?",
+            (guild_id, ladder_id),
+        )
+        monthly_rows = await db.execute_fetchall(
+            "SELECT strftime('%Y-%m', g.played_at) AS month, "
+            "  COUNT(*), AVG(rh.rating_after), AVG(rh.elo_delta + rh.bonus "
+            "  + rh.play_bonus + rh.recommendation_bonus) "
+            "FROM rating_history rh JOIN games g ON g.game_id = rh.game_id "
+            "WHERE rh.guild_id = ? AND rh.ladder_id = ?"
+            + room_filter
+            + " GROUP BY month ORDER BY month DESC LIMIT ?",
+            (guild_id, ladder_id, *room_params, months),
+        )
+
+    ratings = [int(row[0]) for row in rating_rows]
+    histogram: dict[int, int] = {}
+    for rating in ratings:
+        bucket = (rating // bucket_size) * bucket_size
+        histogram[bucket] = histogram.get(bucket, 0) + 1
+    provisional = sum(
+        1 for row in rating_rows
+        if int(row[3] or 0) < LEADERBOARD_MIN_SAMPLES
+    )
+    return {
+        "variant_id": variant_id,
+        "ladder_id": ladder_id,
+        "players": len(ratings),
+        "mean": (sum(ratings) / len(ratings)) if ratings else None,
+        "median": _median([float(value) for value in ratings]),
+        "min": min(ratings) if ratings else None,
+        "max": max(ratings) if ratings else None,
+        "provisional": provisional,
+        "histogram": [
+            {"floor": bucket, "count": count}
+            for bucket, count in sorted(histogram.items())
+        ],
+        "monthly": [
+            {
+                "month": row[0],
+                "settlements": int(row[1] or 0),
+                "avg_rating_after": float(row[2]) if row[2] is not None else None,
+                "avg_total_delta": float(row[3]) if row[3] is not None else None,
+            }
+            for row in reversed(monthly_rows)
+        ],
+    }
