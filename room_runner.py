@@ -378,6 +378,12 @@ class RoomRunner:
         # CO等の連続押下でedit APIを連打しないための最新1件デバウンス。
         self._village_panel_refresh_task: Optional[asyncio.Task] = None
         self._village_panel_refresh_pending = False
+        # 終了直後のDiscord一時障害で参加受付パネルを失わないための
+        # バックグラウンド再掲。stateが次へ変われば自動終了する。
+        self._lobby_panel_recovery_task: Optional[asyncio.Task] = None
+        # 名前村の強制終了後に、前回設定の0人募集カードを再公開する。
+        # DB上の待機フラグを正本にし、再起動後も同じ処理を再開する。
+        self._recruitment_recovery_task: Optional[asyncio.Task] = None
 
     def is_private_room(self) -> bool:
         """GMが作成した名前村か。保存済みの村主IDで判定する。"""
@@ -582,8 +588,12 @@ class RoomRunner:
         *,
         nickname_failures: Optional[dict[int, Optional[str]]] = None,
         cleanup_channel_id: Optional[int] = None,
+        preserve_players: bool = False,
+        preserve_gm: bool = False,
     ) -> GameState:
-        """終了済みstateから、外部復元待ちだけを持つ空LOBBYを作る。"""
+        """終了済みstateから、指定した受付登録だけを持つLOBBYを作る。"""
+        if preserve_players and not preserve_gm:
+            raise ValueError("参加者を残す場合はGMも残す必要があります")
         target = GameState()
         target.room_id = source.room_id
         target.room_name = source.room_name
@@ -595,6 +605,30 @@ class RoomRunner:
         # 新しいパネルをsend-firstで確保できるまでは、従来の参照を残す。
         target.lobby_message = source.lobby_message
         target.original_nicknames = dict(nickname_failures or {})
+        if preserve_gm:
+            target.gm_id = source.gm_id
+        if preserve_players:
+            # 役職・生死・番号など前ゲームの情報は一切持ち越さず、
+            # 参加順とDiscordメンバーだけを新しい受付へ戻す。
+            for player in source.players.values():
+                member = (
+                    source.guild.get_member(player.user_id)
+                    if source.guild is not None
+                    else None
+                ) or player.member
+                target.players[player.user_id] = Player(
+                    user_id=player.user_id,
+                    member=member,
+                    original_nickname=player.original_nickname,
+                )
+        target.pending_recruitment_reopen = bool(
+            source.pending_recruitment_reopen
+            and preserve_gm
+            and not preserve_players
+            and self.is_private_room()
+        )
+        if target.pending_recruitment_reopen:
+            target.lobby_return_mode = "gm"
         self._carry_pending_vc_restore(source, target)
         self._carry_pending_ui_cleanup(
             source,
@@ -620,8 +654,10 @@ class RoomRunner:
         nickname_failures: Optional[dict[int, Optional[str]]] = None,
         cleanup_channel_id: Optional[int] = None,
         log_label: str,
+        preserve_players: bool = False,
+        preserve_gm: bool = False,
     ) -> bool:
-        """募集終了と空LOBBY保存を原子的に確定してからstateを差し替える。"""
+        """募集終了とLOBBY保存を原子的に確定してからstateを差し替える。"""
         if source.guild is None:
             log.error("%s: guildが無いためLOBBYへ移行できません", log_label)
             return False
@@ -629,6 +665,8 @@ class RoomRunner:
             source,
             nickname_failures=nickname_failures,
             cleanup_channel_id=cleanup_channel_id,
+            preserve_players=preserve_players,
+            preserve_gm=preserve_gm,
         )
         payload = self._build_snapshot_for_state(target)
         recruitment_id = source.recruitment_id
@@ -646,6 +684,8 @@ class RoomRunner:
                         source.room_id,
                         recruitment_id,
                         payload,
+                        preserve_players=preserve_players,
+                        preserve_gm=preserve_gm,
                     )
                     # DBが確定する前にメモリだけ空LOBBYへ進めない。
                     self.state = target
@@ -691,7 +731,128 @@ class RoomRunner:
                     recruitment_id,
                     error,
                 )
+        elif not panel_ready:
+            self._schedule_lobby_panel_recovery(
+                target,
+                recruitment_id=recruitment_id,
+                log_label=log_label,
+            )
+        if target.pending_recruitment_reopen:
+            self._schedule_recruitment_recovery(target)
         return True
+
+    def _schedule_lobby_panel_recovery(
+        self,
+        expected_state: GameState,
+        *,
+        recruitment_id: Optional[int],
+        log_label: str,
+    ) -> None:
+        """参加受付パネルをDiscord復旧まで再掲し続ける。"""
+        current = self._lobby_panel_recovery_task
+        if current is not None and not current.done():
+            current.cancel()
+        task = self.manager.spawn_bg_task(
+            self._recover_lobby_panel(
+                expected_state,
+                recruitment_id=recruitment_id,
+                log_label=log_label,
+            )
+        )
+        self._lobby_panel_recovery_task = (
+            task if isinstance(task, asyncio.Task) else None
+        )
+
+    async def _recover_lobby_panel(
+        self,
+        expected_state: GameState,
+        *,
+        recruitment_id: Optional[int],
+        log_label: str,
+    ) -> None:
+        """終了直後の一時障害から参加・取消ボタンを自動回復する。"""
+        delay = 5
+        try:
+            while self.state is expected_state and expected_state.phase == Phase.LOBBY:
+                await asyncio.sleep(delay)
+                try:
+                    await self._post_lobby_ui()
+                except Exception as error:
+                    log.exception(
+                        "%s後の参加受付パネルを再試行できませんでした: %s",
+                        log_label,
+                        error,
+                    )
+                    delay = min(delay * 2, 60)
+                    continue
+                if recruitment_id is not None:
+                    try:
+                        await database.clear_recruitment_message_id(recruitment_id)
+                    except Exception as error:
+                        log.warning(
+                            "%s後の旧募集カードID解除失敗 (%s): %s",
+                            log_label,
+                            recruitment_id,
+                            error,
+                        )
+                return
+        finally:
+            if self._lobby_panel_recovery_task is asyncio.current_task():
+                self._lobby_panel_recovery_task = None
+
+    def _schedule_recruitment_recovery(self, expected_state: GameState) -> None:
+        """名前村の強制終了後募集を、成功するまでバックグラウンド回収する。"""
+        manager = getattr(self.manager, "recruitment_manager", None)
+        recover = getattr(manager, "recover_pending_recruitment", None)
+        if not callable(recover):
+            log.error(
+                "参加受付の自動再開機能を利用できません (%s)",
+                expected_state.room_name,
+            )
+            return
+        current = self._recruitment_recovery_task
+        if current is not None and not current.done():
+            return
+        task = self.manager.spawn_bg_task(
+            self._recover_pending_recruitment(expected_state, recover)
+        )
+        self._recruitment_recovery_task = (
+            task if isinstance(task, asyncio.Task) else None
+        )
+
+    async def _recover_pending_recruitment(
+        self,
+        expected_state: GameState,
+        recover,
+    ) -> None:
+        """Discord/DBの一時障害と再起動をまたいで募集カードを再公開する。"""
+        delay = 1
+        try:
+            while (
+                self.state is expected_state
+                and expected_state.phase == Phase.LOBBY
+                and expected_state.pending_recruitment_reopen
+            ):
+                await asyncio.sleep(delay)
+                try:
+                    result = await recover(self)
+                except Exception as error:
+                    log.exception(
+                        "強制終了後の参加受付を自動再開できませんでした: %s",
+                        error,
+                    )
+                else:
+                    if expected_state.pending_recruitment_reopen:
+                        log.warning(
+                            "強制終了後の参加受付再開を継続します: %s",
+                            result,
+                        )
+                if not expected_state.pending_recruitment_reopen:
+                    return
+                delay = min(delay * 2, 60)
+        finally:
+            if self._recruitment_recovery_task is asyncio.current_task():
+                self._recruitment_recovery_task = None
 
     @property
     def variant(self) -> VariantDefinition:
@@ -1993,6 +2154,8 @@ class RoomRunner:
             "night_resolved": state.night_resolved,
             "pending_winner": state.pending_winner.name if state.pending_winner else None,
             "ending": state.ending,
+            "lobby_return_mode": state.lobby_return_mode,
+            "pending_recruitment_reopen": state.pending_recruitment_reopen,
             "preparation_dm_sent_ids": list(state.preparation_dm_sent_ids),
             "initial_seer_target": state.initial_seer_target,
             "initial_seer_result_sent": state.initial_seer_result_sent,
@@ -2712,6 +2875,22 @@ class RoomRunner:
         state.night_resolved = bool(payload.get("night_resolved", False))
         pending_winner_name = payload.get("pending_winner")
         state.pending_winner = Team[pending_winner_name] if pending_winner_name else None
+        lobby_return_mode = payload.get("lobby_return_mode", "empty")
+        if lobby_return_mode not in {"empty", "gm", "roster"}:
+            raise StateDurabilityError(
+                f"終了後のLOBBY復帰種別が不正です: {lobby_return_mode!r}"
+            )
+        state.lobby_return_mode = str(lobby_return_mode)
+        state.pending_recruitment_reopen = (
+            payload.get("pending_recruitment_reopen") is True
+        )
+        if (
+            state.pending_recruitment_reopen
+            and state.lobby_return_mode != "gm"
+        ):
+            raise StateDurabilityError(
+                "参加受付再開待ちとLOBBY復帰種別が一致しません"
+            )
         # 処理中にプロセスが落ちた場合は、新しいプロセスが
         # GM再試行を担うため実行中ロック自体は解除する。
         state.ending = False
@@ -2828,11 +3007,22 @@ class RoomRunner:
             await self._close_game_views_for_shutdown()
             nickname_failures = await self._restore_nicknames(state)
             await self._teardown_game_roles_and_perms()
+            preserve_gm = (
+                state.lobby_return_mode in {"gm", "roster"}
+                and state.gm_id is not None
+            )
+            # GMを復元できないsnapshotで参加者だけ残すと保存契約に反するため、
+            # その場合は空LOBBYへ落とす (実運用ではGM必須なので通常は通らない)。
+            preserve_players = (
+                state.lobby_return_mode == "roster" and preserve_gm
+            )
             if not await self._transition_to_empty_lobby(
                 state,
                 nickname_failures=nickname_failures,
                 cleanup_channel_id=saved_village_channel_id,
                 log_label="再起動時の終了処理回収",
+                preserve_players=preserve_players,
+                preserve_gm=preserve_gm,
             ):
                 log.error(
                     "終了済みゲームを空LOBBYへ回収できませんでした (%s)",
@@ -2846,8 +3036,21 @@ class RoomRunner:
             await self._retry_pending_ui_cleanup()
             # ロビー復帰時は前ゲームの一時ロールを掃除
             await self._delete_alive_role()
-            await self._post_lobby_ui()
+            try:
+                await self._post_lobby_ui()
+            except Exception as error:
+                log.exception(
+                    "再起動後の参加受付パネル再掲に失敗: %s",
+                    error,
+                )
+                self._schedule_lobby_panel_recovery(
+                    state,
+                    recruitment_id=state.recruitment_id,
+                    log_label="再起動復元",
+                )
             await self._persist_room_state()
+            if state.pending_recruitment_reopen:
+                self._schedule_recruitment_recovery(state)
             return
 
         last_executed_id = payload.get("last_executed")
@@ -3902,9 +4105,9 @@ class RoomRunner:
         vc_member_ids = {m.id for m in vc.members} if vc else set()
 
         def should_initial_mute(member: discord.Member) -> bool:
-            # 参加者を兼ねない専任GMだけは進行役として自動制御から外す。
-            # 参加者兼GMは役職・夜情報を持つため、他の参加者と同じ扱い。
-            if self._is_dedicated_gm(member.id):
+            # GMは参加者を兼ねる場合も、説明しながら進行できるよう
+            # Botの自動制御から外す。参加者としての改名・役職付与は行う。
+            if self._uses_manual_gm_mute(member.id):
                 return False
             if member.id not in vc_member_ids:
                 return False
@@ -3956,7 +4159,7 @@ class RoomRunner:
         # 現在Botが新たにmuteする意図の相手を先に所有記録する。
         # 既にmuteの相手は手動muteとして所有しない。
         for member in vc_members:
-            if member.bot or self._is_dedicated_gm(member.id):
+            if member.bot or self._uses_manual_gm_mute(member.id):
                 continue
             vs = getattr(member, "voice", None)
             if vs is not None and not vs.mute:
@@ -7797,9 +8000,22 @@ class RoomRunner:
         edit_kwargs: dict = {"nick": death_nick(player.display_name, method)}
         vs = getattr(player.member, "voice", None)
         vc = state.voice_channel
+        manual_mute_gm = self._uses_manual_gm_mute(player.user_id)
+        owned_gm_mute = bool(
+            manual_mute_gm
+            and (
+                player.user_id in state.bot_muted_ids
+                or self._has_own_mute_marker(player.member)
+            )
+        )
+        release_owned_gm_mute = bool(
+            owned_gm_mute
+            and vs is not None
+            and vs.channel is not None
+        )
         will_mute = (
-            # playerは必ずroster内なので、参加者兼GMも通常どおりmuteする。
-            vs is not None and vs.channel is not None
+            not manual_mute_gm
+            and vs is not None and vs.channel is not None
             and vc is not None and vs.channel.id == vc.id
             and not vs.mute
         )
@@ -7808,6 +8024,12 @@ class RoomRunner:
             edit_kwargs["mute"] = True
             if state.guild is not None:
                 marker = await self._enable_mute_markers()
+        elif release_owned_gm_mute:
+            # 旧snapshotから復元したBot所有muteだけは、手動運用へ切り替える
+            # このPATCHで解除する。マーカーのない手動muteには触れない。
+            if state.guild is not None:
+                marker = await self._enable_mute_markers()
+            edit_kwargs["mute"] = False
         alive_role = (
             discord.utils.get(state.guild.roles, name=self._alive_role_name())
             if state.guild is not None else None
@@ -7815,9 +8037,14 @@ class RoomRunner:
         current_roles = member_roles_for_edit(player.member)
         desired_roles = [
             role for role in current_roles
-            if alive_role is None or getattr(role, "id", None) != alive_role.id
+            if (alive_role is None or getattr(role, "id", None) != alive_role.id)
+            and not (
+                release_owned_gm_mute
+                and marker is not None
+                and getattr(role, "id", None) == marker.id
+            )
         ]
-        if marker is not None and not any(
+        if will_mute and marker is not None and not any(
             getattr(role, "id", None) == marker.id for role in desired_roles
         ):
             desired_roles.append(marker)
@@ -7839,8 +8066,11 @@ class RoomRunner:
             if getattr(updated_member, "id", None) == player.user_id:
                 player.member = updated_member
             edit_succeeded = True
-            if "mute" in edit_kwargs:
+            if edit_kwargs.get("mute") is True:
                 state.bot_muted_ids.add(player.user_id)
+            elif release_owned_gm_mute:
+                state.bot_muted_ids.discard(player.user_id)
+                state.bot_mute_intent_ids.discard(player.user_id)
         except (discord.Forbidden, discord.HTTPException) as e:
             log.warning(f"死亡者ニックネーム更新失敗 ({player.display_name}): {e}")
         else:
@@ -7849,7 +8079,8 @@ class RoomRunner:
             # 反映済みならBot所有と照合する。
             vs_after = getattr(player.member, "voice", None)
             if (
-                vs_after is not None
+                not manual_mute_gm
+                and vs_after is not None
                 and vs_after.mute
                 and state.mute_marker_enabled
                 and self._has_own_mute_marker(player.member)
@@ -7898,9 +8129,23 @@ class RoomRunner:
             or getattr(vs_after, "mute", False)
             or (edit_succeeded and "mute" in edit_kwargs)
         )
-        # textは個別denyを必須、VCはserver muteまたは生存ロール剥奪の
-        # どちらかを必須にする。満たせない副作用はoutboxから消さない。
-        if not village_blocked or not (mute_applied or alive_role_removed):
+        # textは個別denyを必須、通常参加者のVCはserver muteまたは
+        # 生存ロール剥奪を必須にする。GMの音声ミュートだけは手動運用なので、
+        # その成否を死亡副作用の完了条件には含めない。
+        voice_block_satisfied = (
+            manual_mute_gm or mute_applied or alive_role_removed
+        )
+        # GM兼プレイヤーの音声は意図的に手動運用へ残す一方、参加者としての
+        # 生存ロールは必ず外す。ここを成功扱いにすると死亡後も生存者用の
+        # 接続・閲覧権限を持ち越すため、通常プレイヤー処理とは分けて確認する。
+        participant_role_satisfied = (
+            not manual_mute_gm or alive_role_removed
+        )
+        if (
+            not village_blocked
+            or not voice_block_satisfied
+            or not participant_role_satisfied
+        ):
             error = RuntimeError(
                 "死亡者の発言遮断を確認できません "
                 f"(village={village_blocked}, mute={mute_applied}, "
@@ -10626,12 +10871,45 @@ class RoomRunner:
             return
         await self._end_game(winner)
 
-    async def force_end(self, reason: str = "廃村") -> bool:
+    async def force_end(
+        self,
+        reason: str = "廃村",
+        *,
+        preserve_players: bool = False,
+        preserve_gm: bool = True,
+    ) -> bool:
+        """戦績を残さずゲームを終了する。
+
+        明示的な強制終了は参加者を外してGMだけを残す。ゲームリセットは
+        ``preserve_players=True`` で同じ参加者とGMを受付へ戻す。
+        GM本人がサーバー退出した経路だけは ``preserve_gm=False`` にする。
+        """
         state = self.state
+
+        if preserve_players:
+            preserve_gm = True
 
         # ゲーム進行中以外 (ロビー/終了済み) は無視
         if state.phase in (Phase.LOBBY, Phase.GAME_OVER) or state.ending:
             return False
+
+        if state.gm_id is None:
+            # 残すGMが無い卓で参加者だけ持ち越すと保存契約に反する。
+            # lobby_return_modeと実際の引き継ぎをここで一致させておく。
+            preserve_gm = False
+            preserve_players = False
+
+        state.lobby_return_mode = (
+            "roster"
+            if preserve_players
+            else "gm"
+            if preserve_gm and state.gm_id is not None
+            else "empty"
+        )
+        state.pending_recruitment_reopen = bool(
+            self.is_private_room()
+            and state.lobby_return_mode == "gm"
+        )
 
         # 最初のawaitより前に「終了状態の確定」と「ループのキャンセル指示」を
         # 同期的に行う。これで退出処理 (_eliminate_player_mid_game)・
@@ -10735,14 +11013,16 @@ class RoomRunner:
             state,
             nickname_failures=nickname_failures,
             log_label="廃村後LOBBY初期化",
+            preserve_players=preserve_players,
+            preserve_gm=preserve_gm,
         )
 
     async def reset_game(self) -> str:
         """やり直し。
 
-        ゲーム中: 廃村して参加受付へ戻す。
+        ゲーム中: 廃村して同じ参加者・GMの参加受付へ戻す。
         ロビー中: 参加者とGMを解除して受付を作り直す (無反応にしない)。
-        どちらの場合も直前メンバーの記録は残るので「次村」で組み直せる。
+        どちらの場合も直前メンバーの記録を残す。
         """
         state = self.state
         if state.phase in (Phase.LOBBY, Phase.GAME_OVER):
@@ -10771,8 +11051,11 @@ class RoomRunner:
                 return "🔄 参加受付をリセットしました (参加者とGMを解除)。"
             return "🔄 参加受付をリセットしました (登録はありませんでした)。"
 
-        if await self.force_end("ゲームがリセットされました。"):
-            return "🔄 ゲームをリセットし、参加受付へ戻しました。"
+        if await self.force_end(
+            "ゲームがリセットされました。",
+            preserve_players=True,
+        ):
+            return "🔄 ゲームをリセットし、同じ参加者・GMで参加受付へ戻しました。"
         return (
             "⚠️ 終了処理が既に進行中か、参加受付をDBへ保存できなかったため、"
             "リセット完了を確認できませんでした。"
@@ -11101,15 +11384,13 @@ class RoomRunner:
             return {state.current_speaker_id} if state.current_speaker_id else set()
         return set()
 
-    def _is_dedicated_gm(self, user_id: int) -> bool:
-        """プレイヤーを兼ねない専任GMか。
+    def _uses_manual_gm_mute(self, user_id: int) -> bool:
+        """Botの自動mute/unmuteから外すGM登録者か。
 
-        専任GMだけは進行役として常時発言できるよう自動muteから外す。
-        rosterにもいる参加者兼GMは、役職情報を持つ通常プレイヤーとして
-        フェーズごとのmute/unmuteに必ず従わせる。
+        参加者兼任を含む全GMは、ゲーム説明や周知を続けられるよう
+        Discord側のミュートを本人が手動で管理する。
         """
-        state = self.state
-        return state.gm_id == user_id and user_id not in state.players
+        return self.state.gm_id == user_id
 
     async def _sync_server_mutes(
         self,
@@ -11152,6 +11433,11 @@ class RoomRunner:
             marker = await self._enable_mute_markers()
 
         owned_before = set(state.bot_muted_ids)
+        intents_before = set(state.bot_mute_intent_ids)
+        if state.gm_id is not None:
+            # 新仕様ではGMへ新しいmute意図を適用しない。Discord側に
+            # Bot所有マーカーがあれば、下の候補処理で安全に解除する。
+            state.bot_mute_intent_ids.discard(state.gm_id)
 
         failed: list[tuple[discord.Member, bool]] = []
 
@@ -11208,17 +11494,23 @@ class RoomRunner:
             if member.bot:
                 skip_counts["bot"] += 1
                 continue
-            if member.id in skip_ids:
-                skip_counts["既にmute"] += 1
-                continue
-            # 参加者を兼ねない専任GMだけを進行役として除外する。
-            # 参加者兼GMは他プレイヤーと同じ発言制御に従う。
-            if self._is_dedicated_gm(member.id):
-                skip_counts["gm"] += 1
-                continue
             vs = member.voice
             if vs is None or vs.channel is None or vs.channel.id != vc.id:
                 skip_counts["vc不一致"] += 1
+                continue
+            if self._uses_manual_gm_mute(member.id):
+                # 旧版でBotが付けたものだけ解除する。所有記録もマーカーも
+                # 無いmuteはGM本人の手動操作なので、そのまま保護する。
+                if (
+                    member.id in state.bot_muted_ids
+                    or self._has_own_mute_marker(member)
+                ):
+                    targets.append((member, False))
+                else:
+                    skip_counts["gm"] += 1
+                continue
+            if member.id in skip_ids:
+                skip_counts["既にmute"] += 1
                 continue
             should_speak = member.id in speakers
             if should_speak and vs.mute:
@@ -11254,6 +11546,13 @@ class RoomRunner:
                 f"既にmute={skip_counts['既にmute']}, "
                 f"suppressだが対象化={skip_counts['suppress']})"
             )
+            if (
+                state.bot_muted_ids != owned_before
+                or state.bot_mute_intent_ids != intents_before
+            ):
+                await self._persist_mute_ownership_checkpoint(
+                    "GM手動mute切替状態の保存"
+                )
             return []
         # Member.editはギルド共有バケットのため、Semaphore(5)だけで並列化すると
         # 13人の末尾が429になりやすい。全卓共通ペーサーで順番に流す。
@@ -11281,7 +11580,10 @@ class RoomRunner:
         # mute操作と所有記録を別々の障害窓にしない。
         # ここで落ちても、再起動後にBot自身がmuteした相手を
         # 手動muteと誤認せず解除できる。
-        if state.bot_muted_ids != owned_before:
+        if (
+            state.bot_muted_ids != owned_before
+            or state.bot_mute_intent_ids != intents_before
+        ):
             await self._persist_mute_ownership_checkpoint("フェーズmute所有保存")
         return targets
 
@@ -11293,6 +11595,14 @@ class RoomRunner:
         changed = False
         for user_id in list(state.bot_mute_intent_ids):
             member = state.guild.get_member(user_id)
+            if self._uses_manual_gm_mute(user_id):
+                # markerは直前の所有照合でも拾うが、このメソッド単独でも
+                # Bot所有証拠を捨てない。次の同期でGMから安全に解除する。
+                if member is not None and self._has_own_mute_marker(member):
+                    state.bot_muted_ids.add(user_id)
+                state.bot_mute_intent_ids.discard(user_id)
+                changed = True
+                continue
             if member is None:
                 state.bot_mute_intent_ids.discard(user_id)
                 changed = True
@@ -11533,9 +11843,9 @@ class RoomRunner:
             state.vc_default_send_before_game = default_overwrite.send_messages
             captured_manual_value = True
 
-        # GMが参加者を兼ねていない場合は個別に発言許可する。手動管理卓では
+        # GMは参加者兼任でも個別に発言許可する。手動管理卓では
         # 既存overwriteを丸ごと置換せず、speakだけを一時変更して元値を保存する。
-        if state.gm_id is not None and state.gm_id not in state.players:
+        if state.gm_id is not None:
             gm_member = state.guild.get_member(state.gm_id)
             if gm_member is not None:
                 gm_overwrite = vc.overwrites_for(gm_member)
@@ -11648,7 +11958,7 @@ class RoomRunner:
     async def _mute_all(
         self, *, skip_ids: Optional[set[int]] = None
     ) -> list[tuple[discord.Member, bool]]:
-        """VC接続中の全員をミュート (参加者を兼ねない専任GMを除く)。"""
+        """VC接続中の全員をミュート (参加者兼任を含むGMを除く)。"""
         return await self._sync_server_mutes(set(), skip_ids=skip_ids)
 
     async def _unmute_alive(self) -> list[tuple[discord.Member, bool]]:
@@ -11734,7 +12044,8 @@ class RoomRunner:
                 [] if manual_vc_permissions
                 else [p.member for p in state.players.values()]
             )
-            # 自動管理卓だけ、参加者を兼ねていないGMの個別許可を従来どおり撤去。
+            # 自動管理卓では、参加者の個別上書きも含めてゲーム用設定を撤去する。
+            # GMのspeakはcapture済みなら _release_vc_after_game が元値へ戻す。
             if (
                 not manual_vc_permissions
                 and state.gm_id is not None
@@ -12437,6 +12748,11 @@ class RoomRunner:
                         await self._post_lobby_ui()
                     except Exception as e:
                         log.warning(f"ロビー退出後のUI更新失敗: {e}")
+                        self._schedule_lobby_panel_recovery(
+                            state,
+                            recruitment_id=state.recruitment_id,
+                            log_label="ロビー退出",
+                        )
                 return
 
         state = self.state
@@ -12454,7 +12770,10 @@ class RoomRunner:
                 if state.game_task is None or state.game_task.done():
                     state.game_task = asyncio.create_task(self._end_game(winner))
                 return
-            await self.force_end("GMが退出したためゲームを中断します。")
+            await self.force_end(
+                "GMが退出したためゲームを中断します。",
+                preserve_gm=False,
+            )
             return
 
         # ゲーム中の参加者退出: 即死亡ではなく自動一時停止して復帰を待つ

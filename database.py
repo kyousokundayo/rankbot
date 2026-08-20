@@ -4928,11 +4928,14 @@ async def create_recruitment_from_previous_settings(
     host_id: int,
     *,
     scheduled_at: datetime | str,
+    gm_id: Optional[int] = None,
 ) -> tuple[int, int]:
     """直近の終了募集から設定だけを複製し、空の新規募集を作る。
 
     旧行はゲーム履歴の参照先としてARCHIVEDのまま固定する。参加者・補欠・
     通知台帳・メッセージID・通知済み時刻は一切複製せず、新しい募集IDを発行する。
+    ``gm_id`` を省略した通常再開は村主をGMにする。強制終了からの
+    自動回収では保持中のGMを渡し、その人を受付GMとして引き継ぐ。
     戻り値は ``(new_recruitment_id, source_recruitment_id)``。
     """
     start_text = _normalize_recruitment_time(scheduled_at)
@@ -4997,7 +5000,7 @@ async def create_recruitment_from_previous_settings(
                     str(title).strip(),
                     start_text,
                     room_id,
-                    host_id,
+                    host_id if gm_id is None else int(gm_id),
                     int(bool(streaming)),
                     allowed_ranks_json,
                     str(note or "").strip(),
@@ -5430,20 +5433,41 @@ async def archive_linked_recruitment_and_save_lobby_state(
     room_id: str,
     recruitment_id: Optional[int],
     payload: dict,
+    *,
+    preserve_players: bool = False,
+    preserve_gm: bool = False,
 ) -> Optional[int]:
-    """紐づく募集の終了と空ロビーsnapshotを同一transactionで確定する。
+    """紐づく募集の終了とロビーsnapshotを同一transactionで確定する。
 
     ``recruitment_id`` を先に捨ててHELDだけが残る事故と、募集だけ終了して
     古いロビーsnapshotが残る事故をともに防ぐ。募集はOPEN/HELDから
     ARCHIVEDへ進め、既にARCHIVEDなら冪等に受け入れる。追跡中だったカードの
     message_idを返し、Discord表示を安全に差し替えた後で呼出側がclearする。
+
+    既定は参加者・GMとも空にする。ゲーム中の「リセット」だけは
+    ``preserve_players=True, preserve_gm=True``、明示的な「強制終了」は
+    ``preserve_gm=True`` を渡す。フラグとpayloadが一致しない呼出しは拒否し、
+    意図せず古い役職付きrosterをロビーへ持ち越さない。
     """
     if payload.get("recruitment_id") is not None:
         raise ValueError("lobby payload must clear recruitment_id")
-    if payload.get("players"):
-        raise ValueError("lobby payload must clear players")
-    if payload.get("gm_id") is not None:
-        raise ValueError("lobby payload must clear gm_id")
+    players = payload.get("players") or []
+    gm_id = payload.get("gm_id")
+    if preserve_players and not preserve_gm:
+        raise ValueError("preserving players also requires preserving the GM")
+    if bool(players) != bool(preserve_players):
+        raise ValueError("lobby payload player preservation does not match contract")
+    if (gm_id is not None) != bool(preserve_gm):
+        raise ValueError("lobby payload GM preservation does not match contract")
+    if preserve_players:
+        for player in players:
+            if (
+                not isinstance(player, dict)
+                or player.get("role") is not None
+                or player.get("alive") is not True
+                or player.get("number") != 0
+            ):
+                raise ValueError("preserved lobby players must be reset roster entries")
     if payload.get("ending"):
         raise ValueError("lobby payload must finish ending cleanup")
     _validate_room_snapshot(Phase.LOBBY.name, payload)

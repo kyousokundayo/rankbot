@@ -693,6 +693,15 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.state.category = category
         runner.state.guild = guild
         runner.state.gm_id = gm.id
+        # GM兼プレイヤーでも、ゲーム中の説明のため個別speak許可を得る。
+        runner.state.players[gm.id] = Player(
+            user_id=gm.id,
+            member=gm,
+            role=Role.VILLAGER,
+            alive=True,
+            number=1,
+            base_name=gm.display_name,
+        )
         runner._persist_room_state = AsyncMock()
 
         village_overwrites = runner._build_game_channel_overwrites(
@@ -719,6 +728,8 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(vc.overwrites_for(default).view_channel)
         self.assertTrue(vc.overwrites_for(gm).speak)
         self.assertTrue(vc.overwrites_for(gm).connect)
+        self.assertTrue(runner.state.vc_gm_speak_captured)
+        self.assertEqual(runner.state.vc_gm_speak_user_id, gm.id)
 
         await runner._release_vc_after_game()
         self.assertTrue(vc.overwrites_for(default).speak)
@@ -3753,10 +3764,10 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         await recovered._reconcile_mute_marker_ownership()
         self.assertNotIn(member.id, recovered.state.bot_muted_ids)
 
-    async def test_death_combines_nickname_mute_and_alive_role_removal(self) -> None:
+    async def test_participant_gm_death_keeps_manual_mute_and_removes_alive_role(self) -> None:
         runner = make_runner()
         player = add_player(runner, 1)
-        # GMを兼ねる参加者でも、死亡時は他プレイヤーと同じくmuteする。
+        # GMを兼ねる参加者は、死亡後もゲーム説明のためmuteを手動管理する。
         runner.state.gm_id = player.user_id
         channel = SimpleNamespace(id=10)
         everyone = FakeRole(1, "@everyone", default=True)
@@ -3782,8 +3793,10 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
 
         async def apply_patch(**kwargs):
             player.member.nick = kwargs["nick"]
-            player.member.voice.mute = kwargs["mute"]
-            player.member.roles = [everyone, *kwargs["roles"]]
+            if "mute" in kwargs:
+                player.member.voice.mute = kwargs["mute"]
+            if "roles" in kwargs:
+                player.member.roles = [everyone, *kwargs["roles"]]
             return player.member
 
         player.member.edit = AsyncMock(side_effect=apply_patch)
@@ -3794,11 +3807,92 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         player.member.edit.assert_awaited_once()
         edit_kwargs = player.member.edit.await_args.kwargs
         self.assertIn("nick", edit_kwargs)
-        self.assertTrue(edit_kwargs["mute"])
-        self.assertIn(marker, edit_kwargs["roles"])
+        self.assertNotIn("mute", edit_kwargs)
+        self.assertNotIn(marker, edit_kwargs["roles"])
         self.assertNotIn(alive, edit_kwargs["roles"])
+        self.assertFalse(player.member.voice.mute)
+        self.assertNotIn(player.user_id, runner.state.bot_muted_ids)
         runner._remove_alive_role.assert_not_awaited()
         self.assertEqual(runner.state.pending_death_effects, [])
+
+    async def test_disconnected_participant_gm_keeps_legacy_mute_ownership_until_join(self) -> None:
+        runner = make_runner()
+        player = add_player(runner, 1)
+        runner.state.gm_id = player.user_id
+        everyone = FakeRole(1, "@everyone", default=True)
+        alive = FakeRole(2, runner._alive_role_name())
+        marker = FakeRole(3, runner._mute_marker_role_name())
+        player.member.roles = [everyone, alive, marker]
+        player.member.voice = None
+        guild = FakeGuild([player.member], [everyone, alive, marker])
+        player.member.guild = guild
+        runner.state.guild = guild
+        runner.state.voice_channel = SimpleNamespace(id=10, members=[])
+        runner.state.village_channel = permission_text_channel()
+        runner.state.mute_marker_enabled = True
+        runner.state.bot_muted_ids = {player.user_id}
+        effect = {
+            "event_id": "run-1:除外:1",
+            "player_id": player.user_id,
+            "method": "除外",
+            "reason": None,
+        }
+        runner.state.pending_death_effects = [effect]
+
+        async def apply_patch(**kwargs):
+            player.member.nick = kwargs["nick"]
+            if "roles" in kwargs:
+                player.member.roles = [everyone, *kwargs["roles"]]
+            return player.member
+
+        player.member.edit = AsyncMock(side_effect=apply_patch)
+        runner._remove_alive_role = AsyncMock()
+
+        await runner._apply_death_effect(effect)
+
+        edit_kwargs = player.member.edit.await_args.kwargs
+        self.assertNotIn("mute", edit_kwargs)
+        self.assertIn(marker, player.member.roles)
+        self.assertNotIn(alive, player.member.roles)
+        self.assertIn(player.user_id, runner.state.bot_muted_ids)
+        self.assertEqual(runner.state.pending_death_effects, [])
+
+    async def test_participant_gm_death_safety_stops_if_alive_role_removal_fails(self) -> None:
+        runner = make_runner()
+        player = add_player(runner, 1)
+        runner.state.gm_id = player.user_id
+        channel = SimpleNamespace(id=10)
+        everyone = FakeRole(1, "@everyone", default=True)
+        alive = FakeRole(2, runner._alive_role_name())
+        marker = FakeRole(3, runner._mute_marker_role_name())
+        player.member.roles = [everyone, alive]
+        player.member.voice = FakeVoiceState(mute=False, channel=channel)
+        guild = FakeGuild([player.member], [everyone, alive, marker])
+        player.member.guild = guild
+        runner.state.guild = guild
+        runner.state.voice_channel = SimpleNamespace(
+            id=channel.id, members=[player.member]
+        )
+        runner.state.village_channel = permission_text_channel()
+        runner.state.mute_marker_enabled = True
+        denied = discord.Forbidden(
+            SimpleNamespace(status=403, reason="Forbidden", headers={}), "denied"
+        )
+        player.member.edit = AsyncMock(side_effect=denied)
+        runner._remove_alive_role = AsyncMock(return_value=False)
+        effect = {
+            "event_id": "run-1:襲撃:1",
+            "player_id": player.user_id,
+            "method": "襲撃",
+            "reason": None,
+        }
+        runner.state.pending_death_effects = [effect]
+
+        with self.assertRaises(StateDurabilityError):
+            await runner._apply_death_effect(effect)
+
+        self.assertEqual(runner.state.pending_death_effects, [effect])
+        self.assertTrue(runner.state.paused)
 
     async def test_death_keeps_outbox_and_safety_stops_if_speech_cannot_be_blocked(self) -> None:
         runner = make_runner()

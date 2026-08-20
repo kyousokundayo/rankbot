@@ -59,6 +59,7 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         self.state = SimpleNamespace(
             phase=Phase.LOBBY, players={}, gm_id=None, recruitment_id=None,
             room_id=self.room_id, room_name="GM村", lobby_channel=None,
+            pending_recruitment_reopen=False,
         )
         self.room = SimpleNamespace(
             state=self.state,
@@ -210,6 +211,106 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         self.manager.publish_new_recruitment.assert_awaited_once_with(
             self.guild, self.state.recruitment_id, announce=False,
         )
+
+    async def test_force_end_recovery_keeps_delegated_gm_and_publishes_empty_card(self) -> None:
+        source = await database.create_recruitment(
+            1,
+            1,
+            title="前回の村",
+            scheduled_at=datetime.now(timezone.utc) - timedelta(hours=2),
+            room_id=self.room_id,
+            variant_id="v9_turn",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        self.assertTrue(await database.set_recruitment_status(
+            source, database.RECRUITMENT_ARCHIVED,
+        ))
+        self.room.room_def = RoomDefinition(
+            self.room_id,
+            "GM村",
+            private_owner_id=1,
+            variant_id="v13_cross",
+        )
+        self.state.guild = self.guild
+        self.state.gm_id = 2
+        self.state.pending_recruitment_reopen = True
+        self.manager.ensure_recruitment_message = AsyncMock()
+
+        result = await self.manager.recover_pending_recruitment(self.room)
+
+        self.assertIn("参加者0人", result)
+        self.assertFalse(self.state.pending_recruitment_reopen)
+        self.assertEqual(self.state.gm_id, 2)
+        row = await database.get_recruitment(self.state.recruitment_id)
+        self.assertEqual(row["gm_id"], 2)
+        self.assertEqual(row["variant_id"], "v9_turn")
+        self.assertEqual(await database.list_recruitment_entries(row["id"]), [])
+        self.manager.ensure_recruitment_message.assert_awaited_once()
+
+    async def test_force_end_recovery_adopts_open_row_after_crash(self) -> None:
+        source = await database.create_recruitment(
+            1,
+            1,
+            title="前回の村",
+            scheduled_at=datetime.now(timezone.utc) - timedelta(hours=2),
+            room_id=self.room_id,
+            variant_id="v9_cross",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        self.assertTrue(await database.set_recruitment_status(
+            source, database.RECRUITMENT_ARCHIVED,
+        ))
+        existing_id, _ = await database.create_recruitment_from_previous_settings(
+            1,
+            self.room_id,
+            1,
+            scheduled_at=datetime.now(timezone.utc),
+            gm_id=2,
+        )
+        self.room.room_def = RoomDefinition(
+            self.room_id,
+            "GM村",
+            private_owner_id=1,
+            variant_id="v13_cross",
+        )
+        self.state.guild = self.guild
+        self.state.gm_id = 2
+        self.state.recruitment_id = None
+        self.state.pending_recruitment_reopen = True
+        self.manager.ensure_recruitment_message = AsyncMock()
+
+        await self.manager.recover_pending_recruitment(self.room)
+
+        self.assertEqual(self.state.recruitment_id, existing_id)
+        self.assertFalse(self.state.pending_recruitment_reopen)
+        open_rows = await database.list_open_recruitments(1)
+        self.assertEqual([row["id"] for row in open_rows], [existing_id])
+
+    async def test_force_end_recovery_cancels_when_gm_rebuilt_the_roster(self) -> None:
+        """「次村」で参加者を組み直した後は、0人カードの再掲待ちを解除する。"""
+        self.room.room_def = RoomDefinition(
+            self.room_id,
+            "GM村",
+            private_owner_id=1,
+            variant_id="v13_cross",
+        )
+        self.state.guild = self.guild
+        self.state.gm_id = 2
+        self.state.players = {100: object()}
+        self.state.pending_recruitment_reopen = True
+        self.state.lobby_return_mode = "gm"
+        self.manager.ensure_recruitment_message = AsyncMock()
+
+        result = await self.manager.recover_pending_recruitment(self.room)
+
+        self.assertIn("取り消しました", result)
+        self.assertFalse(self.state.pending_recruitment_reopen)
+        self.assertEqual(self.state.lobby_return_mode, "empty")
+        self.assertIsNone(self.state.recruitment_id)
+        self.manager.ensure_recruitment_message.assert_not_awaited()
+        self.room._persist_room_state.assert_awaited_once()
 
     async def test_host_menu_timeout_disables_controls_and_points_back_to_card(self) -> None:
         view = recruitment_lib.RecruitmentHostView(self.manager, 10, 1)

@@ -329,6 +329,12 @@ class PrivateLobbyRecoveryTest(unittest.IsolatedAsyncioTestCase):
             _persist_room_state=AsyncMock(),
         )
         view = LobbyView(cog)
+        self.assertFalse(any(
+            str(getattr(item, "custom_id", "")).startswith(
+                "reopen_previous_recruitment:"
+            )
+            for item in view.children
+        ))
         leave = next(item for item in view.children if item.custom_id == "leave_game")
         interaction = SimpleNamespace(
             user=SimpleNamespace(id=1),
@@ -509,8 +515,10 @@ class HelpAndRuleEmbedTest(unittest.TestCase):
         self.assertIn("スキップ", fields["GMの操作"])
         self.assertIn("全村", fields["終わった試合を読み返す"])
         self.assertIn("書き込みはできません", fields["終わった試合を読み返す"])
-        self.assertIn("専任GMのミュートだけは手動", fields["発言とミュート"])
-        self.assertNotIn("（GMのミュートだけは手動）", fields["発言とミュート"])
+        self.assertIn("GMのミュートは手動", fields["発言とミュート"])
+        self.assertNotIn("専任GM", fields["発言とミュート"])
+        self.assertIn("リセットは同じ参加者・GMを維持", fields["GMの操作"])
+        self.assertIn("強制終了はGMだけを残して参加者0人", fields["GMの操作"])
 
     def test_release_version_is_consistent_across_current_documents(self) -> None:
         root = Path(__file__).resolve().parents[1]
