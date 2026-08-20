@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from tests.test_turn_discussion import add_players, make_runner
 
@@ -29,9 +30,9 @@ class MuteSyncLoggingTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_targets_logs_breakdown_counts(self) -> None:
         runner = make_runner()
-        speaker, muted_already, joiner = add_players(runner, 3)
+        speaker, muted_already = add_players(runner, 2)
         voice_channel = SimpleNamespace(
-            id=50, members=[speaker.member, muted_already.member, joiner.member]
+            id=50, members=[speaker.member, muted_already.member]
         )
         runner.state.voice_channel = voice_channel
 
@@ -41,9 +42,6 @@ class MuteSyncLoggingTest(unittest.IsolatedAsyncioTestCase):
         # muted_already: 発言不可対象で既にmute -> 変更不要
         muted_already.member.bot = False
         muted_already.member.voice = SimpleNamespace(channel=voice_channel, mute=True, suppress=False)
-        # joiner: 発言不可対象だがsuppressで既に発言不可
-        joiner.member.bot = False
-        joiner.member.voice = SimpleNamespace(channel=voice_channel, mute=False, suppress=True)
 
         with self.assertLogs("room_runner", level="INFO") as cm:
             result = await runner._sync_server_mutes({speaker.user_id})
@@ -52,12 +50,104 @@ class MuteSyncLoggingTest(unittest.IsolatedAsyncioTestCase):
         info_lines = [m for m in cm.output if "ミュート同期: 対象0件" in m]
         self.assertEqual(len(info_lines), 1)
         line = info_lines[0]
-        self.assertIn("VC接続3人", line)
-        self.assertIn("suppress=1", line)
+        self.assertIn("VC接続2人", line)
+        self.assertIn("suppressだが対象化=0", line)
         self.assertIn("既にmute=2", line)
         self.assertIn("bot=0", line)
         self.assertIn("gm=0", line)
         self.assertIn("VC不一致=0", line)
+
+    async def test_suppressed_speaker_is_still_muted_and_logged(self) -> None:
+        """suppress中でも発言不可対象なら必ずサーバーミュートする (取りこぼし対策)。"""
+        runner = make_runner()
+        (joiner,) = add_players(runner, 1)
+        voice_channel = SimpleNamespace(id=50, members=[joiner.member])
+        runner.state.voice_channel = voice_channel
+
+        joiner.member.bot = False
+        joiner.member.voice = SimpleNamespace(channel=voice_channel, mute=False, suppress=True)
+
+        async def edit_member(*, mute=None, _member=joiner.member, **_kwargs):
+            if mute is not None:
+                _member.voice.mute = mute
+            return _member
+
+        joiner.member.edit = edit_member
+
+        with self.assertLogs("room_runner", level="INFO") as cm:
+            changed = await runner._sync_server_mutes(set())
+
+        self.assertTrue(joiner.member.voice.mute)
+        changed_ids = {m.id for m, _ in changed}
+        self.assertEqual(changed_ids, {joiner.user_id})
+        self.assertTrue(
+            any("suppress中の相手もミュート対象に含めました" in m for m in cm.output)
+        )
+
+    async def test_empty_vc_members_still_finds_targets_via_state_players(self) -> None:
+        """vc.membersが空(キャッシュ漏れ)でも、state.players側からミュート対象を拾える。"""
+        runner = make_runner()
+        (victim,) = add_players(runner, 1)
+        voice_channel = SimpleNamespace(id=50, members=[])
+        runner.state.voice_channel = voice_channel
+        marker_role = SimpleNamespace(id=99, name=runner._mute_marker_role_name())
+        runner.state.mute_marker_enabled = True
+        runner.state.guild = SimpleNamespace(
+            get_member=lambda uid: victim.member if uid == victim.user_id else None,
+            roles=[marker_role],
+        )
+
+        victim.member.bot = False
+        victim.member.roles = []
+        victim.member.voice = SimpleNamespace(channel=voice_channel, mute=False, suppress=False)
+
+        async def edit_member(*, mute=None, _member=victim.member, **_kwargs):
+            if mute is not None:
+                _member.voice.mute = mute
+            return _member
+
+        victim.member.edit = edit_member
+
+        changed = await runner._sync_server_mutes(set())
+
+        self.assertTrue(victim.member.voice.mute)
+        changed_ids = {m.id for m, _ in changed}
+        self.assertEqual(changed_ids, {victim.user_id})
+
+    async def test_gm_is_never_muted_even_when_not_speaking(self) -> None:
+        runner = make_runner()
+        (gm,) = add_players(runner, 1)
+        voice_channel = SimpleNamespace(id=50, members=[gm.member])
+        runner.state.voice_channel = voice_channel
+        runner.state.gm_id = gm.user_id
+
+        gm.member.bot = False
+        gm.member.voice = SimpleNamespace(channel=voice_channel, mute=False, suppress=False)
+        gm.member.edit = AsyncMock()
+
+        changed = await runner._sync_server_mutes(set())
+
+        self.assertEqual(changed, [])
+        self.assertFalse(gm.member.voice.mute)
+        gm.member.edit.assert_not_awaited()
+
+    async def test_already_muted_target_is_not_edited_again(self) -> None:
+        """既にBotがmute済み(=対象外)の相手には二重にmember.editしない。"""
+        runner = make_runner()
+        (silent,) = add_players(runner, 1)
+        voice_channel = SimpleNamespace(id=50, members=[silent.member])
+        runner.state.voice_channel = voice_channel
+
+        silent.member.bot = False
+        silent.member.voice = SimpleNamespace(channel=voice_channel, mute=True, suppress=False)
+        runner.state.bot_muted_ids = {silent.user_id}
+        silent.member.edit = AsyncMock()
+
+        changed = await runner._sync_server_mutes(set())
+
+        self.assertEqual(changed, [])
+        self.assertTrue(silent.member.voice.mute)
+        silent.member.edit.assert_not_awaited()
 
     async def test_normal_mute_sync_still_mutes_and_unmutes_as_before(self) -> None:
         """挙動そのもの (mute/unmuteの実行結果) が変わっていないことの確認。"""
