@@ -9,6 +9,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import aiosqlite
 
@@ -118,7 +119,10 @@ class RatingSeriesTest(_SeededDatabaseTest):
             )
             await db.commit()
 
-        series = await database.get_rating_series(11, 1)
+        # CIには運用環境のローカル卓設定 (.env) が無い。除外対象を
+        # テスト内で固定し、実行ホストの設定に依存させない。
+        with patch.object(database, "UNRATED_ROOM_IDS", frozenset({"nate"})):
+            series = await database.get_rating_series(11, 1)
         self.assertNotIn(1299, [point["rating_after"] for point in series["points"]])
 
     async def test_season_reset_marks_the_next_game(self) -> None:
