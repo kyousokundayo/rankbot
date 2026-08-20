@@ -2560,6 +2560,31 @@ async def open_recruitment_call(
         return int(cursor.lastrowid)
 
 
+async def release_recruitment_call(call_id: int) -> bool:
+    """宛先0人・エラーEmbed中止など、1通も送らなかった呼び出し枠を解放する。
+
+    open_recruitment_call は「宛先を数える前」に当日枠を確保するため、
+    導入直後で購読者がほぼいない村では宛先0人のまま枠だけ消費され、
+    主催者はその日はもう「募集」を押せなくなってしまう (親レビュー指摘1)。
+    送達台帳 (recruitment_call_deliveries) に1行でも記録があれば、既に
+    誰かへ送信を試みた/試みている最中なので、行を消すと二重送信の穴に
+    なる → その場合は削除せず False を返す。行が無いとき (=本当に1通も
+    手を付けていないとき) だけ recruitment_calls の行を削除して True を
+    返し、UNIQUE(recruitment_id, called_on) の制約が外れて同日中に再度
+    「募集」を押せるようにする。
+    """
+    async with connect_db() as db:
+        rows = await db.execute_fetchall(
+            "SELECT 1 FROM recruitment_call_deliveries WHERE call_id = ? LIMIT 1",
+            (call_id,),
+        )
+        if rows:
+            return False
+        await db.execute("DELETE FROM recruitment_calls WHERE id = ?", (call_id,))
+        await db.commit()
+        return True
+
+
 async def claim_recruitment_call_delivery(
     call_id: int, user_id: int, notified_at: str,
 ) -> bool:

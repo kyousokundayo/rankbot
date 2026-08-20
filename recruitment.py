@@ -606,13 +606,26 @@ class RecruitmentManager:
         embed = await self.build_embed(guild, recruitment_id)
         if embed.color == discord.Color.red():
             # 募集情報の取得自体が壊れているため、1通も送らずに中止する。
+            # ここで枠を確保したままだと同日中は二度と押せなくなるので解放する
+            # (親レビュー指摘1)。
             log.error("募集通知DMをエラーEmbedのため中止 (%s)", recruitment_id)
+            await database.release_recruitment_call(call_id)
             return await interaction.followup.send(
-                "募集情報を取得できなかったため、通知を送信しませんでした。", ephemeral=True,
+                "募集情報を取得できなかったため、通知を送信しませんでした。"
+                "枠は消費していません。あとで押し直せます。",
+                ephemeral=True,
             )
         recipients = await self._resolve_call_recipients(
             guild, recruitment_id, member.id, call_id,
         )
+        if not recipients:
+            # 宛先0人 (購読者不在・全員除外など) のまま枠だけ消費されるのを防ぐ
+            # (親レビュー指摘1)。まだ誰にも送っていないので安全に解放できる。
+            await database.release_recruitment_call(call_id)
+            return await interaction.followup.send(
+                "通知できる宛先が0人でした。枠は消費していません。あとで押し直せます。",
+                ephemeral=True,
+            )
         await interaction.followup.send(
             f"{len(recipients)}人へ順次送信します。", ephemeral=True,
         )
@@ -3670,9 +3683,13 @@ class OperationsDashboardSelect(discord.ui.Select):
         self.parent_view = parent
 
     async def callback(self, interaction: discord.Interaction) -> None:
-        if interaction.guild is None:
+        # ephemeralなので他人はそもそも触れないが、View timeout(300秒)の間に
+        # 運営ロールを外れた相手が面を切り替えられてしまう穴があった
+        # (親レビュー指摘2)。入口の「運営データ」ボタンと同じ OperationsView.
+        # _is_admin を毎回再検証し、コピペで判定ロジックを二重管理しない。
+        if interaction.guild is None or not OperationsView._is_admin(interaction):
             return await interaction.response.send_message(
-                "❌ サーバー内でのみ使用できます。", ephemeral=True,
+                "❌ 運営のみ操作できます。", ephemeral=True,
             )
         self.parent_view.panel = self.values[0]
         await interaction.response.defer()
