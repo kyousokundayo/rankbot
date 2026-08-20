@@ -9231,8 +9231,9 @@ class RoomRunner:
 
         speakers に含まれるメンバーだけ発言可、他は全てミュート。
         既に目標状態のメンバーはAPIを呼ばずスキップする (メンバー編集
-        バケット ≈10回/10秒 の節約)。権限suppressで既に発言不可の人も
-        ミュートしない (観戦者の途中入室など)。
+        バケット ≈10回/10秒 の節約)。権限suppressは権限変更のタイミング次第で
+        生存者にも立ちうるDiscord側の計算値のため、立っていても発言不可対象なら
+        必ずサーバーミュートする (確実さを優先し、余分なAPI呼び出しは許容する)。
         skip_ids は直前の統合PATCHが成功済みで、Gateway反映待ちだけの相手を
         再送対象から外すためにゲーム開始時だけ指定する。
 
@@ -9288,9 +9289,28 @@ class RoomRunner:
                 if retry:
                     failed.append((member, mute))
 
+        # vc.membersはDiscordのボイス状態キャッシュ由来で、キャッシュ更新の
+        # タイミング次第で参加者が静かに漏れることがある (取りこぼすと対象0件
+        # になり、誰もミュートされない事故につながる)。state.playersの参加者も
+        # guild.get_memberで解決し、実際にこの卓のVCに接続しているメンバーだけ
+        # 候補へ追加する (vc.membersと重複しないようuser_idで集合化)。
+        # 判定条件そのものは変えず、候補の集め方だけを広げる。
+        candidates: dict[int, discord.Member] = {m.id: m for m in vc.members}
+        if state.guild is not None:
+            for user_id in state.players:
+                if user_id in candidates:
+                    continue
+                member = state.guild.get_member(user_id)
+                if member is None:
+                    continue
+                vs = getattr(member, "voice", None)
+                if vs is None or vs.channel is None or vs.channel.id != vc.id:
+                    continue
+                candidates[user_id] = member
+
         targets: list[tuple[discord.Member, bool]] = []
         skip_counts = {"bot": 0, "gm": 0, "vc不一致": 0, "既にmute": 0, "suppress": 0}
-        for member in list(vc.members):
+        for member in candidates.values():
             if member.bot:
                 skip_counts["bot"] += 1
                 continue
@@ -9320,8 +9340,14 @@ class RoomRunner:
                     skip_counts["既にmute"] += 1
             elif not should_speak and not vs.mute:
                 if getattr(vs, "suppress", False):
+                    # 権限側の計算値は生存者にも立ちうるため取りこぼせない。
+                    # スキップはせず、必ずミュート対象に含めた上でログに残す
+                    # (どれだけ取りこぼしていたかを後から確認できるように)。
                     skip_counts["suppress"] += 1
-                    continue  # 権限側で既に発言不可
+                    log.info(
+                        "suppress中の相手もミュート対象に含めました: "
+                        f"{member.display_name} ({state.room_name})"
+                    )
                 targets.append((member, True))
             else:
                 skip_counts["既にmute"] += 1
@@ -9329,11 +9355,11 @@ class RoomRunner:
         if not targets:
             log.info(
                 "ミュート同期: 対象0件 "
-                f"(VC接続{len(vc.members)}人, "
+                f"(VC接続{len(vc.members)}人, 候補{len(candidates)}人, "
                 f"bot={skip_counts['bot']}, gm={skip_counts['gm']}, "
                 f"VC不一致={skip_counts['vc不一致']}, "
                 f"既にmute={skip_counts['既にmute']}, "
-                f"suppress={skip_counts['suppress']})"
+                f"suppressだが対象化={skip_counts['suppress']})"
             )
             return []
         # Member.editはギルド共有バケットのため、Semaphore(5)だけで並列化すると
