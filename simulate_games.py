@@ -113,6 +113,8 @@ class FakeCategory:
 
 
 class FakeMessage:
+    _next_id = 40_000
+
     def __init__(
         self,
         *,
@@ -123,6 +125,8 @@ class FakeMessage:
         embeds: Optional[list[discord.Embed]] = None,
         view: Optional[discord.ui.View] = None,
     ) -> None:
+        self.id = FakeMessage._next_id
+        FakeMessage._next_id += 1
         self.author = author
         self.channel = channel
         self.content = content

@@ -142,24 +142,56 @@ class RecordTablesDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e["event_type"] for e in events], ["CO", "撤回", "CO"])
         self.assertEqual(events[-1]["claimed_role"], "霊媒師")
 
-    async def test_co_results_recorded_before_v050_are_still_readable(self) -> None:
-        """[結果を公開] の書き込み経路は持たないが、既存の行は読める。"""
-        async with aiosqlite.connect(database.DB_PATH) as db:
-            for seq, event_type in ((1, "公開"), (2, "取消")):
-                await db.execute(
-                    "INSERT INTO game_co_results "
-                    "(guild_id, room_id, game_run_id, event_seq, day_number, "
-                    "actor_id, actor_number, claimed_role, event_type, target_id, "
-                    "target_number, judgement) "
-                    "VALUES (1, 'open', 'run-res', ?, 1, 100, 1, '占い師', ?, 200, 2, '白')",
-                    (seq, event_type),
-                )
-            await db.commit()
+    async def test_co_result_events_append_and_list_in_one_transaction(self) -> None:
+        await database.record_co_result_events(
+            1,
+            "open",
+            "run-res",
+            events=[
+                {
+                    "event_seq": 1, "day_number": 1,
+                    "actor_id": 100, "actor_number": 1,
+                    "claimed_role": "占い師", "event_type": "取消",
+                    "target_id": 200, "target_number": 2, "judgement": "白",
+                },
+                {
+                    "event_seq": 2, "day_number": 1,
+                    "actor_id": 100, "actor_number": 1,
+                    "claimed_role": "占い師", "event_type": "公開",
+                    "target_id": 300, "target_number": 3, "judgement": "黒",
+                },
+            ],
+        )
 
         results = await database.list_co_results_for_run(1, "open", "run-res")
         self.assertEqual(len(results), 2)
-        self.assertEqual([r["event_type"] for r in results], ["公開", "取消"])
-        self.assertFalse(hasattr(database, "record_co_result"))
+        self.assertEqual([r["event_type"] for r in results], ["取消", "公開"])
+        self.assertEqual(results[-1]["target_id"], 300)
+
+    async def test_co_result_replacement_rolls_back_both_rows_on_failure(self) -> None:
+        events = [
+            {
+                "event_seq": 1, "day_number": 1,
+                "actor_id": 100, "actor_number": 1,
+                "claimed_role": "占い師", "event_type": "取消",
+                "target_id": 200, "target_number": 2, "judgement": "白",
+            },
+            {
+                "event_seq": 2, "day_number": 1,
+                "actor_id": 100, "actor_number": 1,
+                "claimed_role": "占い師", "event_type": "公開",
+                "target_id": None, "target_number": 3, "judgement": "黒",
+            },
+        ]
+        with self.assertRaises(aiosqlite.IntegrityError):
+            await database.record_co_result_events(
+                1, "open", "run-rollback", events=events
+            )
+
+        results = await database.list_co_results_for_run(
+            1, "open", "run-rollback"
+        )
+        self.assertEqual(results, [])
 
     async def test_vote_and_night_action_events_accept_null_target(self) -> None:
         await database.record_vote_event(

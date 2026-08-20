@@ -340,6 +340,134 @@ class RecruitmentManager:
             ephemeral=True,
         )
 
+    async def reopen_previous_recruitment(
+        self,
+        interaction: discord.Interaction,
+        room,
+    ) -> str:
+        """前回設定だけを複製し、同じGM村へ空の参加受付を再掲する。
+
+        呼出側は先にinteractionをdeferする。旧募集はARCHIVEDの履歴として固定し、
+        参加者・補欠・通知台帳を再利用しない。権限判定は終了後に空になる
+        ``state.gm_id`` ではなく、永続的なGM村所有者を正本にする。
+        """
+        guild = interaction.guild
+        member = interaction.user
+        if guild is None or not isinstance(member, discord.Member):
+            return "サーバー内でのみ使えます。"
+        owner_id = getattr(getattr(room, "room_def", None), "private_owner_id", None)
+        if owner_id is None or not room.is_private_room():
+            return "この操作はGM村の参加受付でのみ使えます。"
+        if member.id != owner_id:
+            return "このGM村の村主だけが参加受付を再開できます。"
+        if not _has_private_room_creator_role(member):
+            return (
+                f"参加受付の再開には **{PRIVATE_ROOM_CREATOR_ROLE_LABEL}** "
+                "ロールが必要です。"
+            )
+
+        async with self.lock:
+            async with room.action_lock:
+                state = room.state
+                if (
+                    state.phase != Phase.LOBBY
+                    or room._is_game_in_progress()
+                    or getattr(room, "_postgame_vote_pending", False)
+                ):
+                    return "ゲーム進行中または終了後処理中のため、参加受付を再開できません。"
+                if state.players or state.gm_id is not None or state.recruitment_id is not None:
+                    return "現在の参加受付に登録または未終了の募集があるため再開できません。"
+
+                old_variant_id = room.room_def.variant_id
+                old_gm_id = state.gm_id
+                old_recruitment_id = state.recruitment_id
+                new_id: Optional[int] = None
+                try:
+                    new_id, _source_id = (
+                        await database.create_recruitment_from_previous_settings(
+                            guild.id,
+                            state.room_id,
+                            owner_id,
+                            scheduled_at=datetime.now(timezone.utc),
+                        )
+                    )
+                    row = await database.get_recruitment(new_id)
+                    if row is None:
+                        raise RuntimeError("作成した参加受付を読み直せませんでした。")
+                    room.room_def = replace(
+                        room.room_def, variant_id=str(row["variant_id"])
+                    )
+                    state.gm_id = owner_id
+                    state.recruitment_id = new_id
+                    await room._persist_room_state()
+                    # 連戦用再掲では自動ロールメンションを出さない。必要なら
+                    # 新カードの「募集」ボタンから主催者が明示的に通知する。
+                    await self.publish_new_recruitment(
+                        guild, new_id, announce=False,
+                    )
+                except (database.RecruitmentConflict, RuntimeError, ValueError) as exc:
+                    if new_id is None:
+                        return str(exc)
+                    log.warning("前回設定からの参加受付再開を補償します: %s", exc)
+                    compensation_error = await self._rollback_reopened_recruitment(
+                        room,
+                        new_id,
+                        old_variant_id=old_variant_id,
+                        old_gm_id=old_gm_id,
+                        old_recruitment_id=old_recruitment_id,
+                    )
+                    if compensation_error:
+                        return compensation_error
+                    return str(exc)
+                except Exception:
+                    log.exception("前回設定からの参加受付再開に失敗")
+                    if new_id is not None:
+                        compensation_error = await self._rollback_reopened_recruitment(
+                            room,
+                            new_id,
+                            old_variant_id=old_variant_id,
+                            old_gm_id=old_gm_id,
+                            old_recruitment_id=old_recruitment_id,
+                        )
+                        if compensation_error:
+                            return compensation_error
+                    return "参加受付を安全に再開できませんでした。時間を置いて再度お試しください。"
+        return "✅ 前回設定で空の参加受付を再開しました。"
+
+    async def _rollback_reopened_recruitment(
+        self,
+        room,
+        recruitment_id: int,
+        *,
+        old_variant_id: str,
+        old_gm_id: Optional[int],
+        old_recruitment_id: Optional[int],
+    ) -> Optional[str]:
+        """再掲失敗時に、新規行とロビー状態だけを補償する。"""
+        state = room.state
+        try:
+            await database.set_recruitment_status(
+                recruitment_id,
+                database.RECRUITMENT_ARCHIVED,
+                expected_status=database.RECRUITMENT_OPEN,
+            )
+            await database.clear_recruitment_message_id(recruitment_id)
+            await database.update_private_room_variant(
+                state.guild.id, state.room_id, old_variant_id,
+            )
+            room.room_def = replace(room.room_def, variant_id=old_variant_id)
+            state.gm_id = old_gm_id
+            state.recruitment_id = old_recruitment_id
+            await room._persist_room_state()
+            await room._post_lobby_ui(reuse_existing=True)
+        except Exception:
+            log.exception("参加受付再開失敗後の補償にも失敗: %s", recruitment_id)
+            return (
+                "参加受付の再開と状態復元を完了できませんでした。"
+                "再度押さず、運営へ連絡してください。"
+            )
+        return None
+
     def _room_for_row(self, row: dict):
         return self.game_cog.rooms.get(str(row.get("room_id") or ""))
 
@@ -1087,6 +1215,12 @@ class RecruitmentManager:
             elif row["status"] == database.RECRUITMENT_ARCHIVED:
                 await self.cleanup_archived_recruitment(guild, int(row["id"]))
 
+        # transfer完了後はmessage_idを消すため、従来の「カードIDがある行」だけの
+        # 復旧では、終了時に取り残されたHELDを永久に発見できない。全HELDを
+        # snapshotと照合し、現在のゲーム／開催反映済みロビーに属さない旧行だけ
+        # archiveする。現在進行中の正しい募集は決して推測で閉じない。
+        await self._archive_orphaned_held_recruitments(guild)
+
         for row in await database.list_open_recruitments(guild.id):
             room = self._room_for_row(row)
             if _recruitment_is_disabled(row):
@@ -1098,6 +1232,54 @@ class RecruitmentManager:
                     f"募集#{row['id']}/{row['room_id']}"
                 )
             await self.ensure_recruitment_message(guild, row)
+
+    async def _archive_orphaned_held_recruitments(
+        self, guild: discord.Guild,
+    ) -> None:
+        """カードIDを失った旧HELDを、現在snapshotと照合して回収する。"""
+        for row in await database.list_held_recruitments(guild.id):
+            recruitment_id = int(row["id"])
+            room = self._room_for_row(row)
+            keep = False
+            if room is not None:
+                state = room.state
+                if state.recruitment_id == recruitment_id:
+                    if state.phase not in (Phase.LOBBY, Phase.GAME_OVER):
+                        keep = True
+                    elif state.phase == Phase.LOBBY:
+                        entries = await database.list_recruitment_entries(
+                            recruitment_id
+                        )
+                        participant_ids = {
+                            int(entry["user_id"])
+                            for entry in entries
+                            if entry["kind"] == "参加"
+                        }
+                        gm_id = int(row["gm_id"] or row["host_id"])
+                        keep = bool(
+                            len(participant_ids) == int(row["capacity"])
+                            and set(state.players) == participant_ids
+                            and state.gm_id == gm_id
+                        )
+            if keep:
+                continue
+            try:
+                changed = await database.set_recruitment_status(
+                    recruitment_id,
+                    database.RECRUITMENT_ARCHIVED,
+                    expected_status=database.RECRUITMENT_HELD,
+                )
+            except Exception:
+                log.exception("孤立HELD募集の回収に失敗: %s", recruitment_id)
+                continue
+            if not changed:
+                continue
+            log.warning("現在snapshotに属さないHELD募集を回収しました: %s", recruitment_id)
+            try:
+                await self.cleanup_archived_recruitment(guild, recruitment_id)
+            except Exception:
+                # DB上は既に安全に閉じている。表示回収は次回setupでも再試行できる。
+                log.exception("孤立HELD募集の表示回収に失敗: %s", recruitment_id)
 
     async def _recover_held_recruitment(
         self, guild: discord.Guild, row: dict,
@@ -1274,9 +1456,17 @@ class RecruitmentManager:
         await database.clear_recruitment_message_id(row["id"])
 
     async def publish_new_recruitment(
-        self, guild: discord.Guild, recruitment_id: int
+        self,
+        guild: discord.Guild,
+        recruitment_id: int,
+        *,
+        announce: bool = True,
     ) -> None:
-        """新規募集を掲示し、掲示不能なら予約だけ残さず取り消す。"""
+        """新規募集を掲示し、掲示不能なら予約だけ残さず取り消す。
+
+        連戦用の再掲は ``announce=False`` とし、参加受付カードだけを静かに
+        戻す。必要な一括通知はカード上の既存「募集」ボタンから主催者が行う。
+        """
         row = await database.get_recruitment(recruitment_id)
         if row is None:
             raise RuntimeError("作成した募集を読み直せませんでした。")
@@ -1296,11 +1486,12 @@ class RecruitmentManager:
                 published_error = exc
                 log.exception("新規募集カードの掲示に失敗: %s", recruitment_id)
             else:
-                try:
-                    await self._notify_new_recruitment(guild, row)
-                except Exception:
-                    # 通知ロールの不調で、公開済みの募集カードまで取り消さない。
-                    log.exception("新規募集のロール通知に失敗: %s", recruitment_id)
+                if announce:
+                    try:
+                        await self._notify_new_recruitment(guild, row)
+                    except Exception:
+                        # 通知ロールの不調で、公開済みの募集カードまで取り消さない。
+                        log.exception("新規募集のロール通知に失敗: %s", recruitment_id)
                 return
         try:
             archived = await database.set_recruitment_status(
@@ -2732,11 +2923,23 @@ class RecruitmentCardView(discord.ui.View):
         )
         if access_error:
             return await interaction.response.send_message(access_error, ephemeral=True)
+        view = RecruitmentHostView(
+            self.manager, self.recruitment_id, interaction.user.id,
+        )
         await interaction.response.send_message(
             "主催者メニューです。受付中はここからゲーム形式も変更できます。",
-            view=RecruitmentHostView(self.manager, self.recruitment_id, interaction.user.id),
+            view=view,
             ephemeral=True,
         )
+        original_response = getattr(interaction, "original_response", None)
+        if not callable(original_response):
+            return
+        try:
+            view.message = await original_response()
+        except (discord.NotFound, discord.HTTPException):
+            # 各操作は押下時にもDBと権限を再検証する。参照取得だけの失敗で
+            # メニュー自体を失敗扱いにはしない。
+            pass
 
 
 class RecruitmentLobbyResetConfirmView(discord.ui.View):
@@ -2762,6 +2965,23 @@ class RecruitmentHostView(discord.ui.View):
     def __init__(self, manager: RecruitmentManager, recruitment_id: int, host_id: int) -> None:
         super().__init__(timeout=180)
         self.manager, self.recruitment_id, self.host_id = manager, recruitment_id, host_id
+        self.message: Optional[discord.Message] = None
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content=(
+                    "この主催者メニューは時間切れです。"
+                    "募集カードの「主催者メニュー」から開き直してください。"
+                ),
+                view=self,
+            )
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            pass
 
     def _allowed(self, interaction: discord.Interaction) -> bool:
         return interaction.user.id == self.host_id
@@ -2920,7 +3140,31 @@ class RecruitmentRemoveEntryView(discord.ui.View):
             )
         except database.RecruitmentConflict as exc:
             return await interaction.followup.send(str(exc), ephemeral=True)
-        await self.manager.refresh_message(self.recruitment_id)
+        except Exception:
+            log.exception(
+                "募集参加者の除外保存に失敗: %s/%s",
+                self.recruitment_id,
+                user_id,
+            )
+            return await interaction.followup.send(
+                "参加者の除外を保存できませんでした。除外は行っていません。",
+                ephemeral=True,
+            )
+        try:
+            await self.manager.refresh_message(self.recruitment_id)
+        except Exception:
+            # remove_entry_with_promotionはここへ来る前にcommit済み。表示失敗を
+            # 「未除外」と案内すると二度押しを誘発するため、保存済みと明示する。
+            log.exception(
+                "募集参加者の除外後カード更新に失敗: %s/%s",
+                self.recruitment_id,
+                user_id,
+            )
+            return await interaction.followup.send(
+                f"{_display_name(interaction.guild, user_id)} の除外は保存済みですが、"
+                "募集カードの表示更新に失敗しました。主催者メニューを開き直してください。",
+                ephemeral=True,
+            )
         # 除外しても再登録は塞がない。繰り返す相手は同村拒否で扱う方が、
         # 主催者ごとの一時的な判断を恒久ルールにせずに済む。
         await interaction.followup.send(
@@ -3919,8 +4163,6 @@ class OperationsGMReleaseView(discord.ui.View):
         await interaction.response.defer(ephemeral=True, thinking=True)
         async with room.action_lock:
             room.state.gm_id = None
-            if not room.state.players:
-                room.state.recruitment_id = None
             await room._persist_room_state()
             await room._post_lobby_ui()
         await interaction.followup.send("GMを解除しました。", ephemeral=True)

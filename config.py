@@ -15,7 +15,7 @@ from room_config import (
 )
 
 # Botのバージョン (ヘルプに表示。ソース公開された派生でも識別できるように)
-BOT_VERSION = "v0.51"
+BOT_VERSION = "v0.52"
 
 # 新規導入先に同名カテゴリが既にある場合、無関係なDiscord構成をBot所有と
 # 誤認しない。既存運用は保存済みchannel IDで自動再利用できる。
@@ -304,7 +304,9 @@ SLOW_INTERACTION_SECONDS = 2.0
 # Falseでは依存検査とSE再生を行わず、無音で運用する。
 SE_ENABLED = True
 VOTE_TIMEOUT = 60              # 決戦の一斉投票制限時間 (秒)
-VOTE_SPEECH_TIME = 20          # 通常投票で1人ずつ発言・投票する時間 (秒)
+VOTE_SPEECH_TIME = 30          # クロストーク通常投票の1人あたり発言時間 (秒)
+VOTE_TRANSITION_GRACE = 2.0    # 投票発言の開始・終了SEを聞くための切替時間 (秒)
+VOTE_SE_MAX_WAIT = 3.0         # VC接続不調で投票進行を止めないSE待機上限 (秒)
 CHANNEL_DELETE_DELAY = 300     # 結果発表後の削除待ち (秒)
 # 人狼予想の受付時間 (秒)。死亡した瞬間から数え、この間だけ #霊界 を開けない。
 # 霊界へ入れてしまうと先に死んだ人から答えを聞けるので、提出は必ずこの窓の中で

@@ -19,6 +19,7 @@ from config import (
     DISCORD_MESSAGE_LIMIT,
     PREPARATION_TIME, INITIAL_NIGHT_GREETING_TIME,
     CHANNEL_DELETE_DELAY, VOTE_TIMEOUT, VOTE_SPEECH_TIME,
+    VOTE_TRANSITION_GRACE, VOTE_SE_MAX_WAIT,
     LOG_CATEGORY_VILLAGE,
     LOG_CATEGORY_LIMIT, LOG_CATEGORY_TRIM_TO,
     CH_VILLAGE, CH_SPIRIT, CH_LOBBY, VC_GAME,
@@ -36,7 +37,8 @@ from config import (
 )
 from models import Player, GameState, by_number
 from views import (
-    LobbyView, GMPanelEntryView, VoteView, VoteQueueView, RunoffVoteView,
+    LobbyView, GMPanelEntryView, VoteView, VoteQueueView,
+    SequentialVoteSpeechView, RunoffVoteView,
     WolfVoteView, WolfSurrenderView, SpeechDoneView,
     TurnSpeechView,
     MorningReadyView, PrepReadyView, PostgameVotePanelView,
@@ -405,6 +407,111 @@ class RoomRunner:
         target.vc_gm_speak_user_id = source.vc_gm_speak_user_id
         target.vc_gm_speak_before_game = source.vc_gm_speak_before_game
 
+    def _make_empty_lobby_state(
+        self,
+        source: GameState,
+        *,
+        nickname_failures: Optional[dict[int, Optional[str]]] = None,
+    ) -> GameState:
+        """終了済みstateから、外部復元待ちだけを持つ空LOBBYを作る。"""
+        target = GameState()
+        target.room_id = source.room_id
+        target.room_name = source.room_name
+        target.guild = source.guild
+        target.category = source.category
+        target.lobby_channel = source.lobby_channel
+        target.stats_channel = source.stats_channel
+        target.voice_channel = source.voice_channel
+        # 新しいパネルをsend-firstで確保できるまでは、従来の参照を残す。
+        target.lobby_message = source.lobby_message
+        target.original_nicknames = dict(nickname_failures or {})
+        self._carry_pending_vc_restore(source, target)
+        target.managed_game_channel_ids = set(source.managed_game_channel_ids)
+        return target
+
+    def _build_snapshot_for_state(self, state: GameState) -> dict:
+        """awaitを挟まず、指定stateのsnapshotを組み立てる。"""
+        current = self.state
+        self.state = state
+        try:
+            return self._build_room_snapshot()
+        finally:
+            self.state = current
+
+    async def _transition_to_empty_lobby(
+        self,
+        source: GameState,
+        *,
+        nickname_failures: Optional[dict[int, Optional[str]]] = None,
+        log_label: str,
+    ) -> bool:
+        """募集終了と空LOBBY保存を原子的に確定してからstateを差し替える。"""
+        if source.guild is None:
+            log.error("%s: guildが無いためLOBBYへ移行できません", log_label)
+            return False
+        target = self._make_empty_lobby_state(
+            source,
+            nickname_failures=nickname_failures,
+        )
+        payload = self._build_snapshot_for_state(target)
+        recruitment_id = source.recruitment_id
+        transitioned = False
+        for attempt, delay in enumerate((0, 1, 2), start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                async with self.state_persist_lock:
+                    if self.state is not source:
+                        log.warning("%s: stateが先に差し替わったため中断", log_label)
+                        return False
+                    await database.archive_linked_recruitment_and_save_lobby_state(
+                        source.guild.id,
+                        source.room_id,
+                        recruitment_id,
+                        payload,
+                    )
+                    # DBが確定する前にメモリだけ空LOBBYへ進めない。
+                    self.state = target
+                transitioned = True
+                break
+            except Exception as error:
+                log.exception(
+                    "%sの原子保存失敗 (%s/3): %s",
+                    log_label,
+                    attempt,
+                    error,
+                )
+        if not transitioned:
+            return False
+
+        panel_ready = False
+        for attempt, delay in enumerate((0, 1, 2), start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await self._post_lobby_ui()
+                panel_ready = True
+                break
+            except Exception as error:
+                log.exception(
+                    "%s後の参加受付パネル再掲失敗 (%s/3): %s",
+                    log_label,
+                    attempt,
+                    error,
+                )
+        if panel_ready and recruitment_id is not None:
+            try:
+                # 新パネルを確保し、旧カードをpurgeした後に追跡IDを外す。
+                await database.clear_recruitment_message_id(recruitment_id)
+            except Exception as error:
+                log.warning(
+                    "%s後の旧募集カードID解除失敗 (%s): %s",
+                    log_label,
+                    recruitment_id,
+                    error,
+                )
+        return True
+
     @property
     def variant(self) -> VariantDefinition:
         return get_variant_definition(self.room_def.variant_id)
@@ -605,6 +712,9 @@ class RoomRunner:
         self._night_views.clear()
 
     def _stop_all_game_views(self) -> None:
+        # PREPARATION中の初日挨拶はnight viewを作らないため、全停止側でも
+        # 中継窓を明示的に閉じる。
+        self.state.wolf_relay_window_open = False
         for view in list(self._game_views):
             try:
                 view.stop()
@@ -1161,10 +1271,23 @@ class RoomRunner:
             immediate.append(member)
         return immediate, pending
 
-    async def _purge_bot_messages(self, ch: discord.TextChannel, label: str) -> None:
-        """チャンネル内のBot投稿を最大50件まで削除"""
+    async def _purge_bot_messages(
+        self,
+        ch: discord.TextChannel,
+        label: str,
+        *,
+        keep_message_ids: Optional[set[int]] = None,
+    ) -> None:
+        """チャンネル内の古いBot投稿を最大50件まで削除する。"""
+        keep_message_ids = keep_message_ids or set()
         try:
-            await ch.purge(limit=50, check=lambda m: m.author == self.bot.user)
+            await ch.purge(
+                limit=50,
+                check=lambda m: (
+                    m.author == self.bot.user
+                    and getattr(m, "id", None) not in keep_message_ids
+                ),
+            )
         except (discord.Forbidden, discord.HTTPException) as e:
             log.warning(f"{label}メッセージ削除失敗: {e}")
 
@@ -1266,6 +1389,30 @@ class RoomRunner:
             return
         self.manager.spawn_bg_task(self.manager.sound_player.play(vc, scene))
 
+    async def _play_transition_se(self, scene: str) -> None:
+        """SEと約2秒の切替間を進行順序に組み込む。
+
+        通常のSEは非同期だが、投票発言の開始・終了と結果開示は
+        音の前に次の操作へ進まないことが仕様。VC不調は上限で打ち切り、
+        無音でも同じ切替間は保つ。
+        """
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        vc = self.state.voice_channel
+        if SE_ENABLED and vc is not None:
+            try:
+                await asyncio.wait_for(
+                    self.manager.sound_player.play(vc, scene),
+                    timeout=VOTE_SE_MAX_WAIT,
+                )
+            except asyncio.TimeoutError:
+                log.warning("SE待機を打ち切りました (%s)", scene)
+            except Exception as error:
+                log.warning("SE待機中の例外 (%s): %s", scene, error)
+        remaining = max(0.0, VOTE_TRANSITION_GRACE - (loop.time() - started))
+        if remaining:
+            await self._pausable_sleep(remaining)
+
     async def _repost_gm_panel(self) -> bool:
         """GMメニュー入口を #昼 の末尾へ再掲示する (古いパネルは削除)。
 
@@ -1326,10 +1473,16 @@ class RoomRunner:
             if message is not None:
                 self.state.lobby_message = message
                 return
-        await self._purge_bot_messages(ch, "ロビー")
-
-        self.state.lobby_message = await ch.send(embed=embed, view=view)
-        await self._remember_lobby_message(self.state.lobby_message)
+        # 運用中は新しい操作面を先に確保する。送信またはID保存に失敗しても、
+        # それまで使えていた参加受付を先に消さない。
+        new_message = await ch.send(embed=embed, view=view)
+        await self._remember_lobby_message(new_message)
+        self.state.lobby_message = new_message
+        await self._purge_bot_messages(
+            ch,
+            "ロビー",
+            keep_message_ids={new_message.id},
+        )
 
     async def _reuse_lobby_message(
         self, ch, *, embed: discord.Embed, view: discord.ui.View,
@@ -1428,6 +1581,8 @@ class RoomRunner:
             "vote_slot_index": state.vote_slot_index,
             "vote_slot_token": state.vote_slot_token,
             "vote_slot_active": state.vote_slot_active,
+            "vote_speech_finished": state.vote_speech_finished,
+            "vote_slot_forced_abstain": state.vote_slot_forced_abstain,
             "vote_current_speaker_id": (
                 state.current_speaker_id
                 if self._effective_phase() == Phase.DAY_VOTE
@@ -1508,6 +1663,10 @@ class RoomRunner:
                     "day": claim.get("day"),
                 }
                 for user_id, claim in state.co_claims.items()
+            ],
+            "co_result_claims": [
+                dict(result) for result in state.co_result_claims
+                if isinstance(result, dict)
             ],
             "medium_results": [dict(result) for result in state.medium_results],
             "record_event_seq": state.record_event_seq,
@@ -1701,18 +1860,47 @@ class RoomRunner:
             raise StateDurabilityError("投票順snapshotのcursorが順序の範囲外です")
         # 発言順は「投票」を押した人だけの部分列なので、生存者が全員
         # 入っている必要はない。まだ押していない人は復元後に押して並ぶ。
-        if not isinstance(payload.get("vote_closed", False), bool):
-            raise StateDurabilityError("vote_closedがboolではありません")
+        for key in (
+            "vote_closed", "vote_slot_active", "vote_speech_finished",
+            "vote_slot_forced_abstain",
+        ):
+            if key in payload and not isinstance(payload[key], bool):
+                raise StateDurabilityError(f"{key}がboolではありません")
 
         active = bool(payload.get("vote_slot_active", False))
         speaker_id = payload.get("vote_current_speaker_id")
+        vote_voter_ids = {
+            int(row["voter_id"])
+            for row in payload.get("votes", [])
+            if isinstance(row, dict) and row.get("voter_id") is not None
+        }
+        # v0.51までは発言と投票が同じ枠。active話者の票が既にある
+        # 旧snapshotだけは「発言・投票完了」と読み替える。
+        speech_finished = (
+            bool(payload.get("vote_speech_finished", False))
+            if "vote_speech_finished" in payload
+            else bool(active and speaker_id in vote_voter_ids)
+        )
+        forced_abstain = bool(payload.get("vote_slot_forced_abstain", False))
         if active:
             if saved_phase != Phase.DAY_VOTE or slot_index >= len(raw_order):
                 raise StateDurabilityError("投票発言中snapshotのフェーズまたはcursorが不正です")
+            if not self.uses_sequential_vote():
+                raise StateDurabilityError("一斉投票snapshotに投票発言枠が残っています")
             if speaker_id != raw_order[slot_index]:
                 raise StateDurabilityError("投票発言中snapshotの話者が順序と一致しません")
-        elif speaker_id is not None:
-            raise StateDurabilityError("非アクティブな投票snapshotに話者が残っています")
+            if (
+                "vote_speech_finished" in payload
+                and not speech_finished
+                and speaker_id in vote_voter_ids
+            ):
+                raise StateDurabilityError("発言終了前の投票snapshotに確定票があります")
+            if forced_abstain and (
+                not speech_finished or speaker_id in vote_voter_ids
+            ):
+                raise StateDurabilityError("GM棄権snapshotの発言・票状態が不正です")
+        elif speaker_id is not None or speech_finished or forced_abstain:
+            raise StateDurabilityError("非アクティブな投票snapshotに現在枠の状態が残っています")
 
         panel_id = payload.get("vote_panel_message_id")
         if panel_id is not None and (
@@ -1975,7 +2163,29 @@ class RoomRunner:
             saved_phase_name = recovery_phase_name
         saved_phase = Phase[saved_phase_name]
         self._validate_night_surrender_snapshot(payload)
-        if saved_phase in (Phase.LOBBY, Phase.GAME_OVER):
+        if saved_phase == Phase.GAME_OVER:
+            # 終了checkpoint後〜空LOBBYの原子保存前に停止した窓を回収する。
+            # 旧実装のように参加者・GM・募集IDを残したままLOBBY扱いにすると、
+            # 次村が開始不能になり、番号付きニックネームも持ち越される。
+            state.phase = Phase.GAME_OVER
+            state.ending = True
+            had_entries = bool(state.players) or state.gm_id is not None
+            if had_entries:
+                self.last_game_roster = list(state.players)
+                self.last_game_gm = state.gm_id
+            nickname_failures = await self._restore_nicknames(state)
+            await self._teardown_game_roles_and_perms()
+            if not await self._transition_to_empty_lobby(
+                state,
+                nickname_failures=nickname_failures,
+                log_label="再起動時の終了処理回収",
+            ):
+                log.error(
+                    "終了済みゲームを空LOBBYへ回収できませんでした (%s)",
+                    state.room_name,
+                )
+            return
+        if saved_phase == Phase.LOBBY:
             state.phase = Phase.LOBBY
             state.recovery_phase = None
             state.recovered_from_restart = False
@@ -2025,8 +2235,35 @@ class RoomRunner:
             int(player_id) for player_id in payload.get("vote_requeue_ids", [])
             if int(player_id) in state.players
         }
-        # 進行中だった枠は同じcursorから20秒を満額でやり直す。
-        state.vote_slot_active = False
+        saved_vote_slot_active = bool(payload.get("vote_slot_active", False))
+        raw_vote_speaker_id = payload.get("vote_current_speaker_id")
+        restored_vote_speaker_id = (
+            int(raw_vote_speaker_id)
+            if raw_vote_speaker_id is not None
+            and int(raw_vote_speaker_id) in state.players
+            and state.vote_slot_index < len(state.vote_order)
+            and state.vote_order[state.vote_slot_index] == int(raw_vote_speaker_id)
+            else None
+        )
+        state.vote_slot_active = bool(
+            saved_vote_slot_active and restored_vote_speaker_id is not None
+        )
+        state.vote_speech_finished = (
+            (
+                bool(payload.get("vote_speech_finished", False))
+                if "vote_speech_finished" in payload
+                else restored_vote_speaker_id in state.votes
+            )
+            if state.vote_slot_active else False
+        )
+        state.vote_slot_forced_abstain = (
+            bool(payload.get("vote_slot_forced_abstain", False))
+            if state.vote_slot_active else False
+        )
+        # 復元直後は必ず全員ミュート。再開タスクがSE後に明示的に窓を開ける。
+        state.vote_speech_window_open = False
+        state.speech_done_event.clear()
+        state.vote_choice_event.clear()
         state.vote_panel_message_id = (
             int(payload["vote_panel_message_id"])
             if payload.get("vote_panel_message_id") is not None else None
@@ -2124,6 +2361,13 @@ class RoomRunner:
             # 元slotを満額でやり直す際に日次枠も返却する。
             state.turn_interrupt_pending_id = None
             state.turn_interrupts_used = max(0, state.turn_interrupts_used - 1)
+        if (
+            saved_phase == Phase.DAY_VOTE
+            and self.uses_sequential_vote()
+            and state.vote_slot_active
+        ):
+            # 共通current_speakerをターン復元で初期化した後、逐次投票の現在者を戻す。
+            state.current_speaker_id = restored_vote_speaker_id
         state.decisive_executions = [
             row for row in payload.get("decisive_executions", []) if isinstance(row, dict)
         ]
@@ -2171,7 +2415,7 @@ class RoomRunner:
         state.bot_muted_ids = set(payload.get("bot_muted_ids", []))
         state.bot_mute_intent_ids = set(payload.get("bot_mute_intent_ids", []))
         state.mute_marker_enabled = bool(payload.get("mute_marker_enabled", False))
-        # 公開CO宣言・霊能結果・記録seq・昼パネルID・開始時刻。
+        # 公開CO宣言・結果自己申告・霊能結果・記録seq・昼パネルID・開始時刻。
         # 壊れた要素は例外を投げず読み飛ばす (旧payloadを隔離しないため)。
         state.co_claims = {}
         for row in payload.get("co_claims", []):
@@ -2186,6 +2430,41 @@ class RoomRunner:
                 }
             except (KeyError, TypeError, ValueError):
                 continue
+        state.co_result_claims = []
+        result_indexes: dict[tuple[int, int, str], int] = {}
+        for row in payload.get("co_result_claims", []):
+            if not isinstance(row, dict):
+                continue
+            try:
+                restored = {
+                    "user_id": int(row["user_id"]),
+                    "number": int(row["number"]),
+                    "display_name": str(row["display_name"]),
+                    "role": str(row["role"]),
+                    "target_id": int(row["target_id"]),
+                    "target_number": int(row["target_number"]),
+                    "target_name": str(row["target_name"]),
+                    "judgement": str(row["judgement"]),
+                    "day": int(row["day"]),
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+            allowed = self.CO_RESULT_JUDGEMENTS.get(restored["role"])
+            if (
+                restored["user_id"] <= 0
+                or restored["target_id"] <= 0
+                or restored["user_id"] == restored["target_id"]
+                or allowed is None
+                or restored["judgement"] not in allowed
+            ):
+                continue
+            key = (restored["user_id"], restored["day"], restored["role"])
+            previous_index = result_indexes.get(key)
+            if previous_index is None:
+                result_indexes[key] = len(state.co_result_claims)
+                state.co_result_claims.append(restored)
+            else:
+                state.co_result_claims[previous_index] = restored
         state.medium_results = [
             dict(result) for result in payload.get("medium_results", [])
             if isinstance(result, dict)
@@ -2420,10 +2699,6 @@ class RoomRunner:
         if member.guild_permissions.administrator:
             return "管理者権限を持つメンバーはプレイヤー参加できません (GMとしてなら参加できます)。"
 
-        other_room = self.manager.find_user_room(member.id, exclude_room_id=self.state.room_id)
-        if other_room is not None:
-            return f"既に **{other_room.state.room_name}** に参加またはGM登録しています。"
-
         strict_access_error = self._strict_access_error(member, action="参加")
         if strict_access_error:
             return strict_access_error
@@ -2453,9 +2728,6 @@ class RoomRunner:
         return None
 
     async def validate_gm_claim(self, member: discord.Member) -> Optional[str]:
-        other_room = self.manager.find_user_room(member.id, exclude_room_id=self.state.room_id)
-        if other_room is not None:
-            return f"既に **{other_room.state.room_name}** に参加またはGM登録しています。"
         member_role_names = {role.name for role in member.roles}
         if self.is_private_room():
             if member.id != self.room_def.private_owner_id:
@@ -2673,17 +2945,84 @@ class RoomRunner:
             except (discord.NotFound, discord.HTTPException):
                 pass
             return
-        owner_id = self.room_def.private_owner_id
-        if owner_id is not None:
-            running = self.manager.running_room_name_for_owner(
-                owner_id, exclude_room_id=state.room_id,
+        participant_ids = set(state.players)
+        if state.gm_id is not None:
+            participant_ids.add(state.gm_id)
+        conflicts: dict[str, list[str]] = {}
+        find_active_user_room = getattr(
+            self.manager,
+            "find_active_user_room",
+            None,
+        )
+        for user_id in sorted(participant_ids):
+            active_room = (
+                find_active_user_room(
+                    user_id,
+                    exclude_room_id=state.room_id,
+                )
+                if callable(find_active_user_room)
+                else None
             )
-            if running is not None:
+            if active_room is None:
+                continue
+            member = guild.get_member(user_id) if guild is not None else None
+            player = state.players.get(user_id)
+            display_name = (
+                getattr(member, "display_name", None)
+                or getattr(getattr(player, "member", None), "display_name", None)
+                or f"ID:{user_id}"
+            )
+            conflicts.setdefault(active_room.state.room_name, []).append(display_name)
+        if conflicts:
+            details = "\n".join(
+                f"・**{room_name}**: {', '.join(names)}"
+                for room_name, names in conflicts.items()
+            )
+            try:
+                await interaction.followup.send(
+                    "次のメンバーは別のゲームが進行中です。"
+                    "待機村への複数登録はできますが、同時に進行できるゲームは1つです。\n"
+                    f"{details}",
+                    ephemeral=True,
+                )
+            except (discord.NotFound, discord.HTTPException):
+                pass
+            return
+
+        # 前ゲームで一時的に戻せなかった名前は、次の開始前に再試行する。
+        # そのゲームへ参加する人だけが未復元なら開始を止め、不在者など
+        # 今回の参加者でない失敗はLOBBY snapshotへ持ち越す。
+        pending_nickname_targets = dict(state.original_nicknames)
+        if pending_nickname_targets:
+            nickname_failures = await self._restore_nicknames(
+                state,
+                member_ids=set(pending_nickname_targets),
+            )
+            state.original_nicknames = nickname_failures
+            try:
+                await self._persist_room_state()
+            except Exception as error:
+                log.exception("開始前の名前復元結果を保存できません: %s", error)
                 try:
                     await interaction.followup.send(
-                        f"同じ村主の **{running}** が進行中です。"
-                        "1人が同時に進行できる村は1つまでなので、"
-                        "先にそちらを終了してください。",
+                        "前ゲームの名前復元結果を保存できないため、開始しませんでした。",
+                        ephemeral=True,
+                    )
+                except (discord.NotFound, discord.HTTPException):
+                    pass
+                return
+            blocked_ids = participant_ids & set(nickname_failures)
+            if blocked_ids:
+                blocked_names = []
+                for user_id in sorted(blocked_ids):
+                    member = guild.get_member(user_id) if guild is not None else None
+                    blocked_names.append(
+                        getattr(member, "display_name", None) or f"ID:{user_id}"
+                    )
+                try:
+                    await interaction.followup.send(
+                        "前ゲームの名前をまだ復元できない参加者がいるため、開始しませんでした: "
+                        + ", ".join(blocked_names),
                         ephemeral=True,
                     )
                 except (discord.NotFound, discord.HTTPException):
@@ -2825,8 +3164,16 @@ class RoomRunner:
             if cached_member is not None:
                 player.member = cached_member
             player.number = numbers[i]
-            player.original_nickname = player.member.nick
-            player.base_name = player.member.nick or player.member.display_name
+            original_nickname = pending_nickname_targets.get(
+                player.user_id, player.member.nick,
+            )
+            player.original_nickname = original_nickname
+            player.base_name = (
+                original_nickname
+                or getattr(player.member, "global_name", None)
+                or getattr(player.member, "name", None)
+                or player.member.display_name
+            )
 
         # ニックネーム変更・初期ミュート・生存ロールは同じPATCHにまとめる。
         # メンバー編集はギルド共有バケット (429の主因) なので、
@@ -2874,7 +3221,10 @@ class RoomRunner:
             state.original_nicknames.setdefault(member.id, member.nick)
 
         for player in state.players.values():
-            state.original_nicknames.setdefault(player.user_id, player.member.nick)
+            state.original_nicknames.setdefault(
+                player.user_id,
+                pending_nickname_targets.get(player.user_id, player.member.nick),
+            )
 
         await self._assign_roles()
         state.mute_marker_enabled = True
@@ -3231,11 +3581,12 @@ class RoomRunner:
             if player.is_wolf:
                 msg += f"\n🐺 他の人狼: {wolf_names}"
                 msg += (
-                    "\n🐺 0日目初夜と夜の制限時間中は、このDMが他の人狼へ中継されます。"
+                    "\n🐺 役職確認タイムの最初の30秒と夜の制限時間中は、"
+                    "このDMが他の人狼へ中継されます。"
                 )
             msg += (
                 "\n\n📩 確認したら #昼 の「役職を確認した」を押してください"
-                "（全員が押すと0日目初夜へ進みます）。"
+                "（全員が押すと1日目へ進みます）。"
             )
             try:
                 surrender_view = (
@@ -3538,8 +3889,35 @@ class RoomRunner:
             content = content[: budget - 1] + "…"
         await self._relay_to_wolves(prefix + content, exclude_id=sender.user_id)
 
+    async def _initial_wolf_greeting_during_preparation(self) -> None:
+        """役職確認と同時に、人狼DM中継を最大30秒だけ開く。"""
+        state = self.state
+        if state.initial_night_completed:
+            return
+        await state.pause_event.wait()
+        if state.surrender_confirmed or state.ending or state.pending_winner is not None:
+            return
+
+        state.wolf_relay_window_open = True
+        try:
+            # 全員確認またはGM締切なら、30秒を待たず同じEventで挨拶も終了する。
+            await self._pausable_countdown(
+                None,
+                lambda _remaining: "",
+                INITIAL_NIGHT_GREETING_TIME,
+                state.prep_ready_event,
+            )
+        finally:
+            state.wolf_relay_window_open = False
+
+        await state.pause_event.wait()
+        if state.surrender_confirmed or state.ending or state.pending_winner is not None:
+            return
+        state.initial_night_completed = True
+        await self._persist_room_state()
+
     async def _initial_night_greeting(self) -> None:
-        """1日目開始前に、人狼だけがDMで挨拶できる0日目初夜を行う。"""
+        """旧INITIAL_NIGHT snapshot復旧用に、0日目初夜を単独で再開する。"""
         state = self.state
         await state.pause_event.wait()
         state.phase = Phase.INITIAL_NIGHT
@@ -3601,7 +3979,12 @@ class RoomRunner:
                 error,
             )
 
-    async def force_skip_wait(self, member: discord.Member) -> str:
+    async def force_skip_wait(
+        self,
+        member: discord.Member,
+        *,
+        expected_vote_slot_token: Optional[int] = None,
+    ) -> str:
         """GMが現在の安全な時間待ちだけを終了する。"""
         state = self.state
         if member.id != state.gm_id:
@@ -3640,12 +4023,51 @@ class RoomRunner:
         if (
             phase == Phase.DAY_VOTE
             and self.uses_sequential_vote()
-            and state.vote_slot_active
-            and not state.speech_done_event.is_set()
+            and expected_vote_slot_token is not None
+            and expected_vote_slot_token != state.vote_slot_token
         ):
+            return "⏳ 対象の投票枠は既に終了しています。状況を更新してください。"
+        if (
+            phase == Phase.DAY_VOTE
+            and self.uses_sequential_vote()
+            and state.vote_slot_active
+            and not state.vote_speech_finished
+        ):
+            old_window = state.vote_speech_window_open
+            state.vote_speech_finished = True
+            state.vote_speech_window_open = False
+            try:
+                await self._persist_room_state()
+            except Exception as error:
+                state.vote_speech_finished = False
+                state.vote_speech_window_open = old_window
+                await self._stop_for_durability_error("GMによる投票発言終了の保存", error)
+                return "❌ 保存できないため安全停止しました。"
             state.speech_done_event.set()
             await self._safe_village_send("⏭️ **GMの操作で現在の投票発言を終了します。**")
-            return "⏭️ 現在の投票発言をスキップしました。"
+            return "⏭️ 現在の投票発言を終了しました。投票先の確定は待ち続けます。"
+        if (
+            phase == Phase.DAY_VOTE
+            and self.uses_sequential_vote()
+            and state.vote_slot_active
+            and state.vote_speech_finished
+            and not state.vote_slot_forced_abstain
+        ):
+            voter = state.get_player(state.current_speaker_id)
+            if voter is None or not voter.alive:
+                state.vote_choice_event.set()
+                return "⏳ 現在の投票者は既に除外されています。"
+            if voter.user_id in state.votes:
+                return "⏳ すでに投票確定済みです。"
+            state.vote_slot_forced_abstain = True
+            if not await self._record_vote_abstentions([voter], "本投票", 0):
+                state.vote_slot_forced_abstain = False
+                return "❌ 棄権を保存できませんでした。もう一度押してください。"
+            state.vote_choice_event.set()
+            await self._safe_village_send(
+                f"⏭️ **GMの操作で {voter.display_name} は棄権となります。**"
+            )
+            return "⏭️ 現在の投票者を棄権にして次へ進めます。"
         if (
             phase == Phase.DAY_VOTE
             and self.uses_sequential_vote()
@@ -3658,14 +4080,12 @@ class RoomRunner:
             and state.vote_slot_index >= len(state.vote_order)
             and not state.vote_closed
         ):
-            # 誰も「投票」を押さず進行が止まったときの唯一の逃げ道。
-            # 通常は締切時間を設けず、押されるまで全員ミュートで待つ。
+            # 通常は締切時間を設けない。GMが明示的に締めた場合だけ、
+            # まだ「投票」を押していない生存者を棄権として閉じる。
+            not_pressed = self._vote_queue_waiting()
             state.vote_closed = True
-            try:
-                await self._persist_room_state()
-            except Exception as error:
+            if not await self._record_vote_abstentions(not_pressed, "本投票", 0):
                 state.vote_closed = False
-                log.exception(f"投票締切の保存に失敗: {error}")
                 return "❌ 保存できませんでした。もう一度押してください。"
             state.vote_queue_event.set()
             await self._safe_village_send(
@@ -3691,7 +4111,8 @@ class RoomRunner:
         state = self.state
         try:
             # 役職確認フェーズ (pause対応)。夜と同じく制限時間は目安で、
-            # 参加者全員が「役職を確認した」を押すまで0日目初夜へ進まない。
+            # 参加者全員が「役職を確認した」を押すまで1日目へ進まない。
+            # 人狼の初日挨拶はこの30秒と同時に走り、確認完了時にも終了する。
             def prep_content(remaining: float) -> str:
                 return (
                     f"⏳ 役職確認タイム（{PREPARATION_TIME}秒）\n"
@@ -3700,30 +4121,57 @@ class RoomRunner:
 
             # 復元で「確認済み」のまま戻ってきた場合はパネルもタイマーも出さない
             if not state.prep_confirmed:
-                prep_msg = await self._safe_village_send(prep_content(PREPARATION_TIME))
-                # 宣言パネルは役職DM配布後に出す (DM到着前に全員が押して
-                # 0日目初夜へ進んでしまわないよう、夜の朝パネルと同じ順序にする)
-                await self._post_prep_panel()
-                await self._repost_gm_panel()
-                if self._check_prep_ready():
-                    await self._persist_room_state()
-                    state.prep_ready_event.set()
-                await self._pausable_countdown(
-                    prep_msg, prep_content, PREPARATION_TIME, state.prep_ready_event
-                )
-                await self._wait_for_prep_ready()
-                # 待機解除と同時にGMが一時停止した場合、パネル終了やSEだけが
-                # 停止中に先行しないよう、進行再開を待ってから副作用を出す。
-                await state.pause_event.wait()
-                await self._close_prep_panel()
-                self._play_se("prep_end")
+                greeting_task: Optional[asyncio.Task] = None
+                try:
+                    prep_msg = await self._safe_village_send(
+                        prep_content(PREPARATION_TIME)
+                    )
+                    # 宣言パネルは役職DM配布後に出す (DM到着前に全員が押して
+                    # 1日目へ進んでしまわないよう、夜の朝パネルと同じ順序にする)
+                    await self._post_prep_panel()
+                    await self._repost_gm_panel()
+                    if self._check_prep_ready():
+                        await self._persist_room_state()
+                        state.prep_ready_event.set()
+                    # 両タイマーは、参加者が操作できるパネルを掲示し終えた時点から
+                    # 同時に開始する。ローカル参照を保持してGC・例外を回収する。
+                    greeting_task = asyncio.create_task(
+                        self._initial_wolf_greeting_during_preparation()
+                    )
+                    await self._pausable_countdown(
+                        prep_msg,
+                        prep_content,
+                        PREPARATION_TIME,
+                        state.prep_ready_event,
+                    )
+                    # どちらも30秒か同じEventで終わる。先に挨拶taskの保存まで
+                    # 確定し、その後は未確認者だけを無期限で待つ。
+                    await greeting_task
+                    await self._wait_for_prep_ready()
+                    # 待機解除と同時にGMが一時停止した場合、パネル終了やSEだけが
+                    # 停止中に先行しないよう、進行再開を待ってから副作用を出す。
+                    await state.pause_event.wait()
+                    await self._close_prep_panel()
+                    self._play_se("prep_end")
+                finally:
+                    if greeting_task is not None and not greeting_task.done():
+                        greeting_task.cancel()
+                        try:
+                            await greeting_task
+                        except asyncio.CancelledError:
+                            pass
+                    elif greeting_task is not None and not greeting_task.cancelled():
+                        # prep側が先に例外になった場合もtask例外を未回収にしない。
+                        greeting_task.exception()
+                    state.wolf_relay_window_open = False
 
-            # 役職確認後の0日目初夜。実人狼の自由文DM中継だけを30秒開き、
-            # 襲撃・占い・護衛・朝待機は出さない。再起動時は未完了なら
-            # 同じ挨拶時間を満額でやり直し、完了済みなら二重実行しない。
+            if state.surrender_confirmed or state.ending or state.pending_winner is not None:
+                return
+            # v0.51以前のPREPARATION snapshotで「確認済み・初夜未完了」だった
+            # 場合と、旧INITIAL_NIGHT復旧だけは従来の単独30秒を維持する。
             if not state.initial_night_completed:
                 await self._initial_night_greeting()
-            if state.surrender_confirmed or state.pending_winner is not None:
+            if state.surrender_confirmed or state.ending or state.pending_winner is not None:
                 return
 
             # メインループ
@@ -4019,6 +4467,19 @@ class RoomRunner:
         "占い師", "霊能者", "狩人", "狂人", "村人", "その他",
     )
 
+    # 実役職とは無関係に自己申告できる公開結果。白黒の真偽もBotは判定しない。
+    # 狩人は結果ではなく、その日に公表する護衛先を1人選ぶ。
+    CO_RESULT_JUDGEMENTS: dict[str, frozenset[str]] = {
+        Role.SEER.value: frozenset({"白", "黒"}),
+        Role.MEDIUM.value: frozenset({"白", "黒"}),
+        Role.GUARD.value: frozenset({"護衛"}),
+    }
+    _CO_RESULT_LABELS: dict[str, str] = {
+        Role.SEER.value: "占い",
+        Role.MEDIUM.value: "霊媒",
+        Role.GUARD.value: "護衛",
+    }
+
     def _village_panel_reference(self) -> Optional[discord.Message]:
         """保存済みIDから再編集可能な村パネル参照を作る。"""
         state = self.state
@@ -4029,18 +4490,12 @@ class RoomRunner:
         return get_partial_message(state.village_panel_message_id)
 
     def build_village_panel_content(self) -> str:
-        """フェーズとCO一覧だけを1枚にまとめる。
-
-        v0.51で「結果を公開」を廃止したため、ここに載るのは役職CO
-        (自己申告) だけ。占い・霊能の結果はVCで口頭で伝える。操作説明も
-        載せない (盤面として読む本文にする)。
-        """
+        """フェーズ・CO・公開結果を、昼夜を問わず1枚にまとめる。"""
         state = self.state
         phase = self._effective_phase()
         phase_label = self._VILLAGE_PANEL_PHASE_LABELS.get(
             phase, phase.name if phase is not None else "不明"
         )
-        lines = [f"🏘️ **村パネル**（現在フェーズ: {phase_label}）"]
 
         # 役職名まで出すのが新CO機構の目的 (旧機構は名前だけだった)。
         # co_claims は user_id をキーにした dict で、値の側に user_id は持たない。
@@ -4063,24 +4518,110 @@ class RoomRunner:
         ordered_roles = [role for role in self.CO_CLAIMABLE_ROLES if role in grouped]
         ordered_roles += [role for role in grouped if role not in ordered_roles]
 
-        co_lines: list[str] = []
-        for role in ordered_roles:
-            members = grouped[role]
-            co_lines.append(f"【{role}CO {len(members)}人】")
-            for _user_id, claim in members:
-                co_lines.append(
-                    f"・{claim.get('number')}番 {claim.get('display_name')}"
-                )
-        lines.append(
-            "📣 **CO一覧**\n" + ("\n".join(co_lines) if co_lines else "・なし")
-        )
+        valid_results: list[dict] = []
+        role_order = {
+            Role.SEER.value: 0,
+            Role.MEDIUM.value: 1,
+            Role.GUARD.value: 2,
+        }
+        for row in state.co_result_claims:
+            if not isinstance(row, dict):
+                continue
+            role = str(row.get("role", ""))
+            judgement = str(row.get("judgement", ""))
+            if judgement not in self.CO_RESULT_JUDGEMENTS.get(role, frozenset()):
+                continue
+            try:
+                normalized = {
+                    **row,
+                    "user_id": int(row["user_id"]),
+                    "number": int(row["number"]),
+                    "target_number": int(row["target_number"]),
+                    "day": int(row["day"]),
+                    "role": role,
+                    "judgement": judgement,
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+            valid_results.append(normalized)
+        valid_results.sort(key=lambda row: (
+            row["number"], row["day"], role_order.get(row["role"], 99)
+        ))
+        results_by_actor: dict[int, list[dict]] = {}
+        for row in valid_results:
+            results_by_actor.setdefault(row["user_id"], []).append(row)
 
-        # 操作説明は載せない。パネル本文はCO状況だけを映す盤面表示にする
-        # (ボタンのラベルで足りるものを常設本文へ書くと、毎日読む人にとって
-        #  ノイズにしかならない)。
-        # CO行は最大でも参加人数ぶんなので上限に達しないが、Discordの2000字で
-        # パネルの送信・編集が落ち続けるとCO受付ごと死ぬため保険で切る。
-        return "\n".join(lines)[:self._VILLAGE_PANEL_MAX_LENGTH]
+        def result_line(row: dict) -> str:
+            label = self._CO_RESULT_LABELS.get(row["role"], row["role"])
+            target_name = str(row.get("target_name") or "?")[:48]
+            target = f"{row['target_number']}番 {target_name}"
+            if row["role"] == Role.GUARD.value:
+                return f"　└ {row['day']}日目 {label}: {target}"
+            return (
+                f"　└ {row['day']}日目 {label}: {target}"
+                f" → {row['judgement']}"
+            )
+
+        displayed_co_ids = {
+            int(user_id)
+            for members in grouped.values()
+            for user_id, _claim in members
+        }
+
+        def render(visible_result_count: int) -> tuple[str, int]:
+            shown = 0
+            co_lines: list[str] = []
+            for role in ordered_roles:
+                members = grouped[role]
+                co_lines.append(f"【{str(role)[:24]}CO {len(members)}人】")
+                for user_id, claim in members:
+                    co_lines.append(
+                        f"・{claim.get('number')}番 "
+                        f"{str(claim.get('display_name'))[:48]}"
+                    )
+                    for result in results_by_actor.get(int(user_id), []):
+                        if shown >= visible_result_count:
+                            break
+                        co_lines.append(result_line(result))
+                        shown += 1
+
+            result_only_lines: list[str] = []
+            for actor_id, results in results_by_actor.items():
+                if actor_id in displayed_co_ids or shown >= visible_result_count:
+                    continue
+                visible = min(len(results), visible_result_count - shown)
+                if visible <= 0:
+                    continue
+                first = results[0]
+                result_only_lines.append(
+                    f"・{first['number']}番 "
+                    f"{str(first.get('display_name') or '?')[:48]}"
+                )
+                for result in results[:visible]:
+                    result_only_lines.append(result_line(result))
+                    shown += 1
+            if result_only_lines:
+                co_lines.append("【結果申告のみ】")
+                co_lines.extend(result_only_lines)
+
+            omitted = len(valid_results) - shown
+            if omitted > 0:
+                co_lines.append(f"・結果ほか{omitted}件")
+            lines = [
+                f"🏘️ **村パネル**（現在フェーズ: {phase_label}）",
+                "📣 **CO一覧**\n" + ("\n".join(co_lines) if co_lines else "・なし"),
+            ]
+            return "\n".join(lines), shown
+
+        # CO行は必ず残し、長くなり得る結果行だけを末尾から省略する。
+        # 盤面のeditが2000字制限で失敗すると以後のCO操作も見えなくなるため、
+        # 余裕を持った1900字以内に収まる表示件数を選ぶ。
+        for visible_count in range(len(valid_results), -1, -1):
+            content, _shown = render(visible_count)
+            if len(content) <= self._VILLAGE_PANEL_MAX_LENGTH:
+                return content
+        content, _shown = render(0)
+        return content[:self._VILLAGE_PANEL_MAX_LENGTH]
 
     def build_medium_results_content(self) -> str:
         """霊媒ボタン用の霊能結果一覧 (新しい順) をephemeral向けに整形する。"""
@@ -4433,6 +4974,126 @@ class RoomRunner:
                 )
             except Exception as error:
                 log.exception(f"CO撤回のDB記録に失敗 ({state.room_name}): {error}")
+            self.refresh_village_panel()
+            return None
+
+    async def publish_co_result(
+        self,
+        actor_id: int,
+        claimed_role: str,
+        target_id: int,
+        judgement: str,
+        *,
+        expected_game_run_id: str,
+    ) -> Optional[str]:
+        """占い・霊媒・護衛結果を公開する（実役職やCO内容とは照合しない）。
+
+        同じ日・本人・結果種別の再申告は最新1件へ置き換える。snapshotでは
+        現在の盤面だけを保存し、記録DBには旧内容の取消と新内容の公開を
+        1transactionで追記する。
+        """
+        async with self.action_lock:
+            state = self.state
+            if expected_game_run_id != state.game_run_id:
+                return "⏳ この結果申告パネルは終了しています。"
+            reason = self._co_action_reject_reason(actor_id)
+            if reason is not None:
+                return reason
+            allowed = self.CO_RESULT_JUDGEMENTS.get(claimed_role)
+            if allowed is None or judgement not in allowed:
+                return "選択された結果を申告できません。"
+            actor = state.get_player(actor_id)
+            target = state.get_player(target_id)
+            if target is None:
+                return "対象が参加者ではありません。"
+            if target_id == actor_id:
+                return "自分自身は結果の対象にできません。"
+
+            key = (actor_id, state.day_number, claimed_role)
+            previous_index: Optional[int] = None
+            previous: Optional[dict] = None
+            for index, row in enumerate(state.co_result_claims):
+                if not isinstance(row, dict):
+                    continue
+                if (
+                    row.get("user_id") == key[0]
+                    and row.get("day") == key[1]
+                    and row.get("role") == key[2]
+                ):
+                    previous_index = index
+                    previous = row
+                    break
+            if (
+                previous is not None
+                and previous.get("target_id") == target_id
+                and previous.get("judgement") == judgement
+            ):
+                return None
+
+            result = {
+                "user_id": actor_id,
+                "number": actor.number,
+                "display_name": actor.display_name,
+                "role": claimed_role,
+                "target_id": target_id,
+                "target_number": target.number,
+                "target_name": target.display_name,
+                "judgement": judgement,
+                "day": state.day_number,
+            }
+            old_results = state.co_result_claims
+            new_results = list(old_results)
+            if previous_index is None:
+                new_results.append(result)
+            else:
+                new_results[previous_index] = result
+
+            old_seq = state.record_event_seq
+            db_events: list[dict] = []
+            if previous is not None:
+                db_events.append({
+                    "event_seq": old_seq + 1,
+                    "day_number": state.day_number,
+                    "actor_id": actor_id,
+                    "actor_number": int(previous.get("number", actor.number)),
+                    "claimed_role": claimed_role,
+                    "event_type": "取消",
+                    "target_id": int(previous["target_id"]),
+                    "target_number": int(previous["target_number"]),
+                    "judgement": str(previous["judgement"]),
+                })
+            db_events.append({
+                "event_seq": old_seq + len(db_events) + 1,
+                "day_number": state.day_number,
+                "actor_id": actor_id,
+                "actor_number": actor.number,
+                "claimed_role": claimed_role,
+                "event_type": "公開",
+                "target_id": target_id,
+                "target_number": target.number,
+                "judgement": judgement,
+            })
+            state.co_result_claims = new_results
+            state.record_event_seq = old_seq + len(db_events)
+            try:
+                await self._persist_room_state()
+            except Exception as error:
+                state.co_result_claims = old_results
+                state.record_event_seq = old_seq
+                log.exception(f"結果自己申告の保存に失敗: {error}")
+                return "結果を保存できませんでした。もう一度お試しください。"
+
+            try:
+                await database.record_co_result_events(
+                    state.guild.id,
+                    state.room_id,
+                    state.game_run_id,
+                    events=db_events,
+                )
+            except Exception as error:
+                log.exception(
+                    f"結果自己申告のDB記録に失敗 ({state.room_name}): {error}"
+                )
             self.refresh_village_panel()
             return None
 
@@ -5057,12 +5718,16 @@ class RoomRunner:
         state.vote_slot_index = 0
         state.vote_slot_token = 0
         state.vote_slot_active = False
+        state.vote_speech_finished = False
+        state.vote_slot_forced_abstain = False
+        state.vote_speech_window_open = False
         state.vote_closed = False
         state.vote_requeue_ids.clear()
         state.vote_panel_message_id = None
         state.vote_remaining_seconds = 0.0
         state.current_speaker_id = None
         state.speech_done_event.clear()
+        state.vote_choice_event.clear()
         state.vote_queue_event.clear()
         await self._persist_vote_checkpoint("通常投票の開始")
         return True
@@ -5091,9 +5756,9 @@ class RoomRunner:
                 if member.id in state.votes:
                     return "投票済みです。"
                 # 枠を使い切っている場合は「並んでいる」と誤解させない。
-                # 発言枠は1人1回なので、時間切れの棄権は取り消せない。
+                # 未投票で完了済みならGMが明示的に棄権にした枠だけ。
                 if state.vote_order.index(member.id) < state.vote_slot_index:
-                    return "この日の投票発言は終了しています（棄権）。"
+                    return "この日の投票は終了しています。"
                 return (
                     f"すでに{state.vote_order.index(member.id) - state.vote_slot_index + 1}"
                     "番目に並んでいます。"
@@ -5129,7 +5794,10 @@ class RoomRunner:
         visible_count = state.vote_slot_index
         if (
             state.vote_slot_active
-            and state.current_speaker_id in state.votes
+            and (
+                state.current_speaker_id in state.votes
+                or state.vote_slot_forced_abstain
+            )
             and state.vote_slot_index < len(state.vote_order)
         ):
             visible_count += 1
@@ -5157,8 +5825,31 @@ class RoomRunner:
 
     def _sequential_vote_content(self, speaker: Player, remaining: float) -> str:
         return (
-            f"🗳️ **{speaker.display_name}** の投票発言 — 名前を押して投票\n"
+            f"🗳️ **{speaker.display_name}** の投票発言\n"
             + self._timer_line(remaining)
+            + "\n投票先は発言終了後に選びます。"
+            + f"\n📋 待機列: {self._vote_queue_line()}"
+            + f"\n\n**ここまでの投票**\n{self._sequential_vote_detail()}"
+        )
+
+    def _sequential_vote_choice_content(self, voter: Player) -> str:
+        return (
+            f"🗳️ **{voter.display_name}** の発言は終了しました。\n"
+            "時間制限はありません。投票先の名前を押して確定してください。"
+            + f"\n📋 待機列: {self._vote_queue_line()}"
+            + f"\n\n**ここまでの投票**\n{self._sequential_vote_detail()}"
+        )
+
+    def _sequential_vote_committed_content(self, voter: Player) -> str:
+        return (
+            f"✅ **{voter.display_name}** の投票が確定しました。"
+            + f"\n📋 待機列: {self._vote_queue_line()}"
+            + f"\n\n**ここまでの投票**\n{self._sequential_vote_detail()}"
+        )
+
+    def _sequential_vote_abstain_content(self, voter: Player) -> str:
+        return (
+            f"⏭️ **{voter.display_name}** はGMの操作で棄権となりました。"
             + f"\n📋 待機列: {self._vote_queue_line()}"
             + f"\n\n**ここまでの投票**\n{self._sequential_vote_detail()}"
         )
@@ -5166,7 +5857,7 @@ class RoomRunner:
     def _vote_waiting_content(self, waiting: list[Player]) -> str:
         """列が空のときの公開パネル。押した人から順に発言する。"""
         return (
-            f"🗳️ **投票待ち** — 「投票」を押した順に{VOTE_SPEECH_TIME}秒ずつ発言します\n"
+            f"🗳️ **投票待ち** — 押した順に{VOTE_SPEECH_TIME}秒発言し、その後に投票先を選びます\n"
             f"未投票 **{len(waiting)}人**: {'、'.join(p.display_name for p in waiting)}\n"
             f"\n**ここまでの投票**\n{self._sequential_vote_detail()}"
         )
@@ -5201,7 +5892,7 @@ class RoomRunner:
             return False
         panel = await self._replace_sequential_vote_panel(
             panel,
-            self._sequential_vote_content(speaker, state.vote_remaining_seconds),
+            self._sequential_vote_committed_content(speaker),
             None,
         )
         if panel is None:
@@ -5269,10 +5960,48 @@ class RoomRunner:
     async def _advance_vote_cursor(self) -> None:
         state = self.state
         state.vote_slot_active = False
+        state.vote_speech_finished = False
+        state.vote_slot_forced_abstain = False
+        state.vote_speech_window_open = False
         state.current_speaker_id = None
         state.vote_remaining_seconds = 0.0
+        state.speech_done_event.clear()
+        state.vote_choice_event.clear()
         state.vote_slot_index += 1
+        # 同じ日の一つ前の候補・発言終了・GMボタンも即座無効にする。
+        state.vote_slot_token += 1
         await self._persist_vote_checkpoint("通常投票発言枠の完了")
+
+    async def finish_sequential_vote_speech(
+        self, actor_id: int, vote_slot_token: int
+    ) -> str:
+        """現在者本人の「発言終了」をdurableに受け付ける。"""
+        async with self.action_lock:
+            state = self.state
+            if state.paused:
+                return "⏸️ 一時停止中は操作できません。"
+            if (
+                self._effective_phase() != Phase.DAY_VOTE
+                or not self.uses_sequential_vote()
+                or not state.vote_slot_active
+                or state.current_speaker_id != actor_id
+                or state.vote_slot_token != vote_slot_token
+                or state.vote_speech_finished
+            ):
+                return "⏳ この投票発言は終了しています。"
+
+            old_window = state.vote_speech_window_open
+            state.vote_speech_finished = True
+            state.vote_speech_window_open = False
+            try:
+                await self._persist_room_state()
+            except Exception as error:
+                state.vote_speech_finished = False
+                state.vote_speech_window_open = old_window
+                await self._stop_for_durability_error("投票発言終了の保存", error)
+                return "❌ 発言終了を保存できないため安全停止しました。"
+            state.speech_done_event.set()
+            return "✅ 発言を終了しました。続けて投票先を選んでください。"
 
     async def _day_vote(self) -> Optional[int]:
         if not self.uses_sequential_vote():
@@ -5342,17 +6071,25 @@ class RoomRunner:
         # 合図として区別できないため (議論終了SEに一本化)
         if initialized:
             await self._safe_village_send(
-                f"🗳️ **投票**「投票」を押した順に、1人{VOTE_SPEECH_TIME}秒ずつ発言して投票します。"
+                f"🗳️ **投票**「投票」を押した順に、1人{VOTE_SPEECH_TIME}秒発言し、"
+                "発言終了後に投票先を確定します。"
             )
         await self._repost_gm_panel()
 
         panel = self._vote_panel_reference()
         queue_view = VoteQueueView(self)
+        # 直前の確定票を公開したあとに投票開示SEを鳴らした場合、その約2秒を
+        # 次の話者への切替猶予として使う。次枠で開始SEまで重ねると二重SE・
+        # 約4秒待ちになるため、列が連続している1枠だけ開始SEを省略する。
+        next_speaker_already_cued = False
         while not state.vote_closed:
             await state.pause_event.wait()
             if state.vote_slot_index >= len(state.vote_order):
                 if not self._vote_queue_waiting():
                     break
+                # 列が空の待機を挟んだ後は、前の確定SEから時間が空いている。
+                # 新しく押した人の開始SEを通常どおり鳴らす。
+                next_speaker_already_cued = False
                 panel = await self._wait_for_vote_queue(panel, queue_view)
                 continue
             voter_id = state.vote_order[state.vote_slot_index]
@@ -5360,50 +6097,155 @@ class RoomRunner:
             if voter is None or not voter.alive:
                 await self._advance_vote_cursor()
                 continue
-            state.vote_slot_token += 1
-            state.vote_slot_active = True
-            state.current_speaker_id = voter.user_id
-            state.vote_remaining_seconds = float(VOTE_SPEECH_TIME)
-            state.speech_done_event.clear()
-            await self._persist_vote_checkpoint("通常投票発言枠の開始")
-            # 交代の合図はミュート解除より前に鳴らす。VCしか見ていない人でも
-            # 「音が鳴った次が自分の番」と分かり、解除待ちの数百msを無音で
-            # 待たせない。決戦弁明と違い直前のSEから20秒近く空くため、
-            # 1.5秒の待機上限で破棄される心配もない
-            self._play_se("speech")
-            await self._grant_speaker(voter.member)
 
-            alive = state.alive_players()
-            view = VoteView(self, candidates=by_number(alive), voters=[voter])
+            if voter.user_id in state.votes and not state.vote_slot_active:
+                # cursor保存直前の旧snapshot等。確定票を消さず二重発言もしない。
+                await self._advance_vote_cursor()
+                continue
 
-            def vote_content(remaining: float, voter=voter) -> str:
-                state.vote_remaining_seconds = remaining
-                return self._sequential_vote_content(voter, remaining)
-
-            panel = await self._replace_sequential_vote_panel(
-                panel, vote_content(VOTE_SPEECH_TIME), view
-            )
-            if panel is None:
-                error = StateDurabilityError("通常投票パネルを掲示できませんでした")
-                await self._stop_for_durability_error("通常投票パネルの掲示", error)
+            resuming_slot = state.vote_slot_active
+            if resuming_slot and state.current_speaker_id != voter.user_id:
+                error = StateDurabilityError("投票cursorと復元中の現在者が一致しません")
+                await self._stop_for_durability_error("通常投票枠の復元", error)
                 raise error
-            # 票保存後・公開更新前のクラッシュから戻った場合は、この再掲示で
-            # 確定票が公開済みになる。20秒を再び待たず、そのまま次へ進む。
-            if voter.user_id in state.votes:
-                state.speech_done_event.set()
-            completed = await self._pausable_countdown(
-                panel, vote_content, VOTE_SPEECH_TIME, state.speech_done_event
+
+            state.vote_slot_token += 1
+            if not resuming_slot:
+                state.vote_slot_active = True
+                state.current_speaker_id = voter.user_id
+                state.vote_speech_finished = False
+                state.vote_slot_forced_abstain = False
+            state.vote_remaining_seconds = float(VOTE_SPEECH_TIME)
+            state.vote_speech_window_open = False
+            state.speech_done_event.clear()
+            state.vote_choice_event.clear()
+            await self._persist_vote_checkpoint(
+                "通常投票発言枠の再開"
+                if resuming_slot else "通常投票発言枠の開始"
             )
-            view.stop()
-            state.vote_slot_active = False
-            await self._clear_speaker()
-            if not completed and voter.user_id not in state.votes:
-                await self._safe_village_send(
-                    f"⏰ **{voter.display_name}** は時間切れのため無投票です。"
+            slot_token = state.vote_slot_token
+
+            if not state.vote_speech_finished:
+                speech_view = SequentialVoteSpeechView(self, voter.user_id)
+
+                def vote_content(remaining: float, voter=voter) -> str:
+                    state.vote_remaining_seconds = remaining
+                    return self._sequential_vote_content(voter, remaining)
+
+                panel = await self._replace_sequential_vote_panel(
+                    panel, vote_content(VOTE_SPEECH_TIME), speech_view
                 )
-                await self._record_vote_abstentions([voter], "本投票", 0)
+                if panel is None:
+                    error = StateDurabilityError("通常投票パネルを掲示できませんでした")
+                    await self._stop_for_durability_error("通常投票パネルの掲示", error)
+                    raise error
+
+                if next_speaker_already_cued:
+                    next_speaker_already_cued = False
+                else:
+                    await self._play_transition_se("speech")
+                await state.pause_event.wait()
+                if (
+                    state.vote_slot_active
+                    and state.vote_slot_token == slot_token
+                    and state.current_speaker_id == voter.user_id
+                    and voter.alive
+                    and not state.vote_speech_finished
+                ):
+                    state.vote_speech_window_open = True
+                    await self._grant_speaker(voter.member)
+                    await self._pausable_countdown(
+                        panel, vote_content, VOTE_SPEECH_TIME, state.speech_done_event
+                    )
+
+                # 30秒経過でも棄権にしない。発言終了だけを先にdurableにする。
+                async with self.action_lock:
+                    if (
+                        state.vote_slot_active
+                        and state.vote_slot_token == slot_token
+                        and state.current_speaker_id == voter.user_id
+                        and not state.vote_speech_finished
+                    ):
+                        state.vote_speech_finished = True
+                        state.vote_speech_window_open = False
+                        await self._persist_vote_checkpoint("通常投票発言の終了")
+                    else:
+                        state.vote_speech_window_open = False
+                speech_view.stop()
+                await self._clear_speaker()
+                if voter.alive and state.vote_slot_active:
+                    await self._play_transition_se("speech_end")
+            else:
+                # 投票先待ちの復元。再度30秒を開けずミュートへ収束させる。
+                await self._clear_speaker()
+
+            if state.paused and state.recovered_from_restart:
+                raise StateDurabilityError("通常投票は安全停止中です")
+
+            if voter.alive and not state.vote_slot_forced_abstain and voter.user_id not in state.votes:
+                choice_view = VoteView(
+                    self, candidates=by_number(state.alive_players()), voters=[voter]
+                )
+                panel = await self._replace_sequential_vote_panel(
+                    panel, self._sequential_vote_choice_content(voter), choice_view
+                )
+                if panel is None:
+                    choice_view.stop()
+                    error = StateDurabilityError("通常投票先パネルを掲示できませんでした")
+                    await self._stop_for_durability_error("通常投票先パネルの掲示", error)
+                    raise error
+                while (
+                    voter.alive
+                    and voter.user_id not in state.votes
+                    and not state.vote_slot_forced_abstain
+                ):
+                    await self._pausable_wait_forever(state.vote_choice_event)
+                    if state.paused and state.recovered_from_restart:
+                        choice_view.stop()
+                        raise StateDurabilityError("通常投票は安全停止中です")
+                    if (
+                        voter.alive
+                        and voter.user_id not in state.votes
+                        and not state.vote_slot_forced_abstain
+                    ):
+                        state.vote_choice_event.clear()
+                choice_view.stop()
+            elif voter.user_id in state.votes:
+                # 確定票保存後の再起動は公開を復旧してからcursorを進める。
+                if not await self._refresh_sequential_vote_panel():
+                    raise StateDurabilityError(
+                        "確定票を公開できず安全停止しました",
+                        state_committed=True,
+                    )
+            elif state.vote_slot_forced_abstain:
+                panel = await self._replace_sequential_vote_panel(
+                    panel, self._sequential_vote_abstain_content(voter), None
+                )
+                if panel is None:
+                    error = StateDurabilityError("GM棄権を公開できませんでした")
+                    await self._stop_for_durability_error("GM棄権の公開", error)
+                    raise error
+
+            # 確定票（またはGM明示棄権）を公開した直後にSEを鳴らし、約2秒後に
+            # 次の人へ進む。列が続いていれば、このSEを次枠の開始合図と兼用する。
+            # 最終票は直後の集計開示SEに任せ、同じ合図を連続させない。
+            slot_completed = (
+                voter.user_id in state.votes
+                or state.vote_slot_forced_abstain
+            )
+            future_queued = any(
+                (candidate := state.get_player(queued_id)) is not None
+                and candidate.alive
+                and queued_id not in state.votes
+                for queued_id in state.vote_order[state.vote_slot_index + 1:]
+            )
+            unqueued_remain = bool(self._vote_queue_waiting())
+            if slot_completed and (future_queued or unqueued_remain):
+                await self._play_transition_se("reveal")
+                next_speaker_already_cued = future_queued
+
             await self._advance_vote_cursor()
-            # 自分の枠の中で投票先が除外されると、票だけ消えて棄権になる。
+            # 自分の枠の中で投票先が除外された場合だけ、末尾で投票し直す。
             # 除外側が置いた印をここで回収し、末尾へ枠を積み直す。
             if voter.user_id in state.vote_requeue_ids:
                 state.vote_requeue_ids.discard(voter.user_id)
@@ -5420,6 +6262,9 @@ class RoomRunner:
                 await self._persist_vote_checkpoint("失効した票の再投票枠")
 
         state.vote_slot_active = False
+        state.vote_speech_finished = False
+        state.vote_slot_forced_abstain = False
+        state.vote_speech_window_open = False
         state.current_speaker_id = None
         queue_view.stop()
         if panel is not None:
@@ -5434,12 +6279,13 @@ class RoomRunner:
     async def _resolve_day_vote(self) -> Optional[int]:
         """集計〜決戦。投票の集め方 (一斉/投票発言) によらず共通。"""
         state = self.state
+        # 投票終了の合図が終わる前に結果を表示しない。0票でも終了合図は鳴らす。
+        await self._play_transition_se("reveal")
         if not state.votes:
             await self._safe_village_send("⚠️ 投票が1票もなかったため、処刑なしとなります。")
             return None
 
         # 結果表示
-        self._play_se("reveal")
         embed = build_vote_result_embed(state.votes, state.players)
         await self._safe_village_send(embed=embed)
 
@@ -5484,12 +6330,18 @@ class RoomRunner:
 
     async def _record_vote_abstentions(
         self, voters: list[Player], vote_kind: str, round_index: int,
-    ) -> None:
-        """投票タイムアウトによる棄権・未投票を record_vote_event へ1行ずつ追記する
+    ) -> bool:
+        """投票タイムアウトまたはGM強制の棄権を record_vote_event へ1行ずつ追記する
         (仕様§2-4)。target_id=NULL の行として残す。失敗しても進行は止めない。
         """
         if not voters:
-            return
+            try:
+                # vote_closed等、呼び出し側が同じcheckpointに載せた状態を保存する。
+                await self._persist_room_state()
+            except Exception as error:
+                log.exception(f"棄権状態の保存に失敗 ({self.state.room_name}): {error}")
+                return False
+            return True
         state = self.state
         entries: list[tuple[Player, int]] = []
         for voter in voters:
@@ -5500,7 +6352,7 @@ class RoomRunner:
         except Exception as error:
             state.record_event_seq -= len(entries)
             log.exception(f"棄権ログの保存に失敗 ({state.room_name}): {error}")
-            return
+            return False
         for voter, seq in entries:
             try:
                 await database.record_vote_event(
@@ -5512,6 +6364,7 @@ class RoomRunner:
                 )
             except Exception as error:
                 log.exception(f"棄権ログのDB記録に失敗 ({state.room_name}): {error}")
+        return True
 
     def _tally_votes(self, votes: dict) -> dict[int, int]:
         tally: dict[int, int] = {}
@@ -5679,7 +6532,7 @@ class RoomRunner:
             )
             return chosen_player.user_id
 
-        self._play_se("reveal")
+        await self._play_transition_se("reveal")
         embed = build_vote_result_embed(state.votes, state.players, title="決戦投票結果")
         await self._safe_village_send(embed=embed)
 
@@ -6894,7 +7747,7 @@ class RoomRunner:
             return "", "❌ 役職確認の締切を保存できませんでした。もう一度お試しください。"
         state.prep_ready_event.set()
         await self._safe_village_send(
-            "⏭️ **GMの操作で役職確認を締め切り、0日目初夜へ進みます。**"
+            "⏭️ **GMの操作で役職確認を締め切り、1日目へ進みます。**"
         )
         return "▶️ **役職確認を締め切りました。**", None
 
@@ -6918,7 +7771,7 @@ class RoomRunner:
         return False
 
     # ============================================================
-    # 役職確認の宣言 (初日はここが揃ってから0日目初夜へ進む)
+    # 役職確認の宣言 (初日はここが揃ってから1日目へ進む)
     # ============================================================
 
     def prep_actions_open(self) -> bool:
@@ -6946,12 +7799,12 @@ class RoomRunner:
         ready = len(required & state.prep_ready_ids)
         if required and ready >= len(required):
             return (
-                "✅ **全員が役職を確認しました。0日目初夜へ進みます。**\n"
+                "✅ **全員が役職を確認しました。1日目へ進みます。**\n"
                 f"**{ready} / {len(required)}人**"
             )
         return (
             "📩 **役職を確認した**（DMの役職を見てから押してください。取消不可）\n"
-            f"現在 **{ready} / {len(required)}人** — 全員が押すと0日目初夜へ進みます"
+            f"現在 **{ready} / {len(required)}人** — 全員が押すと1日目へ進みます"
         )
 
     async def _post_prep_panel(self) -> None:
@@ -6997,7 +7850,7 @@ class RoomRunner:
         """
         state = self.state
         if state.prep_ready_event.is_set():
-            return "", "▶️ まもなく0日目初夜へ進みます。"
+            return "", "▶️ まもなく1日目へ進みます。"
         if not self.prep_actions_open():
             return "", "⏳ 現在この操作はできません。"
         player = state.get_player(member.id)
@@ -7042,18 +7895,18 @@ class RoomRunner:
     async def _wait_for_prep_ready(self) -> None:
         """役職確認タイムの目安時間が切れた後、全員の宣言を待つ。
 
-        時間切れでは自動的に0日目初夜へ進まない (夜の _wait_for_morning と同じ)。
+        時間切れでは自動的に1日目へ進まない (夜の _wait_for_morning と同じ)。
         誰が押していないかは村へ出さず、人数だけ表示する。
         """
         state = self.state
         if state.prep_ready_event.is_set():
             return
 
-        # パネルが出ていないと誰も0日目初夜へ進めない
+        # パネルが出ていないと誰も1日目へ進めない
         if state.prep_panel_message is None:
             await self._post_prep_panel()
         if state.prep_panel_message is None:
-            log.error(f"役職確認パネルを掲示できません ({state.room_name}): 自動で0日目初夜へ進みます")
+            log.error(f"役職確認パネルを掲示できません ({state.room_name}): 自動で1日目へ進みます")
             state.prep_confirmed = True
             try:
                 await self._persist_room_state()
@@ -7062,7 +7915,7 @@ class RoomRunner:
                 raise
             state.prep_ready_event.set()
             await self._safe_village_send(
-                "⚠️ 「役職を確認した」パネルを表示できないため、自動で0日目初夜へ進みます。"
+                "⚠️ 「役職を確認した」パネルを表示できないため、自動で1日目へ進みます。"
             )
             return
 
@@ -7077,7 +7930,7 @@ class RoomRunner:
                         player.member.send,
                         "⚠️ **まだ「役職を確認した」を押していません。**\n"
                         "役職確認タイムの目安時間が終了しました。"
-                        "#昼 のパネルを押すと0日目初夜へ進みます。",
+                        "#昼 のパネルを押すと1日目へ進みます。",
                     )
                 except (discord.Forbidden, discord.HTTPException) as e:
                     log.warning(f"役職確認の催促DM送信失敗 ({player.display_name}): {e}")
@@ -7710,15 +8563,19 @@ class RoomRunner:
             "ニックネーム・ミュート・VC権限を順番に復元しています。"
         )
 
-        # ニックネーム復元
-        await self._restore_nicknames()
+        # ニックネーム復元。Discord一時失敗は空LOBBYへ持ち越し、次の開始前に
+        # 再試行するため、成功した対象と混ぜて捨てない。
+        nickname_failures = await self._restore_nicknames(state)
 
         # ゲーム用の一時ロール・VC個別権限を全て撤去
         await self._teardown_game_roles_and_perms()
-        await self._safe_timer_edit(
-            cleanup_progress,
-            "✅ **ゲーム終了処理が完了しました。**\nニックネームとVC設定を復元しました。",
+        cleanup_text = (
+            "⚠️ **ゲーム終了処理は完了しました。**\n"
+            f"名前を戻せなかったメンバーが{len(nickname_failures)}人います。次の開始前に再試行します。"
+            if nickname_failures
+            else "✅ **ゲーム終了処理が完了しました。**\nニックネームとVC設定を復元しました。"
         )
+        await self._safe_timer_edit(cleanup_progress, cleanup_text)
 
         # ログカテゴリへ退避するのは #昼 だけ。移せなければ従来どおり削除する。
         # #霊界 は退避せず常に削除する (Noneのカテゴリ名で削除側へ倒す)。
@@ -7773,28 +8630,15 @@ class RoomRunner:
             self.last_game_roster = list(state.players.keys())
             self.last_game_gm = state.gm_id
 
-        # ロビーリセット
-        room_id = state.room_id
-        room_name = state.room_name
-        self.state = GameState()
-        self.state.room_id = room_id
-        self.state.room_name = room_name
-        self.state.guild = state.guild
-        self.state.category = state.category
-        self.state.lobby_channel = state.lobby_channel
-        self.state.stats_channel = state.stats_channel
-        self.state.voice_channel = state.voice_channel
-        self._carry_pending_vc_restore(state, self.state)
-        self.state.managed_game_channel_ids = set(state.managed_game_channel_ids)
-        await self._post_lobby_ui()
-        for attempt, delay in enumerate((0, 1, 2), start=1):
-            if delay:
-                await asyncio.sleep(delay)
-            try:
-                await self._persist_room_state()
-                break
-            except Exception as e:
-                log.exception(f"ロビー初期化状態の保存失敗 ({attempt}/3): {e}")
+        if not await self._transition_to_empty_lobby(
+            state,
+            nickname_failures=nickname_failures,
+            log_label="ゲーム終了後LOBBY初期化",
+        ):
+            await self._safe_village_send(
+                "⚠️ 参加受付の初期化をDBへ保存できませんでした。"
+                "状態を保持しているため、GM操作から再試行してください。"
+            )
 
     # ============================================================
     # レーティング処理
@@ -8520,7 +9364,7 @@ class RoomRunner:
             log.exception(f"復元ゲームループエラー: {e}")
             self.manager.spawn_bg_task(self.force_end("復元ゲーム中にエラーが発生したため中断"))
 
-    async def _eliminate_player_mid_game(self, player: Player, reason: str) -> None:
+    async def _eliminate_player_mid_game(self, player: Player, reason: str) -> bool:
         """ゲーム中のプレイヤーを死亡扱いで除外する (サーバー退出 / GM除外)。
 
         役職は公開しない。除外で勝敗が決した場合はゲームループを止めて終了処理を行う。
@@ -8528,9 +9372,9 @@ class RoomRunner:
         state = self.state
         if state.phase in (Phase.LOBBY, Phase.GAME_OVER):
             # 廃村/終了処理と競合した場合は何もしない
-            return
+            return False
         if not player.alive:
-            return
+            return False
         old_votes = dict(state.votes)
         old_vote_order = list(state.vote_order)
         old_disconnected = set(state.disconnected_players)
@@ -8575,7 +9419,7 @@ class RoomRunner:
         for voter_id in invalidated_voters:
             del state.votes[voter_id]
             # 通常投票で既に公開済みの票を失った人には、現在の順番を崩さず
-            # 最後にもう一度20秒枠を与える。同じ人を複数回は積まない。
+            # 最後にもう一度30秒の発言枠を与える。同じ人を複数回は積まない。
             if (
                 # 一時停止中の除外でも票を返す。PAUSEDを素で比較すると、
                 # GMが止めてから除外した場合だけ再投票枠が付かず、
@@ -8639,6 +9483,13 @@ class RoomRunner:
             self._effective_phase() == Phase.DAY_VOTE
             and state.vote_slot_active
             and state.current_speaker_id == player.user_id
+            and not state.vote_speech_finished
+        )
+        release_vote_choice = bool(
+            self._effective_phase() == Phase.DAY_VOTE
+            and state.vote_slot_active
+            and state.current_speaker_id == player.user_id
+            and state.vote_speech_finished
         )
         # 「投票」待ちで止まっている場合は、除外で生存者集合が変わった
         # ことを知らせて条件を見直させる。最後の未押下者が抜けたときに
@@ -8689,17 +9540,17 @@ class RoomRunner:
             ]
             del state.action_log[old_action_log_len:]
             await self._stop_for_durability_error("プレイヤー除外状態の保存", e)
-            return
+            return False
 
         await self._apply_death_effect(effect)
 
         if await self._confirm_surrender_after_roster_change():
-            return
+            return True
 
         winner = state.check_win()
         if winner and state.phase != Phase.GAME_OVER:
             await self._finish_game_externally(winner)
-            return
+            return True
 
         if guard_target_invalidated and guard is not None:
             await self._request_guard_reselection(guard)
@@ -8712,6 +9563,8 @@ class RoomRunner:
             state.speech_done_event.set()
         if release_vote_speech:
             state.speech_done_event.set()
+        if release_vote_choice:
+            state.vote_choice_event.set()
         if release_vote_queue:
             state.vote_queue_event.set()
         if release_turn:
@@ -8725,6 +9578,7 @@ class RoomRunner:
             state.prep_ready_event.set()
         if release_vote_complete:
             state.vote_complete_event.set()
+        return True
 
     async def _finish_game_externally(self, winner: Team) -> None:
         """ゲームループの外側から勝敗を確定して終了する (退出/除外起因)"""
@@ -8747,17 +9601,18 @@ class RoomRunner:
             return
         await self._end_game(winner)
 
-    async def force_end(self, reason: str = "廃村") -> None:
+    async def force_end(self, reason: str = "廃村") -> bool:
         state = self.state
 
         # ゲーム進行中以外 (ロビー/終了済み) は無視
-        if state.phase in (Phase.LOBBY, Phase.GAME_OVER):
-            return
+        if state.phase in (Phase.LOBBY, Phase.GAME_OVER) or state.ending:
+            return False
 
         # 最初のawaitより前に「終了状態の確定」と「ループのキャンセル指示」を
         # 同期的に行う。これで退出処理 (_eliminate_player_mid_game)・
         # start_gameのループ起動・force_endの二度押しが旧stateのGAME_OVERガードで
         # 遮断され、ゲームループがこれ以降 phase を書き換えることもなくなる。
+        state.ending = True
         state.phase = Phase.GAME_OVER
         self._stop_all_game_views()
         await self.close_village_panel()
@@ -8820,14 +9675,17 @@ class RoomRunner:
         )
 
         # ニックネーム復元
-        await self._restore_nicknames()
+        nickname_failures = await self._restore_nicknames(state)
 
         # ゲーム用の一時ロール・VC個別権限を全て撤去
         await self._teardown_game_roles_and_perms()
-        await self._safe_timer_edit(
-            cleanup_progress,
-            "✅ **終了処理が完了しました。**\nニックネームとVC設定を復元しました。",
+        cleanup_text = (
+            "⚠️ **終了処理は完了しました。**\n"
+            f"名前を戻せなかったメンバーが{len(nickname_failures)}人います。次の開始前に再試行します。"
+            if nickname_failures
+            else "✅ **終了処理が完了しました。**\nニックネームとVC設定を復元しました。"
         )
+        await self._safe_timer_edit(cleanup_progress, cleanup_text)
 
         # チャンネル削除予約 (#昼 / #霊界)
         village = state.village_channel
@@ -8856,34 +9714,11 @@ class RoomRunner:
             self.last_game_roster = list(state.players.keys())
             self.last_game_gm = state.gm_id
 
-        # ロビーリセット
-        guild = state.guild
-        category = state.category
-        lobby = state.lobby_channel
-        stats = state.stats_channel
-        vc = state.voice_channel
-        room_id = state.room_id
-        room_name = state.room_name
-
-        self.state = GameState()
-        self.state.room_id = room_id
-        self.state.room_name = room_name
-        self.state.guild = guild
-        self.state.category = category
-        self.state.lobby_channel = lobby
-        self.state.stats_channel = stats
-        self.state.voice_channel = vc
-        self._carry_pending_vc_restore(state, self.state)
-        self.state.managed_game_channel_ids = set(state.managed_game_channel_ids)
-        await self._post_lobby_ui()
-        for attempt, delay in enumerate((0, 1, 2), start=1):
-            if delay:
-                await asyncio.sleep(delay)
-            try:
-                await self._persist_room_state()
-                break
-            except Exception as e:
-                log.exception(f"廃村後LOBBY保存失敗 ({attempt}/3): {e}")
+        return await self._transition_to_empty_lobby(
+            state,
+            nickname_failures=nickname_failures,
+            log_label="廃村後LOBBY初期化",
+        )
 
     async def reset_game(self) -> str:
         """やり直し。
@@ -8895,17 +9730,36 @@ class RoomRunner:
         state = self.state
         if state.phase in (Phase.LOBBY, Phase.GAME_OVER):
             had_entries = bool(state.players) or state.gm_id is not None
-            state.players.clear()
-            state.gm_id = None
-            state.recruitment_id = None
-            await self._post_lobby_ui()
-            await self._persist_room_state()
+            if had_entries:
+                self.last_game_roster = list(state.players)
+                self.last_game_gm = state.gm_id
+            if state.phase == Phase.GAME_OVER:
+                nickname_failures = await self._restore_nicknames(state)
+            else:
+                nickname_failures = dict(state.original_nicknames)
+            old_ending = state.ending
+            state.ending = True
+            transitioned = await self._transition_to_empty_lobby(
+                state,
+                nickname_failures=nickname_failures,
+                log_label="受付リセット",
+            )
+            if not transitioned:
+                state.ending = old_ending
+                return (
+                    "⚠️ 参加受付をDBへ安全に保存できなかったため、"
+                    "リセットしませんでした。時間を置いて再度お試しください。"
+                )
             if had_entries:
                 return "🔄 参加受付をリセットしました (参加者とGMを解除)。"
             return "🔄 参加受付をリセットしました (登録はありませんでした)。"
 
-        await self.force_end("ゲームがリセットされました。")
-        return "🔄 ゲームをリセットし、参加受付へ戻しました。"
+        if await self.force_end("ゲームがリセットされました。"):
+            return "🔄 ゲームをリセットし、参加受付へ戻しました。"
+        return (
+            "⚠️ 終了処理が既に進行中か、参加受付をDBへ保存できなかったため、"
+            "リセット完了を確認できませんでした。"
+        )
 
     # ============================================================
     # 発言制御
@@ -9179,7 +10033,11 @@ class RoomRunner:
         return (
             state.wolf_relay_window_open
             and (
-                phase == Phase.INITIAL_NIGHT
+                (
+                    phase == Phase.PREPARATION
+                    and not state.initial_night_completed
+                )
+                or phase == Phase.INITIAL_NIGHT
                 or (phase == Phase.NIGHT and not state.night_resolved)
             )
             and not state.ending
@@ -9214,7 +10072,12 @@ class RoomRunner:
         if phase == Phase.DAY_VOTE:
             return (
                 {state.current_speaker_id}
-                if state.vote_slot_active and state.current_speaker_id
+                if (
+                    state.vote_slot_active
+                    and state.vote_speech_window_open
+                    and not state.vote_speech_finished
+                    and state.current_speaker_id
+                )
                 else set()
             )
         if phase in (Phase.DAY_RUNOFF_SPEECH, Phase.DAY_LAST_WILL):
@@ -9265,7 +10128,9 @@ class RoomRunner:
 
         failed: list[tuple[discord.Member, bool]] = []
 
-        async def set_mute(member: discord.Member, mute: bool, *, retry: bool = True) -> None:
+        async def set_mute(
+            member: discord.Member, mute: bool, *, retry: bool = True
+        ) -> bool:
             try:
                 edit_kwargs: dict = {"mute": mute}
                 if marker is not None:
@@ -9282,12 +10147,14 @@ class RoomRunner:
                 else:
                     state.bot_muted_ids.discard(member.id)
                     state.bot_mute_intent_ids.discard(member.id)
+                return True
             except (discord.Forbidden, discord.HTTPException) as e:
                 log.warning(
                     f"サーバーミュート変更失敗 ({member.display_name} → mute={mute}): {e}"
                 )
                 if retry:
                     failed.append((member, mute))
+                return False
 
         # vc.membersはDiscordのボイス状態キャッシュ由来で、キャッシュ更新の
         # タイミング次第で参加者が静かに漏れることがある (取りこぼすと対象0件
@@ -9372,8 +10239,19 @@ class RoomRunner:
             failed.clear()
             await asyncio.sleep(MUTE_RETRY_DELAY)
             log.info(f"サーバーミュートを再試行します ({len(retry_targets)}人)")
+            final_failed: list[tuple[discord.Member, bool]] = []
             for member, mute in retry_targets:
-                await set_mute(member, mute, retry=False)
+                if not await set_mute(member, mute, retry=False):
+                    final_failed.append((member, mute))
+            if final_failed:
+                details = ", ".join(
+                    f"{member.display_name}(mute={mute})"
+                    for member, mute in final_failed
+                )
+                log.error(
+                    "サーバーミュート最終失敗 "
+                    f"({state.room_name}, {len(final_failed)}人): {details}"
+                )
         # mute操作と所有記録を別々の障害窓にしない。
         # ここで落ちても、再起動後にBot自身がmuteした相手を
         # 手動muteと誤認せず解除できる。
@@ -9873,10 +10751,14 @@ class RoomRunner:
     async def _restore_nicknames(
         self,
         state: Optional[GameState] = None,
-    ) -> None:
+        *,
+        member_ids: Optional[set[int]] = None,
+    ) -> dict[int, Optional[str]]:
+        """名前を開始前へ戻し、戻せなかった対象だけを返す。"""
         # force_end が self.state を差し替えた後に旧stateの改名を戻すケースが
         # あるため、明示指定できるようにする (省略時は現在のstate)
         state = state or self.state
+        failures: dict[int, Optional[str]] = {}
         marker = (
             discord.utils.get(
                 state.guild.roles,
@@ -9885,8 +10767,15 @@ class RoomRunner:
             if state.guild is not None else None
         )
         async def restore_one(member_id: int, nick: Optional[str]) -> None:
+            if state.guild is None:
+                failures[member_id] = nick
+                return
             member = state.guild.get_member(member_id)
-            if not member or member.bot:
+            if member is None:
+                # キャッシュ不在・一時退出を成功扱いにせず、次のLOBBYへ持ち越す。
+                failures[member_id] = nick
+                return
+            if member.bot:
                 return
             # 同じPATCHでサーバーミュートも解除する (メンバー編集バケット節約)。
             # ミュート指定はVC接続中しか受け付けられないため接続確認する
@@ -9910,16 +10799,45 @@ class RoomRunner:
                         role for role in member_roles_for_edit(member)
                         if getattr(role, "id", None) != marker.id
                     ]
+            if not kwargs:
+                return
+            nickname_needed = "nick" in kwargs
             try:
-                if not kwargs:
-                    return
-                await self._paced_discord_api_call(member.edit, **kwargs)
+                updated = await self._paced_discord_api_call(member.edit, **kwargs)
+                player = state.players.get(member_id)
+                if player is not None and getattr(updated, "id", None) == member_id:
+                    player.member = updated
                 if "mute" in kwargs or "roles" in kwargs:
                     state.bot_muted_ids.discard(member_id)
             except (discord.Forbidden, discord.HTTPException) as e:
                 log.warning(f"ニックネーム復元失敗 (ID:{member_id}, nick:{nick}): {e}")
+                if not nickname_needed:
+                    # mute/マーカーロールだけの失敗は既存のVC復元台帳で扱う。
+                    return
+                try:
+                    # mute・rolesとの統合PATCHだけが失敗した場合にも、名前だけは
+                    # 個別に回収する。二度目も失敗した対象だけを次村へ持ち越す。
+                    updated = await self._paced_discord_api_call(
+                        member.edit,
+                        nick=nick,
+                    )
+                    player = state.players.get(member_id)
+                    if player is not None and getattr(updated, "id", None) == member_id:
+                        player.member = updated
+                except (discord.Forbidden, discord.HTTPException) as nick_error:
+                    failures[member_id] = nick
+                    log.warning(
+                        "ニックネーム単独復元も失敗 (ID:%s, nick:%s): %s",
+                        member_id,
+                        nick,
+                        nick_error,
+                    )
 
-        restore_ids = set(state.players) | set(state.original_nicknames)
+        restore_ids = (
+            set(member_ids)
+            if member_ids is not None
+            else set(state.players) | set(state.original_nicknames)
+        )
         for member_id in restore_ids:
             player = state.players.get(member_id)
             nickname = state.original_nicknames.get(
@@ -9927,6 +10845,7 @@ class RoomRunner:
                 player.original_nickname if player is not None else None,
             )
             await restore_one(member_id, nickname)
+        return failures
 
     # ============================================================
     # 安全な村チャンネル送信ヘルパー
@@ -10474,6 +11393,8 @@ class RoomRunner:
         async with self.action_lock:
             state = self.state
             if state.phase == Phase.LOBBY:
+                old_gm_id = state.gm_id
+                old_players = dict(state.players)
                 changed = False
                 if state.gm_id == member.id:
                     state.gm_id = None
@@ -10481,14 +11402,18 @@ class RoomRunner:
                 if member.id in state.players:
                     del state.players[member.id]
                     changed = True
-                if changed and not state.players and state.gm_id is None:
-                    state.recruitment_id = None
                 if changed:
                     try:
                         await self._persist_room_state()
+                    except Exception as e:
+                        state.gm_id = old_gm_id
+                        state.players = old_players
+                        log.warning(f"ロビー退出状態の保存失敗: {e}")
+                        return
+                    try:
                         await self._post_lobby_ui()
                     except Exception as e:
-                        log.warning(f"ロビー退出状態の保存・UI更新失敗: {e}")
+                        log.warning(f"ロビー退出後のUI更新失敗: {e}")
                 return
 
         state = self.state
