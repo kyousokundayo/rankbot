@@ -426,7 +426,7 @@ class TurnActionRaceTest(unittest.IsolatedAsyncioTestCase):
 
 
 # 旧CO機構 (turn_co_declaration_open / request_turn_co_declaration) の
-# テストは撤去した。新機構 (declare_co / withdraw_co / publish_co_result)
+# テストは撤去した。新機構 (declare_co / withdraw_co)
 # の回帰テストは tests/test_village_panel_co.py にある。
 # state.turn_co_declarations フィールドと _validate_turn_snapshot の検証は
 # 旧 snapshot 互換のため残っており、TurnDurabilityAndSafetyTest 側で

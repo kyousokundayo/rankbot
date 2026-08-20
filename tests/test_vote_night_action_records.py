@@ -1,4 +1,4 @@
-"""v0.49 工程3/3: 投票ログ (record_vote_event) と夜行動ログ
+"""v0.51 工程3/3: 投票ログ (record_vote_event) と夜行動ログ
 (record_night_action: 襲撃投票・襲撃確定) の回帰テスト。
 
 占い・護衛・霊能の record_night_action は工程2/3で既にフックずみ

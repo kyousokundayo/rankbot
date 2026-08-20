@@ -1,4 +1,4 @@
-"""#昼 常設村パネルのCO宣言・撤回・結果公開の回帰テスト (v0.49 工程3)。"""
+"""#昼 常設村パネルのCO宣言・撤回・結果公開の回帰テスト (v0.51 工程3)。"""
 from __future__ import annotations
 
 import asyncio
@@ -127,7 +127,7 @@ class CoRejectionTest(unittest.IsolatedAsyncioTestCase):
 class VillagePanelContentTest(unittest.IsolatedAsyncioTestCase):
     """パネル本文の組み立て。役職名の表示と長さ上限の防御。
 
-    v0.50で [結果を公開] を廃止したため、本文に載るのは役職CO (自己申告)
+    v0.51で [結果を公開] を廃止したため、本文に載るのは役職CO (自己申告)
     だけになった。占い・霊能の結果はVCで口頭で伝える。
     """
 

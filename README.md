@@ -4,7 +4,7 @@
 役職の配布から昼の議論・投票、夜の役職行動、シーズン制のレート/ランクまでを
 すべて自動で進行します。
 
-- 現在のバージョン: **v0.50**（`config.py` の `BOT_VERSION`、`SPEC.md` の対応Bot、`CHANGELOG.md` とここを更新時に揃える）
+- 現在のバージョン: **v0.51**（`config.py` の `BOT_VERSION`、`SPEC.md` の対応Bot、`CHANGELOG.md` とここを更新時に揃える）
 - 詳細仕様: **[SPEC.md](SPEC.md)**
 - ライセンス: **[LICENSE](LICENSE)**（後述）
 

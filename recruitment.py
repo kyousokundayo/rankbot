@@ -268,7 +268,7 @@ class RecruitmentManager:
         # 埋まらないよう間隔を空ける。主催者だけが使う機能なので、
         # 再起動をまたぐ厳密さは要らずメモリ保持で足りる。
         self._contact_sent_at: dict[int, float] = {}
-        # 「募集」ボタンのDM送信専用ペーサー (実装仕様 v0.49 §3-2)。
+        # 「募集」ボタンのDM送信専用ペーサー (実装仕様 v0.51 §3-2)。
         # 全卓共有の bulk_api_lock (paced_discord_api_call) は使わない。
         # ゲーム開始時のロール付与・ミュートを数十秒待たせてしまうため、
         # ここだけ独立した直列化と間隔を持たせる。
@@ -549,7 +549,7 @@ class RecruitmentManager:
         """募集カードの「通知」ボタンから、3チェックの設定パネルを表示する。
 
         ロール状態と prefs.notify_on_create が食い違っていたら、ロールを
-        正としてこの時点で prefs 側を合わせる (実装仕様 v0.49 §3-1)。
+        正としてこの時点で prefs 側を合わせる (実装仕様 v0.51 §3-1)。
         """
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             return await interaction.response.send_message(
@@ -578,7 +578,7 @@ class RecruitmentManager:
         1村1日1回は open_recruitment_call の UNIQUE 制約 (recruitment_id,
         called_on) で担保する。宛先の絞り込みとエラーEmbed判定を終えたら、
         実際の送信は専用ペーサーでバックグラウンド実行し、押した本人には
-        即座に人数だけ返す (実装仕様 v0.49 §3-2)。
+        即座に人数だけ返す (実装仕様 v0.51 §3-2)。
         """
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
             return await interaction.response.send_message(
@@ -3361,7 +3361,7 @@ class PlayerBlockSettingsView(discord.ui.View):
 
 
 # ============================================================
-# 運営ダッシュボード (v0.50)
+# 運営ダッシュボード (v0.51)
 #
 # #運営 はボタンだけの操作盤に保つ方針なので、指標は1枚のephemeralへ
 # まとめ、セレクトで面を切り替える。押した面のSQLだけを都度投げる

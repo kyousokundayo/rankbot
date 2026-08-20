@@ -1,5 +1,5 @@
 """#昼 常設村パネルの [霊媒][人狼予想][占い][狩人] ボタンの回帰テスト
-(v0.49 工程1・工程2/3)。
+(v0.51 工程1・工程2/3)。
 """
 from __future__ import annotations
 
@@ -246,7 +246,7 @@ class WolfGuessButtonTest(unittest.IsolatedAsyncioTestCase):
 
 
 class SeerButtonTest(unittest.IsolatedAsyncioTestCase):
-    """[占い] は #昼常設パネル経由 (v0.49 工程2/3)。占い師DMは廃止した。"""
+    """[占い] は #昼常設パネル経由 (v0.51 工程2/3)。占い師DMは廃止した。"""
 
     async def test_non_seer_is_rejected(self) -> None:
         runner = make_runner(phase=Phase.NIGHT)
@@ -343,7 +343,7 @@ class SeerButtonTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runner.state.seer_target, wolf.user_id)
         content = confirm_interaction.edit_original_response.await_args.kwargs["content"]
         self.assertIn("人狼", content)
-        # v0.50: 占い結果の通常DMは廃止 ([占い]から何度でも見返せるため)。
+        # v0.51: 占い結果の通常DMは廃止 ([占い]から何度でも見返せるため)。
         # FakeMemberにsendが無いこと自体が「DMを送らない」ことの担保になる。
         self.assertFalse(hasattr(runner, "deliver_seer_result"))
         self.assertFalse(hasattr(seer.member, "send"))
@@ -373,7 +373,7 @@ class SeerButtonTest(unittest.IsolatedAsyncioTestCase):
 
 
 class GuardButtonTest(unittest.IsolatedAsyncioTestCase):
-    """[狩人] も #昼常設パネル経由 (v0.49 工程2/3)。狩人DMは廃止した。"""
+    """[狩人] も #昼常設パネル経由 (v0.51 工程2/3)。狩人DMは廃止した。"""
 
     async def test_non_guard_is_rejected(self) -> None:
         runner = make_runner(phase=Phase.NIGHT)

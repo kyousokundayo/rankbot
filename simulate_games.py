@@ -676,7 +676,7 @@ class SimulationController:
             self._schedule(self._handle_village_panel_view(message, view))
 
     def on_dm_message(self, member: FakeMember, message: FakeMessage) -> None:
-        # 占い師・狩人のDMはv0.49で廃止し、#昼常設パネルの[占い][狩人]
+        # 占い師・狩人のDMはv0.51で廃止し、#昼常設パネルの[占い][狩人]
         # ボタン経由へ移した (room_runner._night_phase 参照)。人狼のDMのみ
         # ここに残る。
         view = message.view
@@ -900,7 +900,7 @@ class SimulationController:
     ) -> None:
         """#昼常設パネルの[占い][狩人]ボタンを、夜フェーズの間だけ操作する。
 
-        v0.49で占い師DM・狩人DMを廃止し、#昼パネル経由のephemeral UIへ
+        v0.51で占い師DM・狩人DMを廃止し、#昼パネル経由のephemeral UIへ
         一本化した (VillageSeerTargetView/VillageGuardTargetView →
         VillageSeerConfirmView/VillageGuardConfirmView)。狩人は護衛を
         放棄できない仕様のため、ここで確実に押させないと朝が来ない。

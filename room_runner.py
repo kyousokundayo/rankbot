@@ -4031,7 +4031,7 @@ class RoomRunner:
     def build_village_panel_content(self) -> str:
         """フェーズとCO一覧だけを1枚にまとめる。
 
-        v0.50で「結果を公開」を廃止したため、ここに載るのは役職CO
+        v0.51で「結果を公開」を廃止したため、ここに載るのは役職CO
         (自己申告) だけ。占い・霊能の結果はVCで口頭で伝える。操作説明も
         載せない (盤面として読む本文にする)。
         """
@@ -4338,7 +4338,7 @@ class RoomRunner:
     # ------------------------------------------------------------------
     # CO宣言・撤回 (仕様§2-2)
     #
-    # DBへの追記 (record_co_event/record_co_result) は state 更新 +
+    # DBへの追記 (record_co_event) は state 更新 +
     # _persist_room_state() が成功した「後」に行う。DB書き込みが失敗しても
     # ログに残すだけで進行は止めない (仕様0-8)。event_seq は
     # state.record_event_seq を単調増加させて払い出す (投票・夜行動ログと共有)。
@@ -6356,7 +6356,7 @@ class RoomRunner:
         if wolves_alive:
             await asyncio.gather(*(send_wolf_dm(w) for w in wolves_alive))
 
-        # 占い師・狩人のDMは廃止した (v0.49)。#昼常設パネルの[占い][狩人]
+        # 占い師・狩人のDMは廃止した (v0.51)。#昼常設パネルの[占い][狩人]
         # ボタン経由のephemeral UIへ一本化している (仕様§2-3)。夜が明けるまで
         # 何度でも押せ、確定済みならそのまま確定内容を再表示する。
 

@@ -251,7 +251,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner._release_spirit_hold.assert_awaited_once_with(victim.user_id)
 
     async def test_wolf_guess_dm_is_gone_and_panel_notice_rides_on_death_notice(self) -> None:
-        """v0.50: 人狼予想DMは廃止。案内は既存の死亡告知へ1行足すだけにする。"""
+        """v0.51: 人狼予想DMは廃止。案内は既存の死亡告知へ1行足すだけにする。"""
         self.assertFalse(hasattr(RoomRunner, "_send_wolf_guess_dm"))
         self.assertFalse(hasattr(RoomRunner, "_notify_gm_wolf_guess_dm_failure"))
         self.assertIn("人狼予想", room_runner.WOLF_GUESS_NOTICE)
@@ -3367,7 +3367,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(failed_again, [])
         self.assertTrue(runner.state.initial_seer_result_sent)
         self.assertEqual(runner.state.initial_seer_target, white.user_id)
-        # v0.50: 初日白はDMせず記録だけ残す。役職DMは1通のまま。
+        # v0.51: 初日白はDMせず記録だけ残す。役職DMは1通のまま。
         self.assertEqual(sum("初日占い結果" in message for message in messages), 0)
         self.assertEqual(seer.member.send.await_count, 1)
         self.assertEqual(record.await_count, 1)
@@ -3539,7 +3539,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertLessEqual(len(nick), 32)
 
     async def test_execution_records_medium_result_without_dm(self) -> None:
-        """処刑確定時、霊能結果はstateへ記録され、霊媒師への裸DMは廃止済み (v0.49)。"""
+        """処刑確定時、霊能結果はstateへ記録され、霊媒師への裸DMは廃止済み (v0.51)。"""
         runner = make_runner()
         wolf = add_player(runner, 1, Role.WEREWOLF)
         medium = add_player(runner, 2, Role.MEDIUM)

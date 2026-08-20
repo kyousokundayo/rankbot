@@ -1,4 +1,4 @@
-"""v0.49 Phase1: 記録テーブル (CO/結果申告/投票/夜行動ログ、通知設定、
+"""v0.51 Phase1: 記録テーブル (CO/結果申告/投票/夜行動ログ、通知設定、
 「募集」ボタンの送達台帳) のスキーマ移行・記録API・集計APIを検証する。
 
 DBテストの雛形は tests/test_recruitment_database.py:15 と
@@ -143,7 +143,7 @@ class RecordTablesDatabaseTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[-1]["claimed_role"], "霊媒師")
 
     async def test_co_results_recorded_before_v050_are_still_readable(self) -> None:
-        """v0.50で書き込み経路 ([結果を公開]) は廃止したが、過去行は読める。"""
+        """[結果を公開] の書き込み経路は持たないが、既存の行は読める。"""
         async with aiosqlite.connect(database.DB_PATH) as db:
             for seq, event_type in ((1, "公開"), (2, "取消")):
                 await db.execute(
@@ -390,9 +390,9 @@ class RecordTablesDatabaseTest(unittest.IsolatedAsyncioTestCase):
             guild_id, room_id, run_id, event_seq=1, day_number=1, phase="DAY_DISCUSSION",
             actor_id=seer_id, actor_number=1, event_type="CO", claimed_role="占い師",
         )
-        # v0.49で積んだ結果申告の行 ([結果を公開] はv0.50で廃止したので、
-        # 新規に増えることはない)。精算時の game_id 後埋めと、過去行が
-        # co統計へ乗り続けることを確認するために直接INSERTしておく。
+        # 結果申告の行 ([結果を公開] の書き込み経路は持たないので、通常は
+        # 増えない)。精算時の game_id 後埋めと、既存行が co統計へ乗り続ける
+        # ことを確認するために直接INSERTしておく。
         async with aiosqlite.connect(database.DB_PATH) as db:
             await db.execute(
                 "INSERT INTO game_co_results "
