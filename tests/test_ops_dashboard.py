@@ -298,6 +298,123 @@ class OpsDashboardTest(unittest.IsolatedAsyncioTestCase):
                 # Discordの1フィールド上限。集計が伸びても切れないこと。
                 self.assertLessEqual(len(field.value), 1024)
 
+    async def test_second_game_rate_falls_back_to_all_players(self) -> None:
+        """初参加から30日たった人がまだいなくても数字が出ること。
+
+        運用開始直後は母数条件を満たす人が0になり、30日基準の率だけだと
+        画面が常に「—」になって判断材料が消える (指摘の再現)。
+        """
+        stats = await database.get_ops_activity_stats(GUILD_ID, now=NOW)
+        # 30日基準の母数は102だけ。全体は101〜104の4人。
+        self.assertEqual(stats["second_game_sample"], 1)
+        self.assertEqual(stats["second_game_sample_all"], 4)
+        # 2戦以上遊んだのは101(8/17,8/20)・102(7/11,7/16)・104(7/31,8/20)の3人。
+        # 103は8/20の1戦だけなので到達していない。
+        self.assertAlmostEqual(stats["second_game_rate_all"], 0.75)
+
+        empty = await database.get_ops_activity_stats(
+            GUILD_ID + 999, now=NOW,
+        )
+        self.assertIsNone(empty["second_game_rate_all"])
+        self.assertEqual(empty["second_game_sample_all"], 0)
+
+        text = "\n".join(
+            field.value for field in _build_ops_retention_embed(stats).fields
+        )
+        self.assertIn("75.0%", text)
+
+    async def test_retention_embed_explains_empty_thirty_day_sample(self) -> None:
+        stats = await database.get_ops_activity_stats(GUILD_ID, now=NOW)
+        stats = {**stats, "second_game_sample": 0, "second_game_rate": None}
+
+        text = "\n".join(
+            field.value for field in _build_ops_retention_embed(stats).fields
+        )
+        self.assertIn("まだ30日たった人がいない", text)
+
+    async def test_delivery_failure_rate_excludes_cap_and_pending(self) -> None:
+        """1日の上限スキップと結果待ちは「届かなかった」に数えない。
+
+        意図的なスキップを失敗へ混ぜると、送達が正常でも失敗率が跳ね上がり
+        「DMが届いていない」の検知に使えなくなる。
+        """
+        async with aiosqlite.connect(database.DB_PATH) as db:
+            await db.execute(
+                "INSERT INTO recruitments (id, guild_id, host_id, title, scheduled_at, "
+                "room_id, created_at) VALUES (1, ?, 900, '募集A', "
+                "'2026-08-19T21:00:00+09:00', 'beginner', '2026-08-19 03:00:00')",
+                (GUILD_ID,),
+            )
+            await db.execute(
+                "INSERT INTO recruitment_calls (id, recruitment_id, guild_id, host_id, "
+                "called_on, recipients) VALUES (1, 1, ?, 900, '2026-08-19', 8)",
+                (GUILD_ID,),
+            )
+            statuses = (
+                ("sent", 6), ("forbidden", 1), ("failed", 1),
+                ("skipped_cap", 9), ("sending", 2),
+            )
+            user_id = 0
+            for status, count in statuses:
+                for _ in range(count):
+                    user_id += 1
+                    await db.execute(
+                        "INSERT INTO recruitment_call_deliveries "
+                        "(call_id, user_id, notified_at, delivery_status) "
+                        "VALUES (1, ?, '2026-08-19 03:05:00', ?)",
+                        (user_id, status),
+                    )
+            await db.commit()
+
+        block = (await database.get_ops_delivery_stats(
+            GUILD_ID, days=30, now=NOW,
+        ))["call_dm"]
+        self.assertEqual(block["total"], 19)
+        self.assertEqual(block["attempted"], 8)
+        self.assertEqual(block["skipped_cap"], 9)
+        self.assertEqual(block["pending"], 2)
+        # 上限スキップを混ぜた旧実装なら 13/19 = 68.4% になっていた。
+        self.assertAlmostEqual(block["failure_rate"], 2 / 8)
+
+    async def test_ops_panels_use_plain_japanese(self) -> None:
+        """運営が読んで意味の取れない略語を画面へ残さない。"""
+        await self._seed_recruitments()
+        activity = await database.get_ops_activity_stats(GUILD_ID, now=NOW)
+        embeds = [
+            _build_ops_activity_embed(activity),
+            _build_ops_retention_embed(activity),
+            _build_ops_churn_embed(activity),
+            _build_ops_throughput_embed(
+                await database.get_ops_throughput_stats(GUILD_ID, now=NOW), None,
+            ),
+            _build_ops_delivery_embed(
+                await database.get_ops_delivery_stats(GUILD_ID, now=NOW),
+            ),
+            _build_ops_rating_embed(await database.get_ops_rating_health(GUILD_ID)),
+        ]
+        rendered = []
+        for embed in embeds:
+            rendered.append(embed.title or "")
+            rendered.append(embed.description or "")
+            for field in embed.fields:
+                rendered.append(field.name)
+                rendered.append(str(field.value))
+            if embed.footer is not None and embed.footer.text:
+                rendered.append(embed.footer.text)
+        text = "\n".join(rendered)
+        for banned in (
+            "DAU", "WAU", "MAU", "90%点", "コホート", "オプトアウト",
+            "skipped_cap", "forbidden", "sending",
+        ):
+            self.assertNotIn(banned, text, f"{banned} が画面に残っています")
+        # パネル選択の説明文も同じ基準で見る。
+        descriptions = "\n".join(
+            description for _key, _label, description
+            in __import__("recruitment")._OPS_DASHBOARD_PANELS
+        )
+        for banned in ("DAU", "WAU", "MAU", "オプトアウト"):
+            self.assertNotIn(banned, descriptions)
+
     async def test_dashboard_view_switches_panels(self) -> None:
         view = OperationsDashboardView(GUILD_ID)
         self.assertEqual(len(view.children), 1)

@@ -1052,14 +1052,11 @@ class RecruitmentManager:
                 RECRUITMENT_NOTIFICATION_ROLE_NAME,
             )
             return
-        room = self._room_for_row(row)
-        card_message = getattr(getattr(room, "state", None), "lobby_message", None)
-        jump_url = getattr(card_message, "jump_url", None)
-        link = f"\n{jump_url}" if jump_url else ""
         try:
+            # 通知は同じ#参加受付へ出て、すぐ下に募集カードが並ぶ。
+            # 案内文もカードへのリンクも重複するため、メンションだけ送る。
             await channel.send(
-                f"{role.mention} 新しい人狼ゲーム募集が作成されました。"
-                f"募集カードから参加できます。{link}",
+                role.mention,
                 allowed_mentions=discord.AllowedMentions(
                     users=False,
                     roles=[role],
@@ -3781,12 +3778,12 @@ class PlayerBlockSettingsView(discord.ui.View):
 # ============================================================
 
 _OPS_DASHBOARD_PANELS: tuple[tuple[str, str, str], ...] = (
-    ("activity", "稼働", "DAU/WAU/MAU と直近14日の日別"),
-    ("retention", "定着", "新規流入・2戦目到達・週次継続率"),
-    ("churn", "離脱", "休眠人数・最終プレイからの経過・プレイ間隔"),
-    ("throughput", "回転", "募集の成立率・試合数・所要時間"),
-    ("delivery", "通知", "DM送達失敗率・通知オプトアウト"),
-    ("rating", "レート", "分布・仮ランク・月別の増減"),
+    ("activity", "稼働", "今日 / 7日 / 30日に遊んだ人数と試合数"),
+    ("retention", "定着", "はじめて来た人が2戦目以降も遊んでいるか"),
+    ("churn", "離脱", "しばらく来ていない人と、遊ぶ間隔"),
+    ("throughput", "回転", "募集がゲームまで進んだ割合・試合数・長さ"),
+    ("delivery", "通知", "DMが届かなかった割合と通知設定の状況"),
+    ("rating", "レート", "レートの散らばりと月ごとの増減"),
 )
 
 
@@ -3802,24 +3799,33 @@ def _ops_number(value: object, *, digits: int = 1, suffix: str = "") -> str:
     return "—" if value is None else f"{float(value):.{digits}f}{suffix}"
 
 
+def _ops_at_least(value: object, *, digits: int = 1, suffix: str = "") -> str:
+    """「◯◯以上」の表記。値が無いときは「—以上」にせず「—」だけ返す。"""
+    if value is None:
+        return "—"
+    return f"{float(value):.{digits}f}{suffix}以上"
+
+
 def _build_ops_activity_embed(stats: dict) -> discord.Embed:
     embed = discord.Embed(
         title="📈 稼働",
         description=(
-            f"JST {stats.get('today')} 時点 / 集計窓 {stats.get('window_days')}日\n"
+            f"日本時間 {stats.get('today')} 時点 / "
+            f"{stats.get('window_days')}日ぶんさかのぼって集計\n"
             "練習卓を含む「実際に遊ばれた回数」で数えます。"
         ),
         color=discord.Color.green(),
     )
     embed.add_field(
-        name="アクティブ人数",
+        name="遊んだ人数",
         value=(
-            f"DAU **{_ops_int(stats.get('dau'))}** / "
-            f"WAU **{_ops_int(stats.get('wau'))}** / "
-            f"MAU **{_ops_int(stats.get('mau'))}**\n"
-            f"DAU÷MAU {_ops_percent(stats.get('stickiness'))} ・ "
-            f"WAU÷MAU {_ops_percent(stats.get('wau_mau'))}\n"
-            f"累計プレイヤー {_ops_int(stats.get('total_players'))}人"
+            f"今日 **{_ops_int(stats.get('dau'))}人** / "
+            f"この7日 **{_ops_int(stats.get('wau'))}人** / "
+            f"この30日 **{_ops_int(stats.get('mau'))}人**\n"
+            f"この30日に遊んだ人のうち、今日も遊んだ人 "
+            f"{_ops_percent(stats.get('stickiness'))} ・ "
+            f"この7日も遊んだ人 {_ops_percent(stats.get('wau_mau'))}\n"
+            f"これまでに遊んだ人 のべ {_ops_int(stats.get('total_players'))}人"
         ),
         inline=False,
     )
@@ -3839,7 +3845,7 @@ def _build_ops_activity_embed(stats: dict) -> discord.Embed:
         for row in daily
     ]
     embed.add_field(
-        name="直近の日別", value="\n".join(lines) or "記録なし", inline=False,
+        name="日ごとの推移", value="\n".join(lines) or "記録なし", inline=False,
     )
     return embed
 
@@ -3851,7 +3857,7 @@ def _build_ops_retention_embed(stats: dict) -> discord.Embed:
         color=discord.Color.teal(),
     )
     embed.add_field(
-        name="新規プレイヤー",
+        name="はじめて遊んだ人",
         value=(
             f"本日 {_ops_int(stats.get('new_today'))}人 / "
             f"7日 {_ops_int(stats.get('new_7d'))}人 / "
@@ -3859,28 +3865,41 @@ def _build_ops_retention_embed(stats: dict) -> discord.Embed:
         ),
         inline=False,
     )
+    matured_sample = stats.get("second_game_sample") or 0
+    second_game_lines = [
+        f"これまで全体 **{_ops_percent(stats.get('second_game_rate_all'))}**"
+        f"（はじめて遊んだ {_ops_int(stats.get('second_game_sample_all'))}人が対象）",
+        f"はじめて遊んでから30日たった人だけ "
+        f"{_ops_percent(stats.get('second_game_rate'))}"
+        f"（{_ops_int(stats.get('second_game_sample'))}人が対象）",
+    ]
+    if not matured_sample:
+        # 開始から30日たっていない間は下段が必ず「—」になる。空欄の理由と、
+        # どちらを見ればよいかをその場に書いておく。
+        second_game_lines.append(
+            "※まだ30日たった人がいないので、上の「これまで全体」で見てください。"
+        )
     embed.add_field(
-        name="2戦目到達率",
-        value=(
-            f"{_ops_percent(stats.get('second_game_rate'))}"
-            f"（初参加から30日以上経った {_ops_int(stats.get('second_game_sample'))}人が母数）"
-        ),
+        name="2戦目に進んだ人の割合",
+        value="\n".join(second_game_lines),
         inline=False,
     )
     cohorts = stats.get("cohorts") or []
     if cohorts:
         lines = [
-            f"`{row['week'][5:]}週` {row['size']:>2}人 → "
-            f"W1 {_ops_percent(row['w1_rate'], digits=0)} / "
-            f"W4 {_ops_percent(row['w4_rate'], digits=0)}"
+            f"`{row['week'][5:]}の週` {row['size']:>2}人 → "
+            f"1週目 {_ops_percent(row['w1_rate'], digits=0)} / "
+            f"4週目 {_ops_percent(row['w4_rate'], digits=0)}"
             for row in cohorts[-8:]
         ]
         value = "\n".join(lines)
     else:
-        value = "28日以上経過したコホートがまだありません。"
-    embed.add_field(name="週次コホート（初参加週別）", value=value, inline=False)
+        value = "はじめて遊んでから28日たった人がまだいません。"
+    embed.add_field(
+        name="はじめて遊んだ週ごとの、また遊んだ割合", value=value, inline=False,
+    )
     embed.set_footer(
-        text="W1=初参加から1〜7日目に再プレイ / W4=22〜28日目に再プレイ"
+        text="1週目=はじめての1〜7日後にまた遊んだ人 / 4週目=22〜28日後にまた遊んだ人"
     )
     return embed
 
@@ -3892,18 +3911,19 @@ def _build_ops_churn_embed(stats: dict) -> discord.Embed:
         color=discord.Color.orange(),
     )
     embed.add_field(
-        name="休眠人数",
+        name="しばらく来ていない人",
         value=(
-            f"14日以上 {_ops_int(stats.get('dormant_14'))}人 / "
+            f"14日以上あいた {_ops_int(stats.get('dormant_14'))}人 / "
             f"30日以上 {_ops_int(stats.get('dormant_30'))}人 / "
             f"60日以上 {_ops_int(stats.get('dormant_60'))}人\n"
-            f"直近7日の復帰（14日以上空けて再開） **{_ops_int(stats.get('returning_7d'))}人**"
+            f"この7日に戻ってきた人（14日以上あけて再開） "
+            f"**{_ops_int(stats.get('returning_7d'))}人**"
         ),
         inline=False,
     )
     buckets = stats.get("last_play_buckets") or {}
     embed.add_field(
-        name="最終プレイからの経過",
+        name="最後に遊んでからの日数",
         value="\n".join(
             f"{label}: {count}人" for label, count in buckets.items()
         ) or "記録なし",
@@ -3911,14 +3931,16 @@ def _build_ops_churn_embed(stats: dict) -> discord.Embed:
     )
     streaks = stats.get("longest_streaks") or []
     embed.add_field(
-        name="プレイ間隔 / 連続日数",
+        name="遊ぶ間隔 / 連続で遊んだ日数",
         value=(
-            f"間隔の中央値 {_ops_number(stats.get('gap_median'), suffix='日')} ・ "
-            f"90%点 {_ops_number(stats.get('gap_p90'), suffix='日')}\n"
+            f"次に遊ぶまでの間隔 まんなかの人 "
+            f"{_ops_number(stats.get('gap_median'), suffix='日')} ・ "
+            f"間隔が長いほうの1割 "
+            f"{_ops_at_least(stats.get('gap_p90'), suffix='日')}\n"
             + (
-                "最長連続: "
+                "連続で遊んだ日数の上位: "
                 + " / ".join(f"{row['days']}日" for row in streaks)
-                if streaks else "連続プレイ（2日以上）はまだありません。"
+                if streaks else "2日以上つづけて遊んだ人はまだいません。"
             )
         ),
         inline=False,
@@ -3945,12 +3967,15 @@ def _build_ops_throughput_embed(
     embed.add_field(
         name="募集",
         value=(
-            f"作成 {_ops_int(stats.get('recruitments'))}件 / "
-            f"成立率 {_ops_percent(stats.get('held_rate'))}\n"
+            f"作った募集 {_ops_int(stats.get('recruitments'))}件 / "
+            f"ゲームまで進んだ割合 {_ops_percent(stats.get('held_rate'))}\n"
             + ("内訳: " + " / ".join(f"{k} {v}" for k, v in status.items()) if status else "内訳なし")
-            + f"\n定員充足の中央値 {_ops_percent(stats.get('fill_rate_median'), digits=0)}\n"
-            f"満席までの時間 中央値 {_ops_number(stats.get('ready_wait_median_min'), suffix='分')} ・ "
-            f"90%点 {_ops_number(stats.get('ready_wait_p90_min'), suffix='分')}"
+            + f"\n定員の埋まり具合 まんなかの募集で "
+            f"{_ops_percent(stats.get('fill_rate_median'), digits=0)}\n"
+            f"満席までの時間 まんなかの募集で "
+            f"{_ops_number(stats.get('ready_wait_median_min'), suffix='分')} ・ "
+            f"時間がかかったほうの1割 "
+            f"{_ops_at_least(stats.get('ready_wait_p90_min'), suffix='分')}"
         ),
         inline=False,
     )
@@ -3958,26 +3983,31 @@ def _build_ops_throughput_embed(
         name="試合",
         value=(
             f"{_ops_int(stats.get('games'))}戦 / "
-            f"稼働日あたり {_ops_number(stats.get('games_per_active_day'))}戦\n"
-            f"所要時間 中央値 {_ops_number(stats.get('duration_median_min'), suffix='分')} ・ "
-            f"90%点 {_ops_number(stats.get('duration_p90_min'), suffix='分')}"
-            f"（n={_ops_int(stats.get('duration_sample'))}）\n"
-            f"終了日数の中央値 {_ops_number(stats.get('game_days_median'), suffix='日')}\n"
-            f"途中離脱 {_ops_int(stats.get('dropouts'))} / 参加席 {_ops_int(stats.get('seats'))}"
+            f"試合があった日は1日あたり "
+            f"{_ops_number(stats.get('games_per_active_day'))}戦\n"
+            f"1試合の長さ まんなかの試合で "
+            f"{_ops_number(stats.get('duration_median_min'), suffix='分')} ・ "
+            f"長いほうの1割 "
+            f"{_ops_at_least(stats.get('duration_p90_min'), suffix='分')}"
+            f"（{_ops_int(stats.get('duration_sample'))}戦ぶんで計算）\n"
+            f"決着までのゲーム内日数 まんなかの試合で "
+            f"{_ops_number(stats.get('game_days_median'), suffix='日')}\n"
+            f"途中離脱 {_ops_int(stats.get('dropouts'))}人 / "
+            f"のべ参加 {_ops_int(stats.get('seats'))}人"
             f"（{_ops_percent(stats.get('dropout_rate'), digits=2)}）"
         ),
         inline=False,
     )
     hours = stats.get("hour_buckets") or {}
     embed.add_field(
-        name="時間帯（JST）",
+        name="遊ばれた時間帯（日本時間）",
         value=" / ".join(f"{label} {count}" for label, count in hours.items()) or "記録なし",
         inline=False,
     )
     gm_top = stats.get("gm_top") or []
     if gm_top:
         embed.add_field(
-            name="GM実施回数",
+            name="GMをやった回数",
             value="\n".join(
                 f"{_ops_identity(guild, row['player_id'])}: {row['games']}回"
                 for row in gm_top
@@ -3987,11 +4017,22 @@ def _build_ops_throughput_embed(
     return embed
 
 
+# DBへ保存している送達ステータスは英字のままなので、画面へ出すときだけ
+# 日本語へ寄せる。未知の値が来ても落とさず、そのまま表示する。
+_OPS_DELIVERY_STATUS_LABELS = {
+    "sent": "届いた",
+    "forbidden": "DMを拒否されている",
+    "failed": "送信に失敗",
+    "skipped_cap": "1日の上限でスキップ",
+    "sending": "結果待ち",
+}
+
+
 def _build_ops_delivery_embed(stats: dict) -> discord.Embed:
     embed = discord.Embed(
         title="📮 通知",
         description=(
-            f"直近{stats.get('days')}日のDM送達。失敗率が上がっていると、"
+            f"直近{stats.get('days')}日のDMの届き具合。届かない割合が上がると、"
             "本人にもホストにも見えないまま募集が回らなくなります。"
         ),
         color=discord.Color.purple(),
@@ -3999,47 +4040,68 @@ def _build_ops_delivery_embed(stats: dict) -> discord.Embed:
     for key, label in (("call_dm", "「募集」ボタンのDM"), ("recruitment_dm", "開始前の通知DM")):
         block = stats.get(key) or {}
         by_status = block.get("by_status") or {}
+        # 日次上限で送らなかったぶんと結果待ちは「届かなかった」ではないので、
+        # 割合の内訳とは分け、対象外として件数だけ添える。
+        excluded_keys = ("skipped_cap", "sending")
+        breakdown = " / ".join(
+            f"{_OPS_DELIVERY_STATUS_LABELS.get(k, k)} {v}"
+            for k, v in by_status.items()
+            if k not in excluded_keys
+        )
+        excluded = " ・ ".join(
+            f"{_OPS_DELIVERY_STATUS_LABELS.get(k, k)} {by_status[k]}件"
+            for k in excluded_keys
+            if by_status.get(k)
+        )
         embed.add_field(
             name=label,
             value=(
-                f"送信 {_ops_int(block.get('total'))}件 / "
-                f"失敗率 **{_ops_percent(block.get('failure_rate'), digits=2)}**\n"
-                + ("内訳: " + " / ".join(f"{k} {v}" for k, v in by_status.items())
-                   if by_status else "内訳なし")
+                f"送ろうとした {_ops_int(block.get('attempted'))}件 / "
+                f"届かなかった割合 "
+                f"**{_ops_percent(block.get('failure_rate'), digits=2)}**\n"
+                + (f"内訳: {breakdown}" if breakdown else "内訳なし")
+                + (f"\n割合の対象外: {excluded}" if excluded else "")
             ),
             inline=False,
         )
     embed.add_field(
         name="通知設定",
         value=(
-            f"設定済み {_ops_int(stats.get('prefs_configured'))}人 / "
-            f"オプトアウト {_ops_int(stats.get('prefs_opted_out'))}人"
+            f"設定をさわった人 {_ops_int(stats.get('prefs_configured'))}人 / "
+            f"通知を切った人 {_ops_int(stats.get('prefs_opted_out'))}人"
             f"（{_ops_percent(stats.get('opt_out_rate'))}）\n"
-            f"作成時に通知 {_ops_int(stats.get('prefs_notify_on_create'))}人 / "
-            f"「募集」ボタン {_ops_int(stats.get('prefs_notify_on_call'))}人"
+            f"村ができた時に受け取る {_ops_int(stats.get('prefs_notify_on_create'))}人 / "
+            f"「募集」ボタンで受け取る {_ops_int(stats.get('prefs_notify_on_call'))}人"
         ),
         inline=False,
     )
     return embed
 
 
+def _ops_variant_label(variant_id: object) -> str:
+    """内部の形式IDではなく、募集カードと同じ表示名を出す。"""
+    definition = VARIANT_DEFINITIONS.get(str(variant_id))
+    return definition.label if definition is not None else str(variant_id)
+
+
 def _build_ops_rating_embed(stats: dict) -> discord.Embed:
     embed = discord.Embed(
         title="🎯 レート健全性",
         description=(
-            f"{stats.get('variant_id')} / ラダー {stats.get('ladder_id')}。"
+            f"{_ops_variant_label(stats.get('variant_id'))}のレート。"
             "平均が一方向へ動き続けていたら配分の見直し時です。"
         ),
         color=discord.Color.gold(),
     )
     embed.add_field(
-        name="分布",
+        name="散らばり",
         value=(
             f"対象 {_ops_int(stats.get('players'))}人 / "
             f"平均 {_ops_number(stats.get('mean'), digits=0)} / "
-            f"中央値 {_ops_number(stats.get('median'), digits=0)}\n"
-            f"最小 {_ops_int(stats.get('min'))} 〜 最大 {_ops_int(stats.get('max'))} ・ "
-            f"仮ランク {_ops_int(stats.get('provisional'))}人"
+            f"まんなかの人 {_ops_number(stats.get('median'), digits=0)}\n"
+            f"いちばん低い {_ops_int(stats.get('min'))} 〜 "
+            f"いちばん高い {_ops_int(stats.get('max'))} ・ "
+            f"仮ランク（試合数が足りない人） {_ops_int(stats.get('provisional'))}人"
         ),
         inline=False,
     )
@@ -4054,11 +4116,11 @@ def _build_ops_rating_embed(stats: dict) -> discord.Embed:
     monthly = stats.get("monthly") or []
     if monthly:
         embed.add_field(
-            name="月別（精算ベース）",
+            name="月ごとの動き（精算した試合が対象）",
             value="\n".join(
                 f"`{row['month']}` 精算{row['settlements']:>4}件 / "
-                f"平均レート {_ops_number(row['avg_rating_after'], digits=0)} / "
-                f"平均増減 {_ops_number(row['avg_total_delta'], digits=2)}"
+                f"精算後の平均レート {_ops_number(row['avg_rating_after'], digits=0)} / "
+                f"1件あたりの平均増減 {_ops_number(row['avg_total_delta'], digits=2)}"
                 for row in monthly
             ),
             inline=False,
@@ -4255,31 +4317,11 @@ class OperationsView(discord.ui.View):
         embed = await view.load_embed(interaction.guild)
         await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
-    @discord.ui.button(label="GM解除", style=discord.ButtonStyle.danger, custom_id="operations:release_gm", row=1)
-    async def release_gm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not self._is_admin(interaction):
-            return await interaction.response.send_message("運営のみ操作できます。", ephemeral=True)
-        lobby_rooms = [room for room in self.manager.game_cog.rooms.values() if room.state.phase == Phase.LOBBY and room.state.gm_id]
-        active = [room.state.room_name for room in self.manager.game_cog.rooms.values() if room.state.phase != Phase.LOBBY]
-        if not lobby_rooms:
-            suffix = "\n進行中のため対象外: " + ", ".join(active) if active else ""
-            return await interaction.response.send_message("解除できるGMはいません。" + suffix, ephemeral=True)
-        await interaction.response.send_message(
-            "受付中の卓だけ選べます。" + ("\n進行中のため対象外: " + ", ".join(active) if active else ""),
-            view=OperationsGMReleaseView(self.manager, lobby_rooms), ephemeral=True,
-        )
-
-    @discord.ui.button(label="募集の強制削除", style=discord.ButtonStyle.danger, custom_id="operations:archive_recruitment", row=1)
-    async def archive_recruitment(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not self._is_admin(interaction) or interaction.guild is None:
-            return await interaction.response.send_message("運営のみ操作できます。", ephemeral=True)
-        rows = await database.list_open_recruitments(interaction.guild.id)
-        if not rows:
-            return await interaction.response.send_message("募集中の募集はありません。", ephemeral=True)
-        await interaction.response.send_message(
-            "強制アーカイブする募集を選んでください。",
-            view=OperationsRecruitmentArchiveView(self.manager, rows[:25]), ephemeral=True,
-        )
+    # 「GM解除」は置かない。GMを外した卓は開始も受付の作り直しもできず、
+    # GM村は募集カードからしかGMを戻せないため、救済ではなく詰みを作る操作に
+    # なる。手に負えない卓は「村の強制削除」で丸ごと畳む。
+    # 「募集の強制削除」も置かない。村の強制削除が紐づくOPEN/HELD募集を先に
+    # ARCHIVEDへ倒すので、募集だけを消す入口は同じ後始末を二重に持つだけになる。
 
     @discord.ui.button(label="村の強制削除", style=discord.ButtonStyle.danger, custom_id="operations:delete_private_room", row=1)
     async def delete_private_room(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -4296,54 +4338,3 @@ class OperationsView(discord.ui.View):
         if not self._is_admin(interaction) or interaction.guild is None:
             return await interaction.response.send_message("運営のみ操作できます。", ephemeral=True)
         await self.manager.game_cog.prompt_season_reset(interaction)
-
-
-class OperationsGMReleaseView(discord.ui.View):
-    def __init__(self, manager: RecruitmentManager, rooms: list) -> None:
-        super().__init__(timeout=180)
-        self.manager = manager
-        select = discord.ui.Select(
-            placeholder="GMを解除する卓",
-            options=[discord.SelectOption(label=r.state.room_name, value=r.state.room_id) for r in rooms[:25]],
-        )
-        select.callback = self.selected
-        self.add_item(select)
-
-    async def selected(self, interaction: discord.Interaction) -> None:
-        if not OperationsView._is_admin(interaction):
-            return await interaction.response.send_message("運営のみ操作できます。", ephemeral=True)
-        room = self.manager.game_cog.rooms.get(self.children[0].values[0])
-        if room is None or room.state.phase != Phase.LOBBY:
-            return await interaction.response.send_message("進行中または対象外のため解除できません。", ephemeral=True)
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        async with room.action_lock:
-            room.state.gm_id = None
-            await room._persist_room_state()
-            await room._post_lobby_ui()
-        await interaction.followup.send("GMを解除しました。", ephemeral=True)
-
-
-class OperationsRecruitmentArchiveView(discord.ui.View):
-    def __init__(self, manager: RecruitmentManager, rows: list[dict]) -> None:
-        super().__init__(timeout=180)
-        self.manager = manager
-        select = discord.ui.Select(
-            placeholder="強制アーカイブする募集",
-            options=[discord.SelectOption(label=row["title"][:100], value=str(row["id"])) for row in rows],
-        )
-        select.callback = self.selected
-        self.add_item(select)
-
-    async def selected(self, interaction: discord.Interaction) -> None:
-        if not OperationsView._is_admin(interaction):
-            return await interaction.response.send_message("運営のみ操作できます。", ephemeral=True)
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        recruitment_id = parse_select_id(self.children[0].values[0])
-        if recruitment_id is None:
-            return await interaction.followup.send(
-                "❌ 不正な選択です。", ephemeral=True
-            )
-        await self.manager.archive_recruitment(
-            interaction.guild, recruitment_id,
-        )
-        await interaction.followup.send("募集を強制アーカイブしました。", ephemeral=True)
