@@ -329,6 +329,66 @@ class DeletionAndLobbyExclusionTest(unittest.IsolatedAsyncioTestCase):
         cog.rooms["private-life"].state.phase = Phase.LOBBY
         self.assertFalse(cog._private_room_phase_blocks_delete(row))
 
+    async def test_exclusion_select_defers_before_waiting_on_action_lock(self) -> None:
+        """除外セレクトは、action_lockを待つ前にinteractionを受理する。
+
+        action_lockはフェーズ切替のmute整列などで数秒以上握られる。先に
+        deferしないとDiscordの3秒期限を越えて「応答しませんでした」になり、
+        以降のsend_messageも Unknown interaction で失敗する。
+        """
+        player = Player(10, _member(10, "参加者"), number=0)
+        state = SimpleNamespace(
+            phase=Phase.LOBBY,
+            gm_id=99,
+            game_run_id="",
+            players={10: player},
+            lobby_message=None,
+        )
+        lock = asyncio.Lock()
+        cog = SimpleNamespace(
+            state=state,
+            action_lock=lock,
+            is_current_game_view=lambda _run_id: True,
+            _persist_room_state=AsyncMock(),
+            _post_lobby_ui=AsyncMock(),
+            _schedule_lobby_panel_recovery=Mock(),
+        )
+        order: list[str] = []
+        view = RemovePlayerSelectView(
+            cog, [discord.SelectOption(label="参加者", value="10")],
+        )
+
+        async def record_defer(**_kwargs) -> None:
+            order.append("defer")
+
+        initial = SimpleNamespace(
+            user=SimpleNamespace(id=99),
+            data={"values": ["10"]},
+            response=SimpleNamespace(
+                defer=AsyncMock(side_effect=record_defer),
+                send_message=AsyncMock(),
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        # 進行中の処理がaction_lockを握ったままでも、受理だけは先に返る。
+        await lock.acquire()
+        task = asyncio.create_task(view.select_callback(initial))
+        for _ in range(20):
+            if order:
+                break
+            await asyncio.sleep(0)
+        self.assertEqual(order, ["defer"], "ロック待ちより先にdeferしていない")
+        self.assertFalse(task.done())
+        order.append("lock-released")
+        lock.release()
+        await task
+
+        # 応答済みなので、以降の返信はfollowup側だけを使う。
+        initial.response.send_message.assert_not_awaited()
+        initial.followup.send.assert_awaited()
+        self.assertEqual(order, ["defer", "lock-released"])
+
     async def test_lobby_exclusion_edit_failure_reposts_and_schedules_retry(self) -> None:
         player = Player(10, _member(10, "参加者"), number=0)
         message = SimpleNamespace(
@@ -359,12 +419,14 @@ class DeletionAndLobbyExclusionTest(unittest.IsolatedAsyncioTestCase):
         initial = SimpleNamespace(
             user=SimpleNamespace(id=99),
             data={"values": ["10"]},
-            response=SimpleNamespace(send_message=AsyncMock()),
+            # ロック待ちで応答期限を越えないよう、選択の受理は defer が先。
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
         )
         with patch("views.LobbyView") as lobby_view:
             lobby_view.return_value._build_embed.return_value = object()
             await view.select_callback(initial)
-            confirmation = initial.response.send_message.await_args.kwargs["view"]
+            confirmation = initial.followup.send.await_args.kwargs["view"]
             confirm = SimpleNamespace(
                 user=SimpleNamespace(id=99),
                 response=SimpleNamespace(defer=AsyncMock()),
@@ -403,12 +465,14 @@ class DeletionAndLobbyExclusionTest(unittest.IsolatedAsyncioTestCase):
         initial = SimpleNamespace(
             user=SimpleNamespace(id=99),
             data={"values": ["10"]},
-            response=SimpleNamespace(send_message=AsyncMock()),
+            # ロック待ちで応答期限を越えないよう、選択の受理は defer が先。
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
         )
         with patch("views.LobbyView") as lobby_view:
             lobby_view.return_value._build_embed.return_value = object()
             await view.select_callback(initial)
-            confirmation = initial.response.send_message.await_args.kwargs["view"]
+            confirmation = initial.followup.send.await_args.kwargs["view"]
             confirm = SimpleNamespace(
                 user=SimpleNamespace(id=99),
                 response=SimpleNamespace(defer=AsyncMock()),

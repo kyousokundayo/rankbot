@@ -1423,29 +1423,34 @@ class RemovePlayerSelectView(discord.ui.View):
         self.add_item(select)
 
     async def select_callback(self, interaction: discord.Interaction) -> None:
+        # action_lock はフェーズ切替のmute整列などで数秒以上握られる。
+        # 先に受理しないとDiscordの応答期限を越えて「応答しませんでした」に
+        # なり、以降のsend_messageも Unknown interaction で落ちる。
+        # 「ゲーム開始」と同じく、ロック待ちより先に受理してから中身を見る。
+        await interaction.response.defer(ephemeral=True, thinking=True)
         async with self.cog.action_lock:
             user_id = parse_select_id(interaction.data["values"][0])
             if user_id is None:
-                return await interaction.response.send_message(
+                return await interaction.followup.send(
                     "❌ 不正な選択です。", ephemeral=True
                 )
             state = self.cog.state
             if self.game_run_id and not self.cog.is_current_game_view(self.game_run_id):
-                return await interaction.response.send_message("⏳ このゲームの操作は終了しています。", ephemeral=True)
+                return await interaction.followup.send("⏳ このゲームの操作は終了しています。", ephemeral=True)
             if state.gm_id != interaction.user.id:
-                return await interaction.response.send_message("GMのみ操作可能です。", ephemeral=True)
+                return await interaction.followup.send("GMのみ操作可能です。", ephemeral=True)
 
             if state.phase == Phase.LOBBY:
                 player = state.players.get(user_id)
                 if player is None:
-                    return await interaction.response.send_message(
+                    return await interaction.followup.send(
                         "対象が見つかりません。", ephemeral=True
                     )
                 display_name = player.member.display_name
             else:
                 player = state.get_player(user_id)
                 if player is None or not player.alive:
-                    return await interaction.response.send_message(
+                    return await interaction.followup.send(
                         "対象が見つかりません。", ephemeral=True
                     )
                 display_name = player.display_name
@@ -1552,7 +1557,7 @@ class RemovePlayerSelectView(discord.ui.View):
                 )
 
         label = "ゲームから除外" if self.game_run_id else "参加を取り消す"
-        await interaction.response.send_message(
+        await interaction.followup.send(
             f"⚠️ **{display_name}** を{label}操作です。実行しますか？",
             view=DangerConfirmView(
                 interaction.user.id,

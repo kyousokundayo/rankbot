@@ -2597,6 +2597,47 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
                     expected,
                 )
 
+    async def test_start_failure_schedules_lobby_panel_recovery(self) -> None:
+        """開始失敗でLOBBYへ戻すとき、受付パネルの再掲も落ちたら再試行を予約する。
+
+        ゲームチャンネル作成が失敗した直後はDiscord側が不調なことが多く、
+        続く _post_lobby_ui も落ちやすい。ここを黙って捨てると、参加者が
+        残ったままのLOBBYから参加/取消・GM管理の操作口だけが消える。
+        """
+        runner = RoomRunner(None, FakeManager(), RoomDefinition("test", "テスト村"))
+        runner.manager.rooms["test"] = runner
+        for user_id in range(1, 14):
+            add_player(runner, user_id)
+        game_vc = SimpleNamespace(
+            id=500,
+            members=[player.member for player in runner.state.players.values()],
+        )
+        for player in runner.state.players.values():
+            player.member.voice = SimpleNamespace(channel=game_vc)
+        runner.state.voice_channel = game_vc
+        runner.state.recruitment_id = 42
+        runner._create_game_channels = AsyncMock(
+            side_effect=RuntimeError("チャンネル作成失敗"),
+        )
+        runner._post_lobby_ui = AsyncMock(side_effect=RuntimeError("再掲も失敗"))
+        runner._schedule_lobby_panel_recovery = Mock()
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(
+                get_member=lambda user_id: runner.state.players[user_id].member,
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        await runner._start_game_locked(interaction)
+
+        self.assertEqual(runner.state.phase, Phase.LOBBY)
+        # 参加者は残したままなので、操作口を失わせない。
+        self.assertEqual(len(runner.state.players), 13)
+        runner._post_lobby_ui.assert_awaited()
+        runner._schedule_lobby_panel_recovery.assert_called_once()
+        kwargs = runner._schedule_lobby_panel_recovery.call_args.kwargs
+        self.assertEqual(kwargs["recruitment_id"], 42)
+
     async def test_restricted_snapshot_keeps_access_marker_but_archives_log(self) -> None:
         """限定中の閲覧境界は維持しつつ、終了ログは公開する。"""
         source = RoomRunner(
