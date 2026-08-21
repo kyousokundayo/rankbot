@@ -1608,9 +1608,8 @@ async def _run_simulations_with_private_temp(
     tmp_dir = Path(temp_dir.name)
     original_db_path = database.DB_PATH
     database.DB_PATH = str(tmp_dir / "simulation.db")
-    await database.init_db()
-
     try:
+        await database.init_db()
         scenarios = build_simulation_scenarios(
             runs, variant_ids, base_seed=base_seed,
         )
@@ -1958,15 +1957,14 @@ async def _run_population_simulation_with_private_temp(
     tmp_dir = Path(temp_dir.name)
     original_db_path = database.DB_PATH
     database.DB_PATH = str(tmp_dir / "population.db")
-    await database.init_db()
-
-    guild_id = 888
-    player_ids = [20_000 + idx for idx in range(population_size)]
-    games_played = {player_id: 0 for player_id in player_ids}
-    rng = Random(seed)
-    results: list[SimulationResult] = []
-
     try:
+        await database.init_db()
+        guild_id = 888
+        player_ids = [20_000 + idx for idx in range(population_size)]
+        games_played = {player_id: 0 for player_id in player_ids}
+        rng = Random(seed)
+        results: list[SimulationResult] = []
+
         with patched_rating_calculator(calculator):
             game_seed = seed
             while min(games_played.values()) < min_games:

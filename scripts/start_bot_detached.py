@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import math
 import shlex
 import signal
 import stat
@@ -12,16 +13,44 @@ import fcntl
 from contextlib import contextmanager
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 
 BOT_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BOT_DIR / ".env")
 BOT_FILE = BOT_DIR / "bot.py"
 PYTHON_FILE = BOT_DIR / ".venv" / "bin" / "python"
 LAUNCHER = BOT_DIR / "scripts" / "run_bot.sh"
 LOG_DIR = BOT_DIR / "logs"
 LAUNCHER_LOG = LOG_DIR / "launcher.log"
 LAUNCHER_LOG_MAX_BYTES = 1_000_000
-READY_TIMEOUT = float(os.getenv("WEREWOLF_BOT_READY_TIMEOUT", "90"))
-STOP_TIMEOUT = float(os.getenv("WEREWOLF_BOT_STOP_TIMEOUT", "5"))
+MAX_OPERATION_TIMEOUT_SECONDS = 3600.0
+
+
+def _parse_positive_finite_timeout(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        value = default
+    else:
+        try:
+            value = float(raw.strip())
+        except ValueError as exc:
+            raise RuntimeError(f"{name} は秒数を数値で指定してください: {raw!r}") from exc
+    if (
+        not math.isfinite(value)
+        or value <= 0
+        or value > MAX_OPERATION_TIMEOUT_SECONDS
+    ):
+        shown = raw if raw is not None else str(default)
+        raise RuntimeError(
+            f"{name} は0より大きく{MAX_OPERATION_TIMEOUT_SECONDS:.0f}以下の"
+            f"秒数で指定してください: {shown!r}"
+        )
+    return value
+
+
+READY_TIMEOUT = _parse_positive_finite_timeout("WEREWOLF_BOT_READY_TIMEOUT", 90.0)
+STOP_TIMEOUT = _parse_positive_finite_timeout("WEREWOLF_BOT_STOP_TIMEOUT", 5.0)
 
 
 class ProcessInspectionError(RuntimeError):
@@ -33,6 +62,13 @@ def _runtime_dir() -> Path:
     if configured:
         return Path(configured).expanduser().absolute()
     return Path(tempfile.gettempdir()) / f"werewolf-bot-{os.getuid()}"
+
+
+def _bot_lock_path(runtime_dir: Path) -> Path:
+    configured = os.getenv("WEREWOLF_BOT_LOCK_FILE")
+    if configured:
+        return Path(configured).expanduser().absolute()
+    return runtime_dir / "bot.lock"
 
 
 def _prepare_runtime_dir(path: Path) -> None:
@@ -204,16 +240,63 @@ def _stop_failed_launch(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=2)
 
 
+def _prepare_private_log_directory(path: Path) -> None:
+    if path.is_symlink():
+        raise RuntimeError(f"ログディレクトリがシンボリックリンクです: {path}")
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = path.stat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise RuntimeError(f"安全なログディレクトリではありません: {path}")
+    path.chmod(0o700)
+
+
+def _harden_existing_private_log(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+    ):
+        raise RuntimeError(f"安全な既存ログファイルではありません: {path}")
+    path.chmod(0o600)
+
+
+def _open_private_launcher_log(path: Path):
+    if path.is_symlink():
+        raise RuntimeError(f"ランチャーログがシンボリックリンクです: {path}")
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    file_descriptor = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(file_descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise RuntimeError(f"安全なランチャーログではありません: {path}")
+        os.fchmod(file_descriptor, 0o600)
+        return os.fdopen(file_descriptor, "ab", buffering=0)
+    except Exception:
+        os.close(file_descriptor)
+        raise
+
+
 def _rotate_launcher_log() -> None:
     """初期化前クラッシュの証跡を1世代残しつつ、ログの無限増大を防ぐ。"""
+    if LAUNCHER_LOG.is_symlink():
+        raise RuntimeError(f"ランチャーログがシンボリックリンクです: {LAUNCHER_LOG}")
     try:
         if LAUNCHER_LOG.stat().st_size < LAUNCHER_LOG_MAX_BYTES:
             return
     except FileNotFoundError:
         return
     rotated = LAUNCHER_LOG.with_suffix(f"{LAUNCHER_LOG.suffix}.1")
+    if rotated.is_symlink():
+        raise RuntimeError(f"ローテーション先がシンボリックリンクです: {rotated}")
     rotated.unlink(missing_ok=True)
     LAUNCHER_LOG.replace(rotated)
+    rotated.chmod(0o600)
 
 
 @contextmanager
@@ -238,7 +321,7 @@ def _launcher_operation_lock(runtime_dir: Path):
 def _start_locked(runtime_dir: Path) -> int:
     pid_file = runtime_dir / "bot.pid"
     ready_file = runtime_dir / "bot.ready"
-    lock_file = runtime_dir / "bot.lock"
+    lock_file = _bot_lock_path(runtime_dir)
 
     if _candidate_bot_pids(pid_file):
         print("already_running")
@@ -248,7 +331,11 @@ def _start_locked(runtime_dir: Path) -> int:
     pid_file.unlink(missing_ok=True)
     ready_file.unlink(missing_ok=True)
 
-    LOG_DIR.mkdir(exist_ok=True)
+    _prepare_private_log_directory(LOG_DIR)
+    _harden_existing_private_log(LAUNCHER_LOG)
+    _harden_existing_private_log(
+        LAUNCHER_LOG.with_suffix(f"{LAUNCHER_LOG.suffix}.1")
+    )
     _rotate_launcher_log()
     child_env = os.environ.copy()
     child_env.update(
@@ -259,7 +346,7 @@ def _start_locked(runtime_dir: Path) -> int:
         }
     )
     # 起動失敗の履歴を失わないよう追記する。Bot本体のログは別途ローテーションされる。
-    with LAUNCHER_LOG.open("ab", buffering=0) as log:
+    with _open_private_launcher_log(LAUNCHER_LOG) as log:
         process = subprocess.Popen(
             [str(LAUNCHER)],
             cwd=str(BOT_DIR),

@@ -460,13 +460,26 @@ class LobbyView(discord.ui.View):
         embed.add_field(name="GM", value=gm_name, inline=False)
         return embed
 
-    async def _update(self, interaction: discord.Interaction) -> None:
+    async def _update(self, interaction: discord.Interaction) -> bool:
         embed = self._build_embed()
         self._refresh_start_button()
         try:
             await interaction.message.edit(embed=embed, view=self)
-        except (discord.NotFound, discord.HTTPException):
-            pass
+            self.cog.state.lobby_message = interaction.message
+            return True
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as error:
+            log.info("参加受付カードの更新失敗。再掲します: %s", error)
+        try:
+            await self.cog._post_lobby_ui()
+            return True
+        except Exception as error:
+            log.exception("参加受付カードの再掲に失敗: %s", error)
+            self.cog._schedule_lobby_panel_recovery(
+                self.cog.state,
+                recruitment_id=getattr(self.cog.state, "recruitment_id", None),
+                log_label="ロビー操作",
+            )
+            return False
 
     @discord.ui.button(label="参加", style=discord.ButtonStyle.success, custom_id="join_game", row=0)
     async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -498,7 +511,9 @@ class LobbyView(discord.ui.View):
 
             # DM送信テスト
             try:
-                await interaction.user.send("人狼ゲームへの参加を受け付けました。")
+                await interaction.user.send(
+                    "人狼ゲームの参加確認DMです。参加は保存完了後に確定します。"
+                )
             except (discord.Forbidden, discord.HTTPException):
                 await interaction.followup.send(
                     "DMを開放してください。DMが受け取れないと参加できません。", ephemeral=True
@@ -511,9 +526,24 @@ class LobbyView(discord.ui.View):
                 member=interaction.user,
                 original_nickname=interaction.user.nick,
             )
-            await self._update(interaction)
-            await self.cog._persist_room_state()
-            await interaction.followup.send("参加しました。", ephemeral=True)
+            try:
+                await self.cog._persist_room_state()
+            except Exception as error:
+                # 公開カードだけ参加済みに見せず、開始判定も未保存の名簿を
+                # 参照しないよう、保存前の状態へ戻す。
+                state.players.pop(user_id, None)
+                log.exception("参加状態の保存に失敗: %s", error)
+                return await interaction.followup.send(
+                    "参加を保存できませんでした。もう一度お試しください。",
+                    ephemeral=True,
+                )
+            panel_ready = await self._update(interaction)
+            result = (
+                "参加しました。"
+                if panel_ready
+                else "参加は保存済みです。参加受付カードを復旧中です。"
+            )
+            await interaction.followup.send(result, ephemeral=True)
 
     @discord.ui.button(label="参加取消", style=discord.ButtonStyle.danger, custom_id="leave_game", row=0)
     async def leave_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -547,8 +577,13 @@ class LobbyView(discord.ui.View):
                     "参加取消を保存できませんでした。もう一度お試しください。",
                     ephemeral=True,
                 )
-            await self._update(interaction)
-        await interaction.followup.send("参加を取り消しました。", ephemeral=True)
+            panel_ready = await self._update(interaction)
+        result = (
+            "参加を取り消しました。"
+            if panel_ready
+            else "参加取消は保存済みです。参加受付カードを復旧中です。"
+        )
+        await interaction.followup.send(result, ephemeral=True)
 
     @discord.ui.button(label="GM取得", style=discord.ButtonStyle.success, custom_id="get_gm", row=0)
     async def gm_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -572,10 +607,19 @@ class LobbyView(discord.ui.View):
             if gm_error:
                 return await interaction.response.send_message(gm_error, ephemeral=True)
 
-            state.gm_id = interaction.user.id
             await interaction.response.defer()
+            previous_gm_id = state.gm_id
+            state.gm_id = interaction.user.id
+            try:
+                await self.cog._persist_room_state()
+            except Exception as error:
+                state.gm_id = previous_gm_id
+                log.exception("GM取得状態の保存に失敗: %s", error)
+                return await interaction.followup.send(
+                    "GM登録を保存できませんでした。もう一度お試しください。",
+                    ephemeral=True,
+                )
             await self._update(interaction)
-            await self.cog._persist_room_state()
 
     @discord.ui.button(label="GM放棄", style=discord.ButtonStyle.danger, custom_id="release_gm", row=0)
     async def gm_release_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -591,10 +635,19 @@ class LobbyView(discord.ui.View):
             if interaction.user.id != state.gm_id:
                 return await interaction.response.send_message("あなたはGMではありません。", ephemeral=True)
 
-            state.gm_id = None
             await interaction.response.defer()
+            previous_gm_id = state.gm_id
+            state.gm_id = None
+            try:
+                await self.cog._persist_room_state()
+            except Exception as error:
+                state.gm_id = previous_gm_id
+                log.exception("GM放棄状態の保存に失敗: %s", error)
+                return await interaction.followup.send(
+                    "GM登録解除を保存できませんでした。もう一度お試しください。",
+                    ephemeral=True,
+                )
             await self._update(interaction)
-            await self.cog._persist_room_state()
 
     @discord.ui.button(
         label="通知", emoji="🔔", style=discord.ButtonStyle.primary,
@@ -1778,7 +1831,9 @@ class _BaseVoteView(discord.ui.View):
             return "⏳ 現在この操作はできません。"
         if voter_id not in self.voters:
             return "投票権がありません。"
-        if self.expected_phase == Phase.DAY_VOTE and state.vote_closed:
+        # 公開Viewをstopしても、先に開かれたephemeral確認Viewは独立して
+        # 生き続ける。通常・決戦のどちらも締切checkpoint後はここで拒否する。
+        if state.vote_closed:
             return "投票受付は終了しました。"
         # 投票発言の通常投票は列の先頭1人だけ受け付ける。slot tokenも照合し、
         # 1つ前の投票者に残った古いボタンが次の人の枠へ作用しないようにする。
@@ -2143,11 +2198,20 @@ class VillageSeerConfirmView(discord.ui.View):
         self.actor_id = actor_id
         self.target_id = target_id
         self.target_display = target_display
+        self.game_run_id = cog.state.game_run_id
+        self.night_generation = cog.state.night_generation
 
     @discord.ui.button(label="実行する", style=discord.ButtonStyle.success)
     async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if interaction.user.id != self.actor_id:
             await interaction.response.send_message("本人のみ操作できます。", ephemeral=True)
+            return
+        if not self.cog.is_current_night_view(
+            self.game_run_id, self.night_generation,
+        ):
+            await interaction.response.send_message(
+                "⏳ この夜の占い確認は終了しています。", ephemeral=True,
+            )
             return
         # SQLite busy_timeout中でも3秒のInteraction応答期限を超えない。
         await interaction.response.defer()
@@ -2181,6 +2245,8 @@ class VillageSeerTargetView(discord.ui.View):
         super().__init__(timeout=180)
         self.cog = cog
         self.actor_id = actor_id
+        self.game_run_id = cog.state.game_run_id
+        self.night_generation = cog.state.night_generation
         for player in targets[:25]:
             button = discord.ui.Button(
                 label=player.display_name[:80], style=discord.ButtonStyle.secondary
@@ -2193,6 +2259,13 @@ class VillageSeerTargetView(discord.ui.View):
             if interaction.user.id != self.actor_id:
                 await interaction.response.send_message(
                     "本人のみ操作できます。", ephemeral=True
+                )
+                return
+            if not self.cog.is_current_night_view(
+                self.game_run_id, self.night_generation,
+            ):
+                await interaction.response.send_message(
+                    "⏳ この夜の占い対象選択は終了しています。", ephemeral=True,
                 )
                 return
             view = VillageSeerConfirmView(self.cog, self.actor_id, target_id, target_display)
@@ -2215,11 +2288,20 @@ class VillageGuardConfirmView(discord.ui.View):
         self.actor_id = actor_id
         self.target_id = target_id
         self.target_display = target_display
+        self.game_run_id = cog.state.game_run_id
+        self.night_generation = cog.state.night_generation
 
     @discord.ui.button(label="実行する", style=discord.ButtonStyle.success)
     async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if interaction.user.id != self.actor_id:
             await interaction.response.send_message("本人のみ操作できます。", ephemeral=True)
+            return
+        if not self.cog.is_current_night_view(
+            self.game_run_id, self.night_generation,
+        ):
+            await interaction.response.send_message(
+                "⏳ この夜の護衛確認は終了しています。", ephemeral=True,
+            )
             return
         # SQLite busy_timeout中でも3秒のInteraction応答期限を超えない。
         await interaction.response.defer()
@@ -2249,6 +2331,8 @@ class VillageGuardTargetView(discord.ui.View):
         super().__init__(timeout=180)
         self.cog = cog
         self.actor_id = actor_id
+        self.game_run_id = cog.state.game_run_id
+        self.night_generation = cog.state.night_generation
         for player in targets[:25]:
             button = discord.ui.Button(
                 label=player.display_name[:80], style=discord.ButtonStyle.secondary
@@ -2261,6 +2345,13 @@ class VillageGuardTargetView(discord.ui.View):
             if interaction.user.id != self.actor_id:
                 await interaction.response.send_message(
                     "本人のみ操作できます。", ephemeral=True
+                )
+                return
+            if not self.cog.is_current_night_view(
+                self.game_run_id, self.night_generation,
+            ):
+                await interaction.response.send_message(
+                    "⏳ この夜の護衛対象選択は終了しています。", ephemeral=True,
                 )
                 return
             view = VillageGuardConfirmView(self.cog, self.actor_id, target_id, target_display)
@@ -2378,14 +2469,14 @@ class MorningReadyView(discord.ui.View):
 
 
 class VillagePanelView(discord.ui.View):
-    """#昼 へ常設する村パネル。CO・役職行動への入口をまとめる。
+    """#昼 へ常設する村パネル。役職別CO・役職行動への入口をまとめる。
 
     進行中Viewは永続化されない既存方針 (`bot.add_view` 対象外) に従い、
     custom_id は付けない。掲示・再掲示・削除は runner 側の
     post_village_panel / refresh_village_panel / close_village_panel が担い、
     このクラスはボタン配置と押下時の判定だけを持つ。
 
-    CO・CO撤回は cog._co_action_reject_reason() の判定 (世代照合・生存者判定・
+    役職別CO・CO撤回は cog._co_action_reject_reason() の判定 (世代照合・生存者判定・
     昼フェーズ判定・VC切断判定) を defer より前に通す。
     占い・狩人は cog._night_role_reject_reason() で「生存する当該役職か」
     「夜フェーズ中か」を、霊媒・人狼予想はそれぞれ専用の判定を同じく
@@ -2404,26 +2495,91 @@ class VillagePanelView(discord.ui.View):
         return self.cog.is_current_game_view(self.game_run_id)
 
 
-    @discord.ui.button(label="CO", style=discord.ButtonStyle.primary, row=0)
-    async def co_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
+    async def _open_role_co(
+        self, interaction: discord.Interaction, claimed_role: str
     ) -> None:
+        if not self._is_current():
+            await interaction.response.send_message(
+                "⏳ この村パネルは終了しています。", ephemeral=True,
+            )
+            return
         actor_id = interaction.user.id
         reason = self.cog._co_action_reject_reason(actor_id)
-        if reason is None and actor_id in self.cog.state.co_claims:
-            reason = "既にCOしています。先に撤回してください。"
+        existing = self.cog.state.co_claims.get(actor_id)
+        if (
+            reason is None
+            and isinstance(existing, dict)
+            and existing.get("role") != claimed_role
+        ):
+            reason = (
+                f"既に{existing.get('role')}COをしています。"
+                "先にCOを撤回してください。"
+            )
         if reason is not None:
             await interaction.response.send_message(reason, ephemeral=True)
             return
-        view = COClaimRoleView(self.cog, actor_id)
+        targets = self.cog.co_result_targets(actor_id, claimed_role)
+        if not targets:
+            if claimed_role == Role.MEDIUM.value:
+                text = "処刑された人がまだいないため、霊媒COできません。"
+            else:
+                text = "CO結果を申告できる対象がいません。"
+            await interaction.response.send_message(text, ephemeral=True)
+            return
+        if claimed_role == Role.MEDIUM.value:
+            target = targets[0]
+            await interaction.response.send_message(
+                f"**{target.display_name}** の霊媒結果を選んでください。",
+                view=COResultJudgementView(
+                    self.cog,
+                    actor_id,
+                    claimed_role=claimed_role,
+                    target_id=target.user_id,
+                    target_display=target.display_name,
+                    game_run_id=self.game_run_id,
+                ),
+                ephemeral=True,
+            )
+            return
         await interaction.response.send_message(
-            "CO する役職を選んでください。", view=view, ephemeral=True
+            "結果の対象を選んでください。",
+            view=COResultTargetView(
+                self.cog,
+                actor_id,
+                claimed_role=claimed_role,
+                game_run_id=self.game_run_id,
+                targets=targets,
+            ),
+            ephemeral=True,
         )
+
+    @discord.ui.button(label="占いCO", style=discord.ButtonStyle.primary, row=0)
+    async def seer_co_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self._open_role_co(interaction, Role.SEER.value)
+
+    @discord.ui.button(label="霊媒CO", style=discord.ButtonStyle.primary, row=0)
+    async def medium_co_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self._open_role_co(interaction, Role.MEDIUM.value)
+
+    @discord.ui.button(label="狩人CO", style=discord.ButtonStyle.primary, row=0)
+    async def guard_co_btn(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ) -> None:
+        await self._open_role_co(interaction, Role.GUARD.value)
 
     @discord.ui.button(label="CO撤回", style=discord.ButtonStyle.secondary, row=0)
     async def co_withdraw_btn(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
+        if not self._is_current():
+            await interaction.response.send_message(
+                "⏳ この村パネルは終了しています。", ephemeral=True,
+            )
+            return
         actor_id = interaction.user.id
         reason = self.cog._co_action_reject_reason(actor_id)
         if reason is None and actor_id not in self.cog.state.co_claims:
@@ -2432,28 +2588,10 @@ class VillagePanelView(discord.ui.View):
             await interaction.response.send_message(reason, ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        error = await self.cog.withdraw_co(actor_id)
-        await interaction.followup.send(error or "✅ COを撤回しました。", ephemeral=True)
-
-    @discord.ui.button(label="結果を公開", style=discord.ButtonStyle.secondary, row=0)
-    async def co_result_btn(
-        self, interaction: discord.Interaction, button: discord.ui.Button
-    ) -> None:
-        actor_id = interaction.user.id
-        if not self._is_current():
-            reason = "⏳ この村パネルは終了しています。"
-        else:
-            reason = self.cog._co_action_reject_reason(actor_id)
-        if reason is not None:
-            await interaction.response.send_message(reason, ephemeral=True)
-            return
-        await interaction.response.send_message(
-            "公開する結果の種類を選んでください。",
-            view=COResultTypeView(
-                self.cog, actor_id, game_run_id=self.game_run_id
-            ),
-            ephemeral=True,
+        error = await self.cog.withdraw_co(
+            actor_id, expected_game_run_id=self.game_run_id,
         )
+        await interaction.followup.send(error or "✅ COを撤回しました。", ephemeral=True)
 
     @discord.ui.button(label="占い", style=discord.ButtonStyle.primary, row=1)
     async def seer_btn(
@@ -2677,11 +2815,11 @@ class _COResultBaseView(discord.ui.View):
         )
         self.stop()
         if claimed_role == Role.GUARD.value:
-            success = f"✅ 護衛先: **{target_display}** を公開しました。"
+            success = f"✅ 狩人CO: 護衛先 **{target_display}** を公開しました。"
         else:
-            label = "占い" if claimed_role == Role.SEER.value else "霊媒"
+            label = "占いCO" if claimed_role == Role.SEER.value else "霊媒CO"
             success = (
-                f"✅ {label}結果: **{target_display}** → **{judgement}** "
+                f"✅ {label}: **{target_display}** → **{judgement}** "
                 "を公開しました。"
             )
         try:
@@ -5423,7 +5561,8 @@ def build_help_embeds(
         speech_help = (
             "ターン制は**現在の話者だけ**発言できます。本人はパス、ほかの生存者は村全体で"
             f"1日{variant.turn_interrupts_per_day}回まで30秒割り込みができます。\n"
-            "COは村パネルの[CO]で役職を宣言できます（タイミングはルール参照）。\n"
+            "COは村パネルの[占いCO][霊媒CO][狩人CO]から、"
+            "結果と一緒に公開できます（タイミングはルール参照）。\n"
             "投票・弁明・遺言は発言中の本人だけ。夜と一時停止中は全員ミュート。\n"
             "死亡者・観戦者は終了まで発言できません（GMのミュートは手動）。"
         )

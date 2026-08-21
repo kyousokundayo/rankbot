@@ -60,8 +60,10 @@ fi
 ./.venv/bin/python -c "import platform, sys; raise SystemExit(0 if platform.machine() == '$TARGET_ARCH' else f'The virtual environment must be {\"$TARGET_ARCH\"} (got {platform.machine()})')"
 ./.venv/bin/python "$BOT_DIR/scripts/verify_runtime.py"
 ./.venv/bin/python -m pip install --upgrade pip
-./.venv/bin/python -m pip install -r requirements.txt -c requirements-lock.txt
+# 既存venvを再利用した場合も、推移依存を「制約」扱いで残さず完全固定版へ揃える。
+./.venv/bin/python -m pip install --no-deps -r requirements-lock.txt
 ./.venv/bin/python -m pip check
+./.venv/bin/python scripts/verify_dependency_lock.py
 ./.venv/bin/python -m discord --version
 # SE_ENABLED=Trueなら、discord.pyがdavey/PyNaClを認識していることと
 # DAVEネイティブ初期化・libopusロードまでを環境構築時に検証する。

@@ -42,9 +42,10 @@ jobs:
           PYTHON_BIN="$(command -v python)" ./scripts/setup_venv.sh
       - name: Verify dependency consistency
         # scripts/run_checks.sh (コミット前チェック) と同じ確認をCIでも通す。
-        # requirements.txt と requirements-lock.txt が食い違ったまま解決された
-        # 場合に、依存メタデータの不整合をここで落とす。
-        run: ./.venv/bin/python -m pip check
+        # pip checkは依存メタデータ、専用検証は完全固定lockとの版一致を見る。
+        run: |
+          ./.venv/bin/python -m pip check
+          ./.venv/bin/python scripts/verify_dependency_lock.py
       - name: Verify voice dependencies
         run: ./.venv/bin/python -c 'import sounds; sounds.require_voice_ready()'
       - name: Compile check

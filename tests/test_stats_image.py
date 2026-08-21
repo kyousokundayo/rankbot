@@ -213,6 +213,40 @@ class RenderPlayerCardTest(unittest.TestCase):
         png_bytes = stats_image.render_player_card(data)
         self.assertTrue(png_bytes.startswith(_PNG_SIGNATURE))
 
+    def test_long_display_name_is_fitted_inside_headers(self) -> None:
+        long_name = "とても長い表示名" * 8 + "e\u0301🧙\u200d♂️"
+        font = stats_image._load_font(52)
+        image = stats_image.Image.new("RGB", (1500, 200))
+        draw = stats_image.ImageDraw.Draw(image)
+        fitted = stats_image._fit_text_to_width(draw, long_name, font, 600)
+
+        self.assertLessEqual(draw.textlength(fitted, font=font), 600)
+        self.assertTrue(fitted.endswith(("…", "...")))
+        self.assertLess(len(fitted), len(long_name))
+
+        card_data = stats_image.format_card_data(
+            display_name=long_name,
+            avatar_bytes=None,
+            stats=_ZERO_STATS,
+            rating_info=None,
+        )
+        self.assertTrue(
+            stats_image.render_player_card(card_data).startswith(_PNG_SIGNATURE)
+        )
+        chart_data = {
+            "display_name": long_name,
+            "variant_label": "13人クロストーク",
+            "rank_name": "ゴールド",
+            "current_rating": 1500,
+            "peak_rating": 1600,
+            "games": 0,
+            "winrate_text": "—",
+            "points": [],
+        }
+        self.assertTrue(
+            stats_image.render_rating_chart(chart_data).startswith(_PNG_SIGNATURE)
+        )
+
 
 class PillowMissingTest(unittest.TestCase):
     """Pillow未導入でもBot全体が起動できることの回帰テスト。

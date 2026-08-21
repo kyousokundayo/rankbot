@@ -453,6 +453,11 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         self.cog.rooms[room_id] = room
         return room
 
+    def _mock_setup_operations(self, *, channel=None) -> None:
+        self.manager._ensure_operations_channel = AsyncMock(return_value=channel)
+        self.manager._ensure_operations_log_channel = AsyncMock(return_value=None)
+        self.manager._upsert_panel = AsyncMock()
+
     def _interaction(self):
         return SimpleNamespace(
             user=self.members[1], guild=self.guild,
@@ -1206,6 +1211,198 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         row = await database.get_recruitment(recruitment_id)
         self.assertEqual(row["status"], database.RECRUITMENT_ARCHIVED)
         self.assertIsNone(row["message_id"])
+
+    async def test_setup_continues_after_one_open_card_http_failure(self) -> None:
+        """1村の一時的Discord障害で、別のGM村の復元まで止めない。"""
+        second_room_id = "private_1_2"
+        await database.save_private_room(1, second_room_id, 1, "GM村2")
+        await database.mark_private_room_active(1, second_room_id, category_id=102)
+        self._install_private_room(
+            second_room_id,
+            variant_id="v13_cross",
+            lobby_channel=SimpleNamespace(guild=self.guild),
+        )
+        first_id = await database.create_recruitment(
+            1,
+            1,
+            title="先頭",
+            scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            room_id=self.room_id,
+            variant_id="v13_cross",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        second_id = await database.create_recruitment(
+            1,
+            1,
+            title="後続",
+            scheduled_at=datetime.now(timezone.utc) + timedelta(hours=2),
+            room_id=second_room_id,
+            variant_id="v13_cross",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        unavailable = discord.HTTPException(
+            SimpleNamespace(status=503, reason="Unavailable", headers={}),
+            "retry",
+        )
+        self.manager.ensure_recruitment_message = AsyncMock(
+            side_effect=[unavailable, None]
+        )
+        self._mock_setup_operations()
+
+        await self.manager.setup(self.guild)
+
+        self.assertEqual(
+            [call.args[1]["id"] for call in self.manager.ensure_recruitment_message.await_args_list],
+            [first_id, second_id],
+        )
+        self.assertEqual((await database.get_recruitment(first_id))["status"], database.RECRUITMENT_OPEN)
+
+    async def test_setup_continues_after_one_held_card_http_failure(self) -> None:
+        """HELD復旧の一時的Discord障害も、別の募集へ波及させない。"""
+        second_room_id = "private_1_2"
+        await database.save_private_room(1, second_room_id, 1, "GM村2")
+        await database.mark_private_room_active(1, second_room_id, category_id=102)
+        self._install_private_room(
+            second_room_id,
+            variant_id="v13_cross",
+            lobby_channel=SimpleNamespace(guild=self.guild),
+        )
+        held_ids: list[int] = []
+        for index, room_id in enumerate((self.room_id, second_room_id), 1):
+            recruitment_id = await database.create_recruitment(
+                1,
+                1,
+                title=f"開催済み{index}",
+                scheduled_at=datetime.now(timezone.utc) + timedelta(hours=index),
+                room_id=room_id,
+                variant_id="v13_cross",
+                streaming=False,
+                allowed_ranks=None,
+            )
+            await database.set_recruitment_status(
+                recruitment_id,
+                database.RECRUITMENT_HELD,
+                expected_status=database.RECRUITMENT_OPEN,
+            )
+            await database.set_recruitment_message_id(
+                recruitment_id,
+                2000 + index,
+            )
+            held_ids.append(recruitment_id)
+
+        unavailable = discord.HTTPException(
+            SimpleNamespace(status=503, reason="Unavailable", headers={}),
+            "retry",
+        )
+        self.manager._recover_held_recruitment = AsyncMock(
+            side_effect=[unavailable, None]
+        )
+        self.manager._archive_orphaned_held_recruitments = AsyncMock()
+        self._mock_setup_operations()
+
+        await self.manager.setup(self.guild)
+
+        self.assertEqual(
+            [
+                call.args[1]["id"]
+                for call in self.manager._recover_held_recruitment.await_args_list
+            ],
+            held_ids,
+        )
+
+    async def test_setup_does_not_swallow_database_or_state_failure(self) -> None:
+        """Discord例外以外は部分復元せず、その場で起動側へ返す。"""
+        second_room_id = "private_1_2"
+        await database.save_private_room(1, second_room_id, 1, "GM村2")
+        await database.mark_private_room_active(1, second_room_id, category_id=102)
+        self._install_private_room(
+            second_room_id,
+            variant_id="v13_cross",
+            lobby_channel=SimpleNamespace(guild=self.guild),
+        )
+        for index, room_id in enumerate((self.room_id, second_room_id), 1):
+            await database.create_recruitment(
+                1,
+                1,
+                title=f"募集{index}",
+                scheduled_at=datetime.now(timezone.utc) + timedelta(hours=index),
+                room_id=room_id,
+                variant_id="v13_cross",
+                streaming=False,
+                allowed_ranks=None,
+            )
+        self.manager.ensure_recruitment_message = AsyncMock(
+            side_effect=RuntimeError("DB save failed")
+        )
+        self._mock_setup_operations()
+
+        with self.assertRaisesRegex(RuntimeError, "DB save failed"):
+            await self.manager.setup(self.guild)
+
+        self.manager.ensure_recruitment_message.assert_awaited_once()
+
+    async def test_setup_preflight_rejects_duplicate_active_rows_before_discord(self) -> None:
+        """同じ村の未終了募集が複数なら、先頭カードも掲示しない。"""
+        await database.create_recruitment(
+            1,
+            1,
+            title="正本候補1",
+            scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            room_id=self.room_id,
+            variant_id="v13_cross",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        async with database.connect_db() as db:
+            await db.execute(
+                "INSERT INTO recruitments "
+                "(guild_id, host_id, title, scheduled_at, room_id, streaming, "
+                "status, variant_id, capacity, backup_capacity, occupancy_minutes) "
+                "VALUES (1, 1, '正本候補2', ?, ?, 0, ?, 'v13_cross', 13, 3, 90)",
+                (
+                    (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat(),
+                    self.room_id,
+                    database.RECRUITMENT_OPEN,
+                ),
+            )
+            await db.commit()
+        self.manager.ensure_recruitment_message = AsyncMock()
+        self._mock_setup_operations(channel=SimpleNamespace())
+
+        with self.assertRaisesRegex(RuntimeError, "未終了募集が複数"):
+            await self.manager.setup(self.guild)
+
+        self.manager._upsert_panel.assert_not_awaited()
+        self.manager.ensure_recruitment_message.assert_not_awaited()
+
+    async def test_setup_continues_when_optional_operations_panel_is_unavailable(self) -> None:
+        recruitment_id = await database.create_recruitment(
+            1,
+            1,
+            title="運営パネル独立",
+            scheduled_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            room_id=self.room_id,
+            variant_id="v13_cross",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        unavailable = discord.HTTPException(
+            SimpleNamespace(status=503, reason="Unavailable", headers={}),
+            "retry",
+        )
+        self._mock_setup_operations(channel=SimpleNamespace())
+        self.manager._upsert_panel.side_effect = unavailable
+        self.manager.ensure_recruitment_message = AsyncMock()
+
+        await self.manager.setup(self.guild)
+
+        self.manager.ensure_recruitment_message.assert_awaited_once()
+        self.assertEqual(
+            self.manager.ensure_recruitment_message.await_args.args[1]["id"],
+            recruitment_id,
+        )
 
     async def test_notification_loop_retries_hidden_card_after_discord_error(self) -> None:
         recruitment_id = await self._insert_disabled_recruitment(

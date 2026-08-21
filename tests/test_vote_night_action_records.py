@@ -147,13 +147,13 @@ class VoteEventRecordingTest(unittest.IsolatedAsyncioTestCase):
         runner = make_runner()
         absent = add_player(runner, 1)
 
-        with patch("views.database.record_vote_event", new=AsyncMock()) as record:
+        with patch(
+            "room_runner.database.record_vote_abstention_once", new=AsyncMock(),
+        ) as record:
             await runner._record_vote_abstentions([absent], "本投票", 0)
 
         record.assert_awaited_once()
         _args, kwargs = record.await_args
-        self.assertIsNone(kwargs["target_id"])
-        self.assertIsNone(kwargs["target_number"])
         self.assertEqual(kwargs["voter_id"], absent.user_id)
         self.assertEqual(kwargs["vote_kind"], "本投票")
         self.assertEqual(kwargs["round_index"], 0)
@@ -162,7 +162,9 @@ class VoteEventRecordingTest(unittest.IsolatedAsyncioTestCase):
         runner = make_runner(phase=Phase.DAY_RUNOFF_VOTE)
         absent = add_player(runner, 1)
 
-        with patch("views.database.record_vote_event", new=AsyncMock()) as record:
+        with patch(
+            "room_runner.database.record_vote_abstention_once", new=AsyncMock(),
+        ) as record:
             await runner._record_vote_abstentions([absent], "決選投票", 1)
 
         self.assertEqual(record.await_args.kwargs["vote_kind"], "決選投票")
@@ -176,7 +178,7 @@ class VoteEventRecordingTest(unittest.IsolatedAsyncioTestCase):
         view = VoteView(runner, [target], [voter])
 
         with patch(
-            "views.database.record_vote_event",
+            "room_runner.database.record_vote_abstention_once",
             new=AsyncMock(side_effect=RuntimeError("db down")),
         ):
             result, committed = await view.commit_vote(voter.user_id, target.user_id)

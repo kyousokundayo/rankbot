@@ -5,11 +5,13 @@ import asyncio
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
+
+import discord
 
 import stats_image
 import views
-from config import BOT_VERSION, Phase, SLOW_INTERACTION_SECONDS
+from config import BOT_VERSION, Phase, SLOW_INTERACTION_SECONDS, VARIANT_DEFINITIONS
 from recruitment import OperationsView
 from views import (
     DangerConfirmView,
@@ -462,6 +464,143 @@ class PrivateLobbyRecoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("前回設定で参加受付を再開", result)
 
 
+class LobbyPersistenceRollbackTest(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _make_view(*, gm_id=None):
+        state = SimpleNamespace(
+            phase=Phase.LOBBY,
+            players={},
+            gm_id=gm_id,
+            room_id="public-test",
+            recruitment_id=None,
+            guild=SimpleNamespace(get_member=lambda _user_id: None),
+            room_name="公開テスト村",
+        )
+        cog = SimpleNamespace(
+            state=state,
+            manager=SimpleNamespace(
+                join_lock=asyncio.Lock(),
+                recruitment_manager=SimpleNamespace(),
+            ),
+            action_lock=asyncio.Lock(),
+            variant=SimpleNamespace(player_count=13, label="13人テスト"),
+            room_def=SimpleNamespace(
+                allowed_ranks=None,
+                allowed_gm_user_ids=None,
+                owner_only_gm=False,
+            ),
+            is_private_room=lambda: False,
+            _postgame_vote_pending=False,
+            validate_join=AsyncMock(return_value=None),
+            validate_gm_claim=AsyncMock(return_value=None),
+            _persist_room_state=AsyncMock(side_effect=RuntimeError("DB down")),
+            _post_lobby_ui=AsyncMock(),
+            _schedule_lobby_panel_recovery=Mock(),
+        )
+        return state, cog, LobbyView(cog)
+
+    @staticmethod
+    def _interaction(user_id: int):
+        user = SimpleNamespace(
+            id=user_id,
+            nick=None,
+            display_name=f"user-{user_id}",
+            send=AsyncMock(),
+        )
+        return SimpleNamespace(
+            user=user,
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+            message=SimpleNamespace(edit=AsyncMock()),
+        )
+
+    async def test_join_save_failure_rolls_back_before_public_update(self) -> None:
+        state, cog, view = self._make_view()
+        interaction = self._interaction(1)
+        join = next(item for item in view.children if item.custom_id == "join_game")
+
+        await join.callback(interaction)
+
+        self.assertEqual(state.players, {})
+        cog._persist_room_state.assert_awaited_once()
+        interaction.message.edit.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once_with(
+            "参加を保存できませんでした。もう一度お試しください。",
+            ephemeral=True,
+        )
+
+    async def test_gm_claim_save_failure_rolls_back_before_public_update(self) -> None:
+        state, cog, view = self._make_view()
+        interaction = self._interaction(1)
+        claim = next(item for item in view.children if item.custom_id == "get_gm")
+
+        await claim.callback(interaction)
+
+        self.assertIsNone(state.gm_id)
+        cog._persist_room_state.assert_awaited_once()
+        interaction.message.edit.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once_with(
+            "GM登録を保存できませんでした。もう一度お試しください。",
+            ephemeral=True,
+        )
+
+    async def test_gm_release_save_failure_restores_owner_before_public_update(self) -> None:
+        state, cog, view = self._make_view(gm_id=1)
+        interaction = self._interaction(1)
+        release = next(item for item in view.children if item.custom_id == "release_gm")
+
+        await release.callback(interaction)
+
+        self.assertEqual(state.gm_id, 1)
+        cog._persist_room_state.assert_awaited_once()
+        interaction.message.edit.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once_with(
+            "GM登録解除を保存できませんでした。もう一度お試しください。",
+            ephemeral=True,
+        )
+
+    async def test_missing_lobby_card_is_reposted_after_saved_join(self) -> None:
+        state, cog, view = self._make_view()
+        cog._persist_room_state = AsyncMock()
+        interaction = self._interaction(1)
+        interaction.message.edit.side_effect = discord.NotFound(
+            SimpleNamespace(status=404, reason="gone", headers={}), "gone",
+        )
+        join = next(item for item in view.children if item.custom_id == "join_game")
+
+        await join.callback(interaction)
+
+        self.assertIn(1, state.players)
+        cog._post_lobby_ui.assert_awaited_once()
+        cog._schedule_lobby_panel_recovery.assert_not_called()
+        interaction.followup.send.assert_awaited_once_with(
+            "参加しました。", ephemeral=True,
+        )
+
+    async def test_failed_lobby_repost_schedules_recovery(self) -> None:
+        state, cog, view = self._make_view()
+        cog._persist_room_state = AsyncMock()
+        cog._post_lobby_ui = AsyncMock(side_effect=RuntimeError("Discord down"))
+        interaction = self._interaction(1)
+        interaction.message.edit.side_effect = discord.NotFound(
+            SimpleNamespace(status=404, reason="gone", headers={}), "gone",
+        )
+        join = next(item for item in view.children if item.custom_id == "join_game")
+
+        await join.callback(interaction)
+
+        self.assertIn(1, state.players)
+        cog._schedule_lobby_panel_recovery.assert_called_once_with(
+            state,
+            recruitment_id=None,
+            log_label="ロビー操作",
+        )
+        interaction.followup.send.assert_awaited_once_with(
+            "参加は保存済みです。参加受付カードを復旧中です。",
+            ephemeral=True,
+        )
+
+
 class DangerConfirmationTest(unittest.IsolatedAsyncioTestCase):
     async def test_action_runs_only_after_same_user_confirms(self) -> None:
         action = AsyncMock()
@@ -517,6 +656,14 @@ class HelpAndRuleEmbedTest(unittest.TestCase):
                     r"DM[^\n]*朝を迎える|朝を迎える[^\n]*DM",
                     f"{embed.title}/{field.name}",
                 )
+
+    def test_turn_help_uses_role_specific_co_buttons(self) -> None:
+        help_embed = build_help_embeds(VARIANT_DEFINITIONS["v9_turn"])[0]
+        fields = {field.name: field.value for field in help_embed.fields}
+        speech_help = fields["発言とミュート"]
+
+        self.assertIn("[占いCO][霊媒CO][狩人CO]", speech_help)
+        self.assertNotIn("村パネルの[CO]", speech_help)
 
     def test_help_omits_release_notes_and_keeps_gm_and_log_policy(self) -> None:
         """ヘルプはリリースノートを持たない。

@@ -32,6 +32,9 @@ data/*.db-wal
 logs/
 bot.log
 
+# 戦績カード一括出力 (Discord ID・表示名・アバター・戦績を含む)
+/season_cards/
+
 # macOS / エディタ
 .DS_Store
 .claude/

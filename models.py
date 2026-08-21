@@ -215,6 +215,10 @@ class GameState:
         self.vote_speech_window_open: bool = False
         # GMが待機を打ち切って締め切った状態。未発言者は棄権として集計する。
         self.vote_closed: bool = False
+        # vote_closed が通常投票と決戦投票のどちらの締切を
+        # 表すかを保存する。旧snapshotは決戦開始後も通常投票の
+        # Trueを持ち越すため、復元時の後方互換判定に使う。
+        self.vote_closed_phase: Optional[Phase] = None
         # 自分の発言枠の中で投票先が除外され、票だけ失った人。cursorを
         # 進めた後でないと列を組み替えられないので、印だけ置いて
         # _day_vote 側で末尾へ積み直す。
@@ -366,8 +370,9 @@ class GameState:
         # ロビーメッセージ (永続化用)
         self.lobby_message: Optional[discord.Message] = None
 
-        # GMコントロールパネル (#昼 の末尾に掲示するための参照。非永続)
+        # GMコントロールパネル。再起動後に古い入口を削除できるようIDだけ保存する。
         self.gm_panel_message: Optional[discord.Message] = None
+        self.gm_panel_message_id: Optional[int] = None
         self.gm_panel_view: Optional[object] = None
 
         # 各人狼のDM襲撃UIメッセージ (現在の襲撃先を全狼へ反映するため。非永続)

@@ -14,6 +14,7 @@ from config import (
     LOG_CATEGORY_LIMIT,
     LOG_CATEGORY_SPIRIT,
     LOG_CATEGORY_TRIM_TO,
+    MUTE_RETRY_DELAY,
     Phase,
     Role,
     RoomDefinition,
@@ -380,6 +381,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         player = add_player(runner, 1)
         runner.state.prep_ready_ids = {player.user_id}
         runner._post_prep_panel = AsyncMock()
+        runner.post_village_panel = AsyncMock(return_value=True)
         runner._repost_gm_panel = AsyncMock(return_value=True)
         runner._close_prep_panel = AsyncMock()
         runner._play_se = Mock()
@@ -389,10 +391,32 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
 
         await runner._game_loop()
 
+        runner.post_village_panel.assert_awaited_once()
+
         self.assertTrue(runner.state.prep_confirmed)
         self.assertTrue(runner.state.initial_night_completed)
         runner._initial_night_greeting.assert_not_awaited()
         runner._day_discussion.assert_awaited_once()
+
+    async def test_preparation_village_panel_failure_stops_before_day_one(self) -> None:
+        runner = make_runner()
+        runner.state.phase = Phase.PREPARATION
+        player = add_player(runner, 1)
+        runner.state.prep_ready_ids = {player.user_id}
+        runner._post_prep_panel = AsyncMock()
+        runner.post_village_panel = AsyncMock(return_value=False)
+        runner._repost_gm_panel = AsyncMock(return_value=True)
+        runner._day_discussion = AsyncMock()
+
+        await runner._game_loop()
+
+        self.assertEqual(runner.state.phase, Phase.PAUSED)
+        self.assertEqual(runner.state.phase_before_pause, Phase.PREPARATION)
+        self.assertEqual(runner.state.recovery_phase, Phase.PREPARATION)
+        self.assertTrue(runner.state.recovered_from_restart)
+        self.assertFalse(runner.state.pause_event.is_set())
+        runner._repost_gm_panel.assert_not_awaited()
+        runner._day_discussion.assert_not_awaited()
 
     async def test_initial_night_opens_relay_before_wolf_notice_and_has_no_actions(self) -> None:
         runner = make_runner()
@@ -2638,6 +2662,40 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         kwargs = runner._schedule_lobby_panel_recovery.call_args.kwargs
         self.assertEqual(kwargs["recruitment_id"], 42)
 
+    async def test_final_preparation_checkpoint_failure_stops_for_resume(self) -> None:
+        """役職配布後の最終保存だけ落ちてもPREPARATIONを捨てず再開できる。"""
+        runner = make_runner()
+        runner.state.phase = Phase.PREPARATION
+        runner.state.game_task = None
+        failure = RuntimeError("final checkpoint down")
+        # 1回目が開始完了checkpoint、2回目が耐久停止checkpoint。
+        runner._persist_room_state = AsyncMock(side_effect=[failure, None])
+
+        with self.assertRaisesRegex(
+            StateDurabilityError, "開始準備完了状態を保存できません",
+        ):
+            await runner._persist_preparation_ready_or_stop()
+
+        self.assertTrue(runner.state.paused)
+        self.assertEqual(runner.state.phase, Phase.PAUSED)
+        self.assertEqual(runner.state.phase_before_pause, Phase.PREPARATION)
+        self.assertEqual(runner.state.recovery_phase, Phase.PREPARATION)
+        self.assertTrue(runner.state.recovered_from_restart)
+        self.assertIsNone(runner.state.game_task)
+        self.assertEqual(runner._persist_room_state.await_count, 2)
+
+        # DB復旧後のGM再開が、通常ゲームではなく開始復元タスクを1本だけ作る。
+        runner._persist_room_state = AsyncMock()
+        runner._sync_server_mutes = AsyncMock(return_value=[])
+        runner._await_mute_applied = AsyncMock(return_value=True)
+        runner._resume_preparation = AsyncMock()
+
+        result = await runner.resume_game()
+        await runner.state.game_task
+
+        self.assertIn("復元ゲームを再開", result)
+        runner._resume_preparation.assert_awaited_once()
+
     async def test_restricted_snapshot_keeps_access_marker_but_archives_log(self) -> None:
         """限定中の閲覧境界は維持しつつ、終了ログは公開する。"""
         source = RoomRunner(
@@ -2939,6 +2997,14 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.state.phase = Phase.DAY_VOTE
         runner.state.vote_order = [voter.user_id, later.user_id]
         runner.state.vote_slot_index = 1
+        runner.state.vote_requeue_ids = {later.user_id}
+        runner.state.vote_slot_token = 17
+        runner.state.vote_slot_active = True
+        runner.state.vote_speech_finished = True
+        runner.state.vote_slot_forced_abstain = True
+        runner.state.vote_speech_window_open = True
+        runner.state.vote_remaining_seconds = 12.5
+        runner.state.current_speaker_id = later.user_id
         runner.state.votes = {voter.user_id: target.user_id}
         runner._persist_room_state = AsyncMock(side_effect=RuntimeError("DB down"))
         runner._stop_for_durability_error = AsyncMock()
@@ -2948,6 +3014,38 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(target.alive)
         self.assertEqual(runner.state.votes, {voter.user_id: target.user_id})
         self.assertEqual(runner.state.vote_order, [voter.user_id, later.user_id])
+        self.assertEqual(runner.state.vote_slot_index, 1)
+        self.assertEqual(runner.state.vote_requeue_ids, {later.user_id})
+        self.assertEqual(runner.state.vote_slot_token, 17)
+        self.assertTrue(runner.state.vote_slot_active)
+        self.assertTrue(runner.state.vote_speech_finished)
+        self.assertTrue(runner.state.vote_slot_forced_abstain)
+        self.assertTrue(runner.state.vote_speech_window_open)
+        self.assertEqual(runner.state.vote_remaining_seconds, 12.5)
+        self.assertEqual(runner.state.current_speaker_id, later.user_id)
+
+    async def test_current_vote_requeue_flag_rolls_back_on_save_failure(self) -> None:
+        runner = make_runner()
+        voter = add_player(runner, 1)
+        target = add_player(runner, 2)
+        later = add_player(runner, 3)
+        runner.state.phase = Phase.DAY_VOTE
+        runner.state.vote_order = [voter.user_id, later.user_id]
+        runner.state.vote_slot_index = 0
+        runner.state.vote_slot_active = True
+        runner.state.vote_speech_finished = True
+        runner.state.current_speaker_id = voter.user_id
+        runner.state.vote_requeue_ids.clear()
+        runner.state.votes = {voter.user_id: target.user_id}
+        runner._persist_room_state = AsyncMock(side_effect=RuntimeError("DB down"))
+        runner._stop_for_durability_error = AsyncMock()
+
+        await runner._eliminate_player_mid_game(target, "テスト")
+
+        self.assertEqual(runner.state.vote_requeue_ids, set())
+        self.assertEqual(runner.state.vote_slot_index, 0)
+        self.assertEqual(runner.state.vote_order, [voter.user_id, later.user_id])
+        self.assertEqual(runner.state.current_speaker_id, voter.user_id)
 
     async def test_requeued_voter_order_remains_valid_for_restart(self) -> None:
         runner = make_runner()
@@ -3431,6 +3529,63 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(StateDurabilityError, "vote_closed"):
             runner._validate_vote_snapshot(payload, Phase.DAY_VOTE, [])
 
+    def test_legacy_runoff_close_marker_is_treated_as_open(self) -> None:
+        """旧決戦snapshotのTrueは通常投票からの持越しと読み替える。"""
+        runner = make_runner()
+
+        runner._restore_vote_close_marker(
+            {"vote_closed": True}, Phase.DAY_RUNOFF_VOTE,
+        )
+
+        self.assertFalse(runner.state.vote_closed)
+        self.assertIsNone(runner.state.vote_closed_phase)
+
+    def test_current_closed_runoff_restores_with_phase_marker(self) -> None:
+        runner = make_runner()
+
+        runner._restore_vote_close_marker(
+            {
+                "vote_closed": True,
+                "vote_closed_phase": Phase.DAY_RUNOFF_VOTE.name,
+            },
+            Phase.DAY_RUNOFF_VOTE,
+        )
+
+        self.assertTrue(runner.state.vote_closed)
+        self.assertEqual(runner.state.vote_closed_phase, Phase.DAY_RUNOFF_VOTE)
+
+    def test_mismatched_vote_close_phase_fails_closed(self) -> None:
+        runner = make_runner()
+
+        with self.assertRaisesRegex(StateDurabilityError, "締切フェーズ"):
+            runner._restore_vote_close_marker(
+                {
+                    "vote_closed": True,
+                    "vote_closed_phase": Phase.DAY_VOTE.name,
+                },
+                Phase.DAY_RUNOFF_VOTE,
+            )
+
+    async def test_runoff_start_save_failure_uses_durability_stop(self) -> None:
+        runner = make_runner()
+        first = add_player(runner, 1)
+        second = add_player(runner, 2)
+        runner.state.phase = Phase.DAY_RUNOFF_VOTE
+        runner.state.runoff_candidates = [first.user_id, second.user_id]
+        runner._persist_room_state = AsyncMock(side_effect=RuntimeError("DB down"))
+        runner._stop_for_durability_error = AsyncMock()
+
+        with self.assertRaisesRegex(StateDurabilityError, "決戦投票の開始"):
+            await runner._runoff(
+                [first.user_id, second.user_id], resume_vote=True,
+            )
+
+        runner._stop_for_durability_error.assert_awaited_once()
+        self.assertEqual(
+            runner._stop_for_durability_error.await_args.args[0],
+            "決戦投票の開始",
+        )
+
     async def test_vote_end_cue_precedes_next_speaker_without_duplicate_start_se(self) -> None:
         """確定票公開後のSEを次枠の開始合図と兼用し、二重再生を避ける。"""
         runner = make_runner()
@@ -3473,6 +3628,36 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
                 "se:speech", f"grant:{first.user_id}", "clear", "se:speech_end",
                 "se:reveal", f"grant:{second.user_id}", "clear", "se:speech_end",
             ],
+        )
+
+    async def test_last_will_waits_for_transition_se_before_countdown(self) -> None:
+        runner = make_runner()
+        player = add_player(runner, 1)
+        events: list[str] = []
+        runner._require_recovered_speech_panel_closed = AsyncMock()
+        runner._grant_speaker = AsyncMock(
+            side_effect=lambda _member: events.append("grant")
+        )
+
+        async def record_se(scene: str) -> None:
+            events.append(f"se:{scene}")
+
+        runner._play_transition_se = AsyncMock(side_effect=record_se)
+        runner._safe_village_send = AsyncMock(return_value=None)
+        runner._remember_speech_panel = AsyncMock()
+        runner._repost_gm_panel = AsyncMock(return_value=True)
+        runner._pausable_countdown = AsyncMock(
+            side_effect=lambda *_args: events.append("countdown")
+        )
+        runner._close_speech_panel = AsyncMock()
+        runner._clear_speaker = AsyncMock(
+            side_effect=lambda: events.append("clear")
+        )
+
+        await runner._last_will(player)
+
+        self.assertEqual(
+            events, ["grant", "se:lastwill", "countdown", "clear"]
         )
 
     async def test_runoff_random_target_is_checkpointed_before_announcement(self) -> None:
@@ -3530,6 +3715,32 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
             sent_view._vote_error(first.user_id, second.user_id),
             "投票権がありません。",
         )
+        self.assertTrue(runner.state.vote_closed)
+
+    async def test_new_runoff_resets_normal_close_then_checkpoints_its_own_close(self) -> None:
+        runner = make_runner()
+        first = add_player(runner, 1)
+        second = add_player(runner, 2)
+        runner.state.phase = Phase.DAY_RUNOFF_SPEECH
+        runner.state.runoff_candidates = [first.user_id, second.user_id]
+        runner.state.runoff_speech_index = 2
+        runner.state.vote_closed = True  # 通常投票の締切印
+        runner._pausable_countdown = AsyncMock(return_value=True)
+        closed_states: list[bool] = []
+
+        async def persist() -> None:
+            if runner.state.phase == Phase.DAY_RUNOFF_VOTE:
+                closed_states.append(runner.state.vote_closed)
+
+        runner._persist_room_state = AsyncMock(side_effect=persist)
+        with patch("room_runner.secrets.choice", return_value=first):
+            await runner._runoff(
+                [first.user_id, second.user_id], resume_speech=True
+            )
+
+        self.assertGreaterEqual(len(closed_states), 2)
+        self.assertEqual(closed_states[:2], [False, True])
+        self.assertTrue(runner.state.vote_closed)
 
     async def test_runoff_without_eligible_voters_does_not_wait(self) -> None:
         runner = make_runner()
@@ -4203,6 +4414,58 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.await_args.kwargs["action"], "初日白")
         self.assertEqual(record.await_args.kwargs["target_id"], white.user_id)
 
+    async def test_initial_white_db_failure_remains_retryable(self) -> None:
+        runner = make_runner()
+        runner.state.phase = Phase.PREPARATION
+        seer = add_player(runner, 1, Role.SEER)
+        white = add_player(runner, 2, Role.VILLAGER)
+        runner.state.initial_seer_target = white.user_id
+        runner.state.guild = SimpleNamespace(id=1)
+
+        with patch(
+            "room_runner.database.record_night_action_once",
+            new=AsyncMock(side_effect=[RuntimeError("DB down"), None]),
+        ) as record:
+            first_failed = await runner._send_role_dms()
+            self.assertFalse(runner.state.initial_seer_result_sent)
+            second_failed = await runner._send_role_dms()
+
+        self.assertEqual(first_failed, [])
+        self.assertEqual(second_failed, [])
+        self.assertTrue(runner.state.initial_seer_result_sent)
+        self.assertEqual(record.await_count, 2)
+        self.assertEqual(seer.member.send.await_count, 1)
+        self.assertEqual(runner.state.initial_seer_target, white.user_id)
+
+    async def test_game_loop_retries_initial_white_without_restart(self) -> None:
+        runner = make_runner()
+        runner.state.phase = Phase.PREPARATION
+        seer = add_player(runner, 1, Role.SEER)
+        white = add_player(runner, 2, Role.VILLAGER)
+        runner.state.initial_seer_target = white.user_id
+        runner.state.guild = SimpleNamespace(id=1)
+
+        with patch(
+            "room_runner.database.record_night_action_once",
+            new=AsyncMock(side_effect=[RuntimeError("DB down"), None]),
+        ) as record:
+            await runner._send_role_dms()
+            self.assertFalse(runner.state.initial_seer_result_sent)
+
+            runner.state.prep_ready_ids = {seer.user_id, white.user_id}
+            runner._post_prep_panel = AsyncMock()
+            runner.post_village_panel = AsyncMock(return_value=True)
+            runner._repost_gm_panel = AsyncMock(return_value=True)
+            runner._close_prep_panel = AsyncMock()
+            runner._play_se = Mock()
+            runner._pausable_countdown = AsyncMock(return_value=True)
+            runner._day_discussion = AsyncMock(side_effect=asyncio.CancelledError())
+
+            await runner._game_loop()
+
+        self.assertTrue(runner.state.initial_seer_result_sent)
+        self.assertEqual(record.await_count, 2)
+
     async def test_game_over_checkpoint_failure_does_not_turn_result_into_abandonment(self) -> None:
         runner = make_runner()
         runner.state.guild = SimpleNamespace(id=123)
@@ -4559,6 +4822,11 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         manager.pending_unmutes = {123: {1}}
         manager._startup_active_vc_rooms = {30: "active-room"}
 
+        async def paced_call(func, *args, **kwargs):
+            return await func(*args, **kwargs)
+
+        manager.paced_discord_api_call = AsyncMock(side_effect=paced_call)
+
         member = FakeMember(1)
         everyone = FakeRole(1, "@everyone", default=True)
         marker = FakeRole(2, "人狼Botミュート:old-room")
@@ -4584,6 +4852,43 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         kwargs = member.edit.await_args.kwargs
         self.assertFalse(kwargs["mute"])
         self.assertEqual(kwargs["roles"], [ordinary])
+        manager.paced_discord_api_call.assert_awaited_once()
+        self.assertNotIn(member.id, manager.pending_unmutes[123])
+        remove_pending.assert_awaited_once_with(123, member.id)
+
+    async def test_pending_unmute_retries_one_http_failure_then_succeeds(self) -> None:
+        manager = object.__new__(GameCog)
+        manager.rooms = {}
+        manager.pending_unmutes = {123: {1}}
+        manager._startup_active_vc_rooms = {}
+
+        async def paced_call(func, *args, **kwargs):
+            return await func(*args, **kwargs)
+
+        manager.paced_discord_api_call = AsyncMock(side_effect=paced_call)
+        member = FakeMember(1)
+        member.voice = FakeVoiceState(channel=SimpleNamespace(id=20))
+        member.guild = FakeGuild([member], [])
+        member.edit.side_effect = [
+            discord.HTTPException(
+                SimpleNamespace(status=503, reason="Service Unavailable"),
+                {"message": "Service Unavailable", "code": 0},
+            ),
+            None,
+        ]
+
+        with (
+            patch("game.asyncio.sleep", new=AsyncMock()) as sleep,
+            patch(
+                "game.database.remove_pending_unmute", new=AsyncMock()
+            ) as remove_pending,
+            self.assertLogs("game", level="WARNING"),
+        ):
+            await manager._resolve_pending_unmute(member)
+
+        sleep.assert_awaited_once_with(MUTE_RETRY_DELAY)
+        self.assertEqual(manager.paced_discord_api_call.await_count, 2)
+        self.assertEqual(member.edit.await_count, 2)
         self.assertNotIn(member.id, manager.pending_unmutes[123])
         remove_pending.assert_awaited_once_with(123, member.id)
 

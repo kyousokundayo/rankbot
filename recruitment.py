@@ -1295,19 +1295,40 @@ class RecruitmentManager:
     async def setup(self, guild: discord.Guild) -> None:
         """GM村の参加受付へ募集カードを復元する。"""
         self.channel = None
-        self.operations_channel = await self._ensure_operations_channel(guild)
-        self.operations_log_channel = await self._ensure_operations_log_channel(guild)
-        if self.operations_channel is not None:
-            await self._upsert_panel(
-                self.operations_channel, "operations_home_message_id",
-                content="🛠️ **運営メニュー**（運営のみ）",
-                view=OperationsView(self),
-            )
         expired = await database.archive_expired_recruitments(
             guild.id, datetime.now(timezone.utc)
         )
+
+        # Discordへ1枚でも書き込む前に、未終了募集を全件検査する。
+        # 途中の行で構造不整合が見つかって先行行だけ復元されると、同じ村の
+        # state.recruitment_id が後勝ちになり、どの募集が正本か分からなくなる。
+        # 無効固定卓の残存行だけは下の既存回収経路へ流すため対象外にする。
+        open_rows = await database.list_open_recruitments(guild.id)
+        held_rows = await database.list_held_recruitments(guild.id)
+        self._validate_recruitment_recovery_rows((*open_rows, *held_rows))
+
+        self.operations_channel = await self._ensure_operations_channel(guild)
+        self.operations_log_channel = await self._ensure_operations_log_channel(guild)
+        if self.operations_channel is not None:
+            try:
+                await self._upsert_panel(
+                    self.operations_channel, "operations_home_message_id",
+                    content="🛠️ **運営メニュー**（運営のみ）",
+                    view=OperationsView(self),
+                )
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                # 任意の運営パネルだけが一時的に使えなくても、各GM村の
+                # 参加受付カードは独立して復元する。
+                log.error("運営パネルの復元失敗（募集復元は継続）: %s", exc)
         for recruitment_id in expired:
-            await self.cleanup_archived_recruitment(guild, recruitment_id)
+            try:
+                await self.cleanup_archived_recruitment(guild, recruitment_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                log.error(
+                    "期限切れ募集カードの回収失敗（後続は継続） (%s): %s",
+                    recruitment_id,
+                    exc,
+                )
 
         # HELDへのCAS後、ロビーsnapshot保存前に停止した場合はカードIDが
         # 残る。その狭い窓だけ先に復旧してから、通常のOPENカードを戻す。
@@ -1317,9 +1338,31 @@ class RecruitmentManager:
                 await self._remove_hidden_recruitment_message(row)
                 continue
             if row["status"] == database.RECRUITMENT_HELD:
-                await self._recover_held_recruitment(guild, row)
+                try:
+                    await self._recover_held_recruitment(guild, row)
+                except (
+                    discord.NotFound,
+                    discord.Forbidden,
+                    discord.HTTPException,
+                ) as exc:
+                    log.error(
+                        "開催確定済み募集の復元失敗（後続は継続） (%s): %s",
+                        row["id"],
+                        exc,
+                    )
             elif row["status"] == database.RECRUITMENT_ARCHIVED:
-                await self.cleanup_archived_recruitment(guild, int(row["id"]))
+                try:
+                    await self.cleanup_archived_recruitment(guild, int(row["id"]))
+                except (
+                    discord.NotFound,
+                    discord.Forbidden,
+                    discord.HTTPException,
+                ) as exc:
+                    log.error(
+                        "終了募集カードの回収失敗（後続は継続） (%s): %s",
+                        row["id"],
+                        exc,
+                    )
 
         # transfer完了後はmessage_idを消すため、従来の「カードIDがある行」だけの
         # 復旧では、終了時に取り残されたHELDを永久に発見できない。全HELDを
@@ -1337,7 +1380,52 @@ class RecruitmentManager:
                     "未終了募集のGM名前村を復元できません: "
                     f"募集#{row['id']}/{row['room_id']}"
                 )
-            await self.ensure_recruitment_message(guild, row)
+            try:
+                await self.ensure_recruitment_message(guild, row)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                # Discordの単一カード障害だけを行単位で隔離する。DB保存失敗や
+                # RuntimeErrorまで握り潰すと、壊れた状態を部分復元してしまう。
+                log.error(
+                    "募集カードの復元失敗（後続は継続） (%s/%s): %s",
+                    row["id"],
+                    row["room_id"],
+                    exc,
+                )
+
+    def _validate_recruitment_recovery_rows(self, rows) -> None:
+        """未終了募集を、起動時のDiscord副作用より先に一括検査する。"""
+        by_room: dict[str, int] = {}
+        for row in rows:
+            if _recruitment_is_disabled(row):
+                continue
+            recruitment_id = int(row["id"])
+            room_id = str(row["room_id"])
+            room = self._room_for_row(row)
+            if room is None or not room.is_private_room():
+                raise RuntimeError(
+                    "未終了募集のGM名前村を復元できません: "
+                    f"募集#{recruitment_id}/{room_id}"
+                )
+            previous_id = by_room.setdefault(room_id, recruitment_id)
+            if previous_id != recruitment_id:
+                raise RuntimeError(
+                    "同じGM名前村に未終了募集が複数あります: "
+                    f"{room_id}/募集#{previous_id},#{recruitment_id}"
+                )
+            if row["status"] != database.RECRUITMENT_OPEN:
+                continue
+            state = room.state
+            linked_id = getattr(state, "recruitment_id", None)
+            if linked_id not in (None, recruitment_id):
+                raise RuntimeError(
+                    "募集とGM名前村の復元状態が一致しません: "
+                    f"{room_id}/募集#{recruitment_id}/snapshot募集#{linked_id}"
+                )
+            if state.phase not in (Phase.LOBBY, Phase.GAME_OVER) or room._is_game_in_progress():
+                raise RuntimeError(
+                    "ゲーム進行中のGM名前村に募集中の募集が残っています: "
+                    f"{room_id}/募集#{recruitment_id}"
+                )
 
     async def _archive_orphaned_held_recruitments(
         self, guild: discord.Guild,

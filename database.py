@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+import tempfile
 import aiosqlite
+from collections import Counter
 from collections.abc import Collection
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
@@ -45,6 +47,7 @@ DEFAULT_LADDER_ID = rating_lib.DEFAULT_LADDER_ID
 
 BACKUP_DIR = DATA_DIR / "backups"
 BACKUP_KEEP_PER_LABEL = 10
+_SQLITE_BACKUP_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
 
 class SeasonResetConflict(RuntimeError):
@@ -215,6 +218,14 @@ def _validate_room_snapshot(phase: str, payload: dict) -> None:
     ):
         if key in payload and not isinstance(payload[key], bool):
             raise ValueError(f"{key} is not boolean")
+    vote_closed_phase = payload.get("vote_closed_phase")
+    if vote_closed_phase is not None and vote_closed_phase not in {
+        Phase.DAY_VOTE.name,
+        Phase.DAY_RUNOFF_VOTE.name,
+    }:
+        raise ValueError("vote_closed_phase is invalid")
+    if vote_closed_phase is not None and payload.get("vote_closed") is not True:
+        raise ValueError("vote_closed_phase requires vote_closed")
     vote_order = payload.get("vote_order", [])
     if len(vote_order) != len(set(vote_order)):
         raise ValueError("vote_order contains duplicate IDs")
@@ -271,16 +282,43 @@ async def backup_db(*, label: str = "auto", keep: int = BACKUP_KEEP_PER_LABEL) -
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     dest = BACKUP_DIR / f"{src_path.stem}_{timestamp}_{label}.db"
-    async with aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT_SECONDS) as src:
-        async with aiosqlite.connect(str(dest)) as dst:
-            await src.backup(dst)
-            # 元DBがWALなのでバックアップ先もWALになる。閉じる前に
-            # 本体へ書き戻し、-wal / -shm 無しで復元できる状態にする。
-            await dst.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    # チェックポイント済みなので、残っていても復元には要らない
-    for suffix in ("-wal", "-shm"):
-        Path(f"{dest}{suffix}").unlink(missing_ok=True)
+    temporary_path: Optional[Path] = None
+    try:
+        # 検証前の不完全なコピーを完成名で見せない。同一ディレクトリに置き、
+        # 検証後のreplaceが同一filesystem上のatomic renameになるようにする。
+        with tempfile.NamedTemporaryFile(
+            dir=BACKUP_DIR,
+            prefix=f".{dest.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
 
+        async with aiosqlite.connect(DB_PATH, timeout=DB_TIMEOUT_SECONDS) as src:
+            async with aiosqlite.connect(str(temporary_path)) as dst:
+                await src.backup(dst)
+                # 元DBがWALなのでバックアップ先もWALになる。閉じる前に
+                # 本体へ書き戻し、単独の.dbで復元できる状態にする。
+                checkpoint_rows = await dst.execute_fetchall(
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
+                )
+                if not checkpoint_rows or int(checkpoint_rows[0][0]) != 0:
+                    raise RuntimeError(
+                        "DBバックアップのWALチェックポイントに失敗しました。"
+                    )
+                await _validate_backup_copy(dst)
+
+        # 接続を閉じてcheckpoint済み。sidecarを完成名へ持ち越さない。
+        for suffix in _SQLITE_BACKUP_SIDECAR_SUFFIXES:
+            Path(f"{temporary_path}{suffix}").unlink(missing_ok=True)
+        temporary_path.replace(dest)
+    except BaseException:
+        if temporary_path is not None:
+            _remove_backup_files(temporary_path)
+        raise
+
+    # 完全なバックアップをatomicに公開できた後だけ、古い世代を整理する。
+    # 整理に失敗した場合は例外を返すが、公開済みの正常な新世代は削除しない。
     if keep > 0:
         backups = sorted(BACKUP_DIR.glob(f"{src_path.stem}_*_{label}.db"))
         for old in backups[:-keep]:
@@ -289,26 +327,57 @@ async def backup_db(*, label: str = "auto", keep: int = BACKUP_KEEP_PER_LABEL) -
     return str(dest)
 
 
+async def _validate_backup_copy(db: aiosqlite.Connection) -> None:
+    """公開前のバックアップ本体を、SQLiteと現行DB契約の両面で検証する。"""
+    integrity_rows = await db.execute_fetchall("PRAGMA integrity_check")
+    if len(integrity_rows) != 1 or str(integrity_rows[0][0]).casefold() != "ok":
+        details = "; ".join(str(row[0]) for row in integrity_rows[:3])
+        raise RuntimeError(
+            "DBバックアップのintegrity_checkに失敗しました: "
+            + (details or "結果なし")
+        )
+    try:
+        await _validate_current_schema(db)
+    except Exception as exc:
+        raise RuntimeError(
+            f"DBバックアップの現行スキーマ検査に失敗しました: {exc}"
+        ) from exc
+    try:
+        await _validate_foreign_key_integrity(db)
+    except Exception as exc:
+        raise RuntimeError(
+            f"DBバックアップの外部キー整合性検査に失敗しました: {exc}"
+        ) from exc
+    try:
+        await _validate_check_integrity(db)
+        await _validate_ladder_integrity(db)
+        await _validate_recruitment_integrity(db)
+    except Exception as exc:
+        raise RuntimeError(
+            f"DBバックアップの現行データ整合性検査に失敗しました: {exc}"
+        ) from exc
+
+
 def _remove_backup_files(backup: Path) -> None:
-    """バックアップ本体と、SQLiteが同名で作る -wal / -shm をまとめて消す。
+    """バックアップ本体と、SQLiteが同名で作るsidecarをまとめて消す。
 
     本体だけ消すと、バックアップ先がWALモードのときに残る
-    `xxx.db-wal` / `xxx.db-shm` が回収されず、世代を捨てても
-    ディスクを食い続ける。
+    `xxx.db-wal` / `xxx.db-shm` や、失敗時の `xxx.db-journal` が
+    回収されず、世代を捨ててもディスクを食い続ける。
     """
-    for suffix in ("", "-wal", "-shm"):
+    for suffix in ("", *_SQLITE_BACKUP_SIDECAR_SUFFIXES):
         Path(f"{backup}{suffix}").unlink(missing_ok=True)
 
 
 def _remove_orphan_backup_sidecars(stem: str) -> None:
-    """本体が無い -wal / -shm を回収する。
+    """本体が無いSQLite sidecarを回収する。
 
     本体だけを消していた頃に取り残されたぶんを、次のバックアップで
     まとめて片付ける。単体では復元に使えないので消して問題ない。
     """
     for sidecar in BACKUP_DIR.glob(f"{stem}_*.db-*"):
         name = sidecar.name
-        for suffix in ("-wal", "-shm"):
+        for suffix in _SQLITE_BACKUP_SIDECAR_SUFFIXES:
             if not name.endswith(suffix):
                 continue
             if not (BACKUP_DIR / name[: -len(suffix)]).exists():
@@ -865,7 +934,7 @@ def _expected_current_column_type(column_key: str) -> str:
 
 
 async def _validate_current_schema(db: aiosqlite.Connection) -> None:
-    """v0.40移行済みDBだけを、DDL実行前に読み取り検査する。"""
+    """現行契約を満たすDBだけを、移行確定前に読み取り検査する。"""
     errors: list[str] = []
     table_info: dict[str, list[tuple]] = {}
     for table_name, required_columns in _CURRENT_SCHEMA_REQUIRED_COLUMNS.items():
@@ -886,6 +955,15 @@ async def _validate_current_schema(db: aiosqlite.Connection) -> None:
             if int(row[3] or 0) and row[4] is None:
                 errors.append(
                     f"{table_name}.{column_name}がDEFAULTなしNOT NULLの余分な列"
+                )
+            elif (
+                int(row[3] or 0)
+                and _normalized_schema_default(row[4]) == "null"
+            ):
+                # DEFAULT NULLは宣言上DEFAULT付きでも、列を省略したINSERTが
+                # NOT NULL違反になる。DEFAULTなしと同様に起動前に拒否する。
+                errors.append(
+                    f"{table_name}.{column_name}がDEFAULT NULLのNOT NULL余分な列"
                 )
 
         rows_by_name = {str(row[1]): row for row in rows}
@@ -1003,8 +1081,57 @@ async def _validate_foreign_key_integrity(db: aiosqlite.Connection) -> None:
             )
 
 
-def _private_rooms_table_sql(table_name: str) -> str:
+async def _foreign_key_violation_counts(
+    db: aiosqlite.Connection,
+) -> Counter[tuple[str, Optional[int], str, int]]:
+    """管理対象外の旧テーブルも含め、外部キー違反を多重集合で返す。
+
+    WITHOUT ROWIDテーブルのforeign_key_checkはrowidをNULLで返すため、同じ
+    外部キーに反する複数行が同一tupleになる。setに潰すと移行中に1行増えても
+    差分を検出できないので、件数も含めて比較する。
+    """
+    return Counter(
+        (str(table_name), row_id, str(parent_table), int(foreign_key_id))
+        for table_name, row_id, parent_table, foreign_key_id
+        in await db.execute_fetchall("PRAGMA foreign_key_check")
+    )
+
+
+async def _validate_no_new_foreign_key_violations(
+    db: aiosqlite.Connection,
+    violations_before: Counter[tuple[str, Optional[int], str, int]],
+) -> None:
+    """移行が新しく作った外部キー違反だけを拒否する。
+
+    廃止済みの管理対象外テーブルには、旧版から孤児行が残り得る。その既存行は
+    起動互換のため許容する一方、親テーブル再構築による新規破損は全テーブルを
+    対象に検出する。現行管理テーブルの既存違反は、この差分とは別に
+    `_validate_foreign_key_integrity` が従来どおり拒否する。
+    """
+    new_violations = await _foreign_key_violation_counts(db) - violations_before
+    if not new_violations:
+        return
+    table_name, row_id, parent_table, foreign_key_id = min(
+        new_violations,
+        key=lambda item: (item[0], repr(item[1]), item[2], item[3]),
+    )
+    raise RuntimeError(
+        "DB移行で新しい外部キー違反が発生しました: "
+        f"{table_name} rowid={row_id} -> {parent_table} "
+        f"(foreign_key_id={foreign_key_id}, "
+        f"count={new_violations[(table_name, row_id, parent_table, foreign_key_id)]})"
+    )
+
+
+def _private_rooms_table_sql(
+    table_name: str,
+    *,
+    extra_columns: Collection[str] = (),
+) -> str:
     """現行のprivate_rooms定義。新規作成と移行の再構築で同じ形を使う。"""
+    extra_columns_sql = "".join(
+        f"\n            {column_sql}," for column_sql in extra_columns
+    )
     return f"""
         CREATE TABLE IF NOT EXISTS {table_name} (
             guild_id INTEGER NOT NULL,
@@ -1015,86 +1142,295 @@ def _private_rooms_table_sql(table_name: str) -> str:
             status TEXT NOT NULL DEFAULT 'active',
             category_id INTEGER,
             last_error TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,{extra_columns_sql}
             PRIMARY KEY (guild_id, room_id),
             UNIQUE (guild_id, room_name)
         )
     """
 
 
-async def _migrate_private_rooms_multi_owner(db: aiosqlite.Connection) -> None:
+def _sql_without_quoted_content(sql: str) -> str:
+    """DDLの文字列・quoted identifier・コメントを空白化して返す。
+
+    再構築で失われる構文キーワードを調べる際、DEFAULT文字列やコメント内の
+    ``CHECK`` 等を誤検出しないための最小scanner。SQLiteのquote内の同一quote
+    2文字によるescapeも読み飛ばす。
+    """
+    result: list[str] = []
+    index = 0
+    while index < len(sql):
+        if sql.startswith("--", index):
+            end = sql.find("\n", index + 2)
+            if end < 0:
+                result.append(" " * (len(sql) - index))
+                break
+            result.append(" " * (end - index))
+            result.append("\n")
+            index = end + 1
+            continue
+        if sql.startswith("/*", index):
+            end = sql.find("*/", index + 2)
+            if end < 0:
+                result.append(" " * (len(sql) - index))
+                break
+            end += 2
+            result.append(" " * (end - index))
+            index = end
+            continue
+
+        quote = sql[index]
+        if quote not in {"'", '"', "`", "["}:
+            result.append(quote)
+            index += 1
+            continue
+
+        closing_quote = "]" if quote == "[" else quote
+        start = index
+        index += 1
+        while index < len(sql):
+            if sql[index] != closing_quote:
+                index += 1
+                continue
+            if index + 1 < len(sql) and sql[index + 1] == closing_quote:
+                index += 2
+                continue
+            index += 1
+            break
+        result.append(" " * (index - start))
+    return "".join(result)
+
+
+async def _private_rooms_rebuild_unsupported_features(
+    db: aiosqlite.Connection,
+) -> list[str]:
+    """table_infoだけでは復元できないprivate_roomsのDDL機能を列挙する。"""
+    unsupported: list[str] = []
+    table_xinfo = await db.execute_fetchall("PRAGMA table_xinfo(private_rooms)")
+    if not table_xinfo:
+        return ["table_xinfo結果なし"]
+    hidden_columns = [
+        str(row[1]) for row in table_xinfo if len(row) < 7 or int(row[6] or 0)
+    ]
+    if hidden_columns:
+        unsupported.append("生成/hidden列=" + ",".join(hidden_columns))
+    current_columns = _CURRENT_SCHEMA_REQUIRED_COLUMNS["private_rooms"]
+    extra_primary_key_columns = [
+        str(row[1])
+        for row in table_xinfo
+        if str(row[1]) not in current_columns and int(row[5] or 0)
+    ]
+    if extra_primary_key_columns:
+        unsupported.append(
+            "余分な主キー列=" + ",".join(extra_primary_key_columns)
+        )
+
+    table_sql_rows = await db.execute_fetchall(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='private_rooms'"
+    )
+    if not table_sql_rows or table_sql_rows[0][0] is None:
+        unsupported.append("sqlite_master.sqlなし")
+        return unsupported
+
+    unquoted_sql = _sql_without_quoted_content(str(table_sql_rows[0][0]))
+    tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*", unquoted_sql.casefold())
+    token_set = set(tokens)
+    feature_tokens = {
+        "check": "CHECK",
+        "collate": "COLLATE",
+        "constraint": "名前付きCONSTRAINT",
+        "generated": "生成列",
+    }
+    unsupported.extend(
+        description
+        for token, description in feature_tokens.items()
+        if token in token_set
+    )
+    if any(
+        first == "on" and second == "conflict"
+        for first, second in zip(tokens, tokens[1:])
+    ):
+        unsupported.append("ON CONFLICT")
+    if await db.execute_fetchall("PRAGMA foreign_key_list(private_rooms)"):
+        unsupported.append("REFERENCES/外部キー")
+
+    # table_info/index_infoだけでは、維持するPK・村名UNIQUEのCOLLATEや
+    # ASC/DESCが分からない。現行DDLと同じBINARY・昇順以外は拒否する。
+    preserved_auto_indexes = {
+        ("pk", ("guild_id", "room_id")),
+        ("u", ("guild_id", "room_name")),
+    }
+    for index_row in await db.execute_fetchall("PRAGMA index_list(private_rooms)"):
+        index_name = str(index_row[1])
+        origin = str(index_row[3] or "")
+        columns = tuple(
+            str(row[0])
+            for row in await db.execute_fetchall(
+                "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+                (index_name,),
+            )
+        )
+        if (origin, columns) not in preserved_auto_indexes:
+            continue
+        index_xinfo = await db.execute_fetchall(
+            "SELECT * FROM pragma_index_xinfo(?) ORDER BY seqno",
+            (index_name,),
+        )
+        key_columns = [
+            row for row in index_xinfo if len(row) >= 6 and int(row[5] or 0)
+        ]
+        if len(key_columns) != len(columns) or any(
+            int(row[3] or 0) or str(row[4] or "").casefold() != "binary"
+            for row in key_columns
+        ):
+            unsupported.append(f"索引属性={index_name}")
+
+    # STRICT/WITHOUT ROWIDはテーブル末尾だけで有効なoption。extra列の型名が
+    # 偶然STRICT等でも誤検出しないよう、最後の閉じ括弧より後だけを見る。
+    tail_match = re.search(r"\)([^()]*)$", unquoted_sql, flags=re.DOTALL)
+    if tail_match:
+        tail_tokens = re.findall(
+            r"[A-Za-z_][A-Za-z0-9_]*", tail_match.group(1).casefold()
+        )
+        if "strict" in tail_tokens:
+            unsupported.append("STRICT")
+        if any(
+            first == "without" and second == "rowid"
+            for first, second in zip(tail_tokens, tail_tokens[1:])
+        ):
+            unsupported.append("WITHOUT ROWID")
+
+    # 表記箇所が違っても同じ未対応機能は1回だけ表示する。
+    return list(dict.fromkeys(unsupported))
+
+
+async def _migrate_private_rooms_multi_owner(db: aiosqlite.Connection) -> bool:
     """1人1村時代の UNIQUE(guild_id, owner_id) を外す。
 
     SQLiteはCREATE TABLE内のUNIQUEを後から削除できない (自動生成インデックスは
     DROP INDEXできない) ため、新テーブルへ入れ替える。現行スキーマには制約が
     無いので、この関数は再実行しても何もしない。
     行数は最大でもサーバーの村数ぶんしかないため一括コピーで足りる。
+    呼出元がtransactionとforeign_keysを管理し、再構築した時だけTrueを返す。
     """
     legacy_unique = False
+    manual_owner_unique_indexes: list[str] = []
+    unknown_table_unique_constraints: list[str] = []
     for index_row in await db.execute_fetchall("PRAGMA index_list(private_rooms)"):
-        # 条件付きUNIQUEは旧版が作った制約ではない。検証側も代用として
-        # 認めていないので、ここでもテーブル再構築の根拠にしない
-        # (手で足された索引を、移行のついでに黙って落とさないため)。
-        if not int(index_row[2] or 0) or int(index_row[4] or 0):
+        if not int(index_row[2] or 0):
             continue
+        index_name = str(index_row[1])
+        origin = str(index_row[3] or "")
+        partial = bool(index_row[4])
         columns = tuple(
             str(row[0])
             for row in await db.execute_fetchall(
                 "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
-                (str(index_row[1]),),
+                (index_name,),
             )
         )
-        if columns == ("guild_id", "owner_id"):
-            legacy_unique = True
-            break
+        # CREATE UNIQUE INDEX で手動追加されたowner制約は、現行でも2村目を
+        # 妨げる。旧テーブル制約と誤認して黙って落とさず、DBを無変更で拒否する。
+        if origin == "c" and columns == ("guild_id", "owner_id"):
+            manual_owner_unique_indexes.append(index_name)
+        # 旧版CREATE TABLE内のUNIQUEだけを移行対象にする。条件付きUNIQUEは
+        # テーブル制約では作れないため、originだけでなくpartialも確認する。
+        elif origin == "u":
+            if columns == ("guild_id", "owner_id") and not partial:
+                legacy_unique = True
+            elif columns != ("guild_id", "room_name") or partial:
+                rendered_columns = ",".join(columns) or "式/列なし"
+                unknown_table_unique_constraints.append(
+                    f"{index_name}({rendered_columns})"
+                )
+    if manual_owner_unique_indexes:
+        raise RuntimeError(
+            "private_roomsに手動owner UNIQUE索引が残っています: "
+            + ", ".join(sorted(manual_owner_unique_indexes))
+        )
+    if unknown_table_unique_constraints:
+        raise RuntimeError(
+            "private_roomsに未対応の追加UNIQUE制約が残っています: "
+            + ", ".join(sorted(unknown_table_unique_constraints))
+        )
     if not legacy_unique:
-        return
+        return False
+
+    unsupported_features = await _private_rooms_rebuild_unsupported_features(db)
+    if unsupported_features:
+        raise RuntimeError(
+            "private_roomsに再構築で保持できないテーブル機能があります: "
+            + ", ".join(unsupported_features)
+        )
+
+    schema_objects = [
+        (str(object_type), str(object_name), str(sql))
+        for object_type, object_name, sql in await db.execute_fetchall(
+            "SELECT type, name, sql FROM sqlite_master "
+            "WHERE tbl_name='private_rooms' "
+            "AND type IN ('index', 'trigger') AND sql IS NOT NULL "
+            "ORDER BY type, name"
+        )
+    ]
 
     # 入れ替えは現行定義でテーブルを作り直すため、放っておくと定義外の列を
     # 黙って落とす。旧版が残した列は「保持したまま無視する」のがこのDBの方針
-    # なので、nullableな余分列は新テーブルへ引き継ぐ。
+    # なので、nullableまたはDEFAULT付きNOT NULLの余分列は宣言ごと引き継ぐ。
     current_columns = _CURRENT_SCHEMA_REQUIRED_COLUMNS["private_rooms"]
-    extra_columns: list[str] = []
+    extra_columns: list[tuple[str, str]] = []
     for row in await db.execute_fetchall("PRAGMA table_info(private_rooms)"):
         name = str(row[1])
         if name in current_columns:
             continue
-        if int(row[3] or 0) and row[4] is None:
+        if int(row[3] or 0) and (
+            row[4] is None or _normalized_schema_default(row[4]) == "null"
+        ):
             # DEFAULTなしNOT NULLの余分な列は移せない (INSERTが落ちる)。
             # 黙って捨てるのも危険なので、DDLへ触れずに戻り、この後の
             # スキーマ検証に「起動を止める」判断を任せる。
             log.warning(
                 "private_rooms に移行できない余分な列があります: %s", name,
             )
-            return
-        extra_columns.append(f'"{name}" {str(row[2] or "").strip() or "TEXT"}')
+            return False
+        quoted_name = '"' + name.replace('"', '""') + '"'
+        column_type = str(row[2] or "").strip() or "TEXT"
+        definition_parts = [quoted_name, column_type]
+        if int(row[3] or 0):
+            definition_parts.append("NOT NULL")
+        if row[4] is not None:
+            definition_parts.extend(("DEFAULT", str(row[4])))
+        extra_columns.append((quoted_name, " ".join(definition_parts)))
 
-    await db.execute("BEGIN IMMEDIATE")
-    try:
-        await db.execute("DROP TABLE IF EXISTS private_rooms_migrating")
-        await db.execute(_private_rooms_table_sql("private_rooms_migrating"))
-        for column_sql in extra_columns:
-            await db.execute(
-                f"ALTER TABLE private_rooms_migrating ADD COLUMN {column_sql}"
-            )
-        carried = ", ".join(
-            ["guild_id", "room_id", "owner_id", "room_name", "variant_id",
-             "status", "category_id", "last_error", "created_at"]
-            + [column_sql.split(" ")[0] for column_sql in extra_columns]
+    migrating_table_exists = await db.execute_fetchall(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='private_rooms_migrating'"
+    )
+    if migrating_table_exists:
+        raise RuntimeError(
+            "private_rooms_migratingが既に存在するため、安全に移行できません。"
         )
-        await db.execute(
-            f"INSERT INTO private_rooms_migrating ({carried}) "
-            f"SELECT {carried} FROM private_rooms"
-        )
-        await db.execute("DROP TABLE private_rooms")
-        await db.execute(
-            "ALTER TABLE private_rooms_migrating RENAME TO private_rooms"
-        )
-    except Exception:
-        await db.rollback()
-        raise
-    await db.commit()
-    log.info("private_rooms の1人1村制約を外しました (複数GM村へ移行)")
+
+    # transactionとforeign_keysの管理はinit_dbが一括して担う。ここでcommit
+    # しないことで、後段の整合性検査や索引修復が失敗しても全変更を戻せる。
+    await db.execute(_private_rooms_table_sql(
+        "private_rooms_migrating",
+        extra_columns=[column_sql for _, column_sql in extra_columns],
+    ))
+    carried = ", ".join(
+        ["guild_id", "room_id", "owner_id", "room_name", "variant_id",
+         "status", "category_id", "last_error", "created_at"]
+        + [quoted_name for quoted_name, _ in extra_columns]
+    )
+    await db.execute(
+        f"INSERT INTO private_rooms_migrating ({carried}) "
+        f"SELECT {carried} FROM private_rooms"
+    )
+    await db.execute("DROP TABLE private_rooms")
+    await db.execute(
+        "ALTER TABLE private_rooms_migrating RENAME TO private_rooms"
+    )
+    for _, _, create_sql in schema_objects:
+        await db.execute(create_sql)
+    return True
 
 
 async def _validate_check_integrity(db: aiosqlite.Connection) -> None:
@@ -1199,7 +1535,7 @@ async def _validate_ladder_integrity(db: aiosqlite.Connection) -> None:
 
 
 async def _validate_recruitment_integrity(db: aiosqlite.Connection) -> None:
-    """未終了募集が同じ村主のGM名前村へ結び付いていることを確認する。"""
+    """未終了募集の村主対応と、1村1件の復元前提を確認する。"""
     invalid_rows = await db.execute_fetchall(
         "SELECT r.id, r.room_id FROM recruitments r "
         "LEFT JOIN private_rooms p "
@@ -1213,6 +1549,21 @@ async def _validate_recruitment_integrity(db: aiosqlite.Connection) -> None:
         raise RuntimeError(
             "未終了募集が村主のGM名前村と一致しません: "
             f"募集#{recruitment_id}/{room_id}"
+        )
+
+    duplicate_rows = await db.execute_fetchall(
+        "SELECT guild_id, room_id, COUNT(*), GROUP_CONCAT(id) "
+        "FROM recruitments WHERE status IN (?, ?) "
+        "GROUP BY guild_id, room_id HAVING COUNT(*) > 1 "
+        "ORDER BY guild_id, room_id LIMIT 1",
+        (RECRUITMENT_OPEN, RECRUITMENT_HELD),
+    )
+    if duplicate_rows:
+        guild_id, room_id, count, recruitment_ids = duplicate_rows[0]
+        raise RuntimeError(
+            "同じGM村に複数の未終了募集が残っています: "
+            f"guild={guild_id}/room={room_id}/count={count}/"
+            f"募集={recruitment_ids}"
         )
 
 
@@ -1360,38 +1711,58 @@ async def init_db() -> None:
             "AND name NOT LIKE 'sqlite_%'"
         ))[0][0])
         if user_table_count:
-            # 記録テーブル8種と started_at 列は「新しく足すだけ」の移行。
-            # 検証は不足列を見つけると即RuntimeErrorで起動を止めるため、
-            # 新テーブルを契約定義へ載せた状態で検証を先に走らせると
-            # 移行前の本番DBが起動不能になる。必ず検証より前に置く。
-            # SAVEPOINTで包むのは、v0.40より前の未知スキーマ (games/
-            # game_settlements自体が想定と違う形) でALTER TABLEが失敗した
-            # ときに、中途半端にテーブルを作った状態を残さないため。
-            # 失敗時はロールバックして検証に委ね、「未移行のDBスキーマは
-            # 書き換えず拒否する」既存方針をそのまま保つ。
+            # 親テーブル再構築中だけFK強制を止める。PRAGMA foreign_keysは
+            # transaction中に変更できないため、BEGINより前に行う。違反集合は
+            # write lock取得後・DDL前に採取し、commit前の集合との差分を検査する。
+            await db.execute("PRAGMA foreign_keys = OFF")
+            foreign_keys = await db.execute_fetchall("PRAGMA foreign_keys")
+            if int(foreign_keys[0][0]) != 0:
+                raise RuntimeError("DB移行の外部キー制御を開始できません。")
+            migrated_private_rooms = False
             try:
-                await db.execute("SAVEPOINT apply_record_tables")
-                await _apply_record_tables(db)
-            except Exception:
-                await db.execute("ROLLBACK TO SAVEPOINT apply_record_tables")
-                await db.execute("RELEASE SAVEPOINT apply_record_tables")
-            else:
-                await db.execute("RELEASE SAVEPOINT apply_record_tables")
+                await db.execute("BEGIN IMMEDIATE")
+                foreign_key_violations_before = await _foreign_key_violation_counts(db)
+
+                # 記録テーブル8種とstarted_at列は、旧対応DBへ新しく足す移行。
+                # 検証に必要な追加も含め、後段検証・索引修復と同じtransactionで
+                # 実行するため、どこで失敗しても元のschema/dataへ戻る。
+                try:
+                    await _apply_record_tables(db)
+                except Exception as migration_error:
+                    # 未対応の古いschemaなら、従来の契約エラーを返す。検証が
+                    # 通る想定外の実行失敗だけは移行固有エラーとして伝える。
+                    try:
+                        await _validate_current_schema(db)
+                    except RuntimeError:
+                        raise
+                    raise RuntimeError(
+                        "記録テーブルのDB移行を完了できません。"
+                    ) from migration_error
+                await _validate_current_schema(db)
+                migrated_private_rooms = await _migrate_private_rooms_multi_owner(db)
+                # 再構築後の宣言schemaも、commit前に現行契約へ再照合する。
+                await _validate_current_schema(db)
+                await _validate_foreign_key_integrity(db)
+                await _validate_check_integrity(db)
+                await _validate_ladder_integrity(db)
+                await _validate_recruitment_integrity(db)
+                await _ensure_current_indexes(db)
+                await _validate_no_new_foreign_key_violations(
+                    db, foreign_key_violations_before,
+                )
                 await db.commit()
-            await _validate_current_schema(db)
-            # 検証を通ったDBだけを書き換える。検証は「不足している制約」しか
-            # 見ないので、旧版の UNIQUE(guild_id, owner_id) はここまで残る。
-            # 外さないと検証は通ったまま2村目のINSERTで失敗する。
-            # 未知・破損スキーマは上の検証で先に拒否されるため、
-            # 「古いスキーマは書き換えず拒否する」方針は保たれる。
-            await _migrate_private_rooms_multi_owner(db)
-            await _validate_foreign_key_integrity(db)
-            await _validate_check_integrity(db)
-            await _validate_ladder_integrity(db)
-            await _validate_recruitment_integrity(db)
-            await _ensure_current_indexes(db)
+            except BaseException:
+                await db.rollback()
+                raise
+            finally:
+                await db.execute("PRAGMA foreign_keys = ON")
+                foreign_keys = await db.execute_fetchall("PRAGMA foreign_keys")
+                if int(foreign_keys[0][0]) != 1:
+                    raise RuntimeError("DB移行後に外部キー制約を復元できません。")
+
+            if migrated_private_rooms:
+                log.info("private_rooms の1人1村制約を外しました (複数GM村へ移行)")
             await db.execute("PRAGMA journal_mode = WAL")
-            await db.commit()
             return
 
         await db.execute("PRAGMA journal_mode = WAL")
@@ -2380,6 +2751,56 @@ async def record_vote_event(
             ),
         )
         await db.commit()
+
+
+async def record_vote_abstention_once(
+    guild_id: int,
+    room_id: str,
+    game_run_id: str,
+    *,
+    event_seq: int,
+    day_number: int,
+    vote_kind: str,
+    round_index: int,
+    voter_id: int,
+    voter_number: int,
+) -> bool:
+    """同じ投票ラウンドの同一人棄権を1行に保つ。
+
+    締切snapshot保存後、生ログINSERT前に停止しても復元時に
+    再試行できる。既にINSERT済みなら重複追記しない。
+    """
+    async with connect_db() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            existing = await db.execute_fetchall(
+                "SELECT 1 FROM game_vote_events "
+                "WHERE guild_id=? AND room_id=? AND game_run_id=? "
+                "AND day_number=? AND vote_kind=? AND round_index=? "
+                "AND voter_id=? AND target_id IS NULL LIMIT 1",
+                (
+                    guild_id, room_id, game_run_id, day_number, vote_kind,
+                    round_index, voter_id,
+                ),
+            )
+            if existing:
+                await db.commit()
+                return False
+            await db.execute(
+                "INSERT INTO game_vote_events "
+                "(guild_id, room_id, game_run_id, event_seq, day_number, vote_kind, "
+                "round_index, voter_id, voter_number, target_id, target_number) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
+                (
+                    guild_id, room_id, game_run_id, event_seq, day_number,
+                    vote_kind, round_index, voter_id, voter_number,
+                ),
+            )
+        except BaseException:
+            await db.rollback()
+            raise
+        await db.commit()
+        return True
 
 
 async def record_night_action(
@@ -4858,13 +5279,12 @@ async def create_recruitment(
     allowed_ranks: Optional[Collection[str]], note: str = "",
     variant_id: str,
 ) -> int:
-    """名前村の所有権・受付中1件制限・予約を同じtransactionで確定する。"""
+    """名前村の所有権と未終了1件制限を同じtransactionで確定する。"""
     variant = get_variant_definition(variant_id)
     capacity = int(variant.player_count)
     backup_capacity = int(RECRUITMENT_BACKUP_CAPACITY)
     occupancy_minutes = int(variant.recruitment_occupancy_minutes)
     start_text = _normalize_recruitment_time(scheduled_at)
-    end_text = _recruitment_end_text(start_text, occupancy_minutes)
     normalized_ranks = _normalize_recruitment_allowed_ranks(allowed_ranks)
     allowed_ranks_json = (
         json.dumps(normalized_ranks, ensure_ascii=False)
@@ -4887,32 +5307,14 @@ async def create_recruitment(
         if str(room_status) != "active":
             await db.rollback()
             raise RecruitmentConflict("このGM村は利用可能な状態ではありません。")
-        existing_open = await db.execute_fetchall(
+        existing_unfinished = await db.execute_fetchall(
             "SELECT id FROM recruitments WHERE guild_id = ? AND room_id = ? "
-            "AND status = ? LIMIT 1",
-            (guild_id, room_id, RECRUITMENT_OPEN),
+            "AND status IN (?, ?) LIMIT 1",
+            (guild_id, room_id, RECRUITMENT_OPEN, RECRUITMENT_HELD),
         )
-        if existing_open:
+        if existing_unfinished:
             await db.rollback()
-            raise RecruitmentConflict("この村には募集中の募集が既にあります。")
-        overlaps = await db.execute_fetchall(
-            "SELECT id FROM recruitments WHERE guild_id = ? AND room_id = ? "
-            "AND status IN (?, ?) "
-            "AND datetime(scheduled_at) < datetime(?) "
-            "AND datetime(scheduled_at, '+' || occupancy_minutes || ' minutes') "
-            "> datetime(?) LIMIT 1",
-            (
-                guild_id,
-                room_id,
-                RECRUITMENT_OPEN,
-                RECRUITMENT_HELD,
-                end_text,
-                start_text,
-            ),
-        )
-        if overlaps:
-            await db.rollback()
-            raise RecruitmentConflict("同じ卓の占有時間と重なる募集があります。")
+            raise RecruitmentConflict("この村には未終了の募集が既にあります。")
         cursor = await db.execute(
             "INSERT INTO recruitments "
             "(guild_id, host_id, title, scheduled_at, room_id, streaming, allowed_ranks, "
@@ -5423,14 +5825,54 @@ async def set_recruitment_status(
     if status not in {RECRUITMENT_OPEN, RECRUITMENT_HELD, RECRUITMENT_ARCHIVED}:
         raise ValueError("unknown recruitment status")
     async with connect_db() as db:
-        cursor = await db.execute(
-            "UPDATE recruitments SET status=?, "
-            "closed_at=CASE WHEN ?=? THEN NULL ELSE COALESCE(closed_at, CURRENT_TIMESTAMP) END "
-            "WHERE id=? AND status=?",
-            (status, status, RECRUITMENT_OPEN, recruitment_id, expected_status),
-        )
-        await db.commit()
-    return cursor.rowcount == 1
+        await db.execute("BEGIN IMMEDIATE")
+        try:
+            target_rows = await db.execute_fetchall(
+                "SELECT guild_id, room_id FROM recruitments "
+                "WHERE id=? AND status=?",
+                (recruitment_id, expected_status),
+            )
+            if not target_rows:
+                await db.rollback()
+                return False
+
+            if status in {RECRUITMENT_OPEN, RECRUITMENT_HELD}:
+                guild_id, room_id = target_rows[0]
+                conflicting_rows = await db.execute_fetchall(
+                    "SELECT id FROM recruitments "
+                    "WHERE guild_id=? AND room_id=? AND id<>? "
+                    "AND status IN (?, ?) ORDER BY id LIMIT 1",
+                    (
+                        guild_id,
+                        room_id,
+                        recruitment_id,
+                        RECRUITMENT_OPEN,
+                        RECRUITMENT_HELD,
+                    ),
+                )
+                if conflicting_rows:
+                    raise RecruitmentConflict(
+                        "同じGM村に別の未終了募集があります: "
+                        f"募集#{conflicting_rows[0][0]}"
+                    )
+
+            # SELECTとUPDATEを同じwrite transaction内に置き、状態のCASと
+            # 1村1未終了募集の確認の間へ別writerが割り込めないようにする。
+            cursor = await db.execute(
+                "UPDATE recruitments SET status=?, "
+                "closed_at=CASE WHEN ?=? THEN NULL "
+                "ELSE COALESCE(closed_at, CURRENT_TIMESTAMP) END "
+                "WHERE id=? AND status=?",
+                (status, status, RECRUITMENT_OPEN, recruitment_id, expected_status),
+            )
+            if cursor.rowcount != 1:
+                await db.rollback()
+                return False
+            await db.commit()
+            return True
+        except BaseException:
+            await db.rollback()
+            raise
 
 
 async def archive_linked_recruitment_and_save_lobby_state(

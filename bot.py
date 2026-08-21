@@ -7,6 +7,7 @@ import ssl
 import asyncio
 import atexit
 import fcntl
+import stat
 import tempfile
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -36,7 +37,77 @@ sys.stdout.reconfigure(line_buffering=True)
 # 一時ディレクトリへ差し替える。bot.py の import だけでログハンドラが
 # 張られてしまうため、本番ログ (logs/bot.log) を汚さないための退避先。
 LOG_DIR = Path(os.environ["WEREWOLF_LOG_DIR"]) if os.environ.get("WEREWOLF_LOG_DIR") else BASE_DIR / "logs"
-LOG_DIR.mkdir(exist_ok=True, parents=True)
+
+
+def _prepare_private_log_directory(path: Path) -> None:
+    if path.is_symlink():
+        raise RuntimeError(f"ログディレクトリがシンボリックリンクです: {path}")
+    path.mkdir(mode=0o700, exist_ok=True, parents=True)
+    info = path.stat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        raise RuntimeError(f"安全なログディレクトリではありません: {path}")
+    path.chmod(0o700)
+
+
+def _harden_existing_private_log(path: Path) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+    ):
+        raise RuntimeError(f"安全な既存ログファイルではありません: {path}")
+    path.chmod(0o600)
+
+
+def _harden_existing_bot_logs() -> None:
+    base = LOG_DIR / "bot.log"
+    for path in (base, *(Path(f"{base}.{index}") for index in range(1, 4))):
+        _harden_existing_private_log(path)
+
+
+def _open_private_log_stream(
+    path: Path,
+    mode: str,
+    encoding: str | None,
+    errors: str | None,
+):
+    if path.is_symlink():
+        raise RuntimeError(f"ログファイルがシンボリックリンクです: {path}")
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    file_descriptor = os.open(path, flags, 0o600)
+    try:
+        info = os.fstat(file_descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise RuntimeError(f"安全なログファイルではありません: {path}")
+        os.fchmod(file_descriptor, 0o600)
+        return os.fdopen(
+            file_descriptor,
+            mode,
+            encoding=encoding,
+            errors=errors,
+        )
+    except Exception:
+        os.close(file_descriptor)
+        raise
+
+
+class _PrivateRotatingFileHandler(RotatingFileHandler):
+    """新規作成時とローテーション後も0600を維持する。"""
+
+    def _open(self):
+        return _open_private_log_stream(
+            Path(self.baseFilename), self.mode, self.encoding, self.errors
+        )
+
+
+_prepare_private_log_directory(LOG_DIR)
+_harden_existing_bot_logs()
 
 
 def _configure_ssl_cert_file() -> None:
@@ -66,7 +137,7 @@ def _build_http_connector() -> aiohttp.TCPConnector:
 # 端末から起動したときだけコンソールにも出す。
 # (.app経由ではstdoutがlogs/launcher.logへ向くため、二重書き込みを避ける)
 _log_handlers: list[logging.Handler] = [
-    RotatingFileHandler(
+    _PrivateRotatingFileHandler(
         LOG_DIR / "bot.log",
         maxBytes=5_000_000,
         backupCount=3,

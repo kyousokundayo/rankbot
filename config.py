@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import math
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
@@ -15,7 +16,7 @@ from room_config import (
 )
 
 # Botのバージョン (ヘルプに表示。ソース公開された派生でも識別できるように)
-BOT_VERSION = "v0.60"
+BOT_VERSION = "v0.61"
 
 # 新規導入先に同名カテゴリが既にある場合、無関係なDiscord構成をBot所有と
 # 誤認しない。既存運用は保存済みchannel IDで自動再利用できる。
@@ -434,7 +435,12 @@ PLAYER_BLOCK_LIMIT = 50
 # 募集通知DMはRecruitmentManager専用のペーサーで別枠にする。
 # 環境変数は WEREWOLF_ 接頭辞、不正値は起動時に RuntimeError で止める。
 # ------------------------------------------------------------
-def _parse_positive_float_env(name: str, default: float) -> float:
+def _parse_positive_float_env(
+    name: str,
+    default: float,
+    *,
+    maximum: float | None = None,
+) -> float:
     raw = os.getenv(name)
     if raw is None or not raw.strip():
         return default
@@ -442,8 +448,12 @@ def _parse_positive_float_env(name: str, default: float) -> float:
         value = float(raw.strip())
     except ValueError:
         raise RuntimeError(f"{name} は数値で指定してください: {raw!r}")
-    if not (value > 0):
-        raise RuntimeError(f"{name} は正の数で指定してください: {raw!r}")
+    if not math.isfinite(value) or not (value > 0):
+        raise RuntimeError(f"{name} は有限の正の数で指定してください: {raw!r}")
+    if maximum is not None and value > maximum:
+        raise RuntimeError(
+            f"{name} は{maximum:g}以下で指定してください: {raw!r}"
+        )
     return value
 
 
@@ -462,7 +472,7 @@ def _parse_positive_int_env(name: str, default: int) -> int:
 
 # 募集通知DMの送信間隔 (秒)。連続DM送信でのレート制限回避が目的。
 RECRUITMENT_CALL_DM_INTERVAL_SECONDS = _parse_positive_float_env(
-    "WEREWOLF_RECRUITMENT_CALL_DM_INTERVAL_SECONDS", 0.7,
+    "WEREWOLF_RECRUITMENT_CALL_DM_INTERVAL_SECONDS", 0.7, maximum=60.0,
 )
 # 1人が1日に受け取れる募集通知DMの上限。複数の村から立て続けに
 # 呼ばれてDMが埋まるのを防ぐ (超過分は skipped_cap として記録)。

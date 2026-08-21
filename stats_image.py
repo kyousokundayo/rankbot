@@ -19,6 +19,7 @@ import functools
 import io
 import logging
 import os
+import unicodedata
 from pathlib import Path
 from typing import Optional
 
@@ -365,6 +366,34 @@ def _draw_text_block(
     return y - xy[1]
 
 
+def _fit_text_to_width(
+    draw: "ImageDraw.ImageDraw",
+    text: str,
+    font: "ImageFont.FreeTypeFont",
+    max_width: int,
+) -> str:
+    """表示名などの可変文字列を、指定幅内へ省略記号付きで収める。"""
+    clean = _strip_unsupported_glyphs(str(text), font)
+    if not clean or draw.textlength(clean, font=font) <= max_width:
+        return clean
+    ellipsis = _strip_unsupported_glyphs("…", font) or "..."
+    if draw.textlength(ellipsis, font=font) > max_width:
+        return ""
+
+    low, high = 0, len(clean)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if draw.textlength(clean[:middle] + ellipsis, font=font) <= max_width:
+            low = middle
+        else:
+            high = middle - 1
+    prefix = clean[:low]
+    # 結合文字やZWJだけを末尾へ取り残すと、見た目が不安定になる。
+    while prefix and (unicodedata.combining(prefix[-1]) or prefix[-1] == "\u200d"):
+        prefix = prefix[:-1]
+    return prefix + ellipsis
+
+
 def _content_height(
     lines: list[tuple[str, "ImageFont.FreeTypeFont", tuple[int, int, int]]],
     line_gap: int = 8,
@@ -502,11 +531,17 @@ def render_player_card(data: dict) -> bytes:
     rank_line = _strip_emoji(
         f"{data.get('rank_emoji', '')} {data.get('rank_name', _NOT_AVAILABLE)}"
     ).strip()
+    display_name = _fit_text_to_width(
+        draw,
+        str(data.get("display_name", "")),
+        font_xl,
+        CARD_WIDTH - header_x - 60,
+    )
     _draw_text_block(
         draw,
         (header_x, 70),
         [
-            (str(data.get("display_name", "")), font_xl, _TEXT_COLOR),
+            (display_name, font_xl, _TEXT_COLOR),
             (rank_line, font_lg, _ACCENT_COLOR),
             (
                 f"Rating {data.get('rating_text', _NOT_AVAILABLE)} "
@@ -677,8 +712,12 @@ def render_rating_chart(data: dict) -> bytes:
     image = Image.new("RGB", (CHART_WIDTH, CHART_HEIGHT), _BG_COLOR)
     draw = ImageDraw.Draw(image)
 
-    header = _strip_unsupported_glyphs(
-        f"{data.get('display_name', '')} のレート推移", font_xl,
+    box_left = CHART_WIDTH - 380
+    header = _fit_text_to_width(
+        draw,
+        f"{data.get('display_name', '')} のレート推移",
+        font_xl,
+        box_left - 90,
     )
     draw.text((60, 44), header, font=font_xl, fill=_TEXT_COLOR)
     subtitle_parts = [str(data.get("variant_label") or "")]
@@ -693,7 +732,6 @@ def render_rating_chart(data: dict) -> bytes:
 
     current = data.get("current_rating")
     peak = data.get("peak_rating")
-    box_left = CHART_WIDTH - 380
     draw.rounded_rectangle(
         (box_left, 40, CHART_WIDTH - 60, 150), radius=16, fill=_PANEL_COLOR,
     )
