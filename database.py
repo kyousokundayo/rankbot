@@ -6294,6 +6294,15 @@ async def get_ops_activity_stats(
     ]
     repeated = [pid for pid in matured if total_games.get(pid, 0) >= 2]
     second_game_rate = (len(repeated) / len(matured)) if matured else None
+    # 運用開始から30日たっていない間は matured が空になり、上の率だけだと
+    # 画面が常に「—」になる。判断材料を失わないよう、全プレイヤーを母数に
+    # した現時点の値も返す (新規が多い時期は低めに出る点は表示側で断る)。
+    repeated_all = [
+        pid for pid in first_date if total_games.get(pid, 0) >= 2
+    ]
+    second_game_rate_all = (
+        len(repeated_all) / len(first_date) if first_date else None
+    )
 
     # 週次コホートのW1/W4継続率。window内に初参加し、かつ観測期間が
     # 足りている (28日経過) コホートだけを返す。
@@ -6392,6 +6401,8 @@ async def get_ops_activity_stats(
         "new_30d": new_counts[30],
         "second_game_rate": second_game_rate,
         "second_game_sample": len(matured),
+        "second_game_rate_all": second_game_rate_all,
+        "second_game_sample_all": len(first_date),
         "cohorts": cohort_rows,
         "dormant_14": dormant[14],
         "dormant_30": dormant[30],
@@ -6558,11 +6569,21 @@ async def get_ops_delivery_stats(
     def _summarize(rows) -> dict:
         counts = {str(status): int(count or 0) for status, count in rows}
         total = sum(counts.values())
-        failed = total - counts.get("sent", 0)
+        # 'skipped_cap' は日次上限による意図的なスキップ、'sending' は結果が
+        # まだ確定していない行で、どちらも「DMが届かなかった」ではない。
+        # 分子にも分母にも入れず、別枠の件数として返す (運用上いちばん見たい
+        # のは拒否と送信失敗の率で、上限スキップが混ざると率が跳ね上がる)。
+        skipped = counts.get("skipped_cap", 0)
+        pending = counts.get("sending", 0)
+        attempted = total - skipped - pending
+        failed = attempted - counts.get("sent", 0)
         return {
             "total": total,
+            "attempted": attempted,
+            "skipped_cap": skipped,
+            "pending": pending,
             "by_status": counts,
-            "failure_rate": (failed / total) if total else None,
+            "failure_rate": (failed / attempted) if attempted else None,
         }
 
     configured, opted_out, on_create, on_call = (

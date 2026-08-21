@@ -181,6 +181,24 @@ class UsabilityViewLayoutTest(unittest.TestCase):
             )
         )
 
+    def test_operations_panel_drops_gm_release_and_recruitment_archive(self) -> None:
+        """GMを外す入口と募集だけを消す入口は運営メニューへ戻さない。
+
+        GM解除は卓を詰ませる (GM村は募集カードからしかGMを戻せない)。
+        募集の強制削除は、村の強制削除が紐づく募集を先にARCHIVEDへ
+        倒すため後始末が二重になる。
+        """
+        view = OperationsView(SimpleNamespace())
+
+        custom_ids = {item.custom_id for item in view.children}
+        self.assertNotIn("operations:release_gm", custom_ids)
+        self.assertNotIn("operations:archive_recruitment", custom_ids)
+        self.assertIn("operations:delete_private_room", custom_ids)
+        labels = {getattr(item, "label", None) for item in view.children}
+        self.assertNotIn("GM解除", labels)
+        self.assertNotIn("募集の強制削除", labels)
+        _assert_within_three_rows(self, view)
+
     def test_public_gm_panel_is_one_button_and_private_menu_is_two_rows(self) -> None:
         state = SimpleNamespace(
             game_run_id="run-1",

@@ -1575,7 +1575,9 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         channel.send.assert_awaited_once()
         content = channel.send.await_args.args[0]
         allowed = channel.send.await_args.kwargs["allowed_mentions"]
-        self.assertTrue(content.startswith("<@&809>"))
+        # 案内文もカードへのリンクも足さない。fixtureはjump_url付きの
+        # 募集カードを持たせてあるので、等値比較で地の文の復活を防げる。
+        self.assertEqual(content, "<@&809>")
         self.assertNotIn("@everyone", content)
         self.assertEqual(allowed.roles, [role])
         self.assertFalse(allowed.users)
