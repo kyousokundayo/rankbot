@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import database
-from config import Phase
+from config import CH_STATS, Phase
 from game import GameCog
 
 
@@ -156,6 +156,13 @@ class StartupBodyReachesRoomSetupTest(unittest.IsolatedAsyncioTestCase):
     class _Reached(RuntimeError):
         """本体が卓セットアップ直前まで進んだことを表す番兵。"""
 
+    @staticmethod
+    def _guild() -> SimpleNamespace:
+        # 起動本体は他のDiscord副作用より先に、手動配置の
+        # #統計が一意に存在することを読み取り専用で検査する。
+        stats = SimpleNamespace(id=900, name=CH_STATS)
+        return SimpleNamespace(id=1, text_channels=[stats])
+
     async def test_body_runs_past_snapshot_handling(self) -> None:
         manager = GameCog(SimpleNamespace(managed_guild_id=1))
         manager._recover_pending_settlements = AsyncMock()
@@ -166,7 +173,7 @@ class StartupBodyReachesRoomSetupTest(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaises(self._Reached):
-            await manager.setup_channels(SimpleNamespace(id=1))
+            await manager.setup_channels(self._guild())
 
         manager._recover_pending_settlements.assert_awaited_once()
         manager._ensure_gm_staff_roles.assert_awaited_once()
@@ -186,7 +193,7 @@ class StartupBodyReachesRoomSetupTest(unittest.IsolatedAsyncioTestCase):
         manager._ensure_gm_staff_roles = AsyncMock(side_effect=_record)
 
         with self.assertRaises(self._Reached):
-            await manager.setup_channels(SimpleNamespace(id=1))
+            await manager.setup_channels(self._guild())
 
         self.assertEqual(seen, [True])
         self.assertFalse(manager._startup_in_progress)

@@ -114,6 +114,89 @@ class TestFakeDiscordFidelity(unittest.IsolatedAsyncioTestCase):
             guild.id, "stats_channel_id", str(original.id)
         )
 
+    @patch("game.database.set_meta", new_callable=AsyncMock)
+    @patch("game.database.get_meta", new_callable=AsyncMock)
+    async def test_missing_stats_channel_fails_without_creating_one(
+        self,
+        get_meta: AsyncMock,
+        set_meta: AsyncMock,
+    ):
+        controller = SimpleNamespace(on_channel_message=lambda _message: None)
+        guild = FakeGuild(1, "guild", controller)
+        await guild.create_text_channel("総合")
+        get_meta.return_value = None
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+
+        with self.assertRaisesRegex(RuntimeError, "統計.*自動作成しない"):
+            await manager._ensure_stats_channel(guild)
+
+        self.assertEqual(
+            [channel.name for channel in guild.text_channels],
+            ["総合"],
+        )
+        set_meta.assert_not_awaited()
+
+    @patch("game.database.set_meta", new_callable=AsyncMock)
+    @patch("game.database.get_meta", new_callable=AsyncMock)
+    async def test_duplicate_stats_channels_without_valid_saved_id_fail_closed(
+        self,
+        get_meta: AsyncMock,
+        set_meta: AsyncMock,
+    ):
+        controller = SimpleNamespace(on_channel_message=lambda _message: None)
+        guild = FakeGuild(1, "guild", controller)
+        await guild.create_text_channel("統計")
+        await guild.create_text_channel("統計")
+        get_meta.return_value = "999999"
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+
+        with self.assertRaisesRegex(RuntimeError, "2個.*正本"):
+            await manager._ensure_stats_channel(guild)
+
+        set_meta.assert_not_awaited()
+
+    @patch("game.database.set_meta", new_callable=AsyncMock)
+    @patch("game.database.get_meta", new_callable=AsyncMock)
+    async def test_valid_saved_stats_id_wins_even_when_names_are_duplicated(
+        self,
+        get_meta: AsyncMock,
+        set_meta: AsyncMock,
+    ):
+        controller = SimpleNamespace(on_channel_message=lambda _message: None)
+        guild = FakeGuild(1, "guild", controller)
+        original = await guild.create_text_channel("統計")
+        await guild.create_text_channel("統計")
+        get_meta.return_value = str(original.id)
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        manager.bulk_api_interval = 0
+
+        selected = await manager._ensure_stats_channel(guild)
+
+        self.assertIs(selected, original)
+        set_meta.assert_awaited_once_with(
+            guild.id, "stats_channel_id", str(original.id)
+        )
+
+    @patch("game.database.get_meta", new_callable=AsyncMock)
+    async def test_missing_stats_preflight_runs_before_settlement_or_discord_changes(
+        self,
+        get_meta: AsyncMock,
+    ):
+        controller = SimpleNamespace(on_channel_message=lambda _message: None)
+        guild = FakeGuild(1, "guild", controller)
+        get_meta.return_value = None
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        manager._recover_pending_settlements = AsyncMock()
+        manager.load_pending_unmutes = AsyncMock()
+        manager._ensure_gm_staff_roles = AsyncMock()
+
+        with self.assertRaisesRegex(RuntimeError, "統計.*自動作成しない"):
+            await manager._setup_channels_body(guild, {}, frozenset())
+
+        manager._recover_pending_settlements.assert_not_awaited()
+        manager.load_pending_unmutes.assert_not_awaited()
+        manager._ensure_gm_staff_roles.assert_not_awaited()
+
     async def test_active_snapshot_does_not_publish_empty_lobby_before_restore(self):
         controller = SimpleNamespace(on_channel_message=lambda _message: None)
         guild = FakeGuild(1, "guild", controller)

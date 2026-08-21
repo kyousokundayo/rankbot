@@ -24,6 +24,7 @@ from __future__ import annotations
 import atexit
 import logging
 import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -116,6 +117,39 @@ class LogPathGuardTest(unittest.TestCase):
             "bot.LOG_DIR が本番ログディレクトリを指しています。"
             "WEREWOLF_LOG_DIR による退避が効いていない可能性があります。",
         )
+        self.assertEqual(stat.S_IMODE(Path(bot_module.LOG_DIR).stat().st_mode), 0o700)
+        self.assertEqual(
+            stat.S_IMODE((Path(bot_module.LOG_DIR) / "bot.log").stat().st_mode),
+            0o600,
+        )
+
+    def test_existing_rotated_logs_are_hardened_and_symlinks_rejected(self) -> None:
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"DISCORD_TOKEN": "unit-test-token"}):
+            import bot as bot_module
+
+        rotated_logs = [
+            Path(bot_module.LOG_DIR) / f"bot.log.{index}" for index in range(1, 4)
+        ]
+        for path in rotated_logs:
+            path.write_bytes(b"old")
+            path.chmod(0o644)
+
+        bot_module._harden_existing_bot_logs()
+
+        for path in rotated_logs:
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+        target = Path(bot_module.LOG_DIR) / "target.log"
+        target.write_bytes(b"target")
+        rotated_logs[0].unlink()
+        rotated_logs[0].symlink_to(target)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "安全な既存ログ"):
+                bot_module._harden_existing_bot_logs()
+        finally:
+            rotated_logs[0].unlink()
 
 
 if __name__ == "__main__":

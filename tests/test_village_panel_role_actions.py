@@ -311,6 +311,50 @@ class SeerButtonTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("記録の確認のみ", content)
         self.assertNotIn("view", kwargs)
 
+    async def test_seer_can_review_initial_white_during_role_confirmation(self) -> None:
+        runner = make_runner(phase=Phase.PREPARATION)
+        seer = add_player(runner, 1, Role.SEER)
+        add_player(runner, 2, Role.VILLAGER)
+        view = VillagePanelView(runner)
+        interaction = make_interaction(seer.member)
+
+        with patch(
+            "room_runner.database.list_night_actions_for_run",
+            new=AsyncMock(return_value=[{
+                "event_seq": 0, "night_number": 0, "actor_id": 1,
+                "actor_number": 1, "actor_role": "占い師", "action": "初日白",
+                "target_id": 2, "target_number": 2, "result": "村人",
+                "created_at": None,
+            }]),
+        ):
+            await view.seer_btn.callback(interaction)
+
+        content, kwargs = reply_of(interaction)
+        self.assertIn("初日白（ランダム）", content)
+        self.assertIn("夜だけ操作できます", content)
+        self.assertNotIn("view", kwargs)
+
+    async def test_initial_white_falls_back_to_snapshot_when_record_db_is_empty(self) -> None:
+        runner = make_runner(phase=Phase.PREPARATION)
+        seer = add_player(runner, 1, Role.SEER)
+        white = add_player(runner, 2, Role.VILLAGER)
+        runner.state.initial_seer_target = white.user_id
+        view = VillagePanelView(runner)
+        interaction = make_interaction(seer.member)
+
+        with patch(
+            "room_runner.database.list_night_actions_for_run",
+            new=AsyncMock(return_value=[]),
+        ):
+            await view.seer_btn.callback(interaction)
+
+        content, kwargs = reply_of(interaction)
+        self.assertIn("初日白（ランダム）", content)
+        self.assertIn(white.display_name, content)
+        self.assertIn("村人", content)
+        self.assertNotIn("記録はまだありません", content)
+        self.assertNotIn("view", kwargs)
+
     async def test_seer_sees_history_during_the_day_without_acting(self) -> None:
         """昼に押しても弾かず、記録を出したうえで「夜だけ」と添える。"""
         runner = make_runner(phase=Phase.DAY_DISCUSSION)

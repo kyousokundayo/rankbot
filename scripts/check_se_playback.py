@@ -13,9 +13,14 @@ from dotenv import load_dotenv
 
 BOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BOT_DIR))
+load_dotenv(BOT_DIR / ".env")
 
 from config import ROOM_DEFINITIONS, VC_GAME  # noqa: E402
+from scripts.bot_runtime_guard import bot_stopped_guard as _bot_stopped_guard  # noqa: E402
 import sounds  # noqa: E402
+
+
+_LIVE_PLAYBACK_CONFIRMATION = "PLAY-SE-ON-DISCORD"
 
 
 class PlaybackClient(discord.Client):
@@ -88,26 +93,43 @@ async def _main() -> int:
     parser = argparse.ArgumentParser(description="Discord VCでSEを1回実再生する")
     parser.add_argument("--scene", choices=sorted(sounds._SCENES), default="morning")
     parser.add_argument("--channel-id", type=int)
+    parser.add_argument(
+        "--confirm-live-playback",
+        help="実Discordで再生する確認語 (PLAY-SE-ON-DISCORD)",
+    )
     args = parser.parse_args()
 
-    load_dotenv(BOT_DIR / ".env")
-    token = os.getenv("DISCORD_TOKEN")
-    guild_raw = os.getenv("DISCORD_GUILD_ID")
-    if not token:
-        print("DISCORD_TOKENを.envへ設定してください", file=sys.stderr)
-        return 2
-    if guild_raw and not guild_raw.isdecimal():
-        print("DISCORD_GUILD_IDは整数で指定してください", file=sys.stderr)
+    if args.confirm_live_playback != _LIVE_PLAYBACK_CONFIRMATION:
+        print(
+            "実Discordで再生するには "
+            "--confirm-live-playback PLAY-SE-ON-DISCORD が必要です",
+            file=sys.stderr,
+        )
         return 2
 
-    sounds.require_voice_ready()
-    client = PlaybackClient(
-        guild_id=int(guild_raw) if guild_raw else None,
-        channel_id=args.channel_id,
-        scene=args.scene,
-    )
-    await client.start(token, reconnect=False)
-    return client.exit_code
+    try:
+        # Botの停止を確認してからtokenを読み、切断完了までロックを保持する。
+        with _bot_stopped_guard():
+            token = os.getenv("DISCORD_TOKEN")
+            guild_raw = os.getenv("DISCORD_GUILD_ID")
+            if not token:
+                print("DISCORD_TOKENを.envへ設定してください", file=sys.stderr)
+                return 2
+            if guild_raw and not guild_raw.isdecimal():
+                print("DISCORD_GUILD_IDは整数で指定してください", file=sys.stderr)
+                return 2
+
+            sounds.require_voice_ready()
+            client = PlaybackClient(
+                guild_id=int(guild_raw) if guild_raw else None,
+                channel_id=args.channel_id,
+                scene=args.scene,
+            )
+            await client.start(token, reconnect=False)
+            return client.exit_code
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

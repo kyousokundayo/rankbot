@@ -25,6 +25,28 @@ from permissions import RoomPermissionMixin, RoomVisibilityError
 from views import DangerConfirmView
 
 
+_LEGACY_PRIVATE_ROOMS_SQL = """
+    CREATE TABLE private_rooms (
+        guild_id INTEGER NOT NULL,
+        room_id TEXT NOT NULL,
+        owner_id INTEGER NOT NULL,
+        room_name TEXT NOT NULL,
+        variant_id TEXT NOT NULL DEFAULT 'v13_cross',
+        status TEXT NOT NULL DEFAULT 'active',
+        category_id INTEGER,
+        last_error TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        legacy_note TEXT NOT NULL DEFAULT '既定値',
+        legacy_label TEXT DEFAULT '補完値',
+        legacy_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        legacy_literal TEXT DEFAULT 'CHECK COLLATE WITHOUT ROWID STRICT',
+        PRIMARY KEY (guild_id, room_id),
+        UNIQUE (guild_id, owner_id),
+        UNIQUE (guild_id, room_name)
+    )
+"""
+
+
 class _PermissionTarget:
     def __init__(self, target_id: int, name: str) -> None:
         self.id = target_id
@@ -98,6 +120,12 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         database.DB_PATH = self._original_db_path
         self._tmp.cleanup()
 
+    @staticmethod
+    async def _install_legacy_private_rooms(db) -> None:
+        await db.execute("PRAGMA foreign_keys = OFF")
+        await db.execute("DROP TABLE private_rooms")
+        await db.execute(_LEGACY_PRIVATE_ROOMS_SQL)
+
     async def test_foreign_keys_enabled_on_every_connection(self) -> None:
         async with database.connect_db() as db:
             rows = await db.execute_fetchall("PRAGMA foreign_keys")
@@ -156,6 +184,42 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
             ))[0][0]
         self.assertEqual(table_sql_after, table_sql_before)
 
+    async def test_init_db_rejects_extra_not_null_column_with_null_default(
+        self,
+    ) -> None:
+        """DEFAULT NULLは列省略時にNOT NULL違反になるため移行しない。"""
+        invalid_sql = _LEGACY_PRIVATE_ROOMS_SQL.replace(
+            "legacy_note TEXT NOT NULL DEFAULT '既定値',",
+            "legacy_note TEXT NOT NULL DEFAULT '既定値',\n"
+            "        legacy_required TEXT NOT NULL DEFAULT NULL,",
+        )
+        async with database.connect_db() as db:
+            await db.execute("PRAGMA foreign_keys = OFF")
+            await db.execute("DROP TABLE private_rooms")
+            await db.execute(invalid_sql)
+            await db.commit()
+            schema_before = await db.execute_fetchall(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            )
+            schema_version_before = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+
+        with self.assertRaisesRegex(RuntimeError, "DEFAULT NULL"):
+            await database.init_db()
+
+        async with database.connect_db() as db:
+            schema_after = await db.execute_fetchall(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "ORDER BY type, name"
+            )
+            schema_version_after = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+        self.assertEqual(schema_after, schema_before)
+        self.assertEqual(schema_version_after, schema_version_before)
+
     async def test_existing_private_room_legacy_columns_are_retained_but_ignored(self) -> None:
         async with database.connect_db() as db:
             await db.execute("ALTER TABLE private_rooms ADD COLUMN role_name TEXT")
@@ -198,6 +262,385 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
                 "SELECT COUNT(*) FROM private_room_members"
             ))[0][0]
         self.assertEqual(count, 1)
+
+    async def test_legacy_private_rooms_migration_preserves_related_fk_and_objects(
+        self,
+    ) -> None:
+        """正常な関連行・任意index/trigger・旧孤児を保ったまま再構築する。"""
+        async with database.connect_db() as db:
+            await self._install_legacy_private_rooms(db)
+            await db.execute(
+                "INSERT INTO private_rooms "
+                "(guild_id, room_id, owner_id, room_name, legacy_note) "
+                "VALUES (1, 'private_10', 10, '十村', '保持する値')"
+            )
+            await db.execute("""
+                CREATE TABLE private_room_members (
+                    guild_id INTEGER NOT NULL,
+                    room_id TEXT NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, room_id, user_id),
+                    FOREIGN KEY (guild_id, room_id)
+                        REFERENCES private_rooms(guild_id, room_id)
+                )
+            """)
+            await db.execute(
+                "INSERT INTO private_room_members "
+                "(guild_id, room_id, user_id) VALUES (1, 'private_10', 20)"
+            )
+            await db.execute(
+                "CREATE INDEX private_rooms_legacy_note_lookup "
+                "ON private_rooms(owner_id, legacy_note)"
+            )
+            await db.execute("""
+                CREATE TRIGGER private_rooms_legacy_note_guard
+                BEFORE UPDATE OF legacy_note ON private_rooms
+                WHEN NEW.legacy_note = '禁止'
+                BEGIN
+                    SELECT RAISE(ABORT, '禁止された旧値');
+                END
+            """)
+            # 管理対象外の旧テーブルに元からある孤児は、移行差分に含めない。
+            await db.execute(
+                "CREATE TABLE unused_legacy_parents (id INTEGER PRIMARY KEY)"
+            )
+            await db.execute("""
+                CREATE TABLE unused_legacy_children (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER NOT NULL,
+                    FOREIGN KEY (parent_id) REFERENCES unused_legacy_parents(id)
+                )
+            """)
+            await db.execute(
+                "INSERT INTO unused_legacy_children (id, parent_id) VALUES (1, 999)"
+            )
+            await db.commit()
+            violations_before = await database._foreign_key_violation_counts(db)
+            objects_before = await db.execute_fetchall(
+                "SELECT type, name, sql FROM sqlite_master "
+                "WHERE tbl_name='private_rooms' AND sql IS NOT NULL "
+                "AND type IN ('index', 'trigger') ORDER BY type, name"
+            )
+
+        await database.init_db()
+        # 冪等な再起動でも、復元した任意オブジェクトを触らない。
+        await database.init_db()
+        # 現行APIは余分列を書かない。再構築後も旧DEFAULTで補完できることを確認。
+        await database.save_private_room(1, "private_11", 11, "十一村")
+
+        async with database.connect_db() as db:
+            violations_after = await database._foreign_key_violation_counts(db)
+            objects_after = await db.execute_fetchall(
+                "SELECT type, name, sql FROM sqlite_master "
+                "WHERE tbl_name='private_rooms' AND sql IS NOT NULL "
+                "AND type IN ('index', 'trigger') ORDER BY type, name"
+            )
+            room = (await db.execute_fetchall(
+                "SELECT owner_id, legacy_note, legacy_label, legacy_literal "
+                "FROM private_rooms "
+                "WHERE guild_id=1 AND room_id='private_10'"
+            ))[0]
+            new_room = (await db.execute_fetchall(
+                "SELECT legacy_note, legacy_label, legacy_seen_at, legacy_literal "
+                "FROM private_rooms WHERE guild_id=1 AND room_id='private_11'"
+            ))[0]
+            extra_columns = {
+                str(row[1]): row
+                for row in await db.execute_fetchall(
+                    "PRAGMA table_info(private_rooms)"
+                )
+                if str(row[1]).startswith("legacy_")
+            }
+            member_count = (await db.execute_fetchall(
+                "SELECT COUNT(*) FROM private_room_members"
+            ))[0][0]
+            owner_unique_origins = []
+            for index_row in await db.execute_fetchall(
+                "PRAGMA index_list(private_rooms)"
+            ):
+                if not int(index_row[2] or 0):
+                    continue
+                columns = tuple(
+                    str(row[0])
+                    for row in await db.execute_fetchall(
+                        "SELECT name FROM pragma_index_info(?) ORDER BY seqno",
+                        (str(index_row[1]),),
+                    )
+                )
+                if columns == ("guild_id", "owner_id"):
+                    owner_unique_origins.append(str(index_row[3]))
+            integrity = (await db.execute_fetchall("PRAGMA integrity_check"))[0][0]
+
+        self.assertEqual(violations_after, violations_before)
+        self.assertEqual(objects_after, objects_before)
+        self.assertEqual(
+            tuple(room),
+            (10, "保持する値", "補完値", "CHECK COLLATE WITHOUT ROWID STRICT"),
+        )
+        self.assertEqual(tuple(new_room[:2]), ("既定値", "補完値"))
+        self.assertTrue(new_room[2])
+        self.assertEqual(new_room[3], "CHECK COLLATE WITHOUT ROWID STRICT")
+        self.assertEqual(extra_columns["legacy_note"][3], 1)
+        self.assertEqual(extra_columns["legacy_note"][4], "'既定値'")
+        self.assertEqual(extra_columns["legacy_label"][3], 0)
+        self.assertEqual(extra_columns["legacy_label"][4], "'補完値'")
+        self.assertEqual(extra_columns["legacy_seen_at"][4], "CURRENT_TIMESTAMP")
+        self.assertEqual(
+            extra_columns["legacy_literal"][4],
+            "'CHECK COLLATE WITHOUT ROWID STRICT'",
+        )
+        self.assertEqual(member_count, 1)
+        self.assertEqual(owner_unique_origins, [])
+        self.assertEqual(integrity, "ok")
+
+    async def test_private_room_migration_rejects_unpreserved_table_features(
+        self,
+    ) -> None:
+        """table_infoで復元できないDDL機能を、再構築前に無変更で拒否する。"""
+        check_collate_sql = _LEGACY_PRIVATE_ROOMS_SQL.replace(
+            "legacy_label TEXT DEFAULT '補完値',",
+            "legacy_label TEXT COLLATE NOCASE DEFAULT '補完値' "
+            "CHECK (length(legacy_label) <= 20),",
+        )
+        generated_sql = _LEGACY_PRIVATE_ROOMS_SQL.replace(
+            "PRIMARY KEY (guild_id, room_id),",
+            "legacy_generated TEXT AS (room_name || ':' || owner_id) STORED,\n"
+            "        PRIMARY KEY (guild_id, room_id),",
+        )
+        references_sql = _LEGACY_PRIVATE_ROOMS_SQL.replace(
+            "PRIMARY KEY (guild_id, room_id),",
+            "legacy_parent_id INTEGER REFERENCES private_room_parents(id),\n"
+            "        PRIMARY KEY (guild_id, room_id),",
+        )
+        descending_pk_sql = _LEGACY_PRIVATE_ROOMS_SQL.replace(
+            "PRIMARY KEY (guild_id, room_id),",
+            "PRIMARY KEY (guild_id DESC, room_id),",
+        )
+        conflict_sql = _LEGACY_PRIVATE_ROOMS_SQL.replace(
+            "UNIQUE (guild_id, room_name)",
+            "UNIQUE (guild_id, room_name) ON CONFLICT REPLACE",
+        )
+        strict_sql = _LEGACY_PRIVATE_ROOMS_SQL.replace(
+            "TIMESTAMP", "TEXT"
+        ).strip() + " STRICT"
+        cases = (
+            ("check_collate", check_collate_sql, "保持できないテーブル機能"),
+            ("generated", generated_sql, "保持できないテーブル機能"),
+            (
+                "without_rowid",
+                _LEGACY_PRIVATE_ROOMS_SQL.strip() + " WITHOUT ROWID",
+                "保持できないテーブル機能",
+            ),
+            ("descending_pk", descending_pk_sql, "保持できないテーブル機能"),
+            ("on_conflict", conflict_sql, "保持できないテーブル機能"),
+            ("references", references_sql, "未定義外部キー"),
+            ("strict", strict_sql, "private_rooms.created_atの型=TEXT"),
+        )
+        original_test_path = database.DB_PATH
+        try:
+            for case_name, table_sql, error_pattern in cases:
+                with self.subTest(feature=case_name):
+                    database.DB_PATH = str(
+                        Path(self._tmp.name) / f"unsafe-{case_name}.db"
+                    )
+                    await database.init_db()
+                    async with database.connect_db() as db:
+                        await db.execute("PRAGMA foreign_keys = OFF")
+                        await db.execute(
+                            "CREATE TABLE private_room_parents "
+                            "(id INTEGER PRIMARY KEY)"
+                        )
+                        await db.execute("DROP TABLE private_rooms")
+                        await db.execute(table_sql)
+                        await db.commit()
+                        schema_before = await db.execute_fetchall(
+                            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                            "ORDER BY type, name"
+                        )
+                        schema_version_before = (await db.execute_fetchall(
+                            "PRAGMA schema_version"
+                        ))[0][0]
+
+                    with self.assertRaisesRegex(RuntimeError, error_pattern):
+                        await database.init_db()
+
+                    async with database.connect_db() as db:
+                        schema_after = await db.execute_fetchall(
+                            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                            "ORDER BY type, name"
+                        )
+                        schema_version_after = (await db.execute_fetchall(
+                            "PRAGMA schema_version"
+                        ))[0][0]
+                    self.assertEqual(schema_after, schema_before)
+                    self.assertEqual(schema_version_after, schema_version_before)
+        finally:
+            database.DB_PATH = original_test_path
+
+    async def test_manual_owner_unique_index_is_rejected_without_changes(self) -> None:
+        """origin='c'のowner UNIQUEを旧テーブル制約と誤認して削除しない。"""
+        async with database.connect_db() as db:
+            await db.execute(
+                "CREATE UNIQUE INDEX private_rooms_owner_manual "
+                "ON private_rooms(guild_id, owner_id)"
+            )
+            await db.commit()
+            schema_before = await db.execute_fetchall(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+            )
+            schema_version_before = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+
+        with self.assertRaisesRegex(RuntimeError, "手動owner UNIQUE"):
+            await database.init_db()
+
+        async with database.connect_db() as db:
+            schema_after = await db.execute_fetchall(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+            )
+            schema_version_after = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+            index_row = next(
+                row for row in await db.execute_fetchall(
+                    "PRAGMA index_list(private_rooms)"
+                )
+                if row[1] == "private_rooms_owner_manual"
+            )
+
+        self.assertEqual(schema_after, schema_before)
+        self.assertEqual(schema_version_after, schema_version_before)
+        self.assertEqual(index_row[3], "c")
+
+    async def test_unknown_table_unique_constraint_is_rejected_without_changes(
+        self,
+    ) -> None:
+        """再現方法が不明な追加table UNIQUEを黙って消さない。"""
+        unknown_unique_sql = _LEGACY_PRIVATE_ROOMS_SQL.replace(
+            "UNIQUE (guild_id, owner_id),",
+            "UNIQUE (guild_id, owner_id),\n"
+            "        UNIQUE (guild_id, legacy_note),",
+        )
+        async with database.connect_db() as db:
+            await db.execute("PRAGMA foreign_keys = OFF")
+            await db.execute("DROP TABLE private_rooms")
+            await db.execute(unknown_unique_sql)
+            await db.commit()
+            schema_before = await db.execute_fetchall(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+            )
+            schema_version_before = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+
+        with self.assertRaisesRegex(RuntimeError, "未対応の追加UNIQUE"):
+            await database.init_db()
+
+        async with database.connect_db() as db:
+            schema_after = await db.execute_fetchall(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+            )
+            schema_version_after = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+
+        self.assertEqual(schema_after, schema_before)
+        self.assertEqual(schema_version_after, schema_version_before)
+
+    async def test_new_foreign_key_violation_in_unused_table_rolls_back(self) -> None:
+        """管理対象外でも、init_db中に新しく生じた孤児だけは拒否する。"""
+        async with database.connect_db() as db:
+            await db.execute(
+                "CREATE TABLE unused_parents (id INTEGER PRIMARY KEY)"
+            )
+            await db.execute("""
+                CREATE TABLE unused_children (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER NOT NULL,
+                    FOREIGN KEY (parent_id) REFERENCES unused_parents(id)
+                )
+            """)
+            await db.execute("INSERT INTO unused_parents (id) VALUES (1)")
+            await db.execute(
+                "INSERT INTO unused_children (id, parent_id) VALUES (1, 1)"
+            )
+            await db.commit()
+
+        async def introduce_violation(db) -> bool:
+            await db.execute("DELETE FROM unused_parents WHERE id=1")
+            return False
+
+        with patch.object(
+            database, "_migrate_private_rooms_multi_owner", new=introduce_violation,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "新しい外部キー違反"):
+                await database.init_db()
+
+        async with database.connect_db() as db:
+            parent_count = (await db.execute_fetchall(
+                "SELECT COUNT(*) FROM unused_parents"
+            ))[0][0]
+            violations = await database._foreign_key_violation_counts(db)
+        self.assertEqual(parent_count, 1)
+        self.assertFalse(violations)
+
+    async def test_new_duplicate_without_rowid_fk_violation_is_not_collapsed(
+        self,
+    ) -> None:
+        """rowid=NULLの同一違反も件数差分で検出し、追加行をrollbackする。"""
+        violation_key = (
+            "unused_without_rowid_children",
+            None,
+            "unused_without_rowid_parents",
+            0,
+        )
+        async with database.connect_db() as db:
+            await db.execute("PRAGMA foreign_keys = OFF")
+            await db.execute(
+                "CREATE TABLE unused_without_rowid_parents "
+                "(id INTEGER PRIMARY KEY)"
+            )
+            await db.execute("""
+                CREATE TABLE unused_without_rowid_children (
+                    child_key INTEGER NOT NULL,
+                    parent_id INTEGER NOT NULL,
+                    PRIMARY KEY (child_key),
+                    FOREIGN KEY (parent_id)
+                        REFERENCES unused_without_rowid_parents(id)
+                ) WITHOUT ROWID
+            """)
+            await db.executemany(
+                "INSERT INTO unused_without_rowid_children "
+                "(child_key, parent_id) VALUES (?, 999)",
+                ((1,), (2,)),
+            )
+            await db.commit()
+            counts_before = await database._foreign_key_violation_counts(db)
+        self.assertEqual(counts_before[violation_key], 2)
+
+        async def introduce_same_violation(db) -> bool:
+            await db.execute(
+                "INSERT INTO unused_without_rowid_children "
+                "(child_key, parent_id) VALUES (3, 999)"
+            )
+            return False
+
+        with patch.object(
+            database,
+            "_migrate_private_rooms_multi_owner",
+            new=introduce_same_violation,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "新しい外部キー違反"):
+                await database.init_db()
+
+        async with database.connect_db() as db:
+            counts_after = await database._foreign_key_violation_counts(db)
+            child_count = (await db.execute_fetchall(
+                "SELECT COUNT(*) FROM unused_without_rowid_children"
+            ))[0][0]
+        self.assertEqual(counts_after[violation_key], 2)
+        self.assertEqual(child_count, 2)
 
     async def test_init_db_rejects_partial_private_room_unique_keys(self) -> None:
         async with database.connect_db() as db:
@@ -431,6 +874,305 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         finally:
             database.DB_PATH = original_test_db_path
 
+    async def test_private_room_migration_rolls_back_on_later_validation_failure(
+        self,
+    ) -> None:
+        """親テーブル再構築後に募集検証が失敗してもschema/dataを変えない。"""
+        async with database.connect_db() as db:
+            await self._install_legacy_private_rooms(db)
+            await db.execute(
+                "INSERT INTO private_rooms "
+                "(guild_id, room_id, owner_id, room_name, legacy_note) "
+                "VALUES (1, 'private_10', 10, '十村', '元の値')"
+            )
+            await db.execute(
+                "CREATE INDEX private_rooms_legacy_lookup "
+                "ON private_rooms(legacy_note)"
+            )
+            await db.execute("""
+                CREATE TRIGGER private_rooms_legacy_guard
+                BEFORE UPDATE OF legacy_note ON private_rooms
+                BEGIN
+                    SELECT CASE WHEN NEW.legacy_note = ''
+                        THEN RAISE(ABORT, '空値') END;
+                END
+            """)
+            await db.execute(
+                "INSERT INTO recruitments "
+                "(id, guild_id, host_id, title, scheduled_at, room_id, status) "
+                "VALUES (1, 1, 10, '不整合', '2099-01-01T00:00:00', "
+                "'missing_room', ?)",
+                (database.RECRUITMENT_OPEN,),
+            )
+            await db.commit()
+            schema_before = await db.execute_fetchall(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+            )
+            schema_version_before = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+
+        with self.assertRaisesRegex(RuntimeError, "未終了募集が村主"):
+            await database.init_db()
+
+        async with database.connect_db() as db:
+            schema_after = await db.execute_fetchall(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+            )
+            schema_version_after = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+            room = (await db.execute_fetchall(
+                "SELECT owner_id, legacy_note FROM private_rooms "
+                "WHERE guild_id=1 AND room_id='private_10'"
+            ))[0]
+
+        self.assertEqual(schema_after, schema_before)
+        self.assertEqual(schema_version_after, schema_version_before)
+        self.assertEqual(tuple(room), (10, "元の値"))
+
+    async def test_record_table_migration_rolls_back_on_later_validation_failure(
+        self,
+    ) -> None:
+        """追加型移行も、後段失敗時に列・テーブルを一切残さない。"""
+        record_tables = (
+            "recruitment_call_deliveries",
+            "recruitment_calls",
+            "game_co_events",
+            "game_co_results",
+            "game_vote_events",
+            "game_night_actions",
+            "user_notification_prefs",
+            "game_turn_events",
+        )
+        async with database.connect_db() as db:
+            await db.execute("PRAGMA foreign_keys = OFF")
+            for table_name in record_tables:
+                await db.execute(f"DROP TABLE {table_name}")
+            await db.execute("ALTER TABLE games DROP COLUMN started_at")
+            await db.execute("ALTER TABLE game_settlements DROP COLUMN started_at")
+            await db.execute(
+                "INSERT INTO recruitments "
+                "(id, guild_id, host_id, title, scheduled_at, room_id, status) "
+                "VALUES (1, 1, 10, '不整合', '2099-01-01T00:00:00', "
+                "'missing_room', ?)",
+                (database.RECRUITMENT_OPEN,),
+            )
+            await db.commit()
+            schema_before = await db.execute_fetchall(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+            )
+            schema_version_before = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+
+        with self.assertRaisesRegex(RuntimeError, "未終了募集が村主"):
+            await database.init_db()
+
+        async with database.connect_db() as db:
+            schema_after = await db.execute_fetchall(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+            )
+            schema_version_after = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+            tables_after = {
+                str(row[0]) for row in await db.execute_fetchall(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            games_columns = {
+                str(row[1]) for row in await db.execute_fetchall(
+                    "PRAGMA table_info(games)"
+                )
+            }
+            settlement_columns = {
+                str(row[1]) for row in await db.execute_fetchall(
+                    "PRAGMA table_info(game_settlements)"
+                )
+            }
+
+        self.assertEqual(schema_after, schema_before)
+        self.assertEqual(schema_version_after, schema_version_before)
+        self.assertTrue(set(record_tables).isdisjoint(tables_after))
+        self.assertNotIn("started_at", games_columns)
+        self.assertNotIn("started_at", settlement_columns)
+
+    async def test_init_db_rejects_duplicate_unfinished_recruitments_unchanged(
+        self,
+    ) -> None:
+        """同じ村のOPEN/HELD複数行は復元前にDB無変更で拒否する。"""
+        await database.save_private_room(1, "private_10", 10, "十村")
+        async with database.connect_db() as db:
+            for recruitment_id, status in (
+                (1, database.RECRUITMENT_OPEN),
+                (2, database.RECRUITMENT_HELD),
+            ):
+                await db.execute(
+                    "INSERT INTO recruitments "
+                    "(id, guild_id, host_id, title, scheduled_at, room_id, status) "
+                    "VALUES (?, 1, 10, ?, ?, 'private_10', ?)",
+                    (
+                        recruitment_id,
+                        f"募集{recruitment_id}",
+                        f"2099-01-0{recruitment_id}T00:00:00",
+                        status,
+                    ),
+                )
+            await db.commit()
+            rows_before = await db.execute_fetchall(
+                "SELECT id, status FROM recruitments ORDER BY id"
+            )
+            schema_version_before = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+
+        with self.assertRaisesRegex(RuntimeError, "複数の未終了募集"):
+            await database.init_db()
+
+        async with database.connect_db() as db:
+            rows_after = await db.execute_fetchall(
+                "SELECT id, status FROM recruitments ORDER BY id"
+            )
+            schema_version_after = (await db.execute_fetchall(
+                "PRAGMA schema_version"
+            ))[0][0]
+
+        self.assertEqual(rows_after, rows_before)
+        self.assertEqual(schema_version_after, schema_version_before)
+
+    async def test_archived_recruitment_history_is_not_an_unfinished_duplicate(
+        self,
+    ) -> None:
+        """同じ村の終了履歴は何件残っていても起動互換を保つ。"""
+        await database.save_private_room(1, "private_10", 10, "十村")
+        async with database.connect_db() as db:
+            for recruitment_id, status in (
+                (1, database.RECRUITMENT_ARCHIVED),
+                (2, database.RECRUITMENT_ARCHIVED),
+                (3, database.RECRUITMENT_OPEN),
+            ):
+                await db.execute(
+                    "INSERT INTO recruitments "
+                    "(id, guild_id, host_id, title, scheduled_at, room_id, status) "
+                    "VALUES (?, 1, 10, ?, ?, 'private_10', ?)",
+                    (
+                        recruitment_id,
+                        f"募集{recruitment_id}",
+                        f"2099-01-0{recruitment_id}T00:00:00",
+                        status,
+                    ),
+                )
+            await db.commit()
+
+        await database.init_db()
+        async with database.connect_db() as db:
+            count = (await db.execute_fetchall(
+                "SELECT COUNT(*) FROM recruitments WHERE room_id='private_10'"
+            ))[0][0]
+        self.assertEqual(count, 3)
+
+    async def test_create_recruitment_rejects_existing_held_row(self) -> None:
+        """通常API自身も、次回起動で拒否される未終了重複を生成しない。"""
+        await database.save_private_room(1, "private_10", 10, "十村")
+        await database.mark_private_room_active(1, "private_10", category_id=100)
+        first = await database.create_recruitment(
+            1,
+            10,
+            title="開催中",
+            scheduled_at="2099-01-01T00:00:00+00:00",
+            room_id="private_10",
+            variant_id="v13_cross",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        await database.set_recruitment_status(first, database.RECRUITMENT_HELD)
+
+        with self.assertRaisesRegex(database.RecruitmentConflict, "未終了"):
+            await database.create_recruitment(
+                1,
+                10,
+                title="将来募集",
+                scheduled_at="2099-01-03T00:00:00+00:00",
+                room_id="private_10",
+                variant_id="v13_cross",
+                streaming=False,
+                allowed_ranks=None,
+            )
+
+    async def test_status_transition_cannot_reopen_over_an_unfinished_recruitment(
+        self,
+    ) -> None:
+        """OPEN/HELDへのCASも、同じ村の別未終了募集を原子的に拒否する。"""
+        await database.save_private_room(1, "private_10", 10, "十村")
+        await database.mark_private_room_active(1, "private_10", category_id=100)
+        first = await database.create_recruitment(
+            1,
+            10,
+            title="過去募集",
+            scheduled_at="2099-01-01T00:00:00+00:00",
+            room_id="private_10",
+            variant_id="v13_cross",
+            streaming=False,
+            allowed_ranks=None,
+        )
+        self.assertTrue(await database.set_recruitment_status(
+            first, database.RECRUITMENT_ARCHIVED,
+        ))
+        second = await database.create_recruitment(
+            1,
+            10,
+            title="現行募集",
+            scheduled_at="2099-01-02T00:00:00+00:00",
+            room_id="private_10",
+            variant_id="v13_cross",
+            streaming=False,
+            allowed_ranks=None,
+        )
+
+        for target_status in (
+            database.RECRUITMENT_OPEN,
+            database.RECRUITMENT_HELD,
+        ):
+            with self.subTest(target_status=target_status):
+                with self.assertRaisesRegex(
+                    database.RecruitmentConflict, "別の未終了募集",
+                ):
+                    await database.set_recruitment_status(
+                        first,
+                        target_status,
+                        expected_status=database.RECRUITMENT_ARCHIVED,
+                    )
+
+        async with database.connect_db() as db:
+            rows = await db.execute_fetchall(
+                "SELECT id, status FROM recruitments WHERE id IN (?, ?) "
+                "ORDER BY id",
+                (first, second),
+            )
+        self.assertEqual(
+            rows,
+            [
+                (first, database.RECRUITMENT_ARCHIVED),
+                (second, database.RECRUITMENT_OPEN),
+            ],
+        )
+
+        self.assertTrue(await database.set_recruitment_status(
+            second, database.RECRUITMENT_ARCHIVED,
+        ))
+        self.assertTrue(await database.set_recruitment_status(
+            first,
+            database.RECRUITMENT_HELD,
+            expected_status=database.RECRUITMENT_ARCHIVED,
+        ))
+        # stale expected_statusは更新せずFalseを返す既存CAS契約を維持する。
+        self.assertFalse(await database.set_recruitment_status(
+            first,
+            database.RECRUITMENT_OPEN,
+            expected_status=database.RECRUITMENT_ARCHIVED,
+        ))
+
     async def test_init_db_repairs_indexes_once_without_rebuilding_current_schema(self) -> None:
         index_names = tuple(database._CURRENT_INDEX_DEFINITIONS)
         async with database.connect_db() as db:
@@ -525,8 +1267,188 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         rapid_files = list((Path(self._tmp.name) / "backups").glob("*_rapid.db"))
         self.assertEqual(len(rapid_files), 2)
 
-    async def test_backup_retention_also_removes_wal_and_shm(self) -> None:
-        """本体だけ消すと -wal / -shm が孤児として溜まり続ける。
+    async def test_backup_is_validated_before_atomic_publication(self) -> None:
+        """公開された完成名は単独で整合し、一時ファイルを残さない。"""
+        backup_dir = Path(self._tmp.name) / "validated-backups"
+        original_backup_dir = database.BACKUP_DIR
+        database.BACKUP_DIR = backup_dir
+        await database.save_private_room(1, "private_10", 10, "十村")
+        # 管理対象外の旧テーブルに元からある孤児は、起動契約と同じく許容する。
+        async with database.connect_db() as db:
+            await db.execute("PRAGMA foreign_keys = OFF")
+            await db.execute(
+                "CREATE TABLE backup_unused_parents (id INTEGER PRIMARY KEY)"
+            )
+            await db.execute("""
+                CREATE TABLE backup_unused_children (
+                    id INTEGER PRIMARY KEY,
+                    parent_id INTEGER NOT NULL,
+                    FOREIGN KEY (parent_id) REFERENCES backup_unused_parents(id)
+                )
+            """)
+            await db.execute(
+                "INSERT INTO backup_unused_children (id, parent_id) VALUES (1, 999)"
+            )
+            await db.commit()
+        try:
+            backup = await database.backup_db(label="validated", keep=2)
+        finally:
+            database.BACKUP_DIR = original_backup_dir
+
+        assert backup is not None
+        backup_path = Path(backup)
+        self.assertTrue(backup_path.exists())
+        self.assertEqual(backup_path.parent, backup_dir)
+        self.assertFalse(Path(f"{backup_path}-wal").exists())
+        self.assertFalse(Path(f"{backup_path}-shm").exists())
+        self.assertFalse(Path(f"{backup_path}-journal").exists())
+        self.assertFalse(any(".tmp" in path.name for path in backup_dir.iterdir()))
+
+        async with database.aiosqlite.connect(str(backup_path)) as db:
+            integrity = await db.execute_fetchall("PRAGMA integrity_check")
+            await database._validate_foreign_key_integrity(db)
+            legacy_violations = await database._foreign_key_violation_counts(db)
+            room_count = (await db.execute_fetchall(
+                "SELECT COUNT(*) FROM private_rooms "
+                "WHERE guild_id=1 AND room_id='private_10'"
+            ))[0][0]
+        self.assertEqual(integrity, [("ok",)])
+        self.assertEqual(room_count, 1)
+        self.assertEqual(
+            {violation[0] for violation in legacy_violations},
+            {"backup_unused_children"},
+        )
+
+    async def test_backup_integrity_validator_rejects_non_ok_result(self) -> None:
+        """integrity_checkがok以外なら公開前検証を失敗させる。"""
+        db = SimpleNamespace(
+            execute_fetchall=AsyncMock(return_value=[("page 3 is malformed",)]),
+        )
+        with self.assertRaisesRegex(RuntimeError, "integrity_check"):
+            await database._validate_backup_copy(db)
+        db.execute_fetchall.assert_awaited_once_with("PRAGMA integrity_check")
+
+    async def test_backup_wal_checkpoint_failure_is_not_published(self) -> None:
+        """WALを本体へ回収できないtempは完成名にしない。"""
+        backup_dir = Path(self._tmp.name) / "checkpoint-failed-backups"
+        original_backup_dir = database.BACKUP_DIR
+        database.BACKUP_DIR = backup_dir
+        try:
+            good_backup = await database.backup_db(label="keep1", keep=1)
+            assert good_backup is not None
+            with patch.object(
+                database.aiosqlite.Connection,
+                "execute_fetchall",
+                new=AsyncMock(return_value=[(1, 0, 0)]),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "WALチェックポイント"):
+                    await database.backup_db(label="keep1", keep=1)
+        finally:
+            database.BACKUP_DIR = original_backup_dir
+
+        self.assertTrue(Path(good_backup).exists())
+        self.assertEqual(set(backup_dir.glob("*.db")), {Path(good_backup)})
+        self.assertFalse(any(".tmp" in path.name for path in backup_dir.iterdir()))
+
+    async def test_vote_abstention_record_is_idempotent_across_retry(self) -> None:
+        first = await database.record_vote_abstention_once(
+            1, "open", "run-abstention",
+            event_seq=1,
+            day_number=2,
+            vote_kind="本投票",
+            round_index=0,
+            voter_id=10,
+            voter_number=3,
+        )
+        second = await database.record_vote_abstention_once(
+            1, "open", "run-abstention",
+            event_seq=2,
+            day_number=2,
+            vote_kind="本投票",
+            round_index=0,
+            voter_id=10,
+            voter_number=3,
+        )
+
+        async with database.connect_db() as db:
+            rows = await db.execute_fetchall(
+                "SELECT event_seq, target_id FROM game_vote_events "
+                "WHERE game_run_id='run-abstention'"
+            )
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertEqual(rows, [(1, None)])
+
+    async def test_backup_validator_rejects_empty_schema(self) -> None:
+        """SQLiteとして正常でも、復元起動できない空DBは公開対象にしない。"""
+        async with database.aiosqlite.connect(":memory:") as db:
+            with self.assertRaisesRegex(RuntimeError, "現行スキーマ検査"):
+                await database._validate_backup_copy(db)
+
+    async def test_failed_backup_validation_leaves_no_artifact_or_retention_changes(
+        self,
+    ) -> None:
+        """検証失敗時はtempを消し、既存の正常世代を世代落ちさせない。"""
+        backup_dir = Path(self._tmp.name) / "failed-backups"
+        original_backup_dir = database.BACKUP_DIR
+        database.BACKUP_DIR = backup_dir
+        try:
+            good_backup = await database.backup_db(label="keep1", keep=1)
+            assert good_backup is not None
+            # 成功後整理なら回収される旧sidecar。失敗時には触れないことを確認。
+            old_orphan = backup_dir / "test_20000101_000000_000000_old.db-wal"
+            old_orphan.write_bytes(b"")
+
+            # SQLite本体のintegrity_checkは通るが、現行管理FKが壊れたDBを再現。
+            async with database.connect_db() as db:
+                await db.execute("PRAGMA foreign_keys = OFF")
+                await db.execute(
+                    "INSERT INTO game_players "
+                    "(game_id, player_id, role, team, won) "
+                    "VALUES (999999, 1, 'villager', 'village', 0)"
+                )
+                await db.commit()
+
+            with self.assertRaisesRegex(RuntimeError, "外部キー整合性検査"):
+                await database.backup_db(label="keep1", keep=1)
+        finally:
+            database.BACKUP_DIR = original_backup_dir
+
+        self.assertTrue(Path(good_backup).exists())
+        self.assertTrue(old_orphan.exists())
+        self.assertEqual(set(backup_dir.glob("*.db")), {Path(good_backup)})
+        self.assertFalse(any(".tmp" in path.name for path in backup_dir.iterdir()))
+
+    async def test_failed_backup_schema_validation_keeps_final_and_retention(
+        self,
+    ) -> None:
+        """不足schemaのコピーを公開せず、既存世代・孤児sidecarも触らない。"""
+        backup_dir = Path(self._tmp.name) / "failed-schema-backups"
+        original_backup_dir = database.BACKUP_DIR
+        database.BACKUP_DIR = backup_dir
+        try:
+            good_backup = await database.backup_db(label="keep1", keep=1)
+            assert good_backup is not None
+            old_orphan = backup_dir / "test_20000101_000000_000000_old.db-wal"
+            old_orphan.write_bytes(b"")
+
+            async with database.connect_db() as db:
+                await db.execute("PRAGMA foreign_keys = OFF")
+                await db.execute("DROP TABLE game_stats")
+                await db.commit()
+
+            with self.assertRaisesRegex(RuntimeError, "現行スキーマ検査"):
+                await database.backup_db(label="keep1", keep=1)
+        finally:
+            database.BACKUP_DIR = original_backup_dir
+
+        self.assertTrue(Path(good_backup).exists())
+        self.assertTrue(old_orphan.exists())
+        self.assertEqual(set(backup_dir.glob("*.db")), {Path(good_backup)})
+        self.assertFalse(any(".tmp" in path.name for path in backup_dir.iterdir()))
+
+    async def test_backup_retention_removes_all_sqlite_sidecars(self) -> None:
+        """本体だけ消すとSQLite sidecarが孤児として溜まり続ける。
 
         バックアップ先がWALモードだとSQLiteが同名の -wal / -shm を作る。
         世代を捨てるときに一緒に消さないと、.db を消してもディスクを
@@ -537,11 +1459,11 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
         database.BACKUP_DIR = backup_dir
         try:
             first = await database.backup_db(label="keep1", keep=1)
-            # 作成直後はチェックポイント済みでサイドカーが残らない
-            self.assertFalse(Path(f"{first}-wal").exists())
-            self.assertFalse(Path(f"{first}-shm").exists())
+            # 作成直後はチェックポイント済みでsidecarが残らない
+            for suffix in database._SQLITE_BACKUP_SIDECAR_SUFFIXES:
+                self.assertFalse(Path(f"{first}{suffix}").exists())
             # 過去にSQLiteが残していたぶんを再現する
-            for suffix in ("-wal", "-shm"):
+            for suffix in database._SQLITE_BACKUP_SIDECAR_SUFFIXES:
                 Path(f"{first}{suffix}").write_bytes(b"")
             # 本体だけ消していた頃の取り残しも用意する
             # (DB_PATH の stem は asyncSetUp で "test")
@@ -554,8 +1476,8 @@ class PlatformDatabaseTest(unittest.IsolatedAsyncioTestCase):
 
         # 世代落ちした first は本体もサイドカーも残さない
         self.assertFalse(Path(first).exists())
-        self.assertFalse(Path(f"{first}-wal").exists())
-        self.assertFalse(Path(f"{first}-shm").exists())
+        for suffix in database._SQLITE_BACKUP_SIDECAR_SUFFIXES:
+            self.assertFalse(Path(f"{first}{suffix}").exists())
         # 過去の取り残しも回収する
         self.assertFalse(orphan.exists())
         # 残す世代には手を付けない

@@ -14,8 +14,13 @@ end containsBot
 set configuredDir to system attribute "WEREWOLF_BOT_DIR"
 set publicDir to (POSIX path of (path to desktop folder)) & "rank-werewolf-bot"
 set legacyDir to (POSIX path of (path to desktop folder)) & "bot"
-if configuredDir is not "" and containsBot(configuredDir) then
-	set botDir to configuredDir
+if configuredDir is not "" then
+	if containsBot(configuredDir) then
+		set botDir to configuredDir
+	else
+		display notification "WEREWOLF_BOT_DIR にBotが見つかりません" with title "人狼Bot"
+		return
+	end if
 else if containsBot(legacyDir) then
 	set botDir to legacyDir
 else if containsBot(publicDir) then

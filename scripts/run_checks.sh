@@ -5,7 +5,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 PY=.venv/bin/python
-[[ -x $PY ]] || PY=python3
+if [[ ! -x $PY ]]; then
+  print -u2 "Missing virtual environment. Run ./scripts/setup_venv.sh first."
+  exit 1
+fi
 
 echo "== Python runtime =="
 "$PY" -c 'import sys; print(sys.version); raise SystemExit(0 if sys.version_info[:2] == (3, 14) else "Python 3.14 is required")'
@@ -17,6 +20,7 @@ echo "OK"
 
 echo "== dependency consistency =="
 "$PY" -m pip check
+"$PY" scripts/verify_dependency_lock.py
 
 echo "== unit tests =="
 # -t . が無いと tests/ 自身が top-level 扱いになり tests/__init__.py の

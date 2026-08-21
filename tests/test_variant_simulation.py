@@ -7,6 +7,7 @@ from collections import Counter
 from pathlib import Path
 from random import Random
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -288,6 +289,38 @@ class VariantSimulationPlanTest(unittest.TestCase):
         self.assertGreaterEqual(
             sum(count == max_votes for count in tally.values()),
             2,
+        )
+
+
+class SimulationTemporaryDatabaseCleanupTest(unittest.IsolatedAsyncioTestCase):
+    async def _assert_init_failure_restores_path(self, run) -> None:
+        original_path = simulate_games.database.DB_PATH
+        temporary_paths: list[Path] = []
+
+        async def fail_init() -> None:
+            temporary_paths.append(Path(simulate_games.database.DB_PATH))
+            raise RuntimeError("init failed")
+
+        with patch.object(simulate_games.database, "init_db", side_effect=fail_init):
+            with self.assertRaisesRegex(RuntimeError, "init failed"):
+                await run()
+
+        self.assertEqual(simulate_games.database.DB_PATH, original_path)
+        self.assertEqual(len(temporary_paths), 1)
+        self.assertFalse(temporary_paths[0].parent.exists())
+
+    async def test_single_private_temp_restores_db_path_when_init_fails(self) -> None:
+        await self._assert_init_failure_restores_path(
+            lambda: simulate_games._run_simulations_with_private_temp(1)
+        )
+
+    async def test_population_private_temp_restores_db_path_when_init_fails(self) -> None:
+        await self._assert_init_failure_restores_path(
+            lambda: simulate_games._run_population_simulation_with_private_temp(
+                population_size=13,
+                min_games=1,
+                seed=1,
+            )
         )
 
 

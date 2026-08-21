@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import database
+from scripts import bot_runtime_guard
 from scripts import purge_preseason_stats
 from scripts import purge_preseason_stats as purge
 
@@ -24,7 +25,7 @@ class PurgePreseasonStatsLockTest(unittest.TestCase):
             with (
                 patch.dict(os.environ, {"WEREWOLF_BOT_LOCK_FILE": str(lock_path)}),
                 patch.object(
-                    purge_preseason_stats.fcntl,
+                    bot_runtime_guard.fcntl,
                     "flock",
                     side_effect=BlockingIOError,
                 ),
@@ -43,7 +44,7 @@ class PurgePreseasonStatsLockTest(unittest.TestCase):
 
             with (
                 patch.dict(os.environ, {"WEREWOLF_BOT_LOCK_FILE": str(lock_path)}),
-                patch.object(purge_preseason_stats.fcntl, "flock", record_lock),
+                patch.object(bot_runtime_guard.fcntl, "flock", record_lock),
             ):
                 with purge_preseason_stats._bot_stopped_guard():
                     self.assertTrue(lock_path.exists())

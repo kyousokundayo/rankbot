@@ -28,16 +28,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import fcntl
-import os
 import sys
-import tempfile
-from contextlib import contextmanager
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from dotenv import load_dotenv
+
+BOT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BOT_DIR))
+load_dotenv(BOT_DIR / ".env")
 
 import database  # noqa: E402
+from scripts.bot_runtime_guard import bot_stopped_guard as _bot_stopped_guard  # noqa: E402
 
 # 試合1件から伸びている記録。games を最後に消せるよう、参照している側から並べる。
 # レート本体 (player_ratings ほか) は既定では残す。--reset-ratings 指定時だけ
@@ -69,54 +70,6 @@ _RATING_TABLES = (
 )
 
 _EXECUTE_CONFIRMATION = "ERASE-PRESEASON"
-
-
-def _bot_lock_path() -> Path:
-    runtime_dir = Path(
-        os.getenv(
-            "WEREWOLF_BOT_RUNTIME_DIR",
-            str(Path(tempfile.gettempdir()) / f"werewolf-bot-{os.getuid()}"),
-        )
-    ).expanduser().absolute()
-    return Path(
-        os.getenv("WEREWOLF_BOT_LOCK_FILE", str(runtime_dir / "bot.lock"))
-    ).expanduser().absolute()
-
-
-@contextmanager
-def _bot_stopped_guard():
-    """Bot本体と同じロックを保持し、稼働中と同時にDBを変更させない。"""
-    lock_path = _bot_lock_path()
-    parent = lock_path.parent
-    if parent.is_symlink() or lock_path.is_symlink():
-        raise RuntimeError(f"安全なBotロックではありません: {lock_path}")
-    try:
-        parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if parent.is_symlink() or parent.stat().st_uid != os.getuid():
-            raise RuntimeError(f"Botロックの所有者を確認できません: {lock_path}")
-        handle = lock_path.open("a+", encoding="utf-8")
-    except OSError as exc:
-        raise RuntimeError(f"Bot停止状態を確認できません: {lock_path}") from exc
-
-    acquired = False
-    try:
-        if lock_path.is_symlink() or lock_path.stat().st_uid != os.getuid():
-            raise RuntimeError(f"安全なBotロックではありません: {lock_path}")
-        try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RuntimeError(
-                "人狼Botが稼働中です。Botを停止してから実行してください。"
-            ) from exc
-        acquired = True
-        yield
-    finally:
-        if acquired:
-            try:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-        handle.close()
 
 
 async def _counts(db, tables: tuple[str, ...]) -> dict[str, int]:

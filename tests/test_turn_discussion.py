@@ -11,7 +11,13 @@ import discord
 from config import Phase, Role, RoomDefinition, Team, get_variant_definition
 from models import GameState, Player
 from room_runner import RoomRunner, StateDurabilityError, turn_timer_should_update
-from views import TurnSpeechView, VoteView, build_help_embeds, build_rule_embeds
+from views import (
+    RunoffVoteView,
+    TurnSpeechView,
+    VoteView,
+    build_help_embeds,
+    build_rule_embeds,
+)
 
 
 class FakeManager:
@@ -927,7 +933,9 @@ class TurnSimultaneousVoteTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(runner.state.phase, Phase.DAY_VOTE)
         self.assertEqual(runner.state.vote_day_generation, 3)
+        self.assertTrue(runner.state.vote_closed)
         runner._persist_room_state.assert_awaited()
+        runner._resolve_day_vote.assert_awaited_once_with({})
 
     async def test_closed_turn_vote_resumes_closed_without_losing_votes(self) -> None:
         """GM締切後に再起動しても投票を再開せず、保存済み票を集計する。"""
@@ -940,6 +948,7 @@ class TurnSimultaneousVoteTest(unittest.IsolatedAsyncioTestCase):
         runner._repost_gm_panel = AsyncMock()
         runner._pausable_countdown = AsyncMock(return_value=True)
         runner._resolve_day_vote = AsyncMock(return_value=None)
+        runner._record_vote_abstentions = AsyncMock(return_value=True)
 
         await runner._day_vote_simultaneous()
 
@@ -948,6 +957,18 @@ class TurnSimultaneousVoteTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             runner.state.votes,
             {players[0].user_id: players[1].user_id},
+        )
+        runner._resolve_day_vote.assert_awaited_once_with(
+            {players[0].user_id: players[1].user_id}
+        )
+        abstainers = runner._record_vote_abstentions.await_args.args[0]
+        self.assertEqual(
+            {player.user_id for player in abstainers},
+            {player.user_id for player in players[1:]},
+        )
+        self.assertEqual(
+            runner._record_vote_abstentions.await_args.args[1:],
+            ("本投票", 0),
         )
 
     async def test_closed_turn_vote_rejects_late_vote(self) -> None:
@@ -959,6 +980,79 @@ class TurnSimultaneousVoteTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             view._vote_error(players[0].user_id, players[1].user_id),
+            "投票受付は終了しました。",
+        )
+
+    async def test_vote_close_lock_rejects_confirmation_queued_after_deadline(self) -> None:
+        """締切待ちが先なら、既に開いた確認Viewの確定も受付けない。"""
+        runner = make_runner("v9_turn")
+        players = add_players(runner, 9)
+        runner.state.phase = Phase.DAY_VOTE
+        view = VoteView(runner, candidates=players[1:], voters=players)
+
+        await runner.action_lock.acquire()
+        try:
+            close_task = asyncio.create_task(
+                runner._close_vote_and_snapshot("テスト投票締切")
+            )
+            await asyncio.sleep(0)
+            confirm_task = asyncio.create_task(
+                view.commit_vote(players[0].user_id, players[1].user_id)
+            )
+            await asyncio.sleep(0)
+        finally:
+            runner.action_lock.release()
+
+        snapshot = await close_task
+        message, committed = await confirm_task
+
+        self.assertEqual(snapshot, {})
+        self.assertFalse(committed)
+        self.assertIn("投票受付は終了", message)
+        self.assertEqual(runner.state.votes, {})
+
+    async def test_vote_confirmed_before_close_is_in_the_frozen_snapshot(self) -> None:
+        """締切lockより先に確定した票は、表示・集計用snapshotへ必ず入る。"""
+        runner = make_runner("v9_turn")
+        players = add_players(runner, 9)
+        runner.state.phase = Phase.DAY_VOTE
+        view = VoteView(runner, candidates=players[1:], voters=players)
+
+        with patch("views.database.record_vote_event", new=AsyncMock()):
+            await runner.action_lock.acquire()
+            try:
+                confirm_task = asyncio.create_task(
+                    view.commit_vote(players[0].user_id, players[1].user_id)
+                )
+                await asyncio.sleep(0)
+                close_task = asyncio.create_task(
+                    runner._close_vote_and_snapshot("テスト投票締切")
+                )
+                await asyncio.sleep(0)
+            finally:
+                runner.action_lock.release()
+            message, committed = await confirm_task
+            snapshot = await close_task
+
+        self.assertTrue(committed, message)
+        self.assertEqual(
+            snapshot,
+            {players[0].user_id: players[1].user_id},
+        )
+
+    async def test_closed_runoff_rejects_pending_confirmation(self) -> None:
+        runner = make_runner("v9_turn")
+        players = add_players(runner, 9)
+        runner.state.phase = Phase.DAY_RUNOFF_VOTE
+        runner.state.vote_closed = True
+        view = RunoffVoteView(
+            runner,
+            candidates=players[:2],
+            voters=players[2:],
+        )
+
+        self.assertEqual(
+            view._vote_error(players[2].user_id, players[0].user_id),
             "投票受付は終了しました。",
         )
 

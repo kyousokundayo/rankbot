@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,8 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+
+from scripts import bot_runtime_guard
 
 
 MODULE_PATH = Path(__file__).resolve().parent.parent / "scripts" / "start_bot_detached.py"
@@ -153,6 +156,78 @@ class TestPidValidation(unittest.TestCase):
         link.symlink_to(real, target_is_directory=True)
         with self.assertRaisesRegex(RuntimeError, "シンボリックリンク"):
             launcher._prepare_runtime_dir(link)
+
+    def test_launcher_and_operation_scripts_resolve_the_same_bot_lock(self):
+        runtime = self.root / "custom-runtime"
+        custom_lock = self.root / "custom-lock" / "bot.lock"
+        with mock.patch.dict(
+            os.environ,
+            {"WEREWOLF_BOT_RUNTIME_DIR": str(runtime)},
+            clear=True,
+        ):
+            self.assertEqual(
+                launcher._bot_lock_path(launcher._runtime_dir()),
+                bot_runtime_guard.bot_lock_path(),
+            )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "WEREWOLF_BOT_RUNTIME_DIR": str(runtime),
+                "WEREWOLF_BOT_LOCK_FILE": str(custom_lock),
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                launcher._bot_lock_path(launcher._runtime_dir()),
+                bot_runtime_guard.bot_lock_path(),
+            )
+
+    def test_timeout_env_requires_a_finite_positive_number(self):
+        name = "WEREWOLF_TEST_TIMEOUT"
+        for invalid in (
+            "0", "-1", "nan", "inf", "-inf", "3600.1", "1e300", "not-a-number",
+        ):
+            with self.subTest(invalid=invalid), mock.patch.dict(
+                os.environ, {name: invalid}
+            ):
+                with self.assertRaises(RuntimeError):
+                    launcher._parse_positive_finite_timeout(name, 5.0)
+
+        with mock.patch.dict(os.environ, {name: "1.25"}):
+            self.assertEqual(
+                launcher._parse_positive_finite_timeout(name, 5.0), 1.25
+            )
+        with mock.patch.dict(os.environ, {name: "3600"}):
+            self.assertEqual(
+                launcher._parse_positive_finite_timeout(name, 5.0), 3600.0
+            )
+
+    def test_launcher_logs_are_private(self):
+        log_dir = self.root / "logs"
+        launcher._prepare_private_log_directory(log_dir)
+        log_file = log_dir / "launcher.log"
+        log_file.write_bytes(b"old")
+        log_file.chmod(0o644)
+
+        with launcher._open_private_launcher_log(log_file) as output:
+            output.write(b"new")
+
+        self.assertEqual(stat.S_IMODE(log_dir.stat().st_mode), 0o700)
+        self.assertEqual(stat.S_IMODE(log_file.stat().st_mode), 0o600)
+        self.assertEqual(log_file.read_bytes(), b"oldnew")
+
+        rotated = log_dir / "launcher.log.1"
+        rotated.write_bytes(b"old rotation")
+        rotated.chmod(0o644)
+        launcher._harden_existing_private_log(rotated)
+        self.assertEqual(stat.S_IMODE(rotated.stat().st_mode), 0o600)
+
+        target = log_dir / "target.log"
+        target.write_bytes(b"target")
+        rotated.unlink()
+        rotated.symlink_to(target)
+        with self.assertRaisesRegex(RuntimeError, "安全な既存ログ"):
+            launcher._harden_existing_private_log(rotated)
 
     def test_launcher_operation_lock_serializes_concurrent_operations(self):
         runtime = self.root / "runtime"

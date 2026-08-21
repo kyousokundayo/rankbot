@@ -24,6 +24,7 @@ from config import (
     private_room_limit_for_roles,
     RECRUITMENT_NOTIFICATION_ROLE_NAME,
     BULK_DISCORD_API_INTERVAL,
+    MUTE_RETRY_DELAY,
     DEFAULT_LADDER_ID, LADDER_DEFINITIONS,
     ACTIVE_ROOM_DEFINITIONS,
     ROOM_DEFINITIONS, RoomDefinition,
@@ -527,7 +528,10 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             for room in self.rooms.values()
         )
 
-    async def _ensure_stats_channel(self, guild: discord.Guild) -> discord.TextChannel:
+    async def _resolve_stats_channel(
+        self, guild: discord.Guild,
+    ) -> discord.TextChannel:
+        """統計チャンネルを副作用なしで一意に解決する。"""
         # 一度確定したチャンネルはIDで追跡し、ユーザーが調整した位置や
         # カテゴリを起動時に変更しない。
         stats = None
@@ -543,24 +547,33 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 stats = candidate
 
         if stats is None:
-            candidates = sorted(
-                (channel for channel in guild.text_channels if channel.name == CH_STATS),
-                key=lambda channel: channel.id,
-            )
+            candidates = [
+                channel for channel in guild.text_channels if channel.name == CH_STATS
+            ]
+            if len(candidates) > 1:
+                raise RuntimeError(
+                    f"#{CH_STATS} が{len(candidates)}個あり、正本を特定できません。"
+                    "不要な重複を整理してから再起動してください。"
+                )
             stats = candidates[0] if candidates else None
         if stats is None:
-            general = next(
-                (
-                    channel for channel in guild.text_channels
-                    if channel.name == STATS_PARENT_CHANNEL_NAME
-                    and channel.category is None
-                ),
-                None,
+            raise RuntimeError(
+                f"既存の #{CH_STATS} が見つかりません。"
+                "Botは統計チャンネルを自動作成しないため、"
+                f"Discordで #{STATS_PARENT_CHANNEL_NAME} の直下に作成してから再起動してください。"
             )
-            create_options = {"category": None}
-            if general is not None:
-                create_options["position"] = general.position + 1
-            stats = await guild.create_text_channel(CH_STATS, **create_options)
+        return stats
+
+    async def _ensure_stats_channel(
+        self,
+        guild: discord.Guild,
+        *,
+        resolved: Optional[discord.TextChannel] = None,
+    ) -> discord.TextChannel:
+        """事前解決済みの統計チャンネルへ必要権限と保存IDだけを反映する。"""
+        stats = resolved
+        if stats is None or stats not in guild.text_channels:
+            stats = await self._resolve_stats_channel(guild)
         await database.set_meta(guild.id, "stats_channel_id", str(stats.id))
 
         try:
@@ -1444,6 +1457,9 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         `setup_channels` が起動中フラグを立てて呼ぶ。DBだけで済ませる事前確認
         (snapshots / 隔離ID) は呼び出し側で済ませ、結果をここへ渡す。
         """
+        # 不可逆な未精算ゲーム精算・ロール変更・専用村整理より先に、
+        # 手動配置の #統計 が一意に存在することを副作用なしで確認する。
+        stats_channel = await self._resolve_stats_channel(guild)
         await self._recover_pending_settlements(guild)
         await self.load_pending_unmutes(guild)
         await self._ensure_gm_staff_roles(guild)
@@ -1468,7 +1484,9 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         log.info("ルーム状態読み込み完了")
         await self._ensure_rank_roles(guild)
         log.info("ランクロール確認完了")
-        self.stats_channel = await self._ensure_stats_channel(guild)
+        self.stats_channel = await self._ensure_stats_channel(
+            guild, resolved=stats_channel,
+        )
         log.info(f"統計チャンネル確認完了: #{CH_STATS} (ID: {self.stats_channel.id})")
         if self._rating_recovery_needs_role_sync:
             try:
@@ -1869,7 +1887,12 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             return
         self.pending_unmutes[guild.id] = pending
 
-    async def _resolve_pending_unmute(self, member: discord.Member) -> None:
+    async def _resolve_pending_unmute(
+        self,
+        member: discord.Member,
+        *,
+        _retry_http: bool = True,
+    ) -> None:
         pending = self.pending_unmutes.get(member.guild.id)
         if not pending or member.id not in pending:
             return
@@ -1890,12 +1913,36 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                     role for role in member_roles_for_edit(member)
                     if not getattr(role, "name", "").startswith(MUTE_MARKER_ROLE_PREFIX)
                 ]
-            async with self.discord_api_sem:
-                await member.edit(
-                    **edit_kwargs, reason="人狼: 持ち越しミュート解除"
-                )
-        except (discord.Forbidden, discord.HTTPException) as e:
+            await self.paced_discord_api_call(
+                member.edit,
+                **edit_kwargs,
+                reason="人狼: 持ち越しミュート解除",
+            )
+        except discord.Forbidden as e:
             log.warning(f"持ち越しミュート解除失敗 ({member.display_name}): {e}")
+            return
+        except discord.HTTPException as e:
+            log.warning(f"持ち越しミュート解除失敗 ({member.display_name}): {e}")
+            if not _retry_http:
+                return
+            # 一時的なHTTP失敗だけ短時間後に1回再試行する。待機中に退出した、
+            # 別卓の進行中VCへ入った、別イベントが先に解除した場合は何もしない。
+            await asyncio.sleep(MUTE_RETRY_DELAY)
+            pending_now = self.pending_unmutes.get(member.guild.id)
+            voice_now = member.voice
+            channel_now = (
+                voice_now.channel
+                if voice_now is not None and voice_now.channel is not None
+                else None
+            )
+            if (
+                not pending_now
+                or member.id not in pending_now
+                or channel_now is None
+                or self.is_other_active_game_vc(channel_now.id)
+            ):
+                return
+            await self._resolve_pending_unmute(member, _retry_http=False)
             return
         pending.discard(member.id)
         try:
