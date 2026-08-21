@@ -240,12 +240,14 @@ class NicknameAndRemovalSafetyTest(unittest.IsolatedAsyncioTestCase):
         initial = SimpleNamespace(
             user=SimpleNamespace(id=1),
             data={"values": ["10"]},
-            response=SimpleNamespace(send_message=AsyncMock()),
+            # ロック待ちで応答期限を越えないよう、選択の受理は defer が先。
+            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
         )
 
         await view.select_callback(initial)
 
-        confirmation = initial.response.send_message.await_args.kwargs["view"]
+        confirmation = initial.followup.send.await_args.kwargs["view"]
         confirm_interaction = SimpleNamespace(
             user=SimpleNamespace(id=1),
             response=SimpleNamespace(defer=AsyncMock()),

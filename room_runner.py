@@ -4057,8 +4057,19 @@ class RoomRunner:
                 pass
             try:
                 await self._post_lobby_ui()
-            except Exception:
-                pass
+            except Exception as error:
+                # チャンネル作成が落ちた直後はDiscord側が不調なことが多く、
+                # ここも続けて失敗しやすい。黙って捨てると参加者が残った
+                # LOBBYから参加/取消・GM管理の操作口だけが消えるため、
+                # 他の復帰口と同じくログを残して再掲を予約する。
+                log.exception(
+                    "ゲーム開始失敗後の参加受付パネル再掲に失敗: %s", error,
+                )
+                self._schedule_lobby_panel_recovery(
+                    state,
+                    recruitment_id=state.recruitment_id,
+                    log_label="ゲーム開始失敗",
+                )
             return
 
         progress_message = await self._safe_village_send(
