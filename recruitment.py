@@ -2704,6 +2704,18 @@ class RecruitmentCreateModal(discord.ui.Modal, title="募集内容"):
         except RuntimeError as exc:
             await rollback_failed_creation()
             return await interaction.followup.send(str(exc), ephemeral=True)
+        except Exception:
+            # publish_new_recruitment は掲示できない理由をRuntimeErrorへ畳んで
+            # 返すが、その前段のDB読み出しが落ちると別の例外が素通りする。
+            # ここで拾わないと村とOPEN募集だけが残り、カードの無い受付を
+            # 次の再起動まで抱えることになる。上の作成ブロックと同じく回収する。
+            log.exception("募集カードの掲示で想定外の例外: %s", recruitment_id)
+            await rollback_failed_creation()
+            return await interaction.followup.send(
+                "募集カードを掲示できなかったため、作成を取り消しました。"
+                "時間を置いて再度お試しください。",
+                ephemeral=True,
+            )
         await interaction.followup.send(
             f"✅ GM村 **{room.state.room_name}** と募集を用意しました。"
             f" #{CH_LOBBY} のカードで参加を受け付けます。",

@@ -11,6 +11,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import discord
+import aiosqlite
+
 import database
 from config import (
     CH_OPERATIONS,
@@ -1362,6 +1364,63 @@ class RecruitmentManagerTest(unittest.IsolatedAsyncioTestCase):
         text = interaction.response.send_message.await_args.args[0]
         self.assertIn("ゲーム形式が見つからない", text)
         self.assertIn("作成できません", text)
+
+    async def test_unexpected_publish_error_still_rolls_back_new_village(self) -> None:
+        """掲示が想定外の例外で落ちても、今回作った村と募集を残さない。
+
+        publish_new_recruitment は掲示できない理由をRuntimeErrorへ畳むが、
+        その前段のDB読み出しが落ちると別の例外が素通りする。RuntimeErrorだけ
+        拾っていると、カードの無いOPEN募集と村が次の再起動まで残る。
+        """
+        tomorrow = datetime.now(recruitment_lib.JST) + timedelta(days=1)
+        modal = RecruitmentCreateModal(
+            self.manager,
+            1,
+            {
+                "date": tomorrow.date().isoformat(),
+                "hour": str(tomorrow.hour),
+                "minute": "0",
+                "variant_id": "v13_cross",
+                "streaming": "0",
+                "allowed_ranks": [],
+            },
+        )
+        modal.village_name = "GM村"
+        modal.recruitment_title = "募集"
+        modal.note = ""
+
+        # replace() を通すため、room_def は本物のRoomDefinitionにする。
+        self.room.room_def = RoomDefinition(
+            self.room_id, "GM村", private_owner_id=1, variant_id="v13_cross",
+        )
+        self.manager.game_cog.ensure_gm_village_for_recruitment = AsyncMock(
+            return_value=(self.room, True),
+        )
+        rollback = AsyncMock()
+        self.manager.game_cog.rollback_gm_village_creation = rollback
+        self.manager.publish_new_recruitment = AsyncMock(
+            side_effect=aiosqlite.OperationalError("database is locked"),
+        )
+        interaction = SimpleNamespace(
+            user=self.members[1],
+            guild=self.guild,
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+        await modal._create_locked(
+            interaction, self.guild, self.members[1],
+            datetime.now(recruitment_lib.JST) + timedelta(days=1),
+            "v13_cross",
+        )
+
+        # 今回作った村は回収する。
+        rollback.assert_awaited_once()
+        self.assertEqual(rollback.await_args.args[1], self.room_id)
+        # 募集もOPENのまま残さない。
+        rows = await database.get_open_recruitment_for_room(1, self.room_id)
+        self.assertIsNone(rows)
+        text = interaction.followup.send.await_args.args[0]
+        self.assertIn("作成を取り消しました", text)
 
     async def test_temp_gm_can_open_recruitment_creation(self) -> None:
         class FakeMember:
