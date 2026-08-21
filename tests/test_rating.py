@@ -988,6 +988,51 @@ class TestSeasonHalfResetProduction(unittest.IsolatedAsyncioTestCase):
             [(1, 1500, 1500), (2, 1901, 1700), (3, 1099, 1299)],
         )
 
+    async def test_reset_never_leaves_peak_below_current_rating(self):
+        """初戦黒星でpeakが1500未満に確定した人でも、peak < 現在レートにしない。
+
+        ハーフリセットは1500より下の人を1500側へ引き上げるため、
+        peak=現在=1470 の人は 1485 へ上がり、そのままだと戦績カードに
+        「1485 (最高 1470)」と矛盾が出る。
+        """
+        guild_id = 5555
+        rows = (
+            # (player_id, rating, peak, season_games, season_wins)
+            (1, 1470, 1470, 1, 0),   # 初戦黒星のまま。引き上げでpeakを超える
+            (2, 1300, 1500, 8, 2),   # 通常の下振れ。peakは据え置きのまま
+            (3, 1900, 2000, 9, 6),   # 上位者。引き下げなのでpeakは動かない
+        )
+        async with database.connect_db() as db:
+            await db.executemany(
+                "INSERT INTO player_ratings "
+                "(player_id, guild_id, rating, peak_rating, season_games, season_wins) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [(pid, guild_id, rating, peak, games, wins)
+                 for pid, rating, peak, games, wins in rows],
+            )
+            await db.commit()
+
+        await database.season_half_reset(guild_id, executed_by=999)
+
+        async with database.connect_db() as db:
+            actual = await db.execute_fetchall(
+                "SELECT player_id, rating, peak_rating FROM player_ratings "
+                "WHERE guild_id = ? ORDER BY player_id",
+                (guild_id,),
+            )
+        self.assertEqual(
+            actual,
+            [
+                (1, 1485, 1485),   # peakを現在レートまで底上げ
+                (2, 1400, 1500),   # 過去の最高値はそのまま残す
+                (3, 1700, 2000),
+            ],
+        )
+        for player_id, rating, peak in actual:
+            self.assertGreaterEqual(
+                peak, rating, f"player {player_id} の最高レートが現在を下回った",
+            )
+
     async def test_no_players_is_noop(self):
         self.assertEqual(
             await database.season_half_reset(9876, executed_by=999),

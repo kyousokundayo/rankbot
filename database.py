@@ -3664,12 +3664,17 @@ async def season_half_reset(guild_id: int, executed_by: int,
                     season_games, season_wins,
                 )
             )
-            # 適用 (peakは更新しない=過去の最高値は残す)
+            # 適用。過去の最高値は残すが、現在レートを下回らせない。
+            # ハーフリセットは1500より下の人を1500側へ「引き上げる」ため、
+            # 初戦黒星でpeakが1500未満に確定した人だと new_rating > peak に
+            # なりうる (例: peak=現在=1470 → 1485)。そのまま残すと戦績カードに
+            # 「1485 (最高 1470)」と矛盾が出るので、MAXで底上げする。
             await db.execute(
                 "UPDATE player_ratings "
-                "SET rating = ?, season_games = 0, season_wins = 0, last_updated = CURRENT_TIMESTAMP "
+                "SET rating = ?, peak_rating = MAX(peak_rating, ?), "
+                "season_games = 0, season_wins = 0, last_updated = CURRENT_TIMESTAMP "
                 "WHERE player_id = ? AND guild_id = ? AND ladder_id = ?",
-                (new_rating, player_id, guild_id, ladder_id)
+                (new_rating, new_rating, player_id, guild_id, ladder_id)
             )
 
         await db.commit()
