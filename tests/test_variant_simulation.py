@@ -171,6 +171,37 @@ class VariantSimulationPlanTest(unittest.TestCase):
         self.assertTrue(first[0].fail_rank_lookup)
         self.assertFalse(first[-1].rated)
 
+    def test_base_seed_changes_the_plan_but_keeps_default_and_determinism(self) -> None:
+        """--seed が既定モードでも効き、同じ値なら決定的であること。
+
+        以前は build_simulation_scenarios が index からしかseedを作らず、
+        CLIの --seed は population mode へしか渡っていなかった。そのため
+        --runs が同じなら --seed を変えても完全に同一の試合列になり、
+        独立したサンプルを取ったつもりで同じ結果を数え直してしまう。
+        """
+        default = simulate_games.build_simulation_scenarios(3)
+        # 既定 (base_seed=0) は従来の実行計画とまったく同じ。
+        self.assertEqual(
+            default, simulate_games.build_simulation_scenarios(3, base_seed=0),
+        )
+        shifted = simulate_games.build_simulation_scenarios(3, base_seed=500)
+        # 同じ base_seed なら決定的。
+        self.assertEqual(
+            shifted, simulate_games.build_simulation_scenarios(3, base_seed=500),
+        )
+        # 値を変えれば別のseed列になる。
+        self.assertNotEqual(
+            [item.seed for item in default], [item.seed for item in shifted],
+        )
+        # 変種の並びと特別枠 (強制再投票・非レート) は base_seed で変えない。
+        self.assertEqual(
+            [item.variant_id for item in default],
+            [item.variant_id for item in shifted],
+        )
+        self.assertTrue(shifted[0].force_runoff)
+        self.assertTrue(shifted[0].fail_rank_lookup)
+        self.assertFalse(shifted[-1].rated)
+
     def test_additional_games_cycle_variants_in_a_fixed_order(self) -> None:
         scenarios = simulate_games.build_simulation_scenarios(6)
         additional = scenarios[4:-1]

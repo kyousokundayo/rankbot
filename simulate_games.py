@@ -578,11 +578,17 @@ class SimulationScenario:
 def build_simulation_scenarios(
     runs: int,
     variant_ids: Optional[list[str] | tuple[str, ...]] = None,
+    *,
+    base_seed: int = 0,
 ) -> list[SimulationScenario]:
     """全対象変種を最低1戦ずつ含む、決定的な実行順を返す。
 
     ``runs`` は従来どおり追加の通常戦数。これとは別に、先頭変種の
     強制再投票・残り変種の最低1戦・非レート1戦を必ず組み込む。
+
+    ``base_seed`` は全シナリオのseedへ一律に足す。同じ base_seed なら
+    毎回同じ試合列になる決定性は保ったまま、値を変えれば独立した
+    サンプルを取れる。既定0は従来の実行計画とまったく同じ。
     """
     if runs < 0:
         raise ValueError("runs must be non-negative")
@@ -601,27 +607,27 @@ def build_simulation_scenarios(
 
     scenarios = [
         SimulationScenario(
-            seed=0,
+            seed=base_seed,
             variant_id=selected[0],
             force_runoff=True,
             fail_rank_lookup=True,
         )
     ]
     scenarios.extend(
-        SimulationScenario(seed=index, variant_id=variant_id)
+        SimulationScenario(seed=base_seed + index, variant_id=variant_id)
         for index, variant_id in enumerate(selected[1:], 1)
     )
     next_seed = len(selected)
     scenarios.extend(
         SimulationScenario(
-            seed=next_seed + offset,
+            seed=base_seed + next_seed + offset,
             variant_id=selected[offset % len(selected)],
         )
         for offset in range(runs)
     )
     scenarios.append(
         SimulationScenario(
-            seed=10_000,
+            seed=base_seed + 10_000,
             variant_id=selected[0],
             rated=False,
         )
@@ -1582,16 +1588,21 @@ async def sandbox_db(prefix: str = "werewolf-sim-"):
 async def run_simulations(
     runs: int,
     variant_ids: Optional[list[str] | tuple[str, ...]] = None,
+    *,
+    base_seed: int = 0,
 ) -> None:
     # CLI経路も必ず共通ガードを通し、本番DBを指したまま下位処理へ入れない。
     async with sandbox_db(prefix="werewolf-cli-guard-"):
-        await _run_simulations_with_private_temp(runs, variant_ids=variant_ids)
+        await _run_simulations_with_private_temp(
+            runs, variant_ids=variant_ids, base_seed=base_seed,
+        )
 
 
 async def _run_simulations_with_private_temp(
     runs: int,
     *,
     variant_ids: Optional[list[str] | tuple[str, ...]] = None,
+    base_seed: int = 0,
 ) -> None:
     temp_dir = tempfile.TemporaryDirectory(prefix="werewolf-sim-")
     tmp_dir = Path(temp_dir.name)
@@ -1600,7 +1611,9 @@ async def _run_simulations_with_private_temp(
     await database.init_db()
 
     try:
-        scenarios = build_simulation_scenarios(runs, variant_ids)
+        scenarios = build_simulation_scenarios(
+            runs, variant_ids, base_seed=base_seed,
+        )
         results = [
             await simulate_one_game(
                 seed=scenario.seed,
@@ -2058,7 +2071,10 @@ def main() -> None:
     )
     parser.add_argument("--population-size", type=int, default=200, help="population size for population mode")
     parser.add_argument("--min-games", type=int, default=200, help="minimum games per player in population mode")
-    parser.add_argument("--seed", type=int, default=0, help="base RNG seed")
+    parser.add_argument(
+        "--seed", type=int, default=0,
+        help="base RNG seed (既定モード・population modeの両方に効く)",
+    )
     parser.add_argument(
         "--rating-mode",
         choices=("default", "fixed-pool"),
@@ -2084,7 +2100,9 @@ def main() -> None:
             if args.variant == "all"
             else (args.variant,)
         )
-        asyncio.run(run_simulations(args.runs, variant_ids=variant_ids))
+        asyncio.run(run_simulations(
+            args.runs, variant_ids=variant_ids, base_seed=args.seed,
+        ))
     else:
         # population modeはラダー別に母集団を作る。'all'を13人村へ黙って
         # 読み替えると、9人2ラダーの検証が気付かないまま漏れ続けるため、
