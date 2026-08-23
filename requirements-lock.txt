@@ -12,7 +12,7 @@ cffi==2.1.1
 davey==0.1.6
 discord.py==2.7.1
 frozenlist==1.8.0
-idna==3.18
+idna==3.19
 multidict==6.7.1
 # 戦績カード画像 (stats_image.py) の描画専用。Python 3.14 対応を確認済み。
 Pillow==12.3.0
