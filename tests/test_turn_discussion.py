@@ -723,7 +723,7 @@ class TurnDurabilityAndSafetyTest(unittest.IsolatedAsyncioTestCase):
         state.game_task = asyncio.create_task(asyncio.sleep(60))
         speaker.alive = False
         runner._sync_server_mutes = AsyncMock(return_value=[])
-        runner._await_mute_applied = AsyncMock(return_value=True)
+        runner._await_expected_mute_state = AsyncMock(return_value=True)
 
         result = await runner.resume_game()
 
@@ -758,7 +758,7 @@ class TurnDurabilityAndSafetyTest(unittest.IsolatedAsyncioTestCase):
             return []
 
         runner._sync_server_mutes = sync_mutes
-        runner._await_mute_applied = AsyncMock(return_value=True)
+        runner._await_expected_mute_state = AsyncMock(return_value=True)
         resume = asyncio.create_task(runner.resume_game())
         await resume_sync_entered.wait()
         disconnect = asyncio.create_task(
@@ -788,7 +788,7 @@ class TurnDurabilityAndSafetyTest(unittest.IsolatedAsyncioTestCase):
         runner._sync_server_mutes = AsyncMock(
             return_value=[(speaker.member, True)]
         )
-        runner._await_mute_applied = AsyncMock(return_value=False)
+        runner._await_expected_mute_state = AsyncMock(return_value=False)
 
         result = await runner.pause_game()
 

@@ -1,8 +1,4 @@
-"""_sync_server_mutesの「無言の失敗」を可視化するログの回帰テスト。
-
-voice_channel未解決・対象0件のケースで例外にならずログが出ること、
-および通常のミュート同期が従来どおり動くことを確認する。
-"""
+"""_sync_server_mutesが無言で失敗せず、安全停止することの回帰テスト。"""
 from __future__ import annotations
 
 import logging
@@ -12,21 +8,24 @@ from unittest.mock import AsyncMock, patch
 
 import discord
 
+from room_runner import StateDurabilityError
 from tests.test_turn_discussion import add_players, make_runner
 
 
 class MuteSyncLoggingTest(unittest.IsolatedAsyncioTestCase):
-    async def test_missing_voice_channel_logs_warning_and_returns_empty(self) -> None:
+    async def test_missing_voice_channel_safety_stops_active_game(self) -> None:
         runner = make_runner()
         add_players(runner, 1)
         runner.state.voice_channel = None
 
-        with self.assertLogs("room_runner", level="WARNING") as cm:
-            result = await runner._sync_server_mutes(set())
+        with self.assertLogs("room_runner", level="ERROR") as cm, self.assertRaises(
+            StateDurabilityError
+        ):
+            await runner._sync_server_mutes(set())
 
-        self.assertEqual(result, [])
+        self.assertTrue(runner.state.paused)
         self.assertTrue(
-            any("VC未解決のためミュート同期をスキップしました" in m for m in cm.output)
+            any("サーバーミュート同期に失敗" in m for m in cm.output)
         )
         self.assertTrue(any(runner.state.room_name in m for m in cm.output))
 
@@ -170,12 +169,14 @@ class MuteSyncLoggingTest(unittest.IsolatedAsyncioTestCase):
         # この失敗経路でも本番Member相当の属性を用意しておく。
         victim.member.edit = AsyncMock()
 
-        with patch("room_runner.asyncio.sleep", new=AsyncMock()), self.assertLogs(
-            "room_runner", level="ERROR"
-        ) as cm:
-            changed = await runner._sync_server_mutes(set())
+        with (
+            patch("room_runner.asyncio.sleep", new=AsyncMock()),
+            self.assertLogs("room_runner", level="ERROR") as cm,
+            self.assertRaises(StateDurabilityError),
+        ):
+            await runner._sync_server_mutes(set())
 
-        self.assertEqual(len(changed), 1)
+        self.assertTrue(runner.state.paused)
         self.assertEqual(runner._paced_discord_api_call.await_count, 2)
         final_lines = [line for line in cm.output if "ミュート最終失敗" in line]
         self.assertEqual(len(final_lines), 1)

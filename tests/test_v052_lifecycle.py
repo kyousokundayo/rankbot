@@ -305,6 +305,7 @@ class GameOverRestoreTest(unittest.IsolatedAsyncioTestCase):
 
         async def teardown():
             call_order.append("teardown")
+            return True
 
         async def transition(_state, **kwargs):
             call_order.append("transition")

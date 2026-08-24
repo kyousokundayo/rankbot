@@ -2687,7 +2687,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         # DB復旧後のGM再開が、通常ゲームではなく開始復元タスクを1本だけ作る。
         runner._persist_room_state = AsyncMock()
         runner._sync_server_mutes = AsyncMock(return_value=[])
-        runner._await_mute_applied = AsyncMock(return_value=True)
+        runner._await_expected_mute_state = AsyncMock(return_value=True)
         runner._resume_preparation = AsyncMock()
 
         result = await runner.resume_game()
@@ -3925,7 +3925,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         fake_view = SimpleNamespace(stop=Mock())
         runner.register_game_view(fake_view, night=True)
         runner._restore_nicknames = AsyncMock(return_value={})
-        runner._teardown_game_roles_and_perms = AsyncMock()
+        runner._teardown_game_roles_and_perms = AsyncMock(return_value=True)
         runner._post_lobby_ui = AsyncMock()
         runner._disable_live_wolf_vote_dms = AsyncMock()
         runner._disable_persisted_dm_views = AsyncMock()
@@ -4001,8 +4001,11 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_manual_mute_is_never_unmuted_and_missing_vc_returns_list(self) -> None:
         runner = make_runner()
-        self.assertEqual(await runner._sync_server_mutes({1}), [])
+        with self.assertRaises(StateDurabilityError):
+            await runner._sync_server_mutes({1})
+        self.assertTrue(runner.state.paused)
 
+        runner = make_runner()
         channel = SimpleNamespace(id=10)
         member = FakeMember(1)
         member.voice = FakeVoiceState(mute=True, channel=channel)
@@ -4355,6 +4358,8 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.state.spirit_channel = permission_text_channel(
             set_permissions=AsyncMock(side_effect=denied)
         )
+        runner._sync_server_mutes = AsyncMock(return_value=[])
+        runner._await_expected_mute_state = AsyncMock(return_value=True)
 
         await runner.on_member_join(returning)
 
@@ -4439,6 +4444,8 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         await finished
         runner.state.game_task = finished
         runner._resume_recovered_game = AsyncMock()
+        runner._sync_server_mutes = AsyncMock(return_value=[])
+        runner._await_expected_mute_state = AsyncMock(return_value=True)
 
         result = await runner.resume_game()
         await runner.state.game_task
@@ -4458,7 +4465,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         await finished
         runner.state.game_task = finished
         runner._sync_server_mutes = AsyncMock(return_value=[])
-        runner._await_mute_applied = AsyncMock(return_value=True)
+        runner._await_expected_mute_state = AsyncMock(return_value=True)
         runner._resume_recovered_game = AsyncMock()
 
         first, second = await asyncio.gather(runner.resume_game(), runner.resume_game())
@@ -4570,7 +4577,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.state.guild = SimpleNamespace(id=123)
         add_player(runner, 1, Role.VILLAGER)
         runner._restore_nicknames = AsyncMock(return_value={})
-        runner._teardown_game_roles_and_perms = AsyncMock()
+        runner._teardown_game_roles_and_perms = AsyncMock(return_value=True)
         runner._post_lobby_ui = AsyncMock()
         async def transition_to_empty_lobby(source, **kwargs):
             target = GameState()
@@ -4612,7 +4619,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.state.guild = SimpleNamespace(id=123)
         add_player(runner, 1, Role.VILLAGER)
         runner._restore_nicknames = AsyncMock(return_value={})
-        runner._teardown_game_roles_and_perms = AsyncMock()
+        runner._teardown_game_roles_and_perms = AsyncMock(return_value=True)
         runner._post_lobby_ui = AsyncMock()
 
         order: list[str] = []
@@ -4817,7 +4824,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner = make_runner()
         add_player(runner, 1)
         runner._restore_nicknames = AsyncMock(return_value={})
-        runner._teardown_game_roles_and_perms = AsyncMock()
+        runner._teardown_game_roles_and_perms = AsyncMock(return_value=True)
         runner._post_lobby_ui = AsyncMock()
         calls = 0
 
@@ -4966,8 +4973,10 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
 
         manager.paced_discord_api_call = AsyncMock(side_effect=paced_call)
         member = FakeMember(1)
+        marker = FakeRole(2, "人狼Botミュート:old-room")
+        member.roles = [marker]
         member.voice = FakeVoiceState(channel=SimpleNamespace(id=20))
-        member.guild = FakeGuild([member], [])
+        member.guild = FakeGuild([member], [marker])
         member.edit.side_effect = [
             discord.HTTPException(
                 SimpleNamespace(status=503, reason="Service Unavailable"),
@@ -5024,7 +5033,7 @@ class PauseResumePhaseConsistencyTest(unittest.IsolatedAsyncioTestCase):
         runner.state.phase = phase
         runner.state.gm_id = 999
         runner._sync_server_mutes = AsyncMock(return_value=[])
-        runner._await_mute_applied = AsyncMock(return_value=True)
+        runner._await_expected_mute_state = AsyncMock(return_value=True)
         # _is_game_in_progress を満たすため、終わらないタスクを持たせる
         runner.state.game_task = asyncio.create_task(asyncio.Event().wait())
         return runner
@@ -5089,7 +5098,7 @@ class PauseResumePhaseConsistencyTest(unittest.IsolatedAsyncioTestCase):
         runner = self._runner_in_progress(Phase.DAY_DISCUSSION)
         try:
             await runner.pause_game()
-            runner._await_mute_applied = AsyncMock(return_value=False)
+            runner._await_expected_mute_state = AsyncMock(return_value=False)
 
             result = await runner.resume_game()
 

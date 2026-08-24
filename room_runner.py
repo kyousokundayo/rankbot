@@ -1818,7 +1818,12 @@ class RoomRunner:
                         f"Bot所有の残留ミュートを解除できません ({member.display_name})"
                     ) from e
             if pending_unmutes:
-                await self.manager.register_pending_unmutes(guild, pending_unmutes)
+                if not await self.manager.register_pending_unmutes(
+                    guild, pending_unmutes
+                ):
+                    raise RuntimeError(
+                        "起動時の持ち越しミュート解除待ちを保存できません"
+                    )
 
         # 進行中snapshotは、この時点ではまだ空のLOBBY GameStateである。
         # ここで操作可能なUIを出すと、復元前の参加/GM操作が進行中snapshotを
@@ -3124,7 +3129,10 @@ class RoomRunner:
                 self.last_game_gm = state.gm_id
             await self._close_game_views_for_shutdown()
             nickname_failures = await self._restore_nicknames(state)
-            await self._teardown_game_roles_and_perms()
+            if not await self._teardown_game_roles_and_perms():
+                raise RuntimeError(
+                    "終了済みゲームの持ち越しミュート解除を保存できません"
+                )
             preserve_gm = (
                 state.lobby_return_mode in {"gm", "roster"}
                 and state.gm_id is not None
@@ -4450,10 +4458,10 @@ class RoomRunner:
             )
             await self.force_end("初期ミュートを確認できないため中断")
             return
-        remaining_mutes = await self._mute_all(
+        await self._mute_all(
             skip_ids={member.id for member, _ in initial_mute_targets}
         )
-        if not await self._await_mute_applied(remaining_mutes, MUTE_GRACE_TIME):
+        if not await self._await_expected_mute_state(set(), MUTE_GRACE_TIME):
             await self._safe_village_send(
                 "⚠️ 開始時の発言制御を確認できないため、安全のため開始を中断します。"
             )
@@ -8321,10 +8329,19 @@ class RoomRunner:
         """勝敗に関わる保存失敗で状態を捨てず安全停止する。"""
         state = self.state
         resume_phase = self._effective_phase() or Phase.DAY_DISCUSSION
+        current_task = asyncio.current_task()
+        live_game_task_continues = bool(
+            state.game_task is not None
+            and not state.game_task.done()
+            and current_task is not state.game_task
+        )
         if state.phase != Phase.PAUSED:
             state.phase_before_pause = state.phase
-        state.recovery_phase = resume_phase
-        state.recovered_from_restart = True
+        # VCイベント等の別taskから止めた場合は、既存ゲームtaskがpause gateで
+        # 待ち続ける。新しい復元taskを作る印を立てると二重進行になるため、
+        # game_task自身が失敗して終了する場合だけ復元起動を要求する。
+        state.recovery_phase = None if live_game_task_continues else resume_phase
+        state.recovered_from_restart = not live_game_task_continues
         state.phase = Phase.PAUSED
         state.paused = True
         state.turn_window_open = False
@@ -8334,7 +8351,7 @@ class RoomRunner:
             await self._persist_room_state()
         except Exception:
             log.exception(f"{context}失敗後の停止状態も保存できませんでした")
-        log.exception(f"{context}に失敗: {error}")
+        log.error(f"{context}に失敗: {error}")
         await self._safe_village_send(
             f"⚠️ **{context}に失敗したため安全停止しました。**\n"
             "状態を捨てずに停止しています。原因を解消後、GMが再開してください。"
@@ -8502,15 +8519,29 @@ class RoomRunner:
             and vs_after.channel.id == state.voice_channel.id
         )
         mute_applied = bool(
-            not in_game_vc
-            or getattr(vs_after, "mute", False)
-            or (edit_succeeded and "mute" in edit_kwargs)
+            in_game_vc and getattr(vs_after, "mute", False)
         )
-        # textは個別denyを必須、通常参加者のVCはserver muteまたは
-        # 生存ロール剥奪を必須にする。GMの音声ミュートだけは手動運用なので、
-        # その成否を死亡副作用の完了条件には含めない。
+        if in_game_vc and not manual_mute_gm and not mute_applied:
+            # Member.editが成功してもGateway反映前は実際には発言できる。
+            # まず統合PATCHの反映を待ち、遅延・取りこぼしなら通常の
+            # 再試行付き同期へ合流してから、死亡処理の先へ進む。
+            if edit_succeeded and edit_kwargs.get("mute") is True:
+                mute_applied = await self._await_mute_applied(
+                    [(player.member, True)], MUTE_GRACE_TIME
+                )
+            if not mute_applied:
+                speakers = self._current_speaker_ids() - {player.user_id}
+                await self._sync_server_mutes(speakers)
+                mute_applied = await self._await_mute_applied(
+                    [(player.member, True)], MUTE_GRACE_TIME
+                )
+
+        # textは個別denyを必須。通常参加者は、接続中なら実際のserver mute、
+        # 切断中なら再入室時の発言を塞ぐ生存ロール剥奪を必須にする。
+        # GMの音声ミュートだけは手動運用なので完了条件に含めない。
         voice_block_satisfied = (
-            manual_mute_gm or mute_applied or alive_role_removed
+            manual_mute_gm
+            or (mute_applied if in_game_vc else alive_role_removed)
         )
         # GM兼プレイヤーの音声は意図的に手動運用へ残す一方、参加者としての
         # 生存ロールは必ず外す。ここを成功扱いにすると死亡後も生存者用の
@@ -10153,7 +10184,12 @@ class RoomRunner:
         nickname_failures = await self._restore_nicknames(state)
 
         # ゲーム用の一時ロール・VC個別権限を全て撤去
-        await self._teardown_game_roles_and_perms()
+        if not await self._teardown_game_roles_and_perms():
+            await self._safe_village_send(
+                "⚠️ **ミュート解除待ちをDBへ保存できないため、終了処理を停止しました。**\n"
+                "Bot所有ミュートの記録を保持しています。DB復旧後のBot再起動で自動回収します。"
+            )
+            return
         cleanup_text = (
             "⚠️ **ゲーム終了処理は完了しました。**\n"
             f"名前を戻せなかったメンバーが{len(nickname_failures)}人います。次の開始前に再試行します。"
@@ -10596,8 +10632,8 @@ class RoomRunner:
         await self._persist_room_state()
 
         # タイマーだけでなく会話も停止する。切断者不在のまま議論が続くのを防ぐ。
-        changed = await self._sync_server_mutes(set())
-        if not await self._await_mute_applied(changed, MUTE_GRACE_TIME):
+        await self._sync_server_mutes(set())
+        if not await self._await_expected_mute_state(set(), MUTE_GRACE_TIME):
             await self._safe_village_send(
                 "⚠️ **一時停止しましたが、全員のミュート反映を確認できません。**\n"
                 "タイマーは停止中です。Botのメンバーミュート権限とロール順位を確認してから、"
@@ -10648,8 +10684,11 @@ class RoomRunner:
                     return "⚠️ 死亡通知の復元状態を保存できていません。DB復旧後に再度「再開」を押してください。"
             state.paused = False
             state.phase = resume_phase
-            changed = await self._sync_server_mutes(self._current_speaker_ids())
-            if not await self._await_mute_applied(changed, MUTE_GRACE_TIME):
+            expected_speakers = self._current_speaker_ids()
+            await self._sync_server_mutes(expected_speakers)
+            if not await self._await_expected_mute_state(
+                expected_speakers, MUTE_GRACE_TIME
+            ):
                 await self._restore_pause_after_failed_mute_resume(
                     resume_phase, "復元再開時の発言制御"
                 )
@@ -10686,8 +10725,11 @@ class RoomRunner:
             state.phase = state.phase_before_pause
 
         # 一時停止中に入退室したメンバーのミュート状態をフェーズに合わせ直す
-        changed = await self._sync_server_mutes(self._current_speaker_ids())
-        if not await self._await_mute_applied(changed, MUTE_GRACE_TIME):
+        expected_speakers = self._current_speaker_ids()
+        await self._sync_server_mutes(expected_speakers)
+        if not await self._await_expected_mute_state(
+            expected_speakers, MUTE_GRACE_TIME
+        ):
             failed_phase = self._effective_phase() or state.phase_before_pause or Phase.DAY_DISCUSSION
             await self._restore_pause_after_failed_mute_resume(
                 failed_phase, "再開時の発言制御"
@@ -11383,7 +11425,12 @@ class RoomRunner:
         nickname_failures = await self._restore_nicknames(state)
 
         # ゲーム用の一時ロール・VC個別権限を全て撤去
-        await self._teardown_game_roles_and_perms()
+        if not await self._teardown_game_roles_and_perms():
+            await self._safe_village_send(
+                "⚠️ **ミュート解除待ちをDBへ保存できないため、終了処理を停止しました。**\n"
+                "Bot所有ミュートの記録を保持しています。DB復旧後のBot再起動で自動回収します。"
+            )
+            return False
         cleanup_text = (
             "⚠️ **終了処理は完了しました。**\n"
             f"名前を戻せなかったメンバーが{len(nickname_failures)}人います。次の開始前に再試行します。"
@@ -11442,6 +11489,11 @@ class RoomRunner:
                 self.last_game_gm = state.gm_id
             if state.phase == Phase.GAME_OVER:
                 nickname_failures = await self._restore_nicknames(state)
+                if not await self._teardown_game_roles_and_perms():
+                    return (
+                        "⚠️ ミュート解除待ちをDBへ保存できないため、リセットしませんでした。"
+                        "DB復旧後にもう一度お試しください。"
+                    )
             else:
                 nickname_failures = dict(state.original_nicknames)
             old_ending = state.ending
@@ -11830,9 +11882,14 @@ class RoomRunner:
         state = self.state
         vc = state.voice_channel
         if vc is None:
-            log.warning(
-                f"VC未解決のためミュート同期をスキップしました ({state.room_name})"
-            )
+            message = f"ゲームVCを解決できません ({state.room_name})"
+            if state.phase not in (Phase.LOBBY, Phase.GAME_OVER):
+                error = RuntimeError(message)
+                await self._stop_for_durability_error("サーバーミュート同期", error)
+                raise StateDurabilityError(
+                    "ゲームVCを確認できないため発言制御を続行できません"
+                ) from error
+            log.warning(f"VC未解決のためミュート同期をスキップしました ({state.room_name})")
             return []
         skip_ids = skip_ids or set()
 
@@ -11969,12 +12026,12 @@ class RoomRunner:
         for member, mute in targets:
             await set_mute(member, mute)
 
+        final_failed: list[tuple[discord.Member, bool]] = []
         if failed:
             retry_targets = list(failed)
             failed.clear()
             await asyncio.sleep(MUTE_RETRY_DELAY)
             log.info(f"サーバーミュートを再試行します ({len(retry_targets)}人)")
-            final_failed: list[tuple[discord.Member, bool]] = []
             for member, mute in retry_targets:
                 if not await set_mute(member, mute, retry=False):
                     final_failed.append((member, mute))
@@ -11995,6 +12052,16 @@ class RoomRunner:
             or state.bot_mute_intent_ids != intents_before
         ):
             await self._persist_mute_ownership_checkpoint("フェーズmute所有保存")
+        if final_failed:
+            details = ", ".join(
+                f"{member.display_name}(mute={mute})"
+                for member, mute in final_failed
+            )
+            error = RuntimeError(f"API再試行後も反映要求に失敗: {details}")
+            await self._stop_for_durability_error("サーバーミュート変更", error)
+            raise StateDurabilityError(
+                "サーバーミュート変更に失敗したため進行を停止しました"
+            ) from error
         return targets
 
     async def _reconcile_mute_intents(self) -> None:
@@ -12072,6 +12139,108 @@ class RoomRunner:
                 return False
             await asyncio.sleep(0.25)
 
+    def _mute_state_issues(self, speakers: set[int]) -> list[str]:
+        """現在のVC状態と、そのフェーズで必要な発言者集合との差分を返す。"""
+        state = self.state
+        vc = state.voice_channel
+        if vc is None:
+            return ["ゲームVC未解決"]
+
+        candidates: dict[int, discord.Member] = {
+            member.id: member for member in getattr(vc, "members", [])
+        }
+        if state.guild is not None:
+            for user_id in state.players:
+                if user_id in candidates:
+                    continue
+                member = state.guild.get_member(user_id)
+                if member is None:
+                    continue
+                voice = getattr(member, "voice", None)
+                if (
+                    voice is not None
+                    and voice.channel is not None
+                    and voice.channel.id == vc.id
+                ):
+                    candidates[user_id] = member
+
+        issues: list[str] = []
+        for speaker_id in speakers:
+            member = candidates.get(speaker_id)
+            if member is None:
+                player = state.get_player(speaker_id)
+                fallback = player.member if player is not None else None
+                if fallback is not None and getattr(fallback, "bot", False):
+                    continue
+                name = (
+                    getattr(fallback, "display_name", None)
+                    or f"ID:{speaker_id}"
+                )
+                issues.append(f"{name}(ゲームVC未接続)")
+
+        for member in candidates.values():
+            if member.bot:
+                continue
+            voice = getattr(member, "voice", None)
+            if (
+                voice is None
+                or voice.channel is None
+                or voice.channel.id != vc.id
+            ):
+                continue
+            should_speak = member.id in speakers
+            if self._uses_manual_gm_mute(member.id) and not should_speak:
+                # GMの発言禁止時間は手動運用。Botは状態を強制しない。
+                continue
+            if should_speak:
+                if bool(getattr(voice, "mute", False)):
+                    issues.append(f"{member.display_name}(mute解除未反映)")
+                elif bool(getattr(voice, "suppress", False)):
+                    issues.append(f"{member.display_name}(発言権suppress中)")
+            elif not bool(getattr(voice, "mute", False)):
+                issues.append(f"{member.display_name}(mute未反映)")
+        return issues
+
+    async def _await_expected_mute_state(
+        self, speakers: set[int], timeout: float
+    ) -> bool:
+        """対象者の一部ではなく、VC全体が期待状態へ収束するまで待つ。"""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            issues = self._mute_state_issues(speakers)
+            if not issues:
+                return True
+            if self.state.voice_channel is None:
+                log.warning(
+                    "発言制御の全体確認に失敗しました: %s",
+                    ", ".join(issues),
+                )
+                return False
+            if loop.time() >= deadline:
+                log.warning(
+                    "発言制御の全体確認がタイムアウトしました: %s",
+                    ", ".join(issues),
+                )
+                return False
+            await asyncio.sleep(0.25)
+
+    async def _ensure_mute_state_or_stop(
+        self,
+        speakers: set[int],
+        context: str,
+    ) -> None:
+        """発言制御が揃わなければ、進行を再開可能な状態で安全停止する。"""
+        if await self._await_expected_mute_state(speakers, MUTE_GRACE_TIME):
+            return
+        issues = self._mute_state_issues(speakers)
+        error = RuntimeError(
+            "発言制御が期待状態へ収束しません: "
+            + (", ".join(issues) if issues else "状態不明")
+        )
+        await self._stop_for_durability_error(context, error)
+        raise StateDurabilityError(f"{context}を確認できないため進行を停止しました")
+
     async def _restore_pause_after_failed_mute_resume(
         self, resume_phase: Phase, context: str
     ) -> None:
@@ -12095,7 +12264,7 @@ class RoomRunner:
     ) -> None:
         """進行中の発言制御が揃うまで安全停止とGM再開を繰り返す。"""
         state = self.state
-        while not await self._await_mute_applied(changed, MUTE_GRACE_TIME):
+        while not await self._await_expected_mute_state(speakers, MUTE_GRACE_TIME):
             resume_phase = self._effective_phase() or Phase.DAY_DISCUSSION
             state.paused = True
             state.phase_before_pause = resume_phase
@@ -12108,7 +12277,7 @@ class RoomRunner:
             )
             # resume_game側も同じ発言状態を確認してからだけEventを開く。
             await state.pause_event.wait()
-            changed = await self._sync_server_mutes(speakers)
+            await self._sync_server_mutes(speakers)
 
     async def _mute_phase(self, note: str) -> None:
         """全員ミュートへ移るときの整列フェーズ。
@@ -12122,10 +12291,8 @@ class RoomRunner:
         待ち時間もメッセージも増やさない。
         """
         changed = await self._sync_server_mutes(set())
-        if not changed:
-            return
-
-        await self._safe_village_send(f"🔇 **全員をミュートしました。**\n{note}")
+        if changed:
+            await self._safe_village_send(f"🔇 **全員をミュートしました。**\n{note}")
         await self._wait_for_mute_sync_or_pause(
             changed, set(), "全員ミュートへの切り替え"
         )
@@ -12377,8 +12544,8 @@ class RoomRunner:
             {p.user_id for p in self.state.alive_players()}
         )
 
-    async def _teardown_game_roles_and_perms(self) -> None:
-        """ゲームで使った一時ロール・VC個別権限・サーバーミュートを全て元に戻す"""
+    async def _teardown_game_roles_and_perms(self) -> bool:
+        """ゲーム用設定を戻す。解除待ちを永続化できた場合だけTrue。"""
         state = self.state
         vc = state.voice_channel
 
@@ -12431,7 +12598,12 @@ class RoomRunner:
                 for member in targets:
                     await unmute_one(member)
             if remaining:
-                await self.manager.register_pending_unmutes(state.guild, remaining)
+                if not await self.manager.register_pending_unmutes(
+                    state.guild, remaining
+                ):
+                    # GAME_OVER snapshotのbot_muted_idsを残し、再起動後も
+                    # 解除対象を復元できるよう、空LOBBYへは進ませない。
+                    return False
             state.bot_muted_ids.clear()
 
         if vc is not None:
@@ -12477,6 +12649,7 @@ class RoomRunner:
                     await clear_one(member)
         await self._release_vc_after_game()
         await self._delete_alive_role()
+        return True
 
     # ============================================================
     # チャンネル権限管理
@@ -12971,8 +13144,50 @@ class RoomRunner:
         vc = state.voice_channel
         if vc is None or member.bot:
             return
-        # チャンネル移動のみ対象 (ミュート変更等では発火させない)
+        # ゲーム中のserver mute/suppress変更も監視する。外部操作や別Botで
+        # 発言状態が現在フェーズから外れた場合、次のタイマー更新を許さず停止する。
         if before.channel == after.channel:
+            in_game_vc = (
+                after.channel is not None
+                and after.channel.id == vc.id
+                and self._is_game_in_progress()
+            )
+            if in_game_vc:
+                speakers = self._current_speaker_ids()
+                should_speak = member.id in speakers
+                if self._uses_manual_gm_mute(member.id) and not should_speak:
+                    return
+                drifted = (
+                    (
+                        should_speak
+                        and (
+                            bool(getattr(after, "mute", False))
+                            or bool(getattr(after, "suppress", False))
+                        )
+                    )
+                    or (
+                        not should_speak
+                        and not bool(getattr(after, "mute", False))
+                    )
+                )
+                # 議論終了→投票などでは、phase更新より先にBot所有muteが
+                # Gatewayへ反映される。この既知の遷移だけは外部改変と誤認しない。
+                own_mute_in_flight = bool(
+                    should_speak
+                    and getattr(after, "mute", False)
+                    and member.id in state.bot_muted_ids
+                )
+                if drifted and not own_mute_in_flight:
+                    reason = (
+                        f"{member.display_name} の音声状態が現在フェーズと一致しません"
+                    )
+                    if state.paused:
+                        await self._sync_server_mutes(set())
+                        await self._ensure_mute_state_or_stop(
+                            set(), "停止中のサーバーミュート再同期"
+                        )
+                    else:
+                        await self.pause_game(reason)
             return
 
         joined = after.channel is not None and after.channel.id == vc.id
@@ -12998,7 +13213,37 @@ class RoomRunner:
             # サーバーミュートの残留/不足を現在フェーズに同期する
             # (例: 夜に切断→議論中に復帰した場合の残留ミュート解除)
             if self._is_game_in_progress():
-                await self._sync_server_mutes(self._current_speaker_ids())
+                speakers = self._current_speaker_ids()
+                voice = getattr(member, "voice", None)
+                should_speak = member.id in speakers
+                unsafe_now = bool(
+                    voice is not None
+                    and (
+                        (
+                            should_speak
+                            and (
+                                bool(getattr(voice, "mute", False))
+                                or bool(getattr(voice, "suppress", False))
+                            )
+                        )
+                        or (
+                            not should_speak
+                            and not bool(getattr(voice, "mute", False))
+                            and not bool(getattr(voice, "suppress", False))
+                        )
+                    )
+                )
+                if unsafe_now and not state.paused:
+                    # API待ちの間もタイマーを進めない。いったん全員muteへ
+                    # 停止し、GM再開時にそのフェーズの話者へ同期し直す。
+                    await self.pause_game(
+                        f"{member.display_name} のVC再入室時の発言制御を調整します"
+                    )
+                    return
+                await self._sync_server_mutes(speakers)
+                await self._ensure_mute_state_or_stop(
+                    speakers, "VC再入室時の発言制御"
+                )
             return
 
         if member.id == state.gm_id:
@@ -13025,11 +13270,30 @@ class RoomRunner:
                 )
         if not edit_kwargs:
             return
+        mute_requested = "mute" in edit_kwargs
+        if (
+            in_game
+            and mute_requested
+            and not bool(getattr(vs, "suppress", False))
+            and not state.paused
+        ):
+            # @everyoneのspeak拒否まで未反映なら、観戦者がAPI待ち中に
+            # 発言できる。先にタイマーを止め、全員muteへの同期で遮断する。
+            await self.pause_game(
+                f"{member.display_name} の観戦者ミュートを調整します"
+            )
+            # pause_gameの全体同期がmute+マーカーを担当済み。ここでは
+            # ニックネームだけ残し、同じmember PATCHを重複送信しない。
+            edit_kwargs.pop("mute", None)
+            edit_kwargs.pop("roles", None)
+            mute_requested = False
+            if not edit_kwargs:
+                return
         if "mute" in edit_kwargs:
             state.bot_mute_intent_ids.add(member.id)
             await self._persist_mute_ownership_checkpoint("途中入室観戦者のmute意図保存")
         try:
-            await self._discord_api_call(member.edit, **edit_kwargs)
+            await self._paced_discord_api_call(member.edit, **edit_kwargs)
             if "mute" in edit_kwargs:
                 state.bot_muted_ids.add(member.id)
                 state.bot_mute_intent_ids.discard(member.id)
@@ -13039,6 +13303,14 @@ class RoomRunner:
                 state.bot_mute_intent_ids.discard(member.id)
                 await self._persist_mute_ownership_checkpoint("途中入室観戦者のmute失敗保存")
             log.warning(f"途中入室の観戦者設定失敗: {member.display_name} ({e})")
+        if in_game and mute_requested:
+            # 統合PATCHが失敗した場合も、通常同期の再試行・安全停止契約へ
+            # 合流させる。成功時もGateway反映を全体状態で確認する。
+            speakers = self._current_speaker_ids()
+            await self._sync_server_mutes(speakers)
+            await self._ensure_mute_state_or_stop(
+                speakers, "途中入室観戦者のサーバーミュート"
+            )
 
     # ============================================================
     # メンバー再参加検知 (GameCogのリスナーから各卓へdispatchされる)

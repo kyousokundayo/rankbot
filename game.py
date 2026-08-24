@@ -1867,24 +1867,38 @@ class GameCog(RoomPermissionMixin, commands.Cog):
 
     async def register_pending_unmutes(
         self, guild: Optional[discord.Guild], member_ids: set[int]
-    ) -> None:
+    ) -> bool:
         """終了時に解除できなかったサーバーミュートを記録する (VC入室時に解除)"""
         if guild is None or not member_ids:
-            return
+            return not member_ids
         pending = self.pending_unmutes.setdefault(guild.id, set())
         pending.update(member_ids)
-        try:
-            await database.add_pending_unmutes(guild.id, member_ids)
-        except Exception as e:
-            log.warning(f"ミュート解除待ちの保存失敗: {e}")
-        log.info(f"ミュート解除待ちに登録: {sorted(member_ids)}")
+        for attempt, delay in enumerate((0, 1, 2), start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await database.add_pending_unmutes(guild.id, member_ids)
+            except Exception as e:
+                log.warning(
+                    "ミュート解除待ちの保存失敗 (%d/3): %s", attempt, e
+                )
+                continue
+            log.info(f"ミュート解除待ちに登録: {sorted(member_ids)}")
+            return True
+        log.error(
+            "ミュート解除待ちをDBへ保存できません: guild=%s members=%s",
+            guild.id,
+            sorted(member_ids),
+        )
+        return False
 
     async def load_pending_unmutes(self, guild: discord.Guild) -> None:
         try:
             pending = await database.load_pending_unmute_ids(guild.id)
         except Exception as e:
-            log.warning(f"ミュート解除待ちの読込失敗: {e}")
-            return
+            raise RuntimeError(
+                "持ち越しミュート解除待ちを読み込めないため起動を停止します"
+            ) from e
         self.pending_unmutes[guild.id] = pending
 
     async def _resolve_pending_unmute(
@@ -1903,21 +1917,24 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         if self.is_other_active_game_vc(channel_id):
             return
         try:
-            edit_kwargs: dict = {"mute": False}
             marker_roles = [
                 role for role in getattr(member, "roles", [])
                 if getattr(role, "name", "").startswith(MUTE_MARKER_ROLE_PREFIX)
             ]
             if marker_roles:
-                edit_kwargs["roles"] = [
-                    role for role in member_roles_for_edit(member)
-                    if not getattr(role, "name", "").startswith(MUTE_MARKER_ROLE_PREFIX)
-                ]
-            await self.paced_discord_api_call(
-                member.edit,
-                **edit_kwargs,
-                reason="人狼: 持ち越しミュート解除",
-            )
+                # マーカー除去とunmuteを同一PATCHにし、Discord側だけ成功した
+                # 場合も、次回は「マーカーなし」を成功証拠として再unmuteしない。
+                await self.paced_discord_api_call(
+                    member.edit,
+                    mute=False,
+                    roles=[
+                        role for role in member_roles_for_edit(member)
+                        if not getattr(role, "name", "").startswith(
+                            MUTE_MARKER_ROLE_PREFIX
+                        )
+                    ],
+                    reason="人狼: 持ち越しミュート解除",
+                )
         except discord.Forbidden as e:
             log.warning(f"持ち越しミュート解除失敗 ({member.display_name}): {e}")
             return
@@ -1944,11 +1961,29 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 return
             await self._resolve_pending_unmute(member, _retry_http=False)
             return
+        # Discord側のマーカーが無ければ、前回のunmute PATCHは成功済み。
+        # DB削除だけ失敗した窓で、後から付いた手動muteを再解除しない。
+        removed = False
+        for attempt, delay in enumerate((0, 1, 2), start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await database.remove_pending_unmute(member.guild.id, member.id)
+            except Exception as e:
+                log.warning(
+                    "ミュート解除待ちの削除失敗 (%d/3): %s", attempt, e
+                )
+                continue
+            removed = True
+            break
+        if not removed:
+            log.error(
+                "ミュート解除済みですが待機台帳を削除できません: guild=%s member=%s",
+                member.guild.id,
+                member.id,
+            )
+            return
         pending.discard(member.id)
-        try:
-            await database.remove_pending_unmute(member.guild.id, member.id)
-        except Exception as e:
-            log.warning(f"ミュート解除待ちの保存失敗: {e}")
         log.info(f"持ち越しサーバーミュートを解除しました ({member.display_name})")
 
     @commands.Cog.listener()
