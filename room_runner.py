@@ -2242,6 +2242,7 @@ class RoomRunner:
             "vote_slot_index": state.vote_slot_index,
             "vote_slot_token": state.vote_slot_token,
             "vote_slot_active": state.vote_slot_active,
+            "vote_ballot_before_speech": True,
             "vote_speech_finished": state.vote_speech_finished,
             "vote_slot_forced_abstain": state.vote_slot_forced_abstain,
             "vote_current_speaker_id": (
@@ -2538,7 +2539,8 @@ class RoomRunner:
         # 発言順は「投票参加」を押した人だけの部分列なので、生存者が全員
         # 入っている必要はない。まだ押していない人は復元後に押して並ぶ。
         for key in (
-            "vote_closed", "vote_slot_active", "vote_speech_finished",
+            "vote_closed", "vote_slot_active", "vote_ballot_before_speech",
+            "vote_speech_finished",
             "vote_slot_forced_abstain",
         ):
             if key in payload and not isinstance(payload[key], bool):
@@ -2559,6 +2561,7 @@ class RoomRunner:
             for row in payload.get("votes", [])
             if isinstance(row, dict) and row.get("voter_id") is not None
         }
+        ballot_before_speech = bool(payload.get("vote_ballot_before_speech", False))
         # v0.51までは発言と投票が同じ枠。active話者の票が既にある
         # 旧snapshotだけは「発言・投票完了」と読み替える。
         speech_finished = (
@@ -2574,16 +2577,30 @@ class RoomRunner:
                 raise StateDurabilityError("一斉投票snapshotに投票発言枠が残っています")
             if speaker_id != raw_order[slot_index]:
                 raise StateDurabilityError("投票発言中snapshotの話者が順序と一致しません")
-            if (
-                "vote_speech_finished" in payload
-                and not speech_finished
-                and speaker_id in vote_voter_ids
-            ):
-                raise StateDurabilityError("発言終了前の投票snapshotに確定票があります")
-            if forced_abstain and (
-                not speech_finished or speaker_id in vote_voter_ids
-            ):
-                raise StateDurabilityError("GM棄権snapshotの発言・票状態が不正です")
+            if ballot_before_speech:
+                if forced_abstain and (
+                    not speech_finished or speaker_id in vote_voter_ids
+                ):
+                    raise StateDurabilityError("GM棄権snapshotの発言・票状態が不正です")
+                if (
+                    not forced_abstain
+                    and speech_finished
+                    and speaker_id not in vote_voter_ids
+                ):
+                    raise StateDurabilityError("投票未確定の発言終了snapshotがあります")
+            else:
+                # 従来の「発言→投票」中に保存された卓も復元する。
+                # 発言済み・投票待ちでも、新順序で票を確定してから発言し直す。
+                if (
+                    "vote_speech_finished" in payload
+                    and not speech_finished
+                    and speaker_id in vote_voter_ids
+                ):
+                    raise StateDurabilityError("発言終了前の投票snapshotに確定票があります")
+                if forced_abstain and (
+                    not speech_finished or speaker_id in vote_voter_ids
+                ):
+                    raise StateDurabilityError("GM棄権snapshotの発言・票状態が不正です")
         elif speaker_id is not None or speech_finished or forced_abstain:
             raise StateDurabilityError("非アクティブな投票snapshotに現在枠の状態が残っています")
 
@@ -3219,7 +3236,19 @@ class RoomRunner:
             bool(payload.get("vote_slot_forced_abstain", False))
             if state.vote_slot_active else False
         )
-        # 復元直後は必ず全員ミュート。再開タスクがSE後に明示的に窓を開ける。
+        # 従来の「発言→投票」snapshotが、発言済み・投票待ちで
+        # 残っていた場合は、新しい順序で票を確定した後に改めて30秒開く。
+        # 「確定前に話せる」旧状態をそのまま復活させないための一度限りの変換。
+        if (
+            state.vote_slot_active
+            and not bool(payload.get("vote_ballot_before_speech", False))
+            and state.vote_speech_finished
+            and restored_vote_speaker_id not in state.votes
+            and not state.vote_slot_forced_abstain
+        ):
+            state.vote_speech_finished = False
+        # 復元直後は必ず全員ミュート。再開タスクが確定票の公開後に
+        # 明示的に発言窓を開け、ミュート解除反映後にSEを鳴らす。
         state.vote_speech_window_open = False
         state.speech_done_event.clear()
         state.vote_choice_event.clear()
@@ -5135,6 +5164,10 @@ class RoomRunner:
             and self.uses_sequential_vote()
             and state.vote_slot_active
             and not state.vote_speech_finished
+            and (
+                state.current_speaker_id in state.votes
+                or state.vote_speech_window_open
+            )
         ):
             old_window = state.vote_speech_window_open
             state.vote_speech_finished = True
@@ -5148,12 +5181,11 @@ class RoomRunner:
                 return "❌ 保存できないため安全停止しました。"
             state.speech_done_event.set()
             await self._safe_village_send("⏭️ **GMの操作で現在の投票発言を終了します。**")
-            return "⏭️ 現在の投票発言を終了しました。投票先の確定は待ち続けます。"
+            return "⏭️ 現在の投票発言を終了しました。"
         if (
             phase == Phase.DAY_VOTE
             and self.uses_sequential_vote()
             and state.vote_slot_active
-            and state.vote_speech_finished
             and not state.vote_slot_forced_abstain
         ):
             voter = state.get_player(state.current_speaker_id)
@@ -5161,10 +5193,13 @@ class RoomRunner:
                 state.vote_choice_event.set()
                 return "⏳ 現在の投票者は既に除外されています。"
             if voter.user_id in state.votes:
-                return "⏳ すでに投票確定済みです。"
+                return "⏳ 投票確定後の発言開始を待っています。"
+            old_speech_finished = state.vote_speech_finished
             state.vote_slot_forced_abstain = True
+            state.vote_speech_finished = True
             if not await self._record_vote_abstentions([voter], "本投票", 0):
                 state.vote_slot_forced_abstain = False
+                state.vote_speech_finished = old_speech_finished
                 return "❌ 棄権を保存できませんでした。もう一度押してください。"
             state.vote_choice_event.set()
             await self._safe_village_send(
@@ -7116,22 +7151,24 @@ class RoomRunner:
         return (
             f"🗳️ **{speaker.display_name}** の投票発言\n"
             + self._timer_line(remaining)
-            + "\n投票先は発言終了後に選びます。"
+            + "\n投票は確定済みです。本人の「終了」で短縮できます。"
             + f"\n📋 待機列: {self._vote_queue_line()}"
             + f"\n\n**ここまでの投票**\n{self._sequential_vote_detail()}"
         )
 
     def _sequential_vote_choice_content(self, voter: Player) -> str:
         return (
-            f"🗳️ **{voter.display_name}** の発言は終了しました。\n"
-            "時間制限はありません。投票先の名前を押して確定してください。"
+            f"🗳️ **{voter.display_name}** の投票順です。\n"
+            "全員ミュート中で、時間制限はありません。"
+            "投票先を確定すると発言が始まります。"
             + f"\n📋 待機列: {self._vote_queue_line()}"
             + f"\n\n**ここまでの投票**\n{self._sequential_vote_detail()}"
         )
 
     def _sequential_vote_committed_content(self, voter: Player) -> str:
         return (
-            f"✅ **{voter.display_name}** の投票が確定しました。"
+            f"✅ **{voter.display_name}** の投票が確定しました。\n"
+            "ミュート解除の反映後、SEを合図に発言開始です。"
             + f"\n📋 待機列: {self._vote_queue_line()}"
             + f"\n\n**ここまでの投票**\n{self._sequential_vote_detail()}"
         )
@@ -7144,9 +7181,9 @@ class RoomRunner:
         )
 
     def _vote_waiting_content(self, waiting: list[Player]) -> str:
-        """列が空のときの公開パネル。押した人から順に発言する。"""
+        """列が空のときの公開パネル。押した人から順に投票して発言する。"""
         return (
-            f"🗳️ **投票待ち** — 押した順に{VOTE_SPEECH_TIME}秒発言し、その後に投票先を選びます\n"
+            f"🗳️ **投票待ち** — 押した順に投票先を確定し、その後{VOTE_SPEECH_TIME}秒発言します\n"
             f"未投票 **{len(waiting)}人**: {'、'.join(p.display_name for p in waiting)}\n"
             f"\n**ここまでの投票**\n{self._sequential_vote_detail()}"
         )
@@ -7276,6 +7313,7 @@ class RoomRunner:
                 or state.current_speaker_id != actor_id
                 or state.vote_slot_token != vote_slot_token
                 or state.vote_speech_finished
+                or not state.vote_speech_window_open
             ):
                 return "⏳ この投票発言は終了しています。"
 
@@ -7290,7 +7328,7 @@ class RoomRunner:
                 await self._stop_for_durability_error("投票発言終了の保存", error)
                 return "❌ 発言終了を保存できないため安全停止しました。"
             state.speech_done_event.set()
-            return "✅ 発言を終了しました。続けて投票先を選んでください。"
+            return "✅ 発言を終了しました。次の人の投票へ進みます。"
 
     async def _day_vote(self) -> Optional[int]:
         if not self.uses_sequential_vote():
@@ -7386,25 +7424,18 @@ class RoomRunner:
         # 合図として区別できないため (議論終了SEに一本化)
         if initialized:
             await self._safe_village_send(
-                f"🗳️ **投票**「投票参加」を押した順に、1人{VOTE_SPEECH_TIME}秒発言し、"
-                "発言終了後に投票先を確定します。"
+                f"🗳️ **投票**「投票参加」を押した順に投票先を確定し、"
+                f"その後に1人{VOTE_SPEECH_TIME}秒発言します。"
             )
         await self._repost_gm_panel()
 
         panel = self._vote_panel_reference()
         queue_view = VoteQueueView(self)
-        # 直前の確定票を公開したあとに投票開示SEを鳴らした場合、その約2秒を
-        # 次の話者への切替猶予として使う。次枠で開始SEまで重ねると二重SE・
-        # 約4秒待ちになるため、列が連続している1枠だけ開始SEを省略する。
-        next_speaker_already_cued = False
         while not state.vote_closed:
             await state.pause_event.wait()
             if state.vote_slot_index >= len(state.vote_order):
                 if not self._vote_queue_waiting():
                     break
-                # 列が空の待機を挟んだ後は、前の確定SEから時間が空いている。
-                # 新しく押した人の開始SEを通常どおり鳴らす。
-                next_speaker_already_cued = False
                 panel = await self._wait_for_vote_queue(panel, queue_view)
                 continue
             voter_id = state.vote_order[state.vote_slot_index]
@@ -7435,68 +7466,13 @@ class RoomRunner:
             state.speech_done_event.clear()
             state.vote_choice_event.clear()
             await self._persist_vote_checkpoint(
-                "通常投票発言枠の再開"
-                if resuming_slot else "通常投票発言枠の開始"
+                "通常投票枠の再開"
+                if resuming_slot else "通常投票枠の開始"
             )
             slot_token = state.vote_slot_token
 
-            if not state.vote_speech_finished:
-                speech_view = SequentialVoteSpeechView(self, voter.user_id)
-
-                def vote_content(remaining: float, voter=voter) -> str:
-                    state.vote_remaining_seconds = remaining
-                    return self._sequential_vote_content(voter, remaining)
-
-                panel = await self._replace_sequential_vote_panel(
-                    panel, vote_content(VOTE_SPEECH_TIME), speech_view
-                )
-                if panel is None:
-                    error = StateDurabilityError("通常投票パネルを掲示できませんでした")
-                    await self._stop_for_durability_error("通常投票パネルの掲示", error)
-                    raise error
-
-                if next_speaker_already_cued:
-                    next_speaker_already_cued = False
-                else:
-                    await self._play_transition_se("speech")
-                await state.pause_event.wait()
-                if (
-                    state.vote_slot_active
-                    and state.vote_slot_token == slot_token
-                    and state.current_speaker_id == voter.user_id
-                    and voter.alive
-                    and not state.vote_speech_finished
-                ):
-                    state.vote_speech_window_open = True
-                    await self._grant_speaker(voter.member)
-                    await self._pausable_countdown(
-                        panel, vote_content, VOTE_SPEECH_TIME, state.speech_done_event
-                    )
-
-                # 30秒経過でも棄権にしない。発言終了だけを先にdurableにする。
-                async with self.action_lock:
-                    if (
-                        state.vote_slot_active
-                        and state.vote_slot_token == slot_token
-                        and state.current_speaker_id == voter.user_id
-                        and not state.vote_speech_finished
-                    ):
-                        state.vote_speech_finished = True
-                        state.vote_speech_window_open = False
-                        await self._persist_vote_checkpoint("通常投票発言の終了")
-                    else:
-                        state.vote_speech_window_open = False
-                speech_view.stop()
-                await self._clear_speaker()
-                if voter.alive and state.vote_slot_active:
-                    await self._play_transition_se("speech_end")
-            else:
-                # 投票先待ちの復元。再度30秒を開けずミュートへ収束させる。
-                await self._clear_speaker()
-
-            if state.paused and state.recovered_from_restart:
-                raise StateDurabilityError("通常投票は安全停止中です")
-
+            # 自分の順番が来たら、全員ミュートのまま先に投票先を確定する。
+            # 候補選択には時間制限を設けず、確定票を保存・公開するまで発言を許可しない。
             if voter.alive and not state.vote_slot_forced_abstain and voter.user_id not in state.votes:
                 choice_view = VoteView(
                     self,
@@ -7532,7 +7508,7 @@ class RoomRunner:
                         state.vote_choice_event.clear()
                 choice_view.stop()
             elif voter.user_id in state.votes:
-                # 確定票保存後の再起動は公開を復旧してからcursorを進める。
+                # 確定票保存後の再起動は公開を復旧してから発言を再開する。
                 if not await self._refresh_sequential_vote_panel():
                     raise StateDurabilityError(
                         "確定票を公開できず安全停止しました",
@@ -7547,23 +7523,77 @@ class RoomRunner:
                     await self._stop_for_durability_error("GM棄権の公開", error)
                     raise error
 
-            # 確定票（またはGM明示棄権）を公開した直後にSEを鳴らし、約2秒後に
-            # 次の人へ進む。列が続いていれば、このSEを次枠の開始合図と兼用する。
-            # 最終票は直後の集計開示SEに任せ、同じ合図を連続させない。
-            slot_completed = (
-                voter.user_id in state.votes
-                or state.vote_slot_forced_abstain
-            )
-            future_queued = any(
-                (candidate := state.get_player(queued_id)) is not None
-                and candidate.alive
-                and queued_id not in state.votes
-                for queued_id in state.vote_order[state.vote_slot_index + 1:]
-            )
-            unqueued_remain = bool(self._vote_queue_waiting())
-            if slot_completed and (future_queued or unqueued_remain):
-                await self._play_transition_se("reveal")
-                next_speaker_already_cued = future_queued
+            if state.paused and state.recovered_from_restart:
+                raise StateDurabilityError("通常投票は安全停止中です")
+
+            # 票の保存・公開が完了した人だけ、VCのミュート解除を反映させる。
+            # 反映後に開始SEを鳴らし、そこから30秒の投票発言を行う。
+            if (
+                voter.alive
+                and voter.user_id in state.votes
+                and not state.vote_speech_finished
+            ):
+                speech_view = SequentialVoteSpeechView(self, voter.user_id)
+
+                def vote_content(remaining: float, voter=voter) -> str:
+                    state.vote_remaining_seconds = remaining
+                    return self._sequential_vote_content(voter, remaining)
+
+                panel = await self._replace_sequential_vote_panel(
+                    panel, vote_content(VOTE_SPEECH_TIME), speech_view
+                )
+                if panel is None:
+                    error = StateDurabilityError("通常投票パネルを掲示できませんでした")
+                    await self._stop_for_durability_error("通常投票パネルの掲示", error)
+                    raise error
+
+                await state.pause_event.wait()
+                if (
+                    state.vote_slot_active
+                    and state.vote_slot_token == slot_token
+                    and state.current_speaker_id == voter.user_id
+                    and voter.alive
+                    and voter.user_id in state.votes
+                    and not state.vote_speech_finished
+                ):
+                    state.vote_speech_window_open = True
+                    await self._grant_speaker(voter.member)
+                    # Discordへのミュート解除反映を待ってから、
+                    # この人が話し始める合図を出す。
+                    if (
+                        state.vote_slot_active
+                        and state.vote_slot_token == slot_token
+                        and state.current_speaker_id == voter.user_id
+                        and voter.alive
+                        and not state.paused
+                        and not state.vote_speech_finished
+                    ):
+                        await self._play_transition_se("speech")
+                        await self._pausable_countdown(
+                            panel, vote_content, VOTE_SPEECH_TIME,
+                            state.speech_done_event,
+                        )
+
+                # 30秒経過でも棄権にしない。発言終了だけを先にdurableにする。
+                async with self.action_lock:
+                    if (
+                        state.vote_slot_active
+                        and state.vote_slot_token == slot_token
+                        and state.current_speaker_id == voter.user_id
+                        and not state.vote_speech_finished
+                    ):
+                        state.vote_speech_finished = True
+                        state.vote_speech_window_open = False
+                        await self._persist_vote_checkpoint("通常投票発言の終了")
+                    else:
+                        state.vote_speech_window_open = False
+                speech_view.stop()
+                await self._clear_speaker()
+                if voter.alive and state.vote_slot_active:
+                    await self._play_transition_se("speech_end")
+            else:
+                # GM棄権、除外、または発言完了済みの復元枠は発言を開き直さない。
+                await self._clear_speaker()
 
             await self._advance_vote_cursor()
             # 自分の枠の中で投票先が除外された場合だけ、末尾で投票し直す。
@@ -7578,7 +7608,7 @@ class RoomRunner:
                 if requeued:
                     await self._safe_village_send(
                         f"↩️ **{voter.display_name}** の投票先が外れたため、"
-                        "最後にもう一度投票発言を行います。"
+                        "最後にもう一度投票して発言します。"
                     )
                 await self._persist_vote_checkpoint("失効した票の再投票枠")
 
@@ -11120,12 +11150,13 @@ class RoomRunner:
             and state.vote_slot_active
             and state.current_speaker_id == player.user_id
             and not state.vote_speech_finished
+            and state.vote_speech_window_open
         )
         release_vote_choice = bool(
             self._effective_phase() == Phase.DAY_VOTE
             and state.vote_slot_active
             and state.current_speaker_id == player.user_id
-            and state.vote_speech_finished
+            and not state.vote_speech_window_open
         )
         # 「投票参加」待ちで止まっている場合は、除外で生存者集合が変わった
         # ことを知らせて条件を見直させる。最後の未押下者が抜けたときに

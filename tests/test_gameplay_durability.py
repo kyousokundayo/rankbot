@@ -2215,7 +2215,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.state.vote_slot_index = 0
         runner.state.vote_slot_token = 1
         runner.state.vote_slot_active = True
-        runner.state.vote_speech_finished = True
+        runner.state.vote_speech_finished = False
         runner.state.current_speaker_id = second.user_id
         view = VoteView(runner, [first, second, removed], [first, second, removed])
         removed.alive = False
@@ -2260,7 +2260,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.state.vote_order = [voter.user_id]
         runner.state.vote_slot_token = 1
         runner.state.vote_slot_active = True
-        runner.state.vote_speech_finished = True
+        runner.state.vote_speech_finished = False
         runner.state.current_speaker_id = voter.user_id
         view = VoteView(runner, [voter, target], [voter, target])
         runner._persist_room_state = AsyncMock(side_effect=RuntimeError("DB down"))
@@ -2303,7 +2303,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.state.vote_order = [voter.user_id]
         runner.state.vote_slot_token = 1
         runner.state.vote_slot_active = True
-        runner.state.vote_speech_finished = True
+        runner.state.vote_speech_finished = False
         runner.state.current_speaker_id = voter.user_id
         view = VoteView(runner, [voter, target], [voter, target])
         interaction = SimpleNamespace(
@@ -2744,7 +2744,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.state.vote_slot_index = 0
         runner.state.vote_slot_token = 4
         runner.state.vote_slot_active = True
-        runner.state.vote_speech_finished = True
+        runner.state.vote_speech_finished = False
         runner.state.current_speaker_id = voter.user_id
         final = VoteView(runner, alive, alive)
         self.assertIsNone(final._vote_error(voter.user_id, first.user_id))
@@ -2825,7 +2825,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.state.vote_slot_index = 0
         runner.state.vote_slot_token = 1
         runner.state.vote_slot_active = True
-        runner.state.vote_speech_finished = True
+        runner.state.vote_speech_finished = False
         runner.state.current_speaker_id = voter.user_id
         view = VoteView(runner, [voter, target], [voter])
         runner._refresh_sequential_vote_panel = AsyncMock(return_value=False)
@@ -2846,14 +2846,16 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.state.phase = Phase.DAY_VOTE
         runner.state.vote_slot_active = True
         runner.state.current_speaker_id = voter.user_id
+        runner.state.votes[voter.user_id] = voter.user_id + 1
+        runner.state.vote_speech_window_open = True
 
         result = await runner.force_skip_wait(gm)
 
         self.assertIn("投票発言", result)
         self.assertTrue(runner.state.speech_done_event.is_set())
 
-    async def test_vote_speech_timeout_waits_for_choice_without_abstention(self) -> None:
-        """30秒経過はミュートまで。棄権せず投票確定を無期限で待つ。"""
+    async def test_vote_choice_waits_without_unmuting_or_abstention(self) -> None:
+        """投票確定までは無期限で待ち、発言も棄権も始めない。"""
         runner = make_runner()
         runner.state.phase = Phase.DAY_VOTE
         runner.state.day_generation = 1
@@ -2870,15 +2872,17 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
         await runner.join_vote_queue(voter.member)
         for _ in range(100):
-            if runner.state.vote_speech_finished:
+            if runner.state.vote_slot_active:
                 break
             await asyncio.sleep(0)
 
         self.assertTrue(runner.state.vote_slot_active)
-        self.assertTrue(runner.state.vote_speech_finished)
+        self.assertFalse(runner.state.vote_speech_finished)
         self.assertNotIn(voter.user_id, runner.state.votes)
         self.assertFalse(task.done())
         self.assertEqual(runner._current_speaker_ids(), set())
+        runner._grant_speaker.assert_not_awaited()
+        runner._pausable_countdown.assert_not_awaited()
         runner._record_vote_abstentions.assert_not_awaited()
 
         task.cancel()
@@ -2892,6 +2896,8 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.state.vote_slot_active = True
         runner.state.vote_slot_token = 7
         runner.state.current_speaker_id = voter.user_id
+        runner.state.votes[voter.user_id] = voter.user_id + 1
+        runner.state.vote_speech_window_open = True
 
         view = SequentialVoteSpeechView(runner, voter.user_id)
         custom_ids = {item.custom_id for item in view.children}
@@ -2903,7 +2909,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(runner.state.vote_speech_finished)
         self.assertTrue(runner.state.speech_done_event.is_set())
 
-    async def test_gm_force_abstention_only_after_speech(self) -> None:
+    async def test_gm_force_abstention_before_vote_confirmation(self) -> None:
         runner = make_runner()
         voter = add_player(runner, 1)
         gm = SimpleNamespace(id=99)
@@ -2911,7 +2917,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.state.phase = Phase.DAY_VOTE
         runner.state.vote_order = [voter.user_id]
         runner.state.vote_slot_active = True
-        runner.state.vote_speech_finished = True
+        runner.state.vote_speech_finished = False
         runner.state.vote_slot_token = 3
         runner.state.current_speaker_id = voter.user_id
 
@@ -2921,6 +2927,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("棄権", result)
         self.assertTrue(runner.state.vote_slot_forced_abstain)
+        self.assertTrue(runner.state.vote_speech_finished)
         self.assertTrue(runner.state.vote_choice_event.is_set())
         self.assertNotIn(voter.user_id, runner.state.votes)
 
@@ -2946,6 +2953,40 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         }
         with self.assertRaisesRegex(StateDurabilityError, "重複なし順列"):
             runner._validate_vote_snapshot(payload, Phase.DAY_VOTE, [1, 7])
+
+    def test_ballot_before_speech_snapshot_keeps_confirmed_active_vote(self) -> None:
+        runner = make_runner()
+        runner.state.day_generation = 2
+        payload = {
+            "players": [{"user_id": 1}, {"user_id": 2}],
+            "votes": [{"voter_id": 1, "target_id": 2}],
+            "vote_day_generation": 2,
+            "vote_order": [1],
+            "vote_slot_index": 0,
+            "vote_slot_active": True,
+            "vote_ballot_before_speech": True,
+            "vote_speech_finished": False,
+            "vote_current_speaker_id": 1,
+        }
+
+        runner._validate_vote_snapshot(payload, Phase.DAY_VOTE, [1])
+
+    def test_ballot_before_speech_snapshot_rejects_finished_unconfirmed_slot(self) -> None:
+        runner = make_runner()
+        runner.state.day_generation = 2
+        payload = {
+            "players": [{"user_id": 1}, {"user_id": 2}],
+            "vote_day_generation": 2,
+            "vote_order": [1],
+            "vote_slot_index": 0,
+            "vote_slot_active": True,
+            "vote_ballot_before_speech": True,
+            "vote_speech_finished": True,
+            "vote_current_speaker_id": 1,
+        }
+
+        with self.assertRaisesRegex(StateDurabilityError, "投票未確定"):
+            runner._validate_vote_snapshot(payload, Phase.DAY_VOTE, [1])
 
     async def test_removed_vote_target_requeues_completed_voter(self) -> None:
         runner = make_runner()
@@ -3076,12 +3117,11 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner._grant_speaker = AsyncMock()
         runner._clear_speaker = AsyncMock()
 
-        async def finish_current(*args, **kwargs):
+        async def choose_current(_event):
             runner.state.votes[runner.state.current_speaker_id] = second.user_id
-            runner.state.speech_done_event.set()
-            return False
 
-        runner._pausable_countdown = AsyncMock(side_effect=finish_current)
+        runner._pausable_wait_forever = AsyncMock(side_effect=choose_current)
+        runner._pausable_countdown = AsyncMock(return_value=False)
 
         executed = await runner._day_vote()
 
@@ -3157,15 +3197,18 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner._play_se = Mock()
         spoken: list[int] = []
 
-        async def cast(*_args, **_kwargs) -> bool:
+        async def choose(_event) -> None:
             speaker_id = runner.state.current_speaker_id
-            spoken.append(speaker_id)
             runner.state.votes[speaker_id] = (
                 three.user_id if speaker_id != three.user_id else one.user_id
             )
+
+        async def speak(*_args, **_kwargs) -> bool:
+            spoken.append(runner.state.current_speaker_id)
             return True
 
-        runner._pausable_countdown = AsyncMock(side_effect=cast)
+        runner._pausable_wait_forever = AsyncMock(side_effect=choose)
+        runner._pausable_countdown = AsyncMock(side_effect=speak)
 
         task = asyncio.create_task(runner._day_vote())
         for _ in range(5):
@@ -3273,11 +3316,14 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner._play_transition_se = AsyncMock()
         runner._play_se = Mock()
 
-        async def cast(*_args, **_kwargs) -> bool:
+        async def choose(_event) -> None:
             runner.state.votes[runner.state.current_speaker_id] = three.user_id
+
+        async def speak(*_args, **_kwargs) -> bool:
             return True
 
-        runner._pausable_countdown = AsyncMock(side_effect=cast)
+        runner._pausable_wait_forever = AsyncMock(side_effect=choose)
+        runner._pausable_countdown = AsyncMock(side_effect=speak)
 
         task = asyncio.create_task(runner._day_vote())
         for _ in range(5):
@@ -3391,6 +3437,52 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
             [player.user_id for player in restored._vote_queue_waiting()], [3]
         )
 
+    async def test_legacy_speech_then_vote_snapshot_restarts_with_new_order(self) -> None:
+        """旧順序で発言済み・投票待ちだった卓も、投票→発言で再開する。"""
+        source = make_runner()
+        source.state.phase = Phase.DAY_VOTE
+        source.state.day_generation = 1
+        source.state.vote_day_generation = 1
+        voter = add_player(source, 1)
+        add_player(source, 2)
+        source.state.vote_order = [voter.user_id]
+        source.state.vote_slot_index = 0
+        source.state.vote_slot_active = True
+        source.state.vote_speech_finished = True
+        source.state.current_speaker_id = voter.user_id
+        source.state.mute_marker_enabled = True
+        source.state.gm_id = 99
+        snapshot = source._build_room_snapshot()
+        snapshot["phase"] = Phase.DAY_VOTE.name
+        snapshot.pop("vote_ballot_before_speech")
+
+        restored = make_runner()
+        restored.state.guild = FakeGuild(
+            [player.member for player in source.state.players.values()]
+            + [FakeMember(99)],
+            [],
+        )
+        restored.state.village_channel = object()
+        restored.state.spirit_channel = object()
+        restored._assign_alive_role = AsyncMock()
+        restored._prepare_game_vc_permissions = AsyncMock()
+        restored._apply_spirit_blocks = AsyncMock()
+        restored._post_lobby_ui = AsyncMock()
+        restored._repost_gm_panel = AsyncMock()
+        restored._enable_mute_markers = AsyncMock()
+        restored._reconcile_mute_marker_ownership = AsyncMock()
+        restored._reconcile_mute_intents = AsyncMock()
+        restored._retry_pending_ui_cleanup = AsyncMock()
+        restored._disable_recovered_turn_panel = AsyncMock()
+        restored._reconcile_pending_death_effects = AsyncMock()
+
+        await restored.restore_from_snapshot(snapshot)
+
+        self.assertTrue(restored.state.vote_slot_active)
+        self.assertFalse(restored.state.vote_speech_finished)
+        self.assertEqual(restored.state.current_speaker_id, voter.user_id)
+        self.assertNotIn(voter.user_id, restored.state.votes)
+
     async def test_gm_skip_does_not_close_vote_before_cursor_advances(self) -> None:
         """枠終了〜cursor更新の間に押しても、並んでいる人の枠を捨てない。"""
         runner = make_runner()
@@ -3424,11 +3516,14 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner._apply_death_effect = AsyncMock()
         runner.state.check_win = lambda: None
 
-        async def cast(*_args, **_kwargs) -> bool:
+        async def choose(_event) -> None:
             runner.state.votes[runner.state.current_speaker_id] = three.user_id
+
+        async def speak(*_args, **_kwargs) -> bool:
             return True
 
-        runner._pausable_countdown = AsyncMock(side_effect=cast)
+        runner._pausable_wait_forever = AsyncMock(side_effect=choose)
+        runner._pausable_countdown = AsyncMock(side_effect=speak)
 
         task = asyncio.create_task(runner._day_vote())
         for _ in range(5):
@@ -3461,29 +3556,30 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner._play_se = Mock()
         runner._apply_death_effect = AsyncMock()
         runner.state.check_win = lambda: None
+        runner._resolve_day_vote = AsyncMock(return_value=third.user_id)
         spoken: list[int] = []
+        choices: list[int] = []
 
-        async def cast(*_args, **_kwargs) -> bool:
+        async def choose(_event) -> None:
+            voter_id = runner.state.current_speaker_id
+            choices.append(voter_id)
+            if voter_id == voter.user_id and choices.count(voter_id) == 1:
+                runner.state.votes[voter_id] = target.user_id
+            elif voter_id == third.user_id:
+                runner.state.votes[voter_id] = voter.user_id
+            else:
+                runner.state.votes[voter_id] = third.user_id
+
+        async def speak(*_args, **_kwargs) -> bool:
             speaker_id = runner.state.current_speaker_id
             spoken.append(speaker_id)
             if speaker_id == voter.user_id and len(spoken) == 1:
-                # 自分の枠の中で投票 → その直後に投票先が除外される
-                runner.state.votes[speaker_id] = target.user_id
+                # 投票確定後の発言中に投票先が除外される。
                 await runner._eliminate_player_mid_game(target, "テスト")
-                replacement = third.user_id
-            else:
-                replacement = third.user_id
-
-            async def confirm_choice() -> None:
-                # 発言終了後に表示される候補選択を別イベントとして模擬する。
-                await asyncio.sleep(0)
-                runner.state.votes[speaker_id] = replacement
-                runner.state.vote_choice_event.set()
-
-            asyncio.create_task(confirm_choice())
             return True
 
-        runner._pausable_countdown = AsyncMock(side_effect=cast)
+        runner._pausable_wait_forever = AsyncMock(side_effect=choose)
+        runner._pausable_countdown = AsyncMock(side_effect=speak)
 
         task = asyncio.create_task(runner._day_vote())
         for _ in range(5):
@@ -3492,9 +3588,9 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         await runner.join_vote_queue(third.member)
         executed = await asyncio.wait_for(task, timeout=1)
 
-        # 新仕様では発言枠と投票先確定を分離する。発言中に候補が
-        # 除外されても、同じ枠の候補選択で投票先を確定する。
-        self.assertEqual(spoken, [voter.user_id, third.user_id])
+        # 確定票が失効した人は末尾で改めて投票し、その票で発言する。
+        self.assertEqual(spoken, [voter.user_id, third.user_id, voter.user_id])
+        self.assertEqual(choices, [voter.user_id, third.user_id, voter.user_id])
         self.assertEqual(runner.state.votes[voter.user_id], third.user_id)
         self.assertEqual(executed, third.user_id)
 
@@ -3509,8 +3605,8 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         runner.state.vote_order = [voter.user_id]
         runner.state.vote_slot_active = True
         runner.state.current_speaker_id = voter.user_id
-        # 票を確定した直後: speech_done_eventだけが立った状態
-        runner.state.speech_done_event.set()
+        # 票を確定した直後、まだ発言開始前の状態。
+        runner.state.votes[voter.user_id] = 2
 
         result = await runner.force_skip_wait(gm)
 
@@ -3586,8 +3682,8 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
             "決戦投票の開始",
         )
 
-    async def test_vote_end_cue_precedes_next_speaker_without_duplicate_start_se(self) -> None:
-        """確定票公開後のSEを次枠の開始合図と兼用し、二重再生を避ける。"""
+    async def test_each_confirmed_vote_grants_speaker_before_start_cue(self) -> None:
+        """各人の投票確定後、ミュート解除反映から開始SEの順にする。"""
         runner = make_runner()
         first = add_player(runner, 1)
         second = add_player(runner, 2)
@@ -3609,14 +3705,17 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
             side_effect=lambda: events.append("clear")
         )
 
-        async def cast_vote(*_args, **_kwargs) -> bool:
+        async def choose_vote(_event) -> None:
             current = runner.state.current_speaker_id
             runner.state.votes[current] = (
                 second.user_id if current == first.user_id else first.user_id
             )
+
+        async def finish_speech(*_args, **_kwargs) -> bool:
             return False
 
-        runner._pausable_countdown = AsyncMock(side_effect=cast_vote)
+        runner._pausable_wait_forever = AsyncMock(side_effect=choose_vote)
+        runner._pausable_countdown = AsyncMock(side_effect=finish_speech)
         runner._resolve_day_vote = AsyncMock(return_value=None)
 
         executed = await runner._day_vote()
@@ -3625,8 +3724,8 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             events,
             [
-                "se:speech", f"grant:{first.user_id}", "clear", "se:speech_end",
-                "se:reveal", f"grant:{second.user_id}", "clear", "se:speech_end",
+                f"grant:{first.user_id}", "se:speech", "clear", "se:speech_end",
+                f"grant:{second.user_id}", "se:speech", "clear", "se:speech_end",
             ],
         )
 
