@@ -1138,8 +1138,21 @@ class GMControlView(discord.ui.View):
         if effective_phase == Phase.DAY_DISCUSSION:
             self.skip_wait_btn.label = "議論終了"
         elif effective_phase == Phase.DAY_VOTE and cog.uses_sequential_vote():
-            if state.vote_slot_active and not state.vote_speech_finished:
+            current_voter_id = getattr(state, "current_speaker_id", None)
+            if (
+                state.vote_slot_active
+                and (
+                    current_voter_id in getattr(state, "votes", {})
+                    or getattr(state, "vote_speech_window_open", False)
+                )
+                and not state.vote_speech_finished
+            ):
                 self.skip_wait_btn.label = "発言終了"
+            elif state.vote_slot_active and (
+                state.vote_speech_finished or state.vote_slot_forced_abstain
+            ):
+                self.skip_wait_btn.label = "次へ処理中"
+                self.skip_wait_btn.disabled = True
             elif state.vote_slot_active:
                 self.skip_wait_btn.label = "棄権にして次へ"
                 self.skip_wait_btn.style = discord.ButtonStyle.danger
@@ -1553,8 +1566,14 @@ class RemovePlayerSelectView(discord.ui.View):
                             ephemeral=True,
                         )
                         return
+                    message = f"{display_name} をゲームから除外しました。"
+                    if state.paused:
+                        message += (
+                            " ゲームは一時停止中です。音声状態を確認してから"
+                            "GMパネルの「再開」を押してください。"
+                        )
                     await confirm_interaction.followup.send(
-                        f"{display_name} をゲームから除外しました。", ephemeral=True
+                        message, ephemeral=True
                     )
                     return
 
@@ -1735,8 +1754,9 @@ class VoteQueueView(discord.ui.View):
 class SequentialVoteSpeechView(discord.ui.View):
     """クロストーク通常投票の発言中パネル。
 
-    候補ボタンは発言終了後に初めて出す。他の生存者は発言中でも
-    次以降の列へ並べるため、共通の「投票参加」ボタンだけ併置する。
+    候補ボタンは発言開始前に出し、確定後はこのパネルへ交代する。
+    他の生存者は発言中でも次以降の列へ並べるため、
+    共通の「投票参加」ボタンだけ併置する。
     """
 
     def __init__(self, cog: RoomRunner, speaker_id: int) -> None:
@@ -1789,7 +1809,7 @@ class _BaseVoteView(discord.ui.View):
     persist_label: str
     vote_kind: str  # database.record_vote_event の vote_kind ('本投票'|'決選投票')
     round_index: int  # 決選の回数。本投票は常に0
-    # 通常投票のパネルだけ、発言中の人の候補ボタンと並べて
+    # 通常投票のパネルだけ、発言前の人の候補ボタンと並べて
     # 「投票参加」(列へ並ぶ) を置く。決戦は一斉投票なので置かない。
     with_queue_button: bool = False
 
@@ -1835,9 +1855,12 @@ class _BaseVoteView(discord.ui.View):
         # 生き続ける。通常・決戦のどちらも締切checkpoint後はここで拒否する。
         if state.vote_closed:
             return "投票受付は終了しました。"
-        # 投票発言の通常投票は列の先頭1人だけ受け付ける。slot tokenも照合し、
+        # 投票発言の通常投票は列の先頭1人だけ、発言前に受け付ける。
+        # slot tokenも照合し、
         # 1つ前の投票者に残った古いボタンが次の人の枠へ作用しないようにする。
         # ターン制の一斉投票には発言枠がないため、この照合は行わない。
+        if voter_id in state.votes:
+            return "投票済みです。"
         if (
             self.expected_phase == Phase.DAY_VOTE
             and self.cog.uses_sequential_vote()
@@ -1845,20 +1868,12 @@ class _BaseVoteView(discord.ui.View):
                 not state.vote_slot_active
                 or state.current_speaker_id != voter_id
                 or self.vote_slot_token != state.vote_slot_token
-                or not state.vote_speech_finished
+                or state.vote_speech_finished
+                or state.vote_speech_window_open
                 or state.vote_slot_forced_abstain
             )
         ):
-            if (
-                state.vote_slot_active
-                and state.current_speaker_id == voter_id
-                and self.vote_slot_token == state.vote_slot_token
-                and not state.vote_speech_finished
-            ):
-                return "発言終了後に投票できます。"
             return "自分の番になってから投票できます。"
-        if voter_id in state.votes:
-            return "投票済みです。"
         if voter_id == target_id:
             return "自分には投票できません。"
         voter = state.get_player(voter_id)
@@ -1950,8 +1965,8 @@ class _BaseVoteView(discord.ui.View):
                 log.exception(f"投票ログのDB記録に失敗 ({state.room_name}): {error}")
 
             if self.expected_phase == Phase.DAY_VOTE and self.cog.uses_sequential_vote():
-                # 発言終了後の確定票を同じ公開パネルへ反映してから、
-                # 投票先待ちを解除する。次の人へ進んだ後で表示しない。
+                # 発言前の確定票を同じ公開パネルへ反映してから、
+                # 投票先待ちを解除する。公開前に発言を始めない。
                 if not await self.cog._refresh_sequential_vote_panel():
                     # ゲームタスクが無期限待機のまま残らないよう起こす。
                     # 待機側は安全停止を検出し、cursorを進めず終了する。
@@ -5492,9 +5507,10 @@ def build_rule_embeds(
         )
     else:
         vote_rule = (
-            "「投票参加」を押した順に1人30秒発言します。本人の「終了」または"
-            "時間経過で発言を終え、**発言終了SEと約2秒の切替後**に候補を選びます。\n"
-            "候補を選んだ後は本人専用の確認で確定し、票をその場で公開します。"
+            "「投票参加」を押した順に、先に投票先を選び、"
+            "本人専用の確認で確定・公開します。"
+            "ミュート解除後のSEを合図に1人30秒発言し、本人の「終了」で短縮できます。\n"
+            "発言終了SEと約2秒後に次の人の投票へ進みます。"
             "**候補選択に時間制限はなく、自動棄権はしません。**\n"
             "「投票参加」はいつでも押せます。列が空なら全員ミュートで待機し、"
             "進行が詰まった場合だけGMが明示的に締め切れます。自分には投票できません。\n"

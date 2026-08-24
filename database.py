@@ -213,7 +213,7 @@ def _validate_room_snapshot(phase: str, payload: dict) -> None:
         if value is not None and not _is_snapshot_id(value):
             raise ValueError(f"{key} must be an ID or null")
     for key in (
-        "vote_slot_active", "vote_speech_finished",
+        "vote_slot_active", "vote_ballot_before_speech", "vote_speech_finished",
         "vote_slot_forced_abstain", "vote_closed",
     ):
         if key in payload and not isinstance(payload[key], bool):

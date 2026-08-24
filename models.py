@@ -198,15 +198,15 @@ class GameState:
         self.runoff_speech_index: int = 0
 
         # 通常投票のdurableな発言順とcursor。順番は「投票参加」ボタンを押した順で、
-        # 押した人から1人ずつ30秒発言し、発言終了後は時間制限なしで確定投票を待つ。
+        # 押した人から1人ずつ時間制限なしで投票先を確定し、その後に30秒発言する。
         # 列が空になったら次に押した人が来るまで待つ。進行中に落ちた場合は
-        # 発言中なら満額でやり直し、投票待ちならミュートのまま再開する。
+        # 投票待ちなら全員ミュートのまま、発言中なら確定済み票を保って満額で再開する。
         self.vote_day_generation: int = 0
         self.vote_order: list[int] = []
         self.vote_slot_index: int = 0
         self.vote_slot_token: int = 0
-        # activeは発言開始から投票確定までの枠全体。発言終了後も
-        # 投票先が確定するまでTrueを維持する。
+        # activeは投票先選択から発言終了までの枠全体。
+        # 投票確定後も発言が終わるまでTrueを維持する。
         self.vote_slot_active: bool = False
         self.vote_speech_finished: bool = False
         # 現在枠をGMが明示的に棄権扱いにした。通常の30秒経過では立てない。
@@ -337,7 +337,7 @@ class GameState:
         # 列が空の待機中だけ待ち、起こされたら条件を見直す。
         self.vote_queue_event: asyncio.Event = asyncio.Event()
 
-        # クロストーク通常投票で、発言終了後の投票確定・GM棄権・
+        # クロストーク通常投票で、発言前の投票確定・GM棄権・
         # 現在者除外を待つ合図。時間切れでは立てない。
         self.vote_choice_event: asyncio.Event = asyncio.Event()
 

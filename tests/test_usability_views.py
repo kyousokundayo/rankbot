@@ -702,7 +702,8 @@ class HelpAndRuleEmbedTest(unittest.TestCase):
         daily_flow = fields["1日の流れ"]
         self.assertIn("投票参加", vote_help)
         self.assertIn("1人30秒", vote_help)
-        self.assertIn("発言終了", vote_help)
+        self.assertIn("確定・公開", vote_help)
+        self.assertLess(vote_help.index("確定・公開"), vote_help.index("1人30秒"))
         self.assertIn("発言終了SEと約2秒", vote_help)
         self.assertIn("本人専用の確認", vote_help)
         self.assertIn("候補選択に時間制限はなく", vote_help)

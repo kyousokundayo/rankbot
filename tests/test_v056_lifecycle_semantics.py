@@ -80,7 +80,7 @@ class ResetAndForceEndContractTest(unittest.IsolatedAsyncioTestCase):
         runner._persist_room_state = AsyncMock()
         runner._safe_village_send = AsyncMock(return_value=None)
         runner._restore_nicknames = AsyncMock(return_value={})
-        runner._teardown_game_roles_and_perms = AsyncMock()
+        runner._teardown_game_roles_and_perms = AsyncMock(return_value=True)
         runner._safe_timer_edit = AsyncMock()
         runner._retry_pending_ui_cleanup = AsyncMock()
         runner.manager.spawn_bg_task = Mock(side_effect=lambda coro: coro.close())
@@ -124,7 +124,7 @@ class ResetAndForceEndContractTest(unittest.IsolatedAsyncioTestCase):
                 )
                 restored._close_game_views_for_shutdown = AsyncMock()
                 restored._restore_nicknames = AsyncMock(return_value={})
-                restored._teardown_game_roles_and_perms = AsyncMock()
+                restored._teardown_game_roles_and_perms = AsyncMock(return_value=True)
                 restored._transition_to_empty_lobby = AsyncMock(return_value=True)
 
                 await restored.restore_from_snapshot(payload)

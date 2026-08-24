@@ -100,8 +100,13 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         # 持たないため、参照なしのcreate_taskは実行途中にGCで消えうる)
         self._bg_tasks: set[asyncio.Task] = set()
         # ゲーム終了時にVC未接続でサーバーミュートを解除できなかったメンバー。
-        # どこかのVCへ入った時点で解除する (bot_metaに永続化 / guild_id -> ids)
+        # どこかのVCへ入った時点と定期再試行で解除する
+        # (bot_metaに永続化 / guild_id -> ids)。入室イベントと定期taskが
+        # 同じ相手を同時に解除しないよう、マーカー確認からDB削除まで
+        # メンバー単位で直列化する。全体ロックにすると別人のDB再試行中に
+        # 進行中ゲームのVOICE_STATE_UPDATEまで止めてしまうため共有しない。
         self.pending_unmutes: dict[int, set[int]] = {}
+        self.pending_unmute_locks: dict[tuple[int, int], asyncio.Lock] = {}
         # シーン切替SE (ギルド単位で再生を直列化)
         self.sound_player = sounds.SoundPlayer()
         self.rooms: dict[str, RoomRunner] = {
@@ -253,6 +258,8 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             self.daily_backup_loop.cancel()
         if self.pending_settlement_retry_loop.is_running():
             self.pending_settlement_retry_loop.cancel()
+        if self.pending_unmute_retry_loop.is_running():
+            self.pending_unmute_retry_loop.cancel()
         if self.recruitment_notification_loop.is_running():
             self.recruitment_notification_loop.cancel()
         if self.api_pacing_report_loop.is_running():
@@ -412,6 +419,32 @@ class GameCog(RoomPermissionMixin, commands.Cog):
 
     @pending_settlement_retry_loop.before_loop
     async def _pending_settlement_retry_wait_ready(self) -> None:
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(minutes=2)
+    async def pending_unmute_retry_loop(self) -> None:
+        """接続したまま解除に失敗したBot所有muteを定期的に回収する。"""
+        get_guild = getattr(self.bot, "get_guild", None)
+        if self.managed_guild_id is None or not callable(get_guild):
+            return
+        guild = get_guild(self.managed_guild_id)
+        if guild is None:
+            return
+        try:
+            attempted, resolved = await self._retry_pending_unmutes(guild)
+        except Exception as e:
+            # tasks.loopは例外が外へ出ると停止するため、次回再試行を維持する。
+            log.exception("持ち越しミュート解除の定期再試行に失敗: %s", e)
+            return
+        if attempted:
+            log.info(
+                "持ち越しミュート解除の定期再試行: 対象%d人 / 解決%d人",
+                attempted,
+                resolved,
+            )
+
+    @pending_unmute_retry_loop.before_loop
+    async def _pending_unmute_retry_wait_ready(self) -> None:
         await self.bot.wait_until_ready()
 
     @tasks.loop(minutes=10)
@@ -1609,6 +1642,12 @@ class GameCog(RoomPermissionMixin, commands.Cog):
             log.info("未精算ゲームの自動再試行開始 (5分ごと)")
         if (
             hasattr(self.bot, "wait_until_ready")
+            and not self.pending_unmute_retry_loop.is_running()
+        ):
+            self.pending_unmute_retry_loop.start()
+            log.info("持ち越しミュート解除の自動再試行開始 (2分ごと)")
+        if (
+            hasattr(self.bot, "wait_until_ready")
             and not self.recruitment_notification_loop.is_running()
         ):
             self.recruitment_notification_loop.start()
@@ -1867,25 +1906,62 @@ class GameCog(RoomPermissionMixin, commands.Cog):
 
     async def register_pending_unmutes(
         self, guild: Optional[discord.Guild], member_ids: set[int]
-    ) -> None:
-        """終了時に解除できなかったサーバーミュートを記録する (VC入室時に解除)"""
+    ) -> bool:
+        """終了時に解除できなかったmuteを記録する (VC入室・定期taskで解除)。"""
         if guild is None or not member_ids:
-            return
+            return not member_ids
         pending = self.pending_unmutes.setdefault(guild.id, set())
         pending.update(member_ids)
-        try:
-            await database.add_pending_unmutes(guild.id, member_ids)
-        except Exception as e:
-            log.warning(f"ミュート解除待ちの保存失敗: {e}")
-        log.info(f"ミュート解除待ちに登録: {sorted(member_ids)}")
+        for attempt, delay in enumerate((0, 1, 2), start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await database.add_pending_unmutes(guild.id, member_ids)
+            except Exception as e:
+                log.warning(
+                    "ミュート解除待ちの保存失敗 (%d/3): %s", attempt, e
+                )
+                continue
+            log.info(f"ミュート解除待ちに登録: {sorted(member_ids)}")
+            return True
+        log.error(
+            "ミュート解除待ちをDBへ保存できません: guild=%s members=%s",
+            guild.id,
+            sorted(member_ids),
+        )
+        return False
 
     async def load_pending_unmutes(self, guild: discord.Guild) -> None:
         try:
             pending = await database.load_pending_unmute_ids(guild.id)
         except Exception as e:
-            log.warning(f"ミュート解除待ちの読込失敗: {e}")
-            return
+            raise RuntimeError(
+                "持ち越しミュート解除待ちを読み込めないため起動を停止します"
+            ) from e
         self.pending_unmutes[guild.id] = pending
+
+    async def _retry_pending_unmutes(
+        self, guild: discord.Guild
+    ) -> tuple[int, int]:
+        """現在VC接続中の解除待ちを再試行し、(対象数, 解決数)を返す。"""
+        pending_ids = list(self.pending_unmutes.get(guild.id, set()))
+        attempted = 0
+        resolved = 0
+        for member_id in pending_ids:
+            member = guild.get_member(member_id)
+            if member is None or member.bot:
+                continue
+            voice = getattr(member, "voice", None)
+            channel = voice.channel if voice is not None else None
+            # mute PATCHはVC接続中だけ有効。未接続者は次の入室イベントか
+            # 次回定期実行へ残す。進行中の別卓VCはその卓の制御を優先する。
+            if channel is None or self.is_other_active_game_vc(channel.id):
+                continue
+            attempted += 1
+            await self._resolve_pending_unmute(member)
+            if member_id not in self.pending_unmutes.get(guild.id, set()):
+                resolved += 1
+        return attempted, resolved
 
     async def _resolve_pending_unmute(
         self,
@@ -1896,6 +1972,23 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         pending = self.pending_unmutes.get(member.guild.id)
         if not pending or member.id not in pending:
             return
+        lock_key = (member.guild.id, member.id)
+        lock = self.pending_unmute_locks.setdefault(lock_key, asyncio.Lock())
+        async with lock:
+            await self._resolve_pending_unmute_locked(
+                member, _retry_http=_retry_http
+            )
+
+    async def _resolve_pending_unmute_locked(
+        self,
+        member: discord.Member,
+        *,
+        _retry_http: bool,
+    ) -> None:
+        """メンバー別lock内でマーカー確認・解除・DB削除を完結する。"""
+        pending = self.pending_unmutes.get(member.guild.id)
+        if not pending or member.id not in pending:
+            return
         # 進行中の別卓のVCに入った場合は解除しない (その卓の発言制御を壊さない)。
         # 待ちリストには残し、次に別の場所へ入ったときに解除する
         vs = member.voice
@@ -1903,21 +1996,24 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         if self.is_other_active_game_vc(channel_id):
             return
         try:
-            edit_kwargs: dict = {"mute": False}
             marker_roles = [
                 role for role in getattr(member, "roles", [])
                 if getattr(role, "name", "").startswith(MUTE_MARKER_ROLE_PREFIX)
             ]
             if marker_roles:
-                edit_kwargs["roles"] = [
-                    role for role in member_roles_for_edit(member)
-                    if not getattr(role, "name", "").startswith(MUTE_MARKER_ROLE_PREFIX)
-                ]
-            await self.paced_discord_api_call(
-                member.edit,
-                **edit_kwargs,
-                reason="人狼: 持ち越しミュート解除",
-            )
+                # マーカー除去とunmuteを同一PATCHにし、Discord側だけ成功した
+                # 場合も、次回は「マーカーなし」を成功証拠として再unmuteしない。
+                await self.paced_discord_api_call(
+                    member.edit,
+                    mute=False,
+                    roles=[
+                        role for role in member_roles_for_edit(member)
+                        if not getattr(role, "name", "").startswith(
+                            MUTE_MARKER_ROLE_PREFIX
+                        )
+                    ],
+                    reason="人狼: 持ち越しミュート解除",
+                )
         except discord.Forbidden as e:
             log.warning(f"持ち越しミュート解除失敗 ({member.display_name}): {e}")
             return
@@ -1942,13 +2038,33 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 or self.is_other_active_game_vc(channel_now.id)
             ):
                 return
-            await self._resolve_pending_unmute(member, _retry_http=False)
+            await self._resolve_pending_unmute_locked(
+                member, _retry_http=False
+            )
+            return
+        # Discord側のマーカーが無ければ、前回のunmute PATCHは成功済み。
+        # DB削除だけ失敗した窓で、後から付いた手動muteを再解除しない。
+        removed = False
+        for attempt, delay in enumerate((0, 1, 2), start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                await database.remove_pending_unmute(member.guild.id, member.id)
+            except Exception as e:
+                log.warning(
+                    "ミュート解除待ちの削除失敗 (%d/3): %s", attempt, e
+                )
+                continue
+            removed = True
+            break
+        if not removed:
+            log.error(
+                "ミュート解除済みですが待機台帳を削除できません: guild=%s member=%s",
+                member.guild.id,
+                member.id,
+            )
             return
         pending.discard(member.id)
-        try:
-            await database.remove_pending_unmute(member.guild.id, member.id)
-        except Exception as e:
-            log.warning(f"ミュート解除待ちの保存失敗: {e}")
         log.info(f"持ち越しサーバーミュートを解除しました ({member.display_name})")
 
     @commands.Cog.listener()

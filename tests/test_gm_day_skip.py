@@ -150,7 +150,7 @@ class DayDiscussionSkipDurabilityTest(unittest.IsolatedAsyncioTestCase):
         )
         restored._close_game_views_for_shutdown = AsyncMock()
         restored._restore_nicknames = AsyncMock(return_value={})
-        restored._teardown_game_roles_and_perms = AsyncMock()
+        restored._teardown_game_roles_and_perms = AsyncMock(return_value=True)
         restored._transition_to_empty_lobby = AsyncMock(return_value=True)
         payload["phase"] = Phase.GAME_OVER.name
         return restored
