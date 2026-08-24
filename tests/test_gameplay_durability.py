@@ -4926,6 +4926,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         manager.discord_api_sem = asyncio.Semaphore(1)
         manager.rooms = {}
         manager.pending_unmutes = {123: {1}}
+        manager.pending_unmute_locks = {}
         manager._startup_active_vc_rooms = {30: "active-room"}
 
         async def paced_call(func, *args, **kwargs):
@@ -4966,6 +4967,7 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         manager = object.__new__(GameCog)
         manager.rooms = {}
         manager.pending_unmutes = {123: {1}}
+        manager.pending_unmute_locks = {}
         manager._startup_active_vc_rooms = {}
 
         async def paced_call(func, *args, **kwargs):

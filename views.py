@@ -1566,8 +1566,14 @@ class RemovePlayerSelectView(discord.ui.View):
                             ephemeral=True,
                         )
                         return
+                    message = f"{display_name} をゲームから除外しました。"
+                    if state.paused:
+                        message += (
+                            " ゲームは一時停止中です。音声状態を確認してから"
+                            "GMパネルの「再開」を押してください。"
+                        )
                     await confirm_interaction.followup.send(
-                        f"{display_name} をゲームから除外しました。", ephemeral=True
+                        message, ephemeral=True
                     )
                     return
 

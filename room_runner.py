@@ -11032,6 +11032,36 @@ class RoomRunner:
             return False
         if not player.alive:
             return False
+
+        # GM操作による途中除外はゲームタスクと別taskで走る。先にalive=Falseを
+        # 保存してからDiscordのmute PATCHを待つだけでは、共有APIバケットの
+        # 順番待ち・429再試行中も議論や発言タイマーが進み、除外済みの本人が
+        # 話せる隙間が残る。進行中なら状態変更より前に全体を停止・全員muteへ
+        # 収束させ、GMが確認して再開するまでタイマーを開かない。
+        if self._is_game_in_progress():
+            try:
+                if not state.paused:
+                    await self.pause_game(
+                        f"{player.display_name} の途中除外処理を行います"
+                    )
+                if state.phase == Phase.GAME_OVER or state.ending:
+                    return False
+                await self._ensure_mute_state_or_stop(
+                    set(), "プレイヤー途中除外前の発言停止"
+                )
+            except StateDurabilityError:
+                # 共通mute同期側で既に復旧可能な停止状態へ入っている。
+                return False
+            except Exception as error:
+                # 停止checkpoint自体のDB障害でもalive状態へは触れず、
+                # 可能な限り停止状態だけを保存してGM操作へ戻す。
+                await self._stop_for_durability_error(
+                    "プレイヤー途中除外前の停止", error
+                )
+                return False
+            if not player.alive:
+                return False
+
         old_votes = dict(state.votes)
         old_vote_order = list(state.vote_order)
         old_vote_slot_index = state.vote_slot_index
@@ -11592,9 +11622,13 @@ class RoomRunner:
         """現行ゲームで有効化済みのmute所有マーカーを取得・復旧する。"""
         state = self.state
         if not state.mute_marker_enabled:
-            raise StateDurabilityError(
+            error = RuntimeError(
                 "現行ゲームのsnapshotにmute所有マーカー情報がありません"
             )
+            await self._stop_for_durability_error(
+                "mute所有マーカー情報の確認", error
+            )
+            raise StateDurabilityError(str(error)) from error
         guild = state.guild
         existing_marker = (
             discord.utils.get(guild.roles, name=self._mute_marker_role_name())
@@ -11602,7 +11636,11 @@ class RoomRunner:
         )
         marker = await self._ensure_mute_marker_role()
         if marker is None:
-            raise StateDurabilityError("mute所有マーカーを確保できません")
+            error = RuntimeError("mute所有マーカーを確保できません")
+            await self._stop_for_durability_error(
+                "mute所有マーカーの確保", error
+            )
+            raise StateDurabilityError(str(error)) from error
         if existing_marker is not None or guild is None:
             return marker
 
@@ -12604,6 +12642,12 @@ class RoomRunner:
                     # GAME_OVER snapshotのbot_muted_idsを残し、再起動後も
                     # 解除対象を復元できるよう、空LOBBYへは進ませない。
                     return False
+                await self._safe_village_send(
+                    "⚠️ **Bot所有ミュートをすぐ解除できないメンバーが"
+                    f"{len(remaining)}人います。**\n"
+                    "解除待ちは保存済みです。VC接続中は2分ごと、"
+                    "未接続の場合は次のVC入室時にも自動再試行します。"
+                )
             state.bot_muted_ids.clear()
 
         if vc is not None:

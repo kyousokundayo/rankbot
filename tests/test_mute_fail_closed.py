@@ -22,6 +22,73 @@ from tests.test_gameplay_durability import (
 
 
 class MuteFailClosedTest(unittest.IsolatedAsyncioTestCase):
+    async def test_missing_mute_marker_enters_recoverable_safety_stop(self) -> None:
+        runner = make_runner()
+        runner.state.phase = Phase.DAY_DISCUSSION
+        runner.state.guild = FakeGuild([], [])
+        runner.state.voice_channel = SimpleNamespace(id=50, members=[])
+        runner.state.mute_marker_enabled = True
+        runner._ensure_mute_marker_role = AsyncMock(return_value=None)
+
+        with self.assertRaisesRegex(StateDurabilityError, "確保できません"):
+            await runner._sync_server_mutes(set())
+
+        self.assertTrue(runner.state.paused)
+        self.assertEqual(runner.state.phase, Phase.PAUSED)
+        self.assertEqual(runner.state.recovery_phase, Phase.DAY_DISCUSSION)
+        self.assertTrue(runner.state.recovered_from_restart)
+        runner._safe_village_send.assert_awaited()
+
+    async def test_midgame_elimination_pauses_before_committing_death(self) -> None:
+        runner = make_runner()
+        player = add_player(runner, 1)
+        runner.state.phase = Phase.DAY_DISCUSSION
+        runner.state.check_win = lambda: None
+        runner._confirm_surrender_after_roster_change = AsyncMock(
+            return_value=False
+        )
+        sequence: list[str] = []
+        keep_game_alive = asyncio.Event()
+        runner.state.game_task = asyncio.create_task(keep_game_alive.wait())
+
+        async def pause_for_elimination(_reason: str) -> str:
+            self.assertTrue(player.alive)
+            sequence.append("pause")
+            runner.state.paused = True
+            runner.state.phase_before_pause = runner.state.phase
+            runner.state.phase = Phase.PAUSED
+            runner.state.pause_event.clear()
+            return "paused"
+
+        async def verify_all_muted(_speakers: set[int], _context: str) -> None:
+            self.assertTrue(player.alive)
+            self.assertTrue(runner.state.paused)
+            self.assertFalse(runner.state.pause_event.is_set())
+            sequence.append("mute-verified")
+
+        async def apply_death(_effect: dict) -> None:
+            self.assertFalse(player.alive)
+            sequence.append("death-effect")
+
+        runner.pause_game = AsyncMock(side_effect=pause_for_elimination)
+        runner._ensure_mute_state_or_stop = AsyncMock(
+            side_effect=verify_all_muted
+        )
+        runner._apply_death_effect = AsyncMock(side_effect=apply_death)
+        try:
+            completed = await runner._eliminate_player_mid_game(
+                player, "GM除外"
+            )
+        finally:
+            runner.state.game_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await runner.state.game_task
+
+        self.assertTrue(completed)
+        self.assertEqual(sequence, ["pause", "mute-verified", "death-effect"])
+        self.assertTrue(runner.state.paused)
+        self.assertFalse(runner.state.pause_event.is_set())
+
     async def test_manual_mute_blocks_speech_gate_until_corrected(self) -> None:
         runner = make_runner()
         speaker = add_player(runner, 1)
@@ -217,10 +284,33 @@ class MuteFailClosedTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(completed)
         self.assertEqual(runner.state.bot_muted_ids, {member.id})
 
+    async def test_teardown_announces_durable_automatic_unmute_retry(self) -> None:
+        runner = make_runner()
+        member = FakeMember(1)
+        member.voice = None
+        guild = FakeGuild([member], [])
+        member.guild = guild
+        runner.state.guild = guild
+        runner.state.bot_muted_ids = {member.id}
+        runner.manager.register_pending_unmutes = AsyncMock(return_value=True)
+
+        completed = await runner._teardown_game_roles_and_perms()
+
+        self.assertTrue(completed)
+        self.assertEqual(runner.state.bot_muted_ids, set())
+        notice = "\n".join(
+            str(call.args[0])
+            for call in runner._safe_village_send.await_args_list
+            if call.args
+        )
+        self.assertIn("2分ごと", notice)
+        self.assertIn("次のVC入室時", notice)
+
     async def test_stale_pending_row_never_reunmutes_later_manual_mute(self) -> None:
         manager = object.__new__(GameCog)
         manager.rooms = {}
         manager.pending_unmutes = {123: {1}}
+        manager.pending_unmute_locks = {}
         manager._startup_active_vc_rooms = {}
 
         async def paced_call(func, *args, **kwargs):
@@ -263,6 +353,99 @@ class MuteFailClosedTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(member.voice.mute)
         self.assertEqual(member.edit.await_count, 1)
+        self.assertNotIn(member.id, manager.pending_unmutes[123])
+
+    async def test_periodic_pending_retry_recovers_only_safe_connected_members(self) -> None:
+        manager = object.__new__(GameCog)
+        manager.rooms = {}
+        manager.pending_unmutes = {123: {1, 2, 3}}
+        manager.pending_unmute_locks = {}
+        manager._startup_active_vc_rooms = {30: "active-room"}
+
+        async def paced_call(func, *args, **kwargs):
+            return await func(*args, **kwargs)
+
+        manager.paced_discord_api_call = AsyncMock(side_effect=paced_call)
+        marker = FakeRole(10, "人狼Botミュート:old-room")
+        recoverable = FakeMember(1)
+        recoverable.roles = [marker]
+        recoverable.voice = FakeVoiceState(
+            mute=True, channel=SimpleNamespace(id=20)
+        )
+        protected = FakeMember(2)
+        protected.roles = [marker]
+        protected.voice = FakeVoiceState(
+            mute=True, channel=SimpleNamespace(id=30)
+        )
+        disconnected = FakeMember(3)
+        disconnected.roles = [marker]
+        guild = FakeGuild(
+            [recoverable, protected, disconnected], [marker]
+        )
+        for member in guild.members:
+            member.guild = guild
+
+        async def apply_unmute(**kwargs):
+            recoverable.voice.mute = kwargs["mute"]
+            recoverable.roles = kwargs["roles"]
+            return recoverable
+
+        recoverable.edit = AsyncMock(side_effect=apply_unmute)
+        with patch(
+            "game.database.remove_pending_unmute", new=AsyncMock()
+        ) as remove_pending:
+            attempted, resolved = await manager._retry_pending_unmutes(guild)
+
+        self.assertEqual((attempted, resolved), (1, 1))
+        self.assertFalse(recoverable.voice.mute)
+        self.assertEqual(manager.pending_unmutes[123], {2, 3})
+        protected.edit.assert_not_awaited()
+        disconnected.edit.assert_not_awaited()
+        remove_pending.assert_awaited_once_with(123, recoverable.id)
+
+    async def test_voice_event_and_periodic_retry_do_not_double_unmute(self) -> None:
+        manager = object.__new__(GameCog)
+        manager.rooms = {}
+        manager.pending_unmutes = {123: {1}}
+        manager.pending_unmute_locks = {}
+        manager._startup_active_vc_rooms = {}
+
+        async def paced_call(func, *args, **kwargs):
+            return await func(*args, **kwargs)
+
+        manager.paced_discord_api_call = AsyncMock(side_effect=paced_call)
+        marker = FakeRole(10, "人狼Botミュート:old-room")
+        member = FakeMember(1)
+        member.roles = [marker]
+        member.voice = FakeVoiceState(
+            mute=True, channel=SimpleNamespace(id=20)
+        )
+        guild = FakeGuild([member], [marker])
+        member.guild = guild
+        patch_started = asyncio.Event()
+        release_patch = asyncio.Event()
+
+        async def apply_unmute(**kwargs):
+            patch_started.set()
+            await release_patch.wait()
+            member.voice.mute = kwargs["mute"]
+            member.roles = kwargs["roles"]
+            return member
+
+        member.edit = AsyncMock(side_effect=apply_unmute)
+        with patch(
+            "game.database.remove_pending_unmute", new=AsyncMock()
+        ) as remove_pending:
+            first = asyncio.create_task(manager._resolve_pending_unmute(member))
+            await asyncio.wait_for(patch_started.wait(), timeout=1)
+            second = asyncio.create_task(manager._resolve_pending_unmute(member))
+            await asyncio.sleep(0)
+            self.assertFalse(second.done())
+            release_patch.set()
+            await asyncio.gather(first, second)
+
+        self.assertEqual(member.edit.await_count, 1)
+        remove_pending.assert_awaited_once_with(123, member.id)
         self.assertNotIn(member.id, manager.pending_unmutes[123])
 
     async def test_pending_ledger_write_exhaustion_is_reported(self) -> None:
