@@ -312,7 +312,11 @@ SLOW_INTERACTION_SECONDS = 2.0
 SE_ENABLED = True
 VOTE_TIMEOUT = 60              # 決戦の一斉投票制限時間 (秒)
 VOTE_SPEECH_TIME = 25          # クロストーク通常投票の1人あたり発言時間 (秒)
-VOTE_TRANSITION_GRACE = 2.0    # 投票発言の開始・終了SEを聞くための切替時間 (秒)
+# SE本体は _play_transition_se が再生完了まで await するので、ここは
+# 「SEが鳴り終わった後にさらに足す間」。SEは0.3〜0.5秒の短い和音なので、
+# 2.0だと1回あたり約1.5秒の純粋な待ちになり、13人×2回×日数で数分を消費して
+# いた。切替はSEで分かるため0にする (>0にすれば無音時の間も戻る)。
+VOTE_TRANSITION_GRACE = 0.0    # SE再生後に追加で置く切替の間 (秒)
 VOTE_SE_MAX_WAIT = 3.0         # VC接続不調で投票進行を止めないSE待機上限 (秒)
 CHANNEL_DELETE_DELAY = 300     # 結果発表後の削除待ち (秒)
 # 人狼予想の受付時間 (秒)。死亡した瞬間から数え、この間だけ #霊界 を開けない。

@@ -89,50 +89,124 @@ class MuteFailClosedTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(runner.state.paused)
         self.assertFalse(runner.state.pause_event.is_set())
 
-    async def test_manual_mute_blocks_speech_gate_until_corrected(self) -> None:
+    async def test_manual_mute_does_not_block_the_speech_gate(self) -> None:
+        """手動muteの相手を待たない。喋れないだけで進行は続ける。
+
+        Botは自分が付けていないmuteを保護して外さないので、待つと外部の
+        操作ひとつでゲームが復帰不能になる。fail-closedで守るのは
+        「喋ってはいけない人が喋れる」側だけ。
+        """
         runner = make_runner()
         speaker = add_player(runner, 1)
         runner.state.phase = Phase.DAY_RUNOFF_SPEECH
         runner.state.current_speaker_id = speaker.user_id
         voice_channel = SimpleNamespace(id=50, members=[speaker.member])
         runner.state.voice_channel = voice_channel
-        speaker.member.voice = FakeVoiceState(
-            mute=True, channel=voice_channel
-        )
+        speaker.member.voice = FakeVoiceState(mute=True, channel=voice_channel)
+        runner.state.bot_muted_ids = set()
 
         with patch("room_runner.MUTE_GRACE_TIME", 0):
-            grant = asyncio.create_task(runner._grant_speaker(speaker.member))
-            for _ in range(10):
-                await asyncio.sleep(0)
-                if runner.state.paused:
-                    break
+            await asyncio.wait_for(
+                runner._grant_speaker(speaker.member), timeout=0.5
+            )
 
-            self.assertTrue(runner.state.paused)
-            self.assertFalse(grant.done())
+        self.assertFalse(runner.state.paused)
+        # 保護しているので勝手に外さない。
+        self.assertTrue(speaker.member.voice.mute)
+        self.assertEqual(runner._mute_state_issues({speaker.user_id}), [])
 
-            # モデレーターが手動muteを外し、GMが再開した状態を再現する。
-            speaker.member.voice.mute = False
-            runner.state.paused = False
-            runner.state.phase = Phase.DAY_RUNOFF_SPEECH
-            runner.state.pause_event.set()
-            await asyncio.wait_for(grant, timeout=0.2)
+    async def test_bot_owned_mute_that_will_not_clear_still_stops(self) -> None:
+        """Bot自身が付けたmuteを外せないのはBot側の失敗なので止める。
 
-        self.assertFalse(speaker.member.voice.mute)
+        こちらはGMが権限・ロール順位を直せば解消できる。手動muteと違って
+        待つ意味があるため、従来どおりfail-closedのまま残す。
+        """
+        runner = make_runner()
+        speaker = add_player(runner, 1)
+        runner.state.phase = Phase.DAY_RUNOFF_SPEECH
+        runner.state.current_speaker_id = speaker.user_id
+        voice_channel = SimpleNamespace(id=50, members=[speaker.member])
+        runner.state.voice_channel = voice_channel
+        speaker.member.voice = FakeVoiceState(mute=True, channel=voice_channel)
+        runner.state.bot_muted_ids = {speaker.user_id}
 
-    async def test_participant_gm_is_manual_but_still_checked_when_speaking(self) -> None:
+        issues = runner._mute_state_issues({speaker.user_id})
+
+        self.assertTrue(any("mute解除未反映" in issue for issue in issues))
+
+    async def test_participant_gm_manual_mute_is_left_alone(self) -> None:
+        """参加者兼任GMの手動muteも、外さないし待たない。"""
         runner = make_runner()
         speaker = add_player(runner, 1)
         runner.state.gm_id = speaker.user_id
         voice_channel = SimpleNamespace(id=50, members=[speaker.member])
         runner.state.voice_channel = voice_channel
-        speaker.member.voice = FakeVoiceState(
-            mute=True, channel=voice_channel
-        )
+        speaker.member.voice = FakeVoiceState(mute=True, channel=voice_channel)
+        runner.state.bot_muted_ids = set()
 
-        issues = runner._mute_state_issues({speaker.user_id})
-
-        self.assertTrue(any("mute解除未反映" in issue for issue in issues))
+        self.assertEqual(runner._mute_state_issues({speaker.user_id}), [])
         speaker.member.edit.assert_not_awaited()
+
+    async def test_gm_self_mute_is_not_announced(self) -> None:
+        """GMの自己ミュートは通常運用なので告知しない。
+
+        クロストーク議論ではGMも発言枠を持つため、告知すると
+        GMがミュートし直すたびに #昼 が鳴ってしまう。
+        """
+        runner = make_runner()
+        gm = add_player(runner, 1)
+        runner.state.gm_id = gm.user_id
+        runner.state.phase = Phase.DAY_DISCUSSION
+        voice_channel = SimpleNamespace(id=50, members=[gm.member])
+        runner.state.voice_channel = voice_channel
+        before = FakeVoiceState(mute=False, channel=voice_channel)
+        after = FakeVoiceState(mute=True, channel=voice_channel)
+        gm.member.voice = after
+        runner.state.bot_muted_ids = set()
+        runner.state.game_task = asyncio.create_task(asyncio.Event().wait())
+        try:
+            await runner.on_voice_state_update(gm.member, before, after)
+
+            self.assertFalse(runner.state.paused)
+            runner._safe_village_send.assert_not_awaited()
+            gm.member.edit.assert_not_awaited()
+        finally:
+            runner.state.game_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await runner.state.game_task
+
+    async def test_external_mute_of_speaker_announces_without_pausing(self) -> None:
+        """発言者への手動muteでは止めない。喋れないだけなので知らせて続行する。
+
+        止めてしまうと、モデレーターの操作ひとつでゲームが復帰不能になる
+        (Botは自分が付けていないmuteを保護するので自動では解けない)。
+        """
+        runner = make_runner()
+        player = add_player(runner, 1)
+        runner.state.phase = Phase.DAY_RUNOFF_SPEECH
+        runner.state.current_speaker_id = player.user_id
+        voice_channel = SimpleNamespace(id=50, members=[player.member])
+        runner.state.voice_channel = voice_channel
+        before = FakeVoiceState(mute=False, channel=voice_channel)
+        after = FakeVoiceState(mute=True, channel=voice_channel)
+        player.member.voice = after
+        runner.state.bot_muted_ids = set()
+        runner.state.game_task = asyncio.create_task(asyncio.Event().wait())
+        try:
+            await runner.on_voice_state_update(player.member, before, after)
+
+            self.assertFalse(runner.state.paused)
+            self.assertTrue(player.member.voice.mute)
+            announced = "\n".join(
+                str(call.args[0])
+                for call in runner._safe_village_send.await_args_list
+            )
+            self.assertIn("手動でサーバーミュート", announced)
+            self.assertIn("進行はこのまま続きます", announced)
+        finally:
+            runner.state.game_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await runner.state.game_task
 
     async def test_external_unmute_of_non_speaker_immediately_pauses(self) -> None:
         runner = make_runner()
@@ -529,6 +603,9 @@ class ResumeWithDisconnectedSpeakersTest(unittest.IsolatedAsyncioTestCase):
         present.member.voice = FakeVoiceState(mute=True, channel=vc)
         absent.member.voice = None
         vc.members.append(present.member)
+        # Bot所有のmute。手動muteは待たない仕様なので、解除待ちを見る
+        # テストでは所有記録を持たせる必要がある。
+        runner.state.bot_muted_ids = {present.user_id}
         runner.state.phase = Phase.PAUSED
         runner.state.phase_before_pause = Phase.DAY_DISCUSSION
         runner.state.paused = True
@@ -622,3 +699,94 @@ class SettlementPrepFailureTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runner.state.pending_winner, Team.VILLAGE)
         self.assertTrue(runner.state.paused)
         self.assertEqual(runner.state.phase, Phase.PAUSED)
+
+
+class MuteStopDiagnosticsTest(unittest.IsolatedAsyncioTestCase):
+    """安全停止の告知が、原因にたどり着ける内容になっていること。
+
+    以前は「Botのメンバーミュート権限とロール順位を確認し」しか出しておらず、
+    実際の原因がモデレーターの手動ミュートでもGMがそこへ行き着けなかった。
+    Botは自分が付けていないミュートを保護する = 自動では解けないので、
+    誰のどの状態が残っているかを出さないと停止したまま原因不明になる。
+    """
+
+    def _runner_with_stuck_owned_mute(self):
+        runner = make_runner()
+        vc = SimpleNamespace(id=50, members=[])
+        runner.state.voice_channel = vc
+        runner.state.guild = FakeGuild([], [])
+        speaker = add_player(runner, 1)
+        speaker.member.voice = FakeVoiceState(mute=True, channel=vc)
+        vc.members.append(speaker.member)
+        # Bot自身が付けたmuteを外せない状態 (権限・ロール順位など)。
+        # 手動muteは待たずに進むので、停止するのはこちらだけ。
+        runner.state.bot_muted_ids = {speaker.user_id}
+        return runner, speaker
+
+    def test_detail_names_the_member_and_the_cause(self) -> None:
+        runner, speaker = self._runner_with_stuck_owned_mute()
+
+        detail = runner._mute_stop_detail({speaker.user_id})
+
+        self.assertIn(speaker.member.display_name, detail)
+        self.assertIn("mute解除未反映", detail)
+        self.assertIn("権限", detail)
+
+    def test_detail_is_empty_when_nothing_is_pending(self) -> None:
+        runner, speaker = self._runner_with_stuck_owned_mute()
+        speaker.member.voice.mute = False
+
+        self.assertEqual(runner._mute_stop_detail({speaker.user_id}), "")
+
+    async def test_failed_resume_names_the_speaker_it_tried_to_unmute(self) -> None:
+        """再開失敗の告知に、解除できなかった話者が載ること。
+
+        停止状態では `_current_speaker_ids()` が空集合を返すので、告知の中で
+        取り直すと肝心の相手が抜ける。再開しようとした話者集合を渡す。
+        """
+        runner, speaker = self._runner_with_stuck_owned_mute()
+
+        await runner._restore_pause_after_failed_mute_resume(
+            Phase.DAY_DISCUSSION, "再開時の発言制御", {speaker.user_id}
+        )
+
+        self.assertTrue(runner.state.paused)
+        announced = "\n".join(
+            str(call.args[0])
+            for call in runner._safe_village_send.await_args_list
+        )
+        self.assertIn(speaker.member.display_name, announced)
+        self.assertIn("mute解除未反映", announced)
+
+    async def test_safety_stop_announcement_carries_the_detail(self) -> None:
+        runner, speaker = self._runner_with_stuck_owned_mute()
+        runner.state.phase = Phase.DAY_RUNOFF_SPEECH
+        runner.state.current_speaker_id = speaker.user_id
+        runner._sync_server_mutes = AsyncMock(return_value=[])
+
+        with patch("room_runner.MUTE_GRACE_TIME", 0):
+            stop = asyncio.create_task(
+                runner._wait_for_mute_sync_or_pause(
+                    [], {speaker.user_id}, "テスト用の発言制御"
+                )
+            )
+            for _ in range(20):
+                await asyncio.sleep(0)
+                if runner.state.paused:
+                    break
+            self.assertTrue(runner.state.paused)
+            announced = "\n".join(
+                str(call.args[0])
+                for call in runner._safe_village_send.await_args_list
+            )
+            self.assertIn(speaker.member.display_name, announced)
+            self.assertIn("mute解除未反映", announced)
+            # 原因が分からないまま権限だけを疑わせない。
+            self.assertNotIn(
+                "Botのメンバーミュート権限とロール順位を確認し、解消後に", announced
+            )
+        finally_speaker = speaker
+        finally_speaker.member.voice.mute = False
+        runner.state.paused = False
+        runner.state.pause_event.set()
+        await asyncio.wait_for(stop, timeout=0.5)
