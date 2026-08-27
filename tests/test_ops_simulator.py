@@ -16,6 +16,7 @@ from simulate_games import (
     FakeMember,
     FakeMessage,
     FakeRole,
+    _api_interval_attrs,
     _make_fast_game_methods,
     _wait_for_game_task,
 )
@@ -284,6 +285,47 @@ class TestFakeDiscordFidelity(unittest.IsolatedAsyncioTestCase):
             await runner.setup_channels(guild, snapshot=snapshot)
 
         self.assertEqual(guild.categories, [])
+
+
+class TestSimulatorApiPacing(unittest.IsolatedAsyncioTestCase):
+    """シミュレータが実サーバー用のAPI間隔を全て0秒へ落とすこと。
+
+    1つでも取りこぼすと、13人分のmuteをフェーズごとに実時間で待ってゲームが
+    `_wait_for_game_task` の30秒上限を超え、シミュレータが丸ごと止まる。
+    実際に `VOICE_MUTE_API_INTERVAL` の追加時にこれが起きた。
+    """
+
+    def test_every_pacing_interval_is_discovered(self) -> None:
+        manager = GameCog.__new__(GameCog)
+        manager.bulk_api_interval = 1.1
+        manager.voice_mute_api_interval = 0.5
+
+        self.assertEqual(
+            _api_interval_attrs(manager),
+            ["bulk_api_interval", "voice_mute_api_interval"],
+        )
+
+    async def test_zeroing_makes_every_paced_route_immediate(self) -> None:
+        """0秒化した後は、どのペーシング経路も実時間を消費しないこと。
+
+        属性名の一覧ではなく「待たなくなること」を見るので、間隔が増えても
+        シミュレータ側の設定漏れだけを確実に捕まえられる。
+        """
+        cog = GameCog(SimpleNamespace())
+        attrs = _api_interval_attrs(cog)
+        self.assertTrue(attrs, "APIペーシング間隔が1つも見つからない")
+        for attr in attrs:
+            setattr(cog, attr, 0.0)
+
+        async def noop() -> None:
+            return None
+
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        for _ in range(5):
+            await cog.paced_discord_api_call(noop)
+            await cog.paced_voice_mute_api_call(noop)
+        self.assertLess(loop.time() - started, 0.2)
 
 
 class TestStrictMorningGate(unittest.IsolatedAsyncioTestCase):

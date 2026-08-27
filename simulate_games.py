@@ -1233,8 +1233,13 @@ async def _simulate_selected_game_inner(
 
     fake_bot = FakeBot(guild.me)
     manager = GameCog(fake_bot)  # type: ignore[arg-type]
-    # 実サーバー用の1.1秒ペーシングは、外部APIを呼ばないシミュレーションでは省く。
-    manager.bulk_api_interval = 0.0
+    # 実サーバー用のAPIペーシングは、外部APIを呼ばないシミュレーションでは省く。
+    # 間隔を1つでも取りこぼすと、13人分のmuteをフェーズごとに実時間で待って
+    # ゲームが30秒の上限を超える (_wait_for_game_task が落ちる)。
+    # 新しい間隔を足したときの取りこぼしは test_ops_simulator が検出する
+    # (0秒化した後に実時間を消費しないことを直接確認している)。
+    for attr in _api_interval_attrs(manager):
+        setattr(manager, attr, 0.0)
     if rated:
         candidates = [
             room_def
@@ -1511,6 +1516,18 @@ class _GameLoopLogCapture(logging.Handler):
 
     def tail(self, n: int = 3) -> list[str]:
         return self.records[-n:]
+
+
+def _api_interval_attrs(manager) -> list[str]:
+    """GameCogが持つAPIペーシング間隔の属性名を全て返す。
+
+    間隔が増えたときにシミュレータ側の0秒化を書き忘れないよう、名前で拾う。
+    """
+    return sorted(
+        name
+        for name in vars(manager)
+        if name.endswith("_api_interval")
+    )
 
 
 async def _wait_for_game_task(
