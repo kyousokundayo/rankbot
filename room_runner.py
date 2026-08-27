@@ -345,6 +345,11 @@ class RoomRunner:
         self.manager = manager
         self.room_def = room_def
         self.action_lock = asyncio.Lock()
+        # member.edit(mute=) のHTTP応答より先にGatewayのVOICE_STATE_UPDATEが
+        # 届くことがある。その瞬間だけはまだbot_muted_idsへ所有記録を書けない
+        # ため、Bot自身のmuteを外部変更と誤認しないための揮発中印を持つ。
+        # 再起動をまたいで残す性質ではないのでsnapshotへは保存しない。
+        self._pending_bot_mute_updates: dict[int, bool] = {}
         # 再起動復元後のGM「再開」はDiscord側で二重配送・連打され得る。
         # resume_game内部でも直列化し、復元ゲームタスクを二本起動しない。
         self.resume_lock = asyncio.Lock()
@@ -1021,8 +1026,8 @@ class RoomRunner:
             self.room_def.enabled and self.room_def.rated
         )
 
-    def turn_actions_open(self) -> bool:
-        """現在の発言枠がターン用ボタンを受け付けるか。"""
+    def _turn_actions_open(self, *, allow_paused: bool) -> bool:
+        """ターン発言を終了させられる状態か。GMだけは停止中にも終了予約できる。"""
         state = self.state
         return (
             self.is_turn_discussion_mode()
@@ -1030,10 +1035,18 @@ class RoomRunner:
             and state.turn_slot_active
             and state.turn_window_open
             and state.current_speaker_id is not None
-            and not state.paused
+            and (allow_paused or not state.paused)
             and not state.ending
             and state.pending_winner is None
         )
+
+    def turn_actions_open(self) -> bool:
+        """参加者のターン用ボタンを受け付けるか。停止中は操作させない。"""
+        return self._turn_actions_open(allow_paused=False)
+
+    def gm_turn_actions_open(self) -> bool:
+        """GMの「次の発言へ」を受け付けるか。停止中は再開後に反映する。"""
+        return self._turn_actions_open(allow_paused=True)
 
     # 旧CO機構 (_turn_co_declaration_round_index / turn_co_declaration_open) は
     # 撤去した。CO宣言は #昼 常設パネル (VillagePanelView) の [CO] ボタンへ
@@ -1377,6 +1390,14 @@ class RoomRunner:
     async def _paced_discord_api_call(self, func, *args, **kwargs):
         """高負荷な連続変更を全卓共通で間隔制御し、Semaphore内で呼ぶ。"""
         return await self.manager.paced_discord_api_call(func, *args, **kwargs)
+
+    async def _paced_voice_mute_api_call(self, func, *args, **kwargs):
+        """server mute専用の短い間隔で、他の一括更新とは同じ列で実行する。"""
+        paced = getattr(self.manager, "paced_voice_mute_api_call", None)
+        if callable(paced):
+            return await paced(func, *args, **kwargs)
+        # 単体テストなど旧Manager互換。実運用のGameCogは必ず専用経路を持つ。
+        return await self._paced_discord_api_call(func, *args, **kwargs)
 
     def can_manage_private_room(self, member: discord.Member) -> bool:
         if not self.is_private_room():
@@ -4005,7 +4026,9 @@ class RoomRunner:
                 await interaction.followup.send(
                     "次のメンバーは別のゲームが進行中です。"
                     "待機村への複数登録はできますが、同時に進行できるゲームは1つです。\n"
-                    f"{details}",
+                    f"{details}\n"
+                    "その村が既に終わっているはずなら、村のGMが「GMメニュー・状況」から"
+                    "強制終了するか、運営が #運営メニュー の「村の強制削除」で畳んでください。",
                     ephemeral=True,
                 )
             except (discord.NotFound, discord.HTTPException):
@@ -5106,8 +5129,6 @@ class RoomRunner:
         state = self.state
         if member.id != state.gm_id:
             return "GMのみ操作可能です。"
-        if state.paused:
-            return "⏸️ 一時停止中です。先に「再開」を押してください。"
         phase = self._effective_phase()
         if (
             phase == Phase.INITIAL_NIGHT
@@ -6998,7 +7019,7 @@ class RoomRunner:
             state = self.state
             if actor_id != state.gm_id:
                 return "GMのみ操作可能です。"
-            if not self.turn_actions_open() or state.turn_slot_token != turn_token:
+            if not self.gm_turn_actions_open() or state.turn_slot_token != turn_token:
                 return "対象の発言枠は既に終了しています。状況を更新してください。"
             if state.turn_interrupt_pending_id is not None or state.turn_interrupt_event.is_set():
                 return "割り込みを受け付け済みのため、現在は次へ進めません。"
@@ -9270,9 +9291,6 @@ class RoomRunner:
             return "", "⏳ 現在は夜フェーズではありません。"
         if not state.morning_ready_open:
             return "", "⏳ 夜の制限時間が終わるまで朝には進めません。"
-        if state.paused:
-            # 停止中に朝にすると、再開直後に朝が流れて誰も追えない
-            return "", "⏸️ 一時停止中です。先に「再開」を押してください。"
         if self._pending_guard_player() is not None:
             return "", (
                 "⚠️ **必須の夜行動が未確定のため、朝を強制できません。**\n"
@@ -9287,8 +9305,9 @@ class RoomRunner:
             log.exception(f"GM強制夜明けの保存に失敗: {e}")
             return "", "❌ 夜明けを保存できませんでした。もう一度お試しください。"
         state.morning_ready_event.set()
-        await self._safe_village_send("⏭️ **GMの操作で朝を迎えます。**")
-        return "🌅 **GMの操作で朝を迎えました。**", None
+        after_resume = " 一時停止中のため、再開後に進みます。" if state.paused else ""
+        await self._safe_village_send("⏭️ **GMの操作で朝を迎えます。**" + after_resume)
+        return "🌅 **GMの操作で朝を迎えました。**" + after_resume, None
 
     async def force_prep_complete(self, member: discord.Member) -> tuple[str, Optional[str]]:
         """GMが確認付きで役職確認待ちを締め切る運用上の逃げ道。"""
@@ -9299,8 +9318,6 @@ class RoomRunner:
             return "", "▶️ 既に役職確認が確定しています。"
         if not self.prep_actions_open():
             return "", "⏳ 現在は役職確認フェーズではありません。"
-        if state.paused:
-            return "", "⏸️ 一時停止中です。先に「再開」を押してください。"
         state.prep_confirmed = True
         try:
             await self._persist_room_state()
@@ -9309,10 +9326,11 @@ class RoomRunner:
             log.exception(f"GM役職確認締切の保存に失敗: {e}")
             return "", "❌ 役職確認の締切を保存できませんでした。もう一度お試しください。"
         state.prep_ready_event.set()
+        after_resume = " 一時停止中のため、再開後に進みます。" if state.paused else ""
         await self._safe_village_send(
-            "⏭️ **GMの操作で役職確認を締め切り、1日目へ進みます。**"
+            "⏭️ **GMの操作で役職確認を締め切り、1日目へ進みます。**" + after_resume
         )
-        return "▶️ **役職確認を締め切りました。**", None
+        return "▶️ **役職確認を締め切りました。**" + after_resume, None
 
     def _check_morning_ready(self) -> bool:
         """生存者全員が宣言済みなら確定状態にする。
@@ -9816,16 +9834,16 @@ class RoomRunner:
             return None
         return started_at.strftime("%Y-%m-%d %H:%M:%S")
 
-    async def _end_game(self, winner: Team) -> None:
+    async def _collect_settlement_inputs(
+        self, winner: Team
+    ) -> tuple[list[dict], dict, Optional[dict]]:
+        """精算stageへ渡す材料を集める (霊界提出の締切を含む)。
+
+        `_end_game` が `pending_winner` を立てる前の区間。ここで落ちても
+        `ending` を残さず抜けられるよう、呼び出し側の try で囲めるように
+        切り出している。
+        """
         state = self.state
-        if state.phase == Phase.GAME_OVER:
-            # 退出起因の外部終了とゲームループの終了が競合した場合の二重実行防止
-            return
-        if state.ending:
-            # stage payloadを同じrun_idへ二重に上書きしない。このフラグは
-            # 最初のawaitより前に立つため、同一イベントループ上で原子的。
-            return
-        state.ending = True
         # 受付を閉じてから材料を集める。解放すると spirit_hold_ids が空になり、
         # submit_wolf_guess も通らなくなるので、提出の締めを兼ねる
         await self._release_all_spirit_holds()
@@ -9865,6 +9883,31 @@ class RoomRunner:
                 "rank_at_game": None,
                 "rank_provisional": None,
             })
+        return player_records, bonus_facts, game_stats
+
+    async def _end_game(self, winner: Team) -> None:
+        state = self.state
+        if state.phase == Phase.GAME_OVER:
+            # 退出起因の外部終了とゲームループの終了が競合した場合の二重実行防止
+            return
+        if state.ending:
+            # stage payloadを同じrun_idへ二重に上書きしない。このフラグは
+            # 最初のawaitより前に立つため、同一イベントループ上で原子的。
+            return
+        state.ending = True
+        try:
+            player_records, bonus_facts, game_stats = (
+                await self._collect_settlement_inputs(winner)
+            )
+        except Exception:
+            # pending_winner を立てる前に落ちたら ending を戻してから投げ直す。
+            # 立てたままだと抜け道が全部塞がる: force_end は二重実行ガードで
+            # 即Falseを返して自動廃村もGMの「強制終了」も効かず、パネルの
+            # リセット・プレイヤー除外も _settlement_locked() が拒否し、
+            # 「再開」は pending_winner が無いので精算再試行にもならない。
+            # 進行中でも終了済みでもない村から出られなくなる。
+            state.ending = False
+            raise
 
         before_rank_map = None
         rank_records: Optional[dict[int, dict]] = None
@@ -11949,13 +11992,19 @@ class RoomRunner:
         async def set_mute(
             member: discord.Member, mute: bool, *, retry: bool = True
         ) -> bool:
+            # HTTPのawait中にVOICE_STATE_UPDATEが先に来ると、従来は
+            # bot_muted_idsへの記録前なので「外部でmuteされた」と誤認し、
+            # 議論終了→投票の切替そのものを安全停止していた。ここでは
+            # Botが要求中であることだけを揮発的に示す。成功後は通常の
+            # bot_muted_idsが引き継ぐため、外部unmuteの検知は弱めない。
+            self._pending_bot_mute_updates[member.id] = mute
             try:
                 edit_kwargs: dict = {"mute": mute}
                 if marker is not None:
                     edit_kwargs["roles"] = self._roles_with_mute_marker(
                         member, marker, present=mute
                     )
-                await self._paced_discord_api_call(
+                await self._paced_voice_mute_api_call(
                     member.edit, **edit_kwargs,
                     reason="人狼: フェーズ発言制御",
                 )
@@ -11973,6 +12022,11 @@ class RoomRunner:
                 if retry:
                     failed.append((member, mute))
                 return False
+            finally:
+                # GatewayがHTTPより先に届く競合だけを覆う印なので、応答後に
+                # 残さない。例外時に残すと次の外部更新をBot操作と誤認する。
+                if self._pending_bot_mute_updates.get(member.id) == mute:
+                    self._pending_bot_mute_updates.pop(member.id, None)
 
         # vc.membersはDiscordのボイス状態キャッシュ由来で、キャッシュ更新の
         # タイミング次第で参加者が静かに漏れることがある (取りこぼすと対象0件
@@ -12203,18 +12257,14 @@ class RoomRunner:
                     candidates[user_id] = member
 
         issues: list[str] = []
-        for speaker_id in speakers:
-            member = candidates.get(speaker_id)
-            if member is None:
-                player = state.get_player(speaker_id)
-                fallback = player.member if player is not None else None
-                if fallback is not None and getattr(fallback, "bot", False):
-                    continue
-                name = (
-                    getattr(fallback, "display_name", None)
-                    or f"ID:{speaker_id}"
-                )
-                issues.append(f"{name}(ゲームVC未接続)")
+        # 発言すべき人がゲームVCに居ないのは不整合ではない。_sync_server_mutes は
+        # VC接続中のメンバーしか触らないので、未接続者を「収束していない」と数えると
+        # 誰も満たせない条件になる。とくに一時停止は全員がVCを抜けてから解除される
+        # ことが多く、そのまま resume_game の確認を落として「権限を確認してください」
+        # のまま二度と再開できなくなっていた。未接続者は disconnected_players と
+        # on_voice_state_update の復帰同期に任せる。
+        # fail-closedで守りたいのは「喋ってはいけない人が喋れる」側だけで、
+        # VCに居ない人はそもそも喋れない。
 
         for member in candidates.values():
             if member.bot:
@@ -13216,10 +13266,15 @@ class RoomRunner:
                 )
                 # 議論終了→投票などでは、phase更新より先にBot所有muteが
                 # Gatewayへ反映される。この既知の遷移だけは外部改変と誤認しない。
+                # HTTP応答よりGatewayが先に来る短い競合ではbot_muted_idsがまだ
+                # 更新されないため、同期処理中の揮発印も同じ所有証拠として扱う。
                 own_mute_in_flight = bool(
                     should_speak
                     and getattr(after, "mute", False)
-                    and member.id in state.bot_muted_ids
+                    and (
+                        member.id in state.bot_muted_ids
+                        or getattr(self, "_pending_bot_mute_updates", {}).get(member.id) is True
+                    )
                 )
                 if drifted and not own_mute_in_flight:
                     reason = (

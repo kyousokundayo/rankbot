@@ -701,17 +701,18 @@ class HelpAndRuleEmbedTest(unittest.TestCase):
         vote_help = fields["投票と処刑"]
         daily_flow = fields["1日の流れ"]
         self.assertIn("投票参加", vote_help)
-        self.assertIn("1人30秒", vote_help)
+        self.assertIn("1人25秒", vote_help)
         self.assertIn("確定・公開", vote_help)
-        self.assertLess(vote_help.index("確定・公開"), vote_help.index("1人30秒"))
+        self.assertLess(vote_help.index("確定・公開"), vote_help.index("1人25秒"))
         self.assertIn("発言終了SEと約2秒", vote_help)
         self.assertIn("本人専用の確認", vote_help)
         self.assertIn("候補選択に時間制限はなく", vote_help)
         self.assertIn("自動棄権はしません", vote_help)
-        self.assertIn("1人30秒の投票発言", daily_flow)
+        self.assertIn("1人25秒の投票発言", daily_flow)
         self.assertIn("1票もなければ処刑なし", vote_help)
         self.assertIn("候補者以外が一斉", vote_help)
         self.assertNotIn("1人20秒", vote_help)
+        self.assertNotIn("1人30秒", vote_help)
         self.assertNotIn("時間切れは棄権", vote_help)
 
 
@@ -786,6 +787,46 @@ class GMControlRefreshTest(unittest.IsolatedAsyncioTestCase):
         resumed_view = resume_interaction.edit_original_response.await_args.kwargs["view"]
         self.assertFalse(self._button(resumed_view, "gm_pause").disabled)
         self.assertTrue(self._button(resumed_view, "gm_resume").disabled)
+
+    async def test_paused_panel_keeps_gm_escape_actions_enabled(self) -> None:
+        common = dict(
+            game_run_id="run-1",
+            gm_id=99,
+            phase=Phase.PAUSED,
+            paused=True,
+            ending=False,
+            pending_winner=None,
+            initial_night_completed=False,
+            vote_slot_active=False,
+            vote_slot_token=0,
+            turn_slot_token=0,
+            current_speaker_id=None,
+            day_generation=3,
+            day_discussion_skip_generation=None,
+        )
+        prep_state = SimpleNamespace(
+            **common,
+            phase_before_pause=Phase.PREPARATION,
+            morning_ready_open=False,
+        )
+        prep_view = GMControlView(SimpleNamespace(state=prep_state))
+        self.assertFalse(self._button(prep_view, "gm_force_prep").disabled)
+
+        night_state = SimpleNamespace(
+            **common,
+            phase_before_pause=Phase.NIGHT,
+            morning_ready_open=True,
+        )
+        night_view = GMControlView(SimpleNamespace(state=night_state))
+        self.assertFalse(self._button(night_view, "gm_force_morning").disabled)
+
+        discussion_state = SimpleNamespace(
+            **common,
+            phase_before_pause=Phase.DAY_DISCUSSION,
+            morning_ready_open=False,
+        )
+        discussion_view = GMControlView(SimpleNamespace(state=discussion_state))
+        self.assertFalse(self._button(discussion_view, "gm_skip_wait").disabled)
 
 
 class InteractionTimerTest(unittest.TestCase):
