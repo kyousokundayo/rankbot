@@ -2040,11 +2040,12 @@ class RoomRunner:
         self.manager.spawn_bg_task(self.manager.sound_player.play(vc, scene))
 
     async def _play_transition_se(self, scene: str) -> None:
-        """SEと約2秒の切替間を進行順序に組み込む。
+        """SEの再生完了を進行順序に組み込む。
 
         通常のSEは非同期だが、投票発言の開始・終了と結果開示は
-        音の前に次の操作へ進まないことが仕様。VC不調は上限で打ち切り、
-        無音でも同じ切替間は保つ。
+        音の前に次の操作へ進まないことが仕様。VC不調は上限で打ち切る。
+        `VOTE_TRANSITION_GRACE` はSEが鳴り終わった後にさらに足す間で、
+        既定は0 (切替はSEで分かるため)。無音時の間を戻したいときだけ上げる。
         """
         loop = asyncio.get_running_loop()
         started = loop.time()
@@ -8076,7 +8077,7 @@ class RoomRunner:
         state.current_speaker_id = player.user_id
         await self._persist_room_state()
 
-        # 遺言者のみ発言許可。解除反映後、遺言SEと約2秒の切替を完了してから
+        # 遺言者のみ発言許可。解除反映後、遺言SEの再生完了を待ってから
         # 30秒タイマーを始める。
         await self._grant_speaker(player.member)
         await self._play_transition_se("lastwill")
@@ -10703,9 +10704,9 @@ class RoomRunner:
         await self._sync_server_mutes(set())
         if not await self._await_expected_mute_state(set(), MUTE_GRACE_TIME):
             await self._safe_village_send(
-                "⚠️ **一時停止しましたが、全員のミュート反映を確認できません。**\n"
-                "タイマーは停止中です。Botのメンバーミュート権限とロール順位を確認してから、"
-                "GMが再開してください。"
+                "⚠️ **一時停止しましたが、全員のミュート反映を確認できません。**"
+                f"{self._mute_stop_detail(set())}\n"
+                "タイマーは停止中です。解消後にGMが再開してください。"
             )
             return (
                 "⚠️ タイマーは停止しましたが、全員のミュート反映を確認できません。"
@@ -10758,7 +10759,7 @@ class RoomRunner:
                 expected_speakers, MUTE_GRACE_TIME
             ):
                 await self._restore_pause_after_failed_mute_resume(
-                    resume_phase, "復元再開時の発言制御"
+                    resume_phase, "復元再開時の発言制御", expected_speakers
                 )
                 return "⚠️ 発言制御を確認できないため停止を継続します。権限確認後に再度「再開」を押してください。"
             await self._persist_room_state()
@@ -10800,7 +10801,7 @@ class RoomRunner:
         ):
             failed_phase = self._effective_phase() or state.phase_before_pause or Phase.DAY_DISCUSSION
             await self._restore_pause_after_failed_mute_resume(
-                failed_phase, "再開時の発言制御"
+                failed_phase, "再開時の発言制御", expected_speakers
             )
             return "⚠️ 発言制御を確認できないため停止を継続します。権限確認後に再度「再開」を押してください。"
         await self._persist_room_state()
@@ -12307,12 +12308,26 @@ class RoomRunner:
                 continue
             if should_speak:
                 if bool(getattr(voice, "mute", False)):
-                    issues.append(f"{member.display_name}(mute解除未反映)")
+                    # Botが所有していないmuteはモデレーターの手動操作で、
+                    # _sync_server_mutes も保護して外さない。外せない相手を
+                    # 待ち続けると進行が止まったまま復帰できないので、
+                    # 「喋れないだけ」として通す。fail-closedで守るのは
+                    # 「喋ってはいけない人が喋れる」側だけ。
+                    if self._owns_mute(member):
+                        issues.append(f"{member.display_name}(mute解除未反映)")
                 elif bool(getattr(voice, "suppress", False)):
                     issues.append(f"{member.display_name}(発言権suppress中)")
             elif not bool(getattr(voice, "mute", False)):
                 issues.append(f"{member.display_name}(mute未反映)")
         return issues
+
+    def _owns_mute(self, member: discord.Member) -> bool:
+        """そのmuteをBotが付けたと言えるか (所有記録またはマーカーロール)。"""
+        return (
+            member.id in self.state.bot_muted_ids
+            or self._has_own_mute_marker(member)
+            or self._pending_bot_mute_updates.get(member.id) is True
+        )
 
     async def _await_expected_mute_state(
         self, speakers: set[int], timeout: float
@@ -12338,6 +12353,24 @@ class RoomRunner:
                 return False
             await asyncio.sleep(0.25)
 
+    _MUTE_STOP_HINT = (
+        "原因の候補: モデレーターの手動ミュート (Botは自分が付けていないミュートを"
+        "保護するため自動解除しません) / Botのメンバーミュート権限・ロール順位 / "
+        "チャンネル権限によるsuppress。"
+    )
+
+    def _mute_stop_detail(self, speakers: set[int]) -> str:
+        """安全停止の告知へ、収束していない相手と理由を添える。
+
+        以前は「Botの権限とロール順位を確認してください」しか出しておらず、
+        実際の原因が手動ミュートでもGMがそこへたどり着けなかった。停止した
+        まま原因不明になるのを避けるため、ログと同じ内訳を#昼にも出す。
+        """
+        issues = self._mute_state_issues(speakers)
+        if not issues:
+            return ""
+        return f"\n未解決: {', '.join(issues[:10])}\n{self._MUTE_STOP_HINT}"
+
     async def _ensure_mute_state_or_stop(
         self,
         speakers: set[int],
@@ -12355,9 +12388,14 @@ class RoomRunner:
         raise StateDurabilityError(f"{context}を確認できないため進行を停止しました")
 
     async def _restore_pause_after_failed_mute_resume(
-        self, resume_phase: Phase, context: str
+        self, resume_phase: Phase, context: str, speakers: set[int]
     ) -> None:
-        """再開時の発言制御が揃わなければタイマーを解放せず停止へ戻す。"""
+        """再開時の発言制御が揃わなければタイマーを解放せず停止へ戻す。
+
+        `speakers` は呼び出し側が再開しようとしていた話者集合。停止状態では
+        `_current_speaker_ids()` が空集合を返すため、ここで取り直すと肝心の
+        「誰のミュートが解除できていないか」が告知から抜ける。
+        """
         state = self.state
         state.paused = True
         state.phase_before_pause = resume_phase
@@ -12365,8 +12403,9 @@ class RoomRunner:
         state.pause_event.clear()
         await self._persist_room_state()
         await self._safe_village_send(
-            f"⚠️ **{context}を確認できないため停止を継続します。**\n"
-            "Botのメンバーミュート権限とロール順位を確認し、解消後にGMが再開してください。"
+            f"⚠️ **{context}を確認できないため停止を継続します。**"
+            f"{self._mute_stop_detail(speakers)}\n"
+            "解消後にGMが再開してください。"
         )
 
     async def _wait_for_mute_sync_or_pause(
@@ -12385,8 +12424,9 @@ class RoomRunner:
             state.pause_event.clear()
             await self._persist_room_state()
             await self._safe_village_send(
-                f"⚠️ **{context}を確認できないため安全停止しました。**\n"
-                "Botのメンバーミュート権限とロール順位を確認し、解消後にGMが再開してください。"
+                f"⚠️ **{context}を確認できないため安全停止しました。**"
+                f"{self._mute_stop_detail(speakers)}\n"
+                "解消後にGMが再開してください。"
             )
             # resume_game側も同じ発言状態を確認してからだけEventを開く。
             await state.pause_event.wait()
@@ -13301,6 +13341,31 @@ class RoomRunner:
                         or getattr(self, "_pending_bot_mute_updates", {}).get(member.id) is True
                     )
                 )
+                # 発言者への手動muteは「喋れないだけ」で、Botは保護して外さない。
+                # ここで止めると外部の操作ひとつでゲームが復帰不能になるため、
+                # 知らせるだけで進行は続ける。止めるのは非発言者の手動unmute
+                # (=喋ってはいけない人が喋れる) だけ。
+                manual_mute_on_speaker = bool(
+                    should_speak
+                    and getattr(after, "mute", False)
+                    and not own_mute_in_flight
+                    and not self._owns_mute(member)
+                )
+                if manual_mute_on_speaker:
+                    # GMのミュートは元から本人の手動運用で、Botは状態を強制
+                    # しない。クロストーク議論ではGMも発言枠を持つため、
+                    # 自分でミュートし直すたびに告知すると #昼 が鳴り続ける。
+                    # 止めない点は他の手動muteと揃える (GMの自己ミュートで
+                    # ゲームが止まるのは、今回直した「手動muteで進行不能」の
+                    # 一番起きやすい形そのものだった)。
+                    if not self._uses_manual_gm_mute(member.id):
+                        await self._safe_village_send(
+                            f"🔇 **{member.display_name} は手動でサーバーミュートされています。**\n"
+                            "Botが付けたミュートではないため自動では外しません。"
+                            "発言させる場合はモデレーターがミュートを解除してください。"
+                            "（進行はこのまま続きます）"
+                        )
+                    return
                 if drifted and not own_mute_in_flight:
                     reason = (
                         f"{member.display_name} の音声状態が現在フェーズと一致しません"
