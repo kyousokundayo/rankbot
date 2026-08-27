@@ -123,8 +123,29 @@ class DayDiscussionSkipContractTest(unittest.IsolatedAsyncioTestCase):
         result = await runner.force_skip_wait(players[0].member)
 
         self.assertIn("投票へ進みます", result)
+        # 押した直後は何も起きないので、受理と進むタイミングを必ず添える。
+        self.assertIn("再開後に進みます", result)
         self.assertEqual(runner.state.day_discussion_skip_generation, 1)
         self.assertTrue(runner.state.day_discussion_skip_event.is_set())
+
+    async def test_running_game_skip_has_no_resume_note(self) -> None:
+        runner = make_runner("v9_cross")
+        players = add_players(runner, 9)
+
+        result = await runner.force_skip_wait(players[0].member)
+
+        self.assertIn("投票へ進みます", result)
+        self.assertNotIn("再開後", result)
+
+    async def test_paused_rejection_keeps_its_own_wording(self) -> None:
+        """受理できなかった応答には再開待ちの注記を足さない。"""
+        runner = make_runner("v9_cross")
+        players = add_players(runner, 9)
+        runner.state.paused = True
+
+        result = await runner.force_skip_wait(players[1].member)
+
+        self.assertEqual(result, "GMのみ操作可能です。")
 
     async def test_skip_only_applies_to_the_day_it_was_pressed(self) -> None:
         runner = make_runner("v9_cross")

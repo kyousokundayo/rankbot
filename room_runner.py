@@ -5119,13 +5119,38 @@ class RoomRunner:
                 error,
             )
 
+    def _paused_followup_note(self) -> str:
+        """停止中に受け付けたGM操作へ添える注記。
+
+        一時停止中のGM操作は「拒否」ではなく「予約」にしてある (拒否すると
+        再開できない状況で出口が無くなる)。ただし押した直後は何も起きないので、
+        受理した旨と実際に進むタイミングを必ず添える。
+        """
+        return " 一時停止中のため、再開後に進みます。" if self.state.paused else ""
+
     async def force_skip_wait(
         self,
         member: discord.Member,
         *,
         expected_vote_slot_token: Optional[int] = None,
     ) -> str:
-        """GMが現在の安全な時間待ちだけを終了する。"""
+        """GMが現在の安全な時間待ちだけを終了する。
+
+        停止中も受け付けるため、受理できた場合 (このメソッドの成功応答は
+        すべて ``⏭️`` で始まる) だけ再開待ちの注記を添える。
+        """
+        note = self._paused_followup_note()
+        result = await self._force_skip_wait_body(
+            member, expected_vote_slot_token=expected_vote_slot_token
+        )
+        return f"{result}{note}" if note and result.startswith("⏭️") else result
+
+    async def _force_skip_wait_body(
+        self,
+        member: discord.Member,
+        *,
+        expected_vote_slot_token: Optional[int] = None,
+    ) -> str:
         state = self.state
         if member.id != state.gm_id:
             return "GMのみ操作可能です。"
@@ -9305,7 +9330,7 @@ class RoomRunner:
             log.exception(f"GM強制夜明けの保存に失敗: {e}")
             return "", "❌ 夜明けを保存できませんでした。もう一度お試しください。"
         state.morning_ready_event.set()
-        after_resume = " 一時停止中のため、再開後に進みます。" if state.paused else ""
+        after_resume = self._paused_followup_note()
         await self._safe_village_send("⏭️ **GMの操作で朝を迎えます。**" + after_resume)
         return "🌅 **GMの操作で朝を迎えました。**" + after_resume, None
 
@@ -9326,7 +9351,7 @@ class RoomRunner:
             log.exception(f"GM役職確認締切の保存に失敗: {e}")
             return "", "❌ 役職確認の締切を保存できませんでした。もう一度お試しください。"
         state.prep_ready_event.set()
-        after_resume = " 一時停止中のため、再開後に進みます。" if state.paused else ""
+        after_resume = self._paused_followup_note()
         await self._safe_village_send(
             "⏭️ **GMの操作で役職確認を締め切り、1日目へ進みます。**" + after_resume
         )

@@ -1320,8 +1320,12 @@ class GMControlView(discord.ui.View):
         result = await self.cog.force_next_turn(
             interaction.user.id, self.turn_token
         )
+        # 停止中も受け付ける操作なので、他のGM操作と同じ注記を添える。
+        note = getattr(self.cog, "_paused_followup_note", None)
         await interaction.followup.send(
-            result or "⏭️ 現在の発言を終了しました。", ephemeral=True
+            result
+            or ("⏭️ 現在の発言を終了しました。" + (note() if callable(note) else "")),
+            ephemeral=True,
         )
 
     @discord.ui.button(
