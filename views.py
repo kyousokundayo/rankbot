@@ -16,7 +16,7 @@ import rating as rating_lib
 import stats_image
 from config import (
     MAX_PLAYERS, Role, Team, Phase,
-    RUNOFF_SPEECH_TIME, LAST_WILL_TIME, VOTE_TIMEOUT,
+    RUNOFF_SPEECH_TIME, LAST_WILL_TIME, VOTE_TIMEOUT, VOTE_SPEECH_TIME,
     NIGHT_BASE, NIGHT_MIN,
     CH_LOBBY, CH_STATS, CH_VILLAGE, CH_SPIRIT,
     LOG_CATEGORY_VILLAGE, LOG_CATEGORY_LIMIT,
@@ -1102,16 +1102,16 @@ class GMControlView(discord.ui.View):
         )
         self.force_prep_btn.disabled = (
             effective_phase != Phase.PREPARATION
-            or state.paused
             or self._settlement_locked()
         )
-        turn_actions_open = getattr(cog, "turn_actions_open", None)
+        turn_actions_open = getattr(cog, "gm_turn_actions_open", None)
+        if not callable(turn_actions_open):
+            turn_actions_open = getattr(cog, "turn_actions_open", None)
         self.next_turn_btn.disabled = not (
             callable(turn_actions_open) and turn_actions_open()
         )
         self.skip_wait_btn.disabled = not (
-            not state.paused
-            and (
+            (
                 (
                     effective_phase == Phase.INITIAL_NIGHT
                     and not getattr(state, "initial_night_completed", False)
@@ -5469,7 +5469,7 @@ def build_rule_embeds(
             "朝の結果発表 → 議論 → 投票 →（同票なら弁明と決戦投票）→ 遺言 → 処刑 → 夜\n"
             "**議論中の仮投票はありません。**\n"
             f"議論 **初日{day_base_min}分 / 毎日{day_drop_min}分短縮 / 最低{day_min_min}分**"
-            " ／ 通常投票 **1人30秒の投票発言**\n"
+            f" ／ 通常投票 **1人{VOTE_SPEECH_TIME}秒の投票発言**\n"
             f"弁明 **{RUNOFF_SPEECH_TIME}秒** ／ 遺言 **{LAST_WILL_TIME}秒**（本人かGMが短縮可）\n"
             f"夜 **初日{NIGHT_BASE}秒 / 以降{NIGHT_MIN}秒**（目安。朝は全員の宣言で明ける）"
         )
@@ -5509,7 +5509,7 @@ def build_rule_embeds(
         vote_rule = (
             "「投票参加」を押した順に、先に投票先を選び、"
             "本人専用の確認で確定・公開します。"
-            "ミュート解除後のSEを合図に1人30秒発言し、本人の「終了」で短縮できます。\n"
+            f"ミュート解除後のSEを合図に1人{VOTE_SPEECH_TIME}秒発言し、本人の「終了」で短縮できます。\n"
             "発言終了SEと約2秒後に次の人の投票へ進みます。"
             "**候補選択に時間制限はなく、自動棄権はしません。**\n"
             "「投票参加」はいつでも押せます。列が空なら全員ミュートで待機し、"

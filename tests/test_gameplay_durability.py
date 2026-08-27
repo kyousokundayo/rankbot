@@ -898,6 +898,66 @@ class GameplayDurabilityTest(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertTrue(all(interval >= 0.018 for interval in intervals), intervals)
 
+    async def test_voice_mute_pacer_uses_shorter_interval_in_the_same_queue(self) -> None:
+        manager = GameCog(SimpleNamespace(managed_guild_id=1))
+        manager.bulk_api_interval = 1.0
+        manager.voice_mute_api_interval = 0.02
+        call_times: list[float] = []
+
+        async def record_call() -> None:
+            call_times.append(asyncio.get_running_loop().time())
+
+        await asyncio.gather(
+            manager.paced_voice_mute_api_call(record_call),
+            manager.paced_voice_mute_api_call(record_call),
+        )
+        interval = call_times[1] - call_times[0]
+        self.assertGreaterEqual(interval, 0.018)
+        self.assertLess(interval, 0.2)
+        self.assertIn("voice-mute:record_call", manager._api_call_stats)
+
+    async def test_gm_can_register_escape_actions_while_paused(self) -> None:
+        """停止はタイマーを止めるだけで、GMの復旧操作を塞がない。"""
+        prep_runner = make_runner()
+        gm = add_player(prep_runner, 1)
+        prep_runner.state.gm_id = gm.user_id
+        prep_runner.state.phase = Phase.PAUSED
+        prep_runner.state.phase_before_pause = Phase.PREPARATION
+        prep_runner.state.paused = True
+
+        _, error = await prep_runner.force_prep_complete(gm.member)
+
+        self.assertIsNone(error)
+        self.assertTrue(prep_runner.state.prep_confirmed)
+        self.assertTrue(prep_runner.state.prep_ready_event.is_set())
+
+        night_runner = make_runner()
+        gm = add_player(night_runner, 1)
+        night_runner.state.gm_id = gm.user_id
+        night_runner.state.phase = Phase.PAUSED
+        night_runner.state.phase_before_pause = Phase.NIGHT
+        night_runner.state.paused = True
+        night_runner.state.morning_ready_open = True
+
+        _, error = await night_runner.force_morning(gm.member)
+
+        self.assertIsNone(error)
+        self.assertTrue(night_runner.state.morning_confirmed)
+        self.assertTrue(night_runner.state.morning_ready_event.is_set())
+
+        vote_runner = make_runner()
+        gm = add_player(vote_runner, 1)
+        vote_runner.state.gm_id = gm.user_id
+        vote_runner.state.phase = Phase.PAUSED
+        vote_runner.state.phase_before_pause = Phase.DAY_DISCUSSION
+        vote_runner.state.paused = True
+        vote_runner.state.day_generation = 4
+
+        result = await vote_runner.force_skip_wait(gm.member)
+
+        self.assertIn("議論を終了", result)
+        self.assertTrue(vote_runner.state.day_discussion_skip_event.is_set())
+
     async def test_panel_double_failure_confirms_and_closes_night_actions(self) -> None:
         runner = make_runner()
         add_player(runner, 1)

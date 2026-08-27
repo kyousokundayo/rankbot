@@ -329,6 +329,59 @@ class DeletionAndLobbyExclusionTest(unittest.IsolatedAsyncioTestCase):
         cog.rooms["private-life"].state.phase = Phase.LOBBY
         self.assertFalse(cog._private_room_phase_blocks_delete(row))
 
+    async def test_force_delete_offers_in_progress_rooms(self) -> None:
+        """運営の「村の強制削除」は進行中の村も選ばせる。
+
+        GMパネルの「強制終了」しか出口がないと、#昼 を消した / GMが不在 /
+        全員VC切断で再開できない卓が永久に進行中のまま残り、参加者全員が
+        別の村を始められなくなる。実処理側は元から force_end を通す。
+        """
+        cog = GameCog.__new__(GameCog)
+        cog.rooms = {
+            "private-paused": SimpleNamespace(
+                state=SimpleNamespace(phase=Phase.PAUSED),
+            )
+        }
+        row = {"room_id": "private-paused", "room_name": "止まった村", "owner_id": 1}
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(id=1, get_member=lambda _id: None),
+            user=_member(1),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        cog._send_private_room_delete_confirm = AsyncMock()
+
+        await cog._send_private_room_delete_picker(
+            interaction, [row], force=True,
+        )
+
+        cog._send_private_room_delete_confirm.assert_awaited_once()
+        self.assertIs(cog._send_private_room_delete_confirm.await_args.args[1], row)
+        interaction.followup.send.assert_not_awaited()
+
+    async def test_owner_delete_still_refuses_in_progress_rooms(self) -> None:
+        cog = GameCog.__new__(GameCog)
+        cog.rooms = {
+            "private-paused": SimpleNamespace(
+                state=SimpleNamespace(phase=Phase.PAUSED),
+            )
+        }
+        row = {"room_id": "private-paused", "room_name": "止まった村", "owner_id": 1}
+        interaction = SimpleNamespace(
+            guild=SimpleNamespace(id=1, get_member=lambda _id: None),
+            user=_member(1),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        cog._send_private_room_delete_confirm = AsyncMock()
+
+        await cog._send_private_room_delete_picker(
+            interaction, [row], force=False,
+        )
+
+        cog._send_private_room_delete_confirm.assert_not_awaited()
+        message = interaction.followup.send.await_args.args[0]
+        self.assertIn("ゲーム中のGM村は削除できません", message)
+        self.assertIn("村の強制削除", message)
+
     async def test_exclusion_select_defers_before_waiting_on_action_lock(self) -> None:
         """除外セレクトは、action_lockを待つ前にinteractionを受理する。
 

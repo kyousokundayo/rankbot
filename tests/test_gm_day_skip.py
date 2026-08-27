@@ -115,15 +115,16 @@ class DayDiscussionSkipContractTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(runner.state.day_discussion_skip_generation)
         self.assertFalse(runner.state.day_discussion_skip_event.is_set())
 
-    async def test_paused_game_is_not_skippable(self) -> None:
+    async def test_paused_game_gm_can_schedule_skip_for_resume(self) -> None:
         runner = make_runner("v9_cross")
         players = add_players(runner, 9)
         runner.state.paused = True
 
         result = await runner.force_skip_wait(players[0].member)
 
-        self.assertIn("一時停止中", result)
-        self.assertIsNone(runner.state.day_discussion_skip_generation)
+        self.assertIn("投票へ進みます", result)
+        self.assertEqual(runner.state.day_discussion_skip_generation, 1)
+        self.assertTrue(runner.state.day_discussion_skip_event.is_set())
 
     async def test_skip_only_applies_to_the_day_it_was_pressed(self) -> None:
         runner = make_runner("v9_cross")

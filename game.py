@@ -24,6 +24,7 @@ from config import (
     private_room_limit_for_roles,
     RECRUITMENT_NOTIFICATION_ROLE_NAME,
     BULK_DISCORD_API_INTERVAL,
+    VOICE_MUTE_API_INTERVAL,
     MUTE_RETRY_DELAY,
     DEFAULT_LADDER_ID, LADDER_DEFINITIONS,
     ACTIVE_ROOM_DEFINITIONS,
@@ -79,6 +80,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         # 実際のHTTP呼び出しは従来どおりdiscord_api_semの内側で行う。
         self.bulk_api_lock = asyncio.Lock()
         self.bulk_api_interval = BULK_DISCORD_API_INTERVAL
+        self.voice_mute_api_interval = VOICE_MUTE_API_INTERVAL
         self._bulk_api_next_at = 0.0
         # API待ち時間の内訳をルート別に集計する。間隔を詰めてよいのか、
         # ロック分割が要るのか、Discord側のバケットで待たされているのかは
@@ -151,10 +153,17 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         stat["exec"] += exec_seconds
         stat["max_exec"] = max(stat["max_exec"], exec_seconds)
 
-    async def paced_discord_api_call(self, func, *args, **kwargs):
-        """高負荷な連続APIを全卓で直列化し、最小間隔を空けて実行する。"""
+    async def _paced_discord_api_call(
+        self,
+        func,
+        *args,
+        interval: float,
+        route_prefix: str = "",
+        **kwargs,
+    ):
+        """共有列でAPIを直列化して実行する内部実装。"""
         loop = asyncio.get_running_loop()
-        route = self._api_route_label(func)
+        route = route_prefix + self._api_route_label(func)
         queued_at = loop.time()
         async with self.bulk_api_lock:
             queue_wait = loop.time() - queued_at
@@ -168,13 +177,34 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                     return await func(*args, **kwargs)
             finally:
                 finished_at = loop.time()
-                self._bulk_api_next_at = finished_at + self.bulk_api_interval
+                self._bulk_api_next_at = finished_at + interval
                 self._record_api_call(
                     route,
                     queue_wait=queue_wait,
                     interval_wait=interval_wait,
                     exec_seconds=finished_at - started_at,
                 )
+
+    async def paced_discord_api_call(self, func, *args, **kwargs):
+        """高負荷な連続APIを全卓で直列化し、最小間隔を空けて実行する。"""
+        return await self._paced_discord_api_call(
+            func, *args, interval=self.bulk_api_interval, **kwargs
+        )
+
+    async def paced_voice_mute_api_call(self, func, *args, **kwargs):
+        """発言制御のserver muteを同じ共有列で短い間隔で流す。
+
+        muteを別列にはせず、他のmember editとの直列化を保ったまま
+        間隔だけを短くする。
+        Discord側が返す429の待機はdiscord.pyへ任せる。
+        """
+        return await self._paced_discord_api_call(
+            func,
+            *args,
+            interval=self.voice_mute_api_interval,
+            route_prefix="voice-mute:",
+            **kwargs,
+        )
 
     def log_api_pacing_summary(self, label: str, *, reset: bool = True) -> None:
         """API待ち時間の内訳をルート別に出す。
@@ -2612,26 +2642,37 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         *,
         force: bool,
     ) -> None:
-        """削除対象の選択UIを出す。ゲーム中の村は選ばせない。"""
+        """削除対象の選択UIを出す。村主向けはゲーム中の村を選ばせない。"""
         guild = interaction.guild
         if guild is None:
             return
-        deletable = [
-            row for row in rows
-            if not self._private_room_phase_blocks_delete(row)
-        ]
         busy = [
             row for row in rows
             if self._private_room_phase_blocks_delete(row)
         ]
+        # 村主向けは通常どおりゲーム中を弾く。運営の「村の強制削除」だけは
+        # 進行中でも選ばせる。GMパネルの「強制終了」しか出口がないと、
+        # #昼 を消した / GMが不在 / 全員VC切断で再開できない、といった卓が
+        # 永久に進行中のまま残り、参加者全員が別の村を始められなくなる。
+        # 実処理側 (_delete_private_room_by_row) は元から force_end を通す。
+        busy_ids = {row["room_id"] for row in busy}
+        deletable = (
+            rows if force
+            else [row for row in rows if row["room_id"] not in busy_ids]
+        )
+        # 運営向けは村ごとの最終確認で「廃村してから削除する」と出すので、
+        # 一覧側で重ねて警告しない。
         busy_note = (
-            "\nゲーム中のため選べません: "
+            ""
+            if force or not busy
+            else "\nゲーム中のため選べません: "
             + "、".join(row["room_name"] for row in busy)
-            if busy else ""
         )
         if not deletable:
             await interaction.followup.send(
-                "ゲーム中のGM村は削除できません。先にゲームを終了してください。",
+                "ゲーム中のGM村は削除できません。先にゲームを終了してください。\n"
+                "GMパネルから操作できない場合は、運営に #運営メニュー の"
+                "「村の強制削除」を依頼してください。",
                 ephemeral=True,
             )
             return
@@ -2676,9 +2717,15 @@ class GameCog(RoomPermissionMixin, commands.Cog):
         if force:
             owner = interaction.guild.get_member(int(row["owner_id"])) if interaction.guild else None
             owner_label = f"（村主: {owner.display_name if owner else row['owner_id']}）"
+        in_progress_note = (
+            "\n⚠️ **この村はゲーム中です。戦績を残さず廃村してから削除します。**"
+            if force and self._private_room_phase_blocks_delete(row)
+            else ""
+        )
         await interaction.followup.send(
             f"⚠️ GM村 **{row['room_name']}**{owner_label} のカテゴリ・チャンネルを"
             "削除します。受付中の募集も一緒に締め切られます。実行しますか？"
+            + in_progress_note
             + extra_note,
             view=DangerConfirmView(
                 interaction.user.id,
@@ -2754,7 +2801,7 @@ class GameCog(RoomPermissionMixin, commands.Cog):
                 )
                 return
 
-        if self._private_room_phase_blocks_delete(row):
+        if not force and self._private_room_phase_blocks_delete(row):
             await self._private_reply(
                 interaction,
                 "ゲーム中のGM村は削除できません。先にゲームを終了してください。",
